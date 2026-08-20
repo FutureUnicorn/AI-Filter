@@ -1,0 +1,13 @@
+[project]
+name = "ai-filter"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=3.3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

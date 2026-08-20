@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+*.egg-info/
+
+# real applicant data must never be committed to this repo
+*.applicant.txt
+data/
