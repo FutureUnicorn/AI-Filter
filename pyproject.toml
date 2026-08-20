@@ -1,7 +1,8 @@
 [project]
 name = "ai-filter"
 version = "0.1.0"
-description = "Add your description here"
+description = "Employer-side hiring-signal evidence pipeline (Signal Audit) — concierge-POC stage."
+readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "openai>=3.3.1",
@@ -9,5 +10,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
+    "pytest==9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts"]
