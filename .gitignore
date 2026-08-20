@@ -4,6 +4,10 @@ __pycache__/
 .env
 .pytest_cache/
 *.egg-info/
+dist/
+build/
+.DS_Store
+uv-cache/
 
 # real applicant data must never be committed to this repo
 *.applicant.txt

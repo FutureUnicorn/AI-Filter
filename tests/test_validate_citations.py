@@ -1,10 +1,5 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-
-from schema import EvidenceItem, EvidenceState, Source  # noqa: E402
-from validate_citations import validate_citation  # noqa: E402
+from schema import EvidenceItem, EvidenceState, Source
+from validate_citations import validate_citation
 
 SOURCE = "Built and maintained Python microservices processing 2M+ events/day."
 
