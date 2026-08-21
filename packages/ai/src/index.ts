@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { z } from "zod";
 
 import type { BoundaryContract } from "@signal-audit/contracts";
-import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION, assertUnreachableEvidenceOutcome } from "@signal-audit/domain";
 import type {
   AiAdapter,
   AiCallMetadata,
@@ -428,4 +428,60 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
   }
 
   return outcome;
+}
+
+// ---- AF-39: route ambiguous/invalid/suspicious evidence to human review ----
+//
+// A closed, exhaustive switch, not an allow/deny list: the default
+// branch calls assertUnreachableEvidenceOutcome, so a future
+// EvidenceOutcome kind forces a real decision here (a compile error)
+// instead of silently defaulting to "no review needed" -- fail closed,
+// never silently resolved. The ticket names four categories (failed
+// schema validation, failed citation checks, contradictions, injection
+// indicators); the mapping is citation_invalid (AF-38) for failed
+// citation checks, contradicted for contradictions, quarantined for
+// injection/malicious-input indicators, and extraction_error for a
+// call whose output couldn't be trusted at all (the closest
+// EvidenceOutcome analogue to "failed schema validation", since a
+// schema-invalid model response never becomes a mapped item in the
+// first place -- AF-36 only ever produces extraction_error for a
+// criterion it has nothing usable for). invalid_source/unsupported_file/
+// failed are included too: they are broken or incomplete evidence a
+// human needs to know about, not a clean result a reviewer can trust
+// without a flag. supported/partially_supported/not_found are
+// confident, validated results -- they still go through the ordinary
+// review flow (AF-5), just without this special flag. processing/
+// retrying have not resolved into anything yet.
+
+export type ReviewRouting =
+  | { readonly needsReview: false }
+  | { readonly needsReview: true; readonly reason: string };
+
+export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
+  switch (outcome.kind) {
+    case "supported":
+    case "partially_supported":
+    case "not_found":
+    case "processing":
+    case "retrying":
+      return { needsReview: false };
+    case "unclear":
+      return { needsReview: true, reason: "Evidence is ambiguous and requires human judgment." };
+    case "contradicted":
+      return { needsReview: true, reason: "Supplied facts conflict about this criterion." };
+    case "citation_invalid":
+      return { needsReview: true, reason: `Citation failed validation: ${outcome.reason}` };
+    case "extraction_error":
+      return { needsReview: true, reason: `Extraction failed: ${outcome.message}` };
+    case "invalid_source":
+      return { needsReview: true, reason: `Source material could not be used: ${outcome.reason}` };
+    case "unsupported_file":
+      return { needsReview: true, reason: `Unsupported file format: ${outcome.reason}` };
+    case "quarantined":
+      return { needsReview: true, reason: `Quarantined (${outcome.quarantineClass}): ${outcome.reason}` };
+    case "failed":
+      return { needsReview: true, reason: `Processing failed: ${outcome.message}` };
+    default:
+      return assertUnreachableEvidenceOutcome(outcome);
+  }
 }
