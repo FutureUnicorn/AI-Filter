@@ -2,12 +2,15 @@ import OpenAI from "openai";
 import { z } from "zod";
 
 import type { BoundaryContract } from "@signal-audit/contracts";
+import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 import type {
   AiAdapter,
   AiCallMetadata,
   AiStructuredCallInput,
   AiStructuredCallResult,
-  DomainPort
+  DomainPort,
+  EvidenceOutcome,
+  SourceCitation
 } from "@signal-audit/domain";
 
 /** AI provider adapters will map provider data into domain-owned abstractions. */
@@ -204,3 +207,97 @@ export const evidenceExtractionItemSchema = z
 export const evidenceExtractionResponseSchema = z.strictObject({
   items: z.array(evidenceExtractionItemSchema)
 });
+
+export type EvidenceExtractionItem = z.infer<typeof evidenceExtractionItemSchema>;
+
+// ---- AF-36: rubric-to-evidence mapping ----
+//
+// Reconciles the model's raw (AF-35-validated) items against the
+// rubric that was actually asked about, guaranteeing exactly one
+// EvidenceOutcome per rubric criterion -- never more, never fewer,
+// regardless of what the model returned. A criterion the model omitted
+// is not the same thing as a criterion the model confidently found
+// nothing for: not_found is a deliberate answer the model chose;
+// omission is a pipeline gap. Both omission and duplication become
+// extraction_error with a distinct errorCode, never a silently
+// invented not_found and never a silently dropped criterion. A
+// criterion_id in the model's output that isn't in the rubric at all
+// is dropped -- it cannot correspond to an employer-defined
+// requirement (docs/PRODUCT_BOUNDARY.md: "AI MUST NOT invent
+// requirements"), so there is nothing in the rubric for it to become.
+
+function citationFrom(item: EvidenceExtractionItem): SourceCitation {
+  return {
+    document: item.source.document,
+    pageOrSection: item.source.page_or_section,
+    offset: item.source.offset,
+    quote: item.quote
+  };
+}
+
+function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
+  const criterionId = item.criterion_id;
+  switch (item.state) {
+    case "not_found":
+      return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+    case "supported":
+    case "partially_supported":
+    case "contradicted":
+    case "unclear":
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: item.state,
+        criterionId,
+        citation: citationFrom(item)
+      };
+  }
+}
+
+function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "model_omitted_criterion",
+    message: "The model's response did not include this criterion.",
+    retryable: true
+  };
+}
+
+function duplicateCriterionOutcome(criterionId: string, count: number): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "duplicate_criterion_response",
+    message: `The model returned ${count} responses for one criterion.`,
+    retryable: true
+  };
+}
+
+export function mapRubricToEvidence(
+  rubricCriterionIds: readonly string[],
+  extractedItems: readonly EvidenceExtractionItem[]
+): EvidenceOutcome[] {
+  const itemsByCriterion = new Map<string, EvidenceExtractionItem[]>();
+  for (const item of extractedItems) {
+    const existing = itemsByCriterion.get(item.criterion_id);
+    if (existing === undefined) {
+      itemsByCriterion.set(item.criterion_id, [item]);
+    } else {
+      existing.push(item);
+    }
+  }
+
+  return rubricCriterionIds.map((criterionId): EvidenceOutcome => {
+    const matches = itemsByCriterion.get(criterionId) ?? [];
+    const [firstMatch, ...rest] = matches;
+    if (firstMatch === undefined) {
+      return omittedCriterionOutcome(criterionId);
+    }
+    if (rest.length > 0) {
+      return duplicateCriterionOutcome(criterionId, matches.length);
+    }
+    return mapExtractedItem(firstMatch);
+  });
+}
