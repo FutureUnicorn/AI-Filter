@@ -172,3 +172,43 @@ export const EVIDENCE_OUTCOME_KINDS: readonly EvidenceOutcomeKind[] = [
 export function assertUnreachableEvidenceOutcome(outcome: never): never {
   throw new Error(`Unhandled EvidenceOutcome kind: ${JSON.stringify(outcome)}`);
 }
+
+// ---- AF-15: organization, user, and membership schema ----
+//
+// Organization is the tenant/policy root. Users hold roles via
+// memberships; MembershipRole is a closed set, not a free-text string,
+// so an invalid role can't be typed into existence, only rejected by
+// both the TypeScript type and the database CHECK constraint. See
+// docs/PRODUCT_BOUNDARY.md POL-011: every future query over these
+// records must stay scoped by organizationId, never cross it.
+
+export type MembershipRole = "owner" | "admin" | "recruiter" | "auditor";
+
+export const MEMBERSHIP_ROLES: readonly MembershipRole[] = [
+  "owner",
+  "admin",
+  "recruiter",
+  "auditor"
+] as const;
+
+export interface Organization extends VersionedRecord {
+  readonly organizationId: string;
+  readonly name: string;
+  readonly createdAt: string;
+}
+
+export interface User extends VersionedRecord {
+  readonly userId: string;
+  readonly email: string;
+  readonly displayName: string;
+  readonly createdAt: string;
+}
+
+/** One membership per (organizationId, userId); a role change updates it in place. */
+export interface Membership extends VersionedRecord {
+  readonly membershipId: string;
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly role: MembershipRole;
+  readonly createdAt: string;
+}

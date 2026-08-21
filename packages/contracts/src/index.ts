@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   CitationInvalidEvidence,
@@ -12,7 +12,9 @@ import type {
   ExtractionErrorEvidence,
   FailedEvidence,
   InvalidSourceEvidence,
+  Membership,
   NotFoundEvidence,
+  Organization,
   PartiallySupportedEvidence,
   ProcessingEvidence,
   QuarantinedEvidence,
@@ -20,7 +22,8 @@ import type {
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
-  UnsupportedFileEvidence
+  UnsupportedFileEvidence,
+  User
 } from "@signal-audit/domain";
 
 /** Placeholder boundary shape; AF-13 owns real versioned runtime contracts. */
@@ -349,3 +352,29 @@ export function idempotencyErrorResponse(
     message: `Idempotency-Key header is invalid: ${requirement.reason}`
   });
 }
+
+// ---- AF-15: runtime validation for organization/user/membership ----
+
+export const organizationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  organizationId: z.uuid(),
+  name: z.string().min(1),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Organization>;
+
+export const userSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  userId: z.uuid(),
+  email: z.email(),
+  displayName: z.string().min(1),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<User>;
+
+export const membershipSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  membershipId: z.uuid(),
+  organizationId: z.uuid(),
+  userId: z.uuid(),
+  role: z.enum(MEMBERSHIP_ROLES),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Membership>;
