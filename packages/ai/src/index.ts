@@ -498,3 +498,22 @@ export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
       return assertUnreachableEvidenceOutcome(outcome);
   }
 }
+
+// ---- AF-42: inference kill switch ----
+//
+// The one place a kill-switch block turns into an EvidenceOutcome:
+// "retrying", never "failed" or "extraction_error". A halted call is
+// not a broken one -- the pipeline should pick this criterion back up
+// once an operator disengages the switch, not discard it or hand it to
+// AF-39's review queue as if something went wrong with the extraction
+// itself.
+
+export function killSwitchRetryOutcome(criterionId: string, attempt: number, maxAttempts: number): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "retrying",
+    criterionId,
+    attempt,
+    maxAttempts
+  };
+}

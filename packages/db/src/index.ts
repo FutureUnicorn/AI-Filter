@@ -328,3 +328,68 @@ export async function getInferenceUsage(
     await client.end().catch(() => undefined);
   }
 }
+
+// ---- AF-42: inference kill switch ----
+//
+// The table (migration 0008) is a singleton with a seed row, so a read
+// finding no row at all means the migration hasn't run, not that the
+// switch is somehow undefined -- that is treated as an error, not a
+// silent "assume disengaged."
+
+export interface InferenceKillSwitchRow {
+  readonly engaged: boolean;
+  readonly reason?: string;
+}
+
+export async function getInferenceKillSwitchStatus(
+  databaseUrl: string,
+  schema: string
+): Promise<InferenceKillSwitchRow> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ engaged: boolean; reason: string | null }>(
+      `SELECT engaged, reason FROM "${schema}".inference_kill_switch WHERE id = true`
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+    }
+    return row.reason === null ? { engaged: row.engaged } : { engaged: row.engaged, reason: row.reason };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface SetInferenceKillSwitchInput {
+  readonly engaged: boolean;
+  readonly reason?: string;
+  readonly engagedByUserId?: string;
+}
+
+/**
+ * The database CHECK constraint (migration 0008) is the real enforcement:
+ * engaging without a reason and an engagedByUserId is rejected there
+ * regardless of what this function is called with, matching this
+ * codebase's habit of enforcing an invariant at more than one layer.
+ */
+export async function setInferenceKillSwitch(
+  databaseUrl: string,
+  schema: string,
+  input: SetInferenceKillSwitchInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `UPDATE "${schema}".inference_kill_switch
+          SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE id = true`,
+      [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
