@@ -12,6 +12,7 @@ This document describes structure only. It does not authorize work that belongs 
 |---|---|
 | `apps/web` | Next.js delivery and composition layer |
 | `apps/worker` | Background-process composition layer |
+| `packages/config` | Validated server-only environment configuration |
 | `packages/domain` | Framework-neutral domain abstractions and pure logic |
 | `packages/contracts` | Explicit, versionable boundary contracts |
 | `packages/db` | Persistence adapters and future migrations/repositories |
@@ -31,7 +32,7 @@ apps/web        apps/worker
     +-------+-------+
             |
      adapter packages
-  db / ai / ingestion / security
+  config / db / ai / ingestion / security
             |
         contracts
             |
@@ -42,6 +43,7 @@ The diagram shows permitted inward direction, not a requirement for every possib
 
 | Source | Allowed internal dependencies |
 |---|---|
+| `config` | None |
 | `domain` | None |
 | `contracts` | `domain` |
 | `db` | `domain` |

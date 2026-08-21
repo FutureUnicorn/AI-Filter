@@ -14,10 +14,16 @@ coverage/
 
 # Local tool caches
 .cache/
+.corepack/
 
 # Environment files
 .env.local
 .env.*.local
+**/.env
+.runtime/
+
+# Local infrastructure state and credentials
+infra/runtime/
 
 # Operating system and editor files
 .DS_Store

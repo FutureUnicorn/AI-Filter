@@ -12,6 +12,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@signal-audit/domain": "workspace:*"
+    "@signal-audit/config": "workspace:*",
+    "@signal-audit/db": "workspace:*",
+    "@signal-audit/domain": "workspace:*",
+    "@signal-audit/ingestion": "workspace:*"
   }
 }
