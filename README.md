@@ -76,6 +76,26 @@ pnpm build
 pnpm check               # complete local quality gate
 ```
 
+## Local environment infrastructure
+
+AF-11 provides local Postgres and S3-compatible MinIO using synthetic fixtures
+only. Docker Engine/Desktop with Compose v2 is required.
+
+```bash
+cp .env.example .env.local
+pnpm dev:infra
+pnpm db:seed
+pnpm env:smoke
+pnpm dev:web
+pnpm dev:worker
+```
+
+Return the local database and storage to the known synthetic state with
+`pnpm dev:reset`. Destructive commands refuse staging and production targets.
+Preview, staging, production-shaped validation, secrets, cleanup, cost controls,
+and administrator-audit requirements are documented in
+[`docs/engineering/environments.md`](docs/engineering/environments.md).
+
 ## Continuous integration
 
 Pull requests and pushes involving `develop` or `main` run independent lint,

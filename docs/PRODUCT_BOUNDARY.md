@@ -256,6 +256,32 @@ These development gates limit premature scope in addition to the permanent invar
 | Dashboard or analytics UI | A validated product need beyond the core hypothesis |
 | RAG, vector database, or autonomous agents | Evidence that deterministic retrieval is inadequate and the additional failure modes are justified |
 
+### AF-11 synthetic infrastructure validation exception
+
+[AF-11](https://hemnaathusa.atlassian.net/browse/AF-11) may provision the minimum
+hosted infrastructure needed to verify development, preview, staging, and
+production environment isolation before the hosted-product evidence gate is
+passed. This is a narrow infrastructure-validation exception, not permission to
+launch or operate the product.
+
+Resources created under this exception:
+
+- MUST contain synthetic data only;
+- MUST NOT process real applicant or employer data;
+- MUST NOT be used by customers or design partners;
+- MUST NOT enable authentication or a production hiring workflow;
+- MUST use separate non-production and production-shaped credentials;
+- MUST use minimal capacity, explicit spend controls, and automatic preview
+  cleanup;
+- MUST restrict and audit production-shaped administrative access; and
+- MUST remain disabled unless the repository's AF-11 environment controls and
+  AF-12 green-revision gate authorize the deployment.
+
+The environment named `production` under this exception is an empty,
+production-shaped validation environment. Customer-facing production use is
+still prohibited until the hosted-product evidence gate is passed. No numbered
+policy invariant is weakened or suspended by this exception.
+
 ## Change control
 
 Any future change that weakens, removes, or materially reinterprets a numbered invariant MUST be explicit, reviewed, traceable to a Jira product decision, and reflected in this canonical policy before dependent code is merged.

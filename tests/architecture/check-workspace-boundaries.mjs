@@ -12,6 +12,7 @@ const repositoryRoot = path.resolve(
 const workspaceAreas = [
   "apps/web",
   "apps/worker",
+  "packages/config",
   "packages/domain",
   "packages/contracts",
   "packages/db",
@@ -21,6 +22,7 @@ const workspaceAreas = [
 ];
 
 const allowedDependencies = new Map([
+  ["packages/config", new Set()],
   ["packages/domain", new Set()],
   ["packages/contracts", new Set(["packages/domain"])],
   ["packages/db", new Set(["packages/domain"])],

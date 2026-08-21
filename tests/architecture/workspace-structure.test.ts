@@ -12,6 +12,7 @@ const repositoryRoot = path.resolve(
 const expectedWorkspaces = new Map([
   ["apps/web", "@signal-audit/web"],
   ["apps/worker", "@signal-audit/worker"],
+  ["packages/config", "@signal-audit/config"],
   ["packages/domain", "@signal-audit/domain"],
   ["packages/contracts", "@signal-audit/contracts"],
   ["packages/db", "@signal-audit/db"],

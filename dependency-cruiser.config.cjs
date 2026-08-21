@@ -11,7 +11,7 @@ module.exports = {
       name: "domain-does-not-depend-outward",
       severity: "error",
       from: { path: "^packages/domain" },
-      to: { path: "^(apps|packages/(ai|contracts|db|ingestion|security))" }
+      to: { path: "^(apps|packages/(ai|config|contracts|db|ingestion|security))" }
     },
     {
       name: "packages-do-not-depend-on-apps",

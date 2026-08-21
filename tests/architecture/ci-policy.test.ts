@@ -79,5 +79,9 @@ test("production eligibility is success-only and tied to the tested main SHA", (
   assert.match(productionGate, /ref: \$\{\{ github\.event\.workflow_run\.head_sha \}\}/);
   assert.match(productionGate, /TESTED_SHA: \$\{\{ github\.event\.workflow_run\.head_sha \}\}/);
   assert.equal(productionGate.includes("workflow_dispatch"), false);
-  assert.equal(productionGate.includes("secrets."), false);
+  const eligibilitySection = productionGate.split(/\n {2}deploy:/u)[0] ?? productionGate;
+  assert.equal(eligibilitySection.includes("secrets."), false);
+  assert.match(productionGate, /needs: eligibility/u);
+  assert.match(productionGate, /environment:\s+name: production/u);
+  assert.match(productionGate, /secrets\.POSTGRES_PASSWORD/u);
 });

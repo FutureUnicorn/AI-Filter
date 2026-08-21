@@ -9,7 +9,10 @@ export default tseslint.config(
       "**/coverage/**",
       "**/dist/**",
       "**/node_modules/**",
-      ".cache/**"
+      ".cache/**",
+      ".pytest_cache/**",
+      ".runtime/**",
+      ".venv/**"
     ]
   },
   eslint.configs.recommended,
