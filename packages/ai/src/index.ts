@@ -47,7 +47,10 @@ export interface OpenAiResponsesClient {
           strict: true;
         };
       };
-    }): Promise<{ output_text: string }>;
+    }): Promise<{
+      output_text: string;
+      usage: { input_tokens: number; output_tokens: number };
+    }>;
   };
 }
 
@@ -74,7 +77,13 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
           input: params.input,
           text: params.text
         });
-        return { output_text: response.output_text };
+        return {
+          output_text: response.output_text,
+          usage: {
+            input_tokens: response.usage?.input_tokens ?? 0,
+            output_tokens: response.usage?.output_tokens ?? 0
+          }
+        };
       }
     }
   };
@@ -110,7 +119,11 @@ export function createOpenAiAdapter(
         model: config.model,
         promptVersion: input.promptVersion,
         schemaVersion: input.schemaVersion,
-        schemaName: input.schemaName
+        schemaName: input.schemaName,
+        usage: {
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens
+        }
       };
       return { output, metadata };
     }
