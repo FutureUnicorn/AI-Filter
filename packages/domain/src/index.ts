@@ -265,3 +265,47 @@ export type MagicLinkVerification =
 export interface MagicLinkEmailSender {
   sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void>;
 }
+
+// ---- AF-17: owner/admin/recruiter/auditor roles ----
+//
+// The policy itself: which capabilities each MembershipRole has. This is
+// pure data plus a pure lookup, not enforcement -- AF-19 (server-side
+// resource authorization) is where a request's membership gets checked
+// against this policy and turned into an ApiErrorBody. Auditor is
+// deliberately read-only: it can view_audit_reports but cannot review
+// candidates, record decisions, or approve rubrics, matching its role as
+// oversight, not a decision-maker (POL-001: humans, named and
+// attributable, make employment decisions -- auditor is not that human).
+
+export type Capability =
+  | "approve_rubric"
+  | "review_candidates"
+  | "record_decision"
+  | "view_audit_reports"
+  | "access_admin_settings";
+
+export const CAPABILITIES: readonly Capability[] = [
+  "approve_rubric",
+  "review_candidates",
+  "record_decision",
+  "view_audit_reports",
+  "access_admin_settings"
+] as const;
+
+/**
+ * Owner and admin currently have identical capabilities: nothing here
+ * distinguishes them yet, since no org-lifecycle capability (transfer
+ * ownership, delete organization, remove an admin) exists yet. Owner is
+ * kept as its own role rather than merged into admin because those
+ * future capabilities will belong to owner only.
+ */
+export const ROLE_CAPABILITIES: Readonly<Record<MembershipRole, readonly Capability[]>> = {
+  owner: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings"],
+  admin: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings"],
+  recruiter: ["review_candidates", "record_decision"],
+  auditor: ["view_audit_reports"]
+};
+
+export function roleHasCapability(role: MembershipRole, capability: Capability): boolean {
+  return ROLE_CAPABILITIES[role].includes(capability);
+}

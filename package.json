@@ -25,7 +25,7 @@
     "typecheck": "corepack pnpm run build:packages && corepack pnpm -r --if-present typecheck",
     "test": "corepack pnpm run test:unit && corepack pnpm run test:integration",
     "test:unit": "corepack pnpm run test:unit:ts && corepack pnpm run test:python",
-    "test:unit:ts": "node --test tests/unit/environment-config.test.ts tests/unit/environment-model.test.ts tests/unit/evidence-outcome-domain.test.ts tests/unit/organization-user-membership-domain.test.ts tests/unit/magic-link-security.test.ts",
+    "test:unit:ts": "node --test tests/unit/environment-config.test.ts tests/unit/environment-model.test.ts tests/unit/evidence-outcome-domain.test.ts tests/unit/organization-user-membership-domain.test.ts tests/unit/magic-link-security.test.ts tests/unit/role-capabilities.test.ts",
     "test:integration": "corepack pnpm run build:packages && node --test tests/integration/worker.test.ts tests/integration/environment-policy.test.ts tests/integration/evidence-outcome-contracts.test.ts tests/integration/api-conventions.test.ts tests/integration/organization-user-membership-contracts.test.ts tests/integration/magic-link-contracts.test.ts",
     "test:architecture": "node --test tests/architecture/workspace-structure.test.ts tests/architecture/ci-policy.test.ts",
     "test:ts": "corepack pnpm run test:architecture && corepack pnpm run test:integration",
