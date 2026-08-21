@@ -670,3 +670,67 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
   }
   return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }
+
+// ---- AF-44: resume prompt-injection detection ----
+//
+// Resumes are untrusted input (SYSTEM_POLICY in scripts/extract_evidence.py
+// already says this). "Confirm the model never follows embedded
+// instructions" needs a live model call to verify -- that is the
+// provider-cost-incurring eval path AF-43 explicitly does not build,
+// not something a regex scan can prove. What this file provides
+// instead, and what "the pipeline quarantines/flags them" actually
+// asks for: a deterministic, regression-tested pre-filter that catches
+// known instruction-injection phrasings before or alongside a model
+// call, and a function turning a detection into the quarantine outcome
+// the ticket names. This is a heuristic first layer, not a claim of
+// completeness -- no regex list catches every possible phrasing, and
+// the regression suite (tests/) exists specifically so new bypasses
+// found later get added here as new cases, not just fixed once.
+
+const INJECTION_PATTERNS: readonly RegExp[] = [
+  /ignore (all |any )?(the )?(previous|prior|above) instructions?/iu,
+  /disregard (all |any )?(the )?(previous|prior|above) instructions?/iu,
+  /you are now (a|an)\b/iu,
+  /new instructions?:/iu,
+  /system prompt/iu,
+  /reveal (your |the )?(system prompt|instructions)/iu,
+  /act as (a|an)\b.{0,40}(instead|from now)/iu,
+  /do not (follow|apply|use) (the )?(rubric|criteria|scoring)/iu,
+  /overrid(e|ing) (the )?(evaluation|scoring|rubric)/iu,
+  /mark (this|me) as (qualified|supported|approved|hired|a match)/iu,
+  /\[\s*system\s*\]/iu,
+  /<\|im_start\|>/iu
+];
+
+export interface PromptInjectionScanResult {
+  readonly detected: boolean;
+  readonly matchedPatterns: readonly string[];
+}
+
+export function scanForPromptInjection(text: string): PromptInjectionScanResult {
+  const matchedPatterns = INJECTION_PATTERNS.filter((pattern) => pattern.test(text)).map(
+    (pattern) => pattern.source
+  );
+  return { detected: matchedPatterns.length > 0, matchedPatterns };
+}
+
+/**
+ * A detected injection quarantines every criterion for the document,
+ * not just one: if the source material itself is adversarial, every
+ * extraction attempt against it is suspect, not only the criterion
+ * whose text happened to contain the pattern.
+ */
+export function quarantineForInjection(
+  criterionIds: readonly string[],
+  matchedPatterns: readonly string[]
+): EvidenceOutcome[] {
+  const reason = `Prompt-injection indicator detected: ${matchedPatterns.join(", ")}`;
+  return criterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "quarantined",
+    criterionId,
+    quarantineClass: "malicious",
+    reason,
+    operatorActionRequired: true
+  }));
+}
