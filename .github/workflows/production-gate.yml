@@ -1,0 +1,48 @@
+name: Production Gate
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: production-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  eligibility:
+    name: Production / Eligible
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact revision that passed CI
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Verify production eligibility for the tested revision
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [ -z "$TESTED_SHA" ] || [ "$checked_out_sha" != "$TESTED_SHA" ]; then
+            echo "Production target does not match the revision that passed CI."
+            exit 1
+          fi
+          echo "Production-eligible revision: $TESTED_SHA"
+
+      # AF-11 owns the deployment environment and credentials. Its deployment
+      # job must be added here, depend on this eligibility job, and deploy
+      # github.event.workflow_run.head_sha (or an artifact built from it).

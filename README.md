@@ -68,11 +68,28 @@ pnpm dev:web             # start the Next.js shell
 pnpm dev:worker          # run the credential-free worker shell
 pnpm lint
 pnpm typecheck
-pnpm test                # TypeScript and existing Python tests
+pnpm test:unit           # deterministic Python citation-validation tests
+pnpm test:integration    # credential-free worker/domain boundary test
+pnpm test                # unit and integration suites
 pnpm check:architecture
 pnpm build
 pnpm check               # complete local quality gate
 ```
+
+## Continuous integration
+
+Pull requests and pushes involving `develop` or `main` run independent lint,
+typecheck, unit, integration, architecture, and production-build jobs. The
+fail-closed aggregate status is named `CI / Required`; repository rules must
+require that status before either protected branch can merge.
+
+Production eligibility is evaluated only after a successful `CI` run caused by
+a push to `main`, and it checks out the exact SHA that passed. AF-11 must attach
+any future production deployment behind that eligibility job. Ordinary pull
+request validation is read-only and receives no production credentials.
+
+See [`docs/engineering/ci.md`](docs/engineering/ci.md) for local parity,
+protection settings, failure reproduction, and deployment-gate requirements.
 
 The domain is the stable center. Applications and vendor/framework adapters may depend inward on `@signal-audit/domain`; the domain must never depend on Next.js, database, AI, ingestion, security, test, or evaluation implementations. Cross-workspace imports use public `@signal-audit/*` package names, never sibling `src/` paths.
 
