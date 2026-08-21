@@ -1,4 +1,5 @@
 import type {
+  AuditAction,
   DomainPort,
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
@@ -172,6 +173,41 @@ export async function redeemMagicLinkToken(
       justRedeemed: false,
       record: existingRow === undefined ? undefined : mapMagicLinkTokenRow(existingRow)
     };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-20: immutable audit events ----
+//
+// Insert only. There is deliberately no update or delete function here,
+// on top of the database trigger that rejects them outright (migration
+// 0005): immutability is enforced twice, not assumed from one layer.
+
+export interface AppendAuditEventInput {
+  readonly organizationId: string;
+  readonly actorUserId: string;
+  readonly action: AuditAction;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly requestId: string;
+}
+
+export async function appendAuditEvent(
+  databaseUrl: string,
+  schema: string,
+  input: AppendAuditEventInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".audit_events
+         (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [input.organizationId, input.actorUserId, input.action, input.entityType, input.entityId, input.requestId]
+    );
   } finally {
     await client.end().catch(() => undefined);
   }

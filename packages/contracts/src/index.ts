@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
+import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
+  AuditEvent,
   CitationInvalidEvidence,
   ContradictedEvidence,
   DomainPort,
@@ -396,3 +397,17 @@ export const createInviteInputSchema = z.strictObject({
   organizationId: z.uuid(),
   role: z.enum(MEMBERSHIP_ROLES)
 });
+
+// ---- AF-20: immutable audit events ----
+
+export const auditEventSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  auditEventId: z.uuid(),
+  organizationId: z.uuid(),
+  actorUserId: z.uuid(),
+  action: z.enum(AUDIT_ACTIONS),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  requestId: requestIdSchema,
+  occurredAt: z.iso.datetime()
+}) satisfies z.ZodType<AuditEvent>;
