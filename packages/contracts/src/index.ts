@@ -378,3 +378,21 @@ export const membershipSchema = z.strictObject({
   role: z.enum(MEMBERSHIP_ROLES),
   createdAt: z.iso.datetime()
 }) satisfies z.ZodType<Membership>;
+
+// ---- AF-16: request shapes for invite-only magic-link authentication ----
+//
+// There is no signup schema: requestMagicLinkInputSchema only re-sends a
+// login link to an email that must already have a membership, and
+// createInviteInputSchema requires an inviter to name both the
+// organization and the role up front. Neither shape leaves room for a
+// self-service "just let me in" path.
+
+export const requestMagicLinkInputSchema = z.strictObject({
+  email: z.email()
+});
+
+export const createInviteInputSchema = z.strictObject({
+  email: z.email(),
+  organizationId: z.uuid(),
+  role: z.enum(MEMBERSHIP_ROLES)
+});
