@@ -212,3 +212,52 @@ export async function appendAuditEvent(
     await client.end().catch(() => undefined);
   }
 }
+
+// ---- AF-40: persist model/prompt/schema/rubric versions ----
+//
+// Insert only, same as appendAuditEvent: immutability is enforced by
+// the database trigger (migration 0006), and there is deliberately no
+// update/delete function here either.
+
+export interface RecordEvidenceExtractionRunInput {
+  readonly organizationId: string;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly extractionSchemaVersion: string;
+  readonly extractionSchemaName: string;
+  readonly rubricVersion: string;
+}
+
+export async function recordEvidenceExtractionRun(
+  databaseUrl: string,
+  schema: string,
+  input: RecordEvidenceExtractionRunInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".evidence_extraction_runs
+         (organization_id, entity_type, entity_id, provider, model, prompt_version,
+          extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        input.organizationId,
+        input.entityType,
+        input.entityId,
+        input.provider,
+        input.model,
+        input.promptVersion,
+        input.extractionSchemaVersion,
+        input.extractionSchemaName,
+        input.rubricVersion
+      ]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
