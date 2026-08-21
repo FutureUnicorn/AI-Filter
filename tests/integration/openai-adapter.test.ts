@@ -10,14 +10,18 @@ import type { OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 // request/response mapping and metadata recording without touching
 // OpenAI at all.
 
-function fakeClient(outputText: string, capture?: { params?: unknown }): OpenAiResponsesClient {
+function fakeClient(
+  outputText: string,
+  capture?: { params?: unknown },
+  usage: { input_tokens: number; output_tokens: number } = { input_tokens: 120, output_tokens: 45 }
+): OpenAiResponsesClient {
   return {
     responses: {
       async create(params) {
         if (capture !== undefined) {
           capture.params = params;
         }
-        return { output_text: outputText };
+        return { output_text: outputText, usage };
       }
     }
   };
@@ -46,8 +50,18 @@ test("runStructuredCall records provider/model/prompt/schema metadata on every c
     model: "gpt-5.6",
     promptVersion: "v1",
     schemaVersion: "1.0.0",
-    schemaName: "evidence_response"
+    schemaName: "evidence_response",
+    usage: { inputTokens: 120, outputTokens: 45 }
   });
+});
+
+test("runStructuredCall surfaces the provider's real token usage, not an estimate", async () => {
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6" },
+    fakeClient("{}", undefined, { input_tokens: 900, output_tokens: 150 })
+  );
+  const result = await adapter.runStructuredCall(baseInput);
+  assert.deepEqual(result.metadata.usage, { inputTokens: 900, outputTokens: 150 });
 });
 
 test("runStructuredCall sends the system and user prompts as separate messages, in order", async () => {

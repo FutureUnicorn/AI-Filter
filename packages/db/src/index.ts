@@ -261,3 +261,70 @@ export async function recordEvidenceExtractionRun(
     await client.end().catch(() => undefined);
   }
 }
+
+// ---- AF-41: inference cost/budget tracking ----
+
+export interface RecordInferenceUsageInput {
+  readonly organizationId: string;
+  readonly model: string;
+  /** The caller decides period granularity (e.g. today's date for a daily budget). */
+  readonly periodStart: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+/** Increments the existing row for this (organization, model, period), or creates it. */
+export async function recordInferenceUsage(
+  databaseUrl: string,
+  schema: string,
+  input: RecordInferenceUsageInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".inference_usage_ledger
+         (organization_id, model, period_start, input_tokens, output_tokens)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+         input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+         output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+         updated_at = CURRENT_TIMESTAMP`,
+      [input.organizationId, input.model, input.periodStart, input.inputTokens, input.outputTokens]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface GetInferenceUsageInput {
+  readonly organizationId: string;
+  readonly model: string;
+  readonly periodStart: string;
+}
+
+/** Returns 0/0 when no calls have been made yet this period -- there is nothing to cap against. */
+export async function getInferenceUsage(
+  databaseUrl: string,
+  schema: string,
+  input: GetInferenceUsageInput
+): Promise<{ inputTokens: number; outputTokens: number }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ input_tokens: string; output_tokens: string }>(
+      `SELECT input_tokens, output_tokens FROM "${schema}".inference_usage_ledger
+        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+      [input.organizationId, input.model, input.periodStart]
+    );
+    const row = result.rows[0];
+    return {
+      inputTokens: row === undefined ? 0 : Number(row.input_tokens),
+      outputTokens: row === undefined ? 0 : Number(row.output_tokens)
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
