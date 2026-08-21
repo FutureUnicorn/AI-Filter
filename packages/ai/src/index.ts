@@ -301,3 +301,55 @@ export function mapRubricToEvidence(
     return mapExtractedItem(firstMatch);
   });
 }
+
+// ---- AF-37: deterministic model routing ----
+//
+// Which model handles a retry is decided entirely from four observable,
+// code-computed flags -- never by the model itself (no model-selected
+// routing, no tool use). All four flags come from a prior attempt: this
+// is a retry-escalation decision, not something known before the first
+// call ever runs.
+
+export type EscalationReason =
+  | "unreadable_input"
+  | "citation_failed"
+  | "contradiction_detected"
+  | "injection_indicator";
+
+export interface RoutingSignals {
+  readonly unreadableInput: boolean;
+  readonly citationFailed: boolean;
+  readonly contradictionDetected: boolean;
+  readonly injectionIndicatorDetected: boolean;
+}
+
+export interface ModelRoutingConfig {
+  readonly defaultModel: string;
+  readonly escalationModel: string;
+}
+
+export interface ModelRoutingResult {
+  readonly model: string;
+  readonly tier: "default" | "escalated";
+  readonly reasons: readonly EscalationReason[];
+}
+
+export function routeModel(config: ModelRoutingConfig, signals: RoutingSignals): ModelRoutingResult {
+  const reasons: EscalationReason[] = [];
+  if (signals.unreadableInput) {
+    reasons.push("unreadable_input");
+  }
+  if (signals.citationFailed) {
+    reasons.push("citation_failed");
+  }
+  if (signals.contradictionDetected) {
+    reasons.push("contradiction_detected");
+  }
+  if (signals.injectionIndicatorDetected) {
+    reasons.push("injection_indicator");
+  }
+
+  return reasons.length === 0
+    ? { model: config.defaultModel, tier: "default", reasons: [] }
+    : { model: config.escalationModel, tier: "escalated", reasons };
+}
