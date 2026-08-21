@@ -18,6 +18,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@signal-audit/domain": "workspace:*"
+    "@signal-audit/domain": "workspace:*",
+    "zod": "4.4.3"
   }
 }
