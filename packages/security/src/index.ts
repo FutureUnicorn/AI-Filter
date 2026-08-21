@@ -162,3 +162,86 @@ export function resourceAuthorizationErrorResponse(
     message: `Role ${authorization.role} does not have this capability.`
   });
 }
+
+// ---- AF-21: PII-safe structured logging ----
+//
+// Two independent layers, matching "structured, redacted logging only"
+// literally. Structured: LogContext is a closed set of IDs and
+// metadata -- there is no field here a candidate's name, resume text,
+// or contact info could be passed through, because the type doesn't
+// have one. Redacted: redactPii is a second, separate layer that scans
+// the message string (and any string context values) for email- and
+// phone-shaped substrings and masks them, because a message string can
+// always have PII interpolated into it by a caller, and a closed field
+// set alone cannot stop that.
+
+const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/gu;
+const PHONE_PATTERN = /\+?\d[\d\s().-]{7,}\d/gu;
+const REDACTED = "[REDACTED]";
+
+export function redactPii(value: string): string {
+  return value.replace(EMAIL_PATTERN, REDACTED).replace(PHONE_PATTERN, REDACTED);
+}
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+/**
+ * Closed set of safe structured fields: IDs and metadata only.
+ * Deliberately no field for a name, email, phone, address, or
+ * free-text content (resume text, notes, JD text) -- needing one of
+ * those means this logger is the wrong tool for that call site.
+ */
+export interface LogContext {
+  readonly requestId?: string;
+  readonly organizationId?: string;
+  readonly actorUserId?: string;
+  readonly action?: string;
+  readonly entityType?: string;
+  readonly entityId?: string;
+  readonly statusCode?: number;
+  readonly errorCode?: string;
+  readonly durationMs?: number;
+}
+
+export interface StructuredLogEntry {
+  readonly level: LogLevel;
+  readonly message: string;
+  readonly timestamp: string;
+  readonly context?: LogContext;
+}
+
+function redactContext(context: LogContext | undefined): LogContext | undefined {
+  if (context === undefined) {
+    return undefined;
+  }
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(context)) {
+    redacted[key] = typeof value === "string" ? redactPii(value) : value;
+  }
+  return redacted as LogContext;
+}
+
+export function buildLogEntry(
+  level: LogLevel,
+  message: string,
+  context?: LogContext,
+  now: Date = new Date()
+): StructuredLogEntry {
+  const redactedContext = redactContext(context);
+  return {
+    level,
+    message: redactPii(message),
+    timestamp: now.toISOString(),
+    ...(redactedContext === undefined ? {} : { context: redactedContext })
+  };
+}
+
+/** One JSON line per call, so log aggregators can parse it without a custom format. */
+export function logStructured(level: LogLevel, message: string, context?: LogContext): void {
+  const line = JSON.stringify(buildLogEntry(level, message, context));
+  if (level === "warn" || level === "error") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+}
