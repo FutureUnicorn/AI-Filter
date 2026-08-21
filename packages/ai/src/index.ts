@@ -11,6 +11,7 @@ import type {
   ContradictedEvidence,
   DomainPort,
   EvidenceOutcome,
+  EvidenceOutcomeKind,
   PartiallySupportedEvidence,
   SourceCitation,
   SupportedEvidence,
@@ -516,4 +517,156 @@ export function killSwitchRetryOutcome(criterionId: string, attempt: number, max
     attempt,
     maxAttempts
   };
+}
+
+// ---- AF-43: locked gold-set evaluation harness ----
+//
+// Scores the real deterministic pipeline stages (mapRubricToEvidence,
+// validateCitation, routeForReview) against a versioned, synthetic gold
+// set -- never a live model call, matching evals/README.md's own rule
+// that standard validation must not require provider credentials. This
+// is a self-consistency harness: it proves the deterministic code
+// produces the expected result for a known, hand-authored input, so it
+// catches a regression in mapping/validation/routing logic. It cannot
+// and does not claim anything about how well a real model performs --
+// that needs a separate, provider-cost-incurring eval path this ticket
+// does not build.
+//
+// "locked" on a case is a workflow control (never inspect it while
+// tuning prompts/thresholds), not a CI filter -- every case runs here
+// regardless of locked.
+
+export interface GoldSetCase {
+  readonly caseId: string;
+  readonly locked: boolean;
+  readonly sourceText: string;
+  readonly rubricCriterionIds: readonly string[];
+  readonly simulatedExtraction: readonly EvidenceExtractionItem[];
+  readonly expectedKinds: Readonly<Record<string, EvidenceOutcomeKind>>;
+  readonly expectedReviewCriterionIds: readonly string[];
+}
+
+export interface GoldSetScore {
+  readonly totalCases: number;
+  readonly schemaValidityRate: number;
+  readonly outcomeAccuracy: number;
+  readonly citingPrecision: number;
+  readonly citingRecall: number;
+  readonly escalationRecall: number;
+}
+
+const CITING_KINDS: ReadonlySet<EvidenceOutcomeKind> = new Set([
+  "supported",
+  "partially_supported",
+  "contradicted",
+  "unclear"
+]);
+
+function isCitingKind(kind: EvidenceOutcomeKind): boolean {
+  return CITING_KINDS.has(kind);
+}
+
+export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
+  let totalItems = 0;
+  let validItems = 0;
+  let totalCriteria = 0;
+  let correctKinds = 0;
+  let truePositive = 0;
+  let falsePositive = 0;
+  let falseNegative = 0;
+  let reviewExpectedCount = 0;
+  let reviewCorrectlyFlagged = 0;
+
+  for (const goldCase of cases) {
+    for (const item of goldCase.simulatedExtraction) {
+      totalItems += 1;
+      if (evidenceExtractionItemSchema.safeParse(item).success) {
+        validItems += 1;
+      }
+    }
+
+    const mapped = mapRubricToEvidence(goldCase.rubricCriterionIds, goldCase.simulatedExtraction);
+    const validated = mapped.map((outcome) => validateCitation(outcome, goldCase.sourceText));
+
+    for (const outcome of validated) {
+      totalCriteria += 1;
+      const expectedKind = goldCase.expectedKinds[outcome.criterionId];
+      if (expectedKind === outcome.kind) {
+        correctKinds += 1;
+      }
+
+      const expectedCiting = expectedKind !== undefined && isCitingKind(expectedKind);
+      const actualCiting = isCitingKind(outcome.kind);
+      if (expectedCiting && actualCiting) {
+        truePositive += 1;
+      } else if (!expectedCiting && actualCiting) {
+        falsePositive += 1;
+      } else if (expectedCiting && !actualCiting) {
+        falseNegative += 1;
+      }
+
+      if (goldCase.expectedReviewCriterionIds.includes(outcome.criterionId)) {
+        reviewExpectedCount += 1;
+        if (routeForReview(outcome).needsReview) {
+          reviewCorrectlyFlagged += 1;
+        }
+      }
+    }
+  }
+
+  return {
+    totalCases: cases.length,
+    schemaValidityRate: totalItems === 0 ? 1 : validItems / totalItems,
+    outcomeAccuracy: totalCriteria === 0 ? 1 : correctKinds / totalCriteria,
+    citingPrecision: truePositive + falsePositive === 0 ? 1 : truePositive / (truePositive + falsePositive),
+    citingRecall: truePositive + falseNegative === 0 ? 1 : truePositive / (truePositive + falseNegative),
+    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount
+  };
+}
+
+export interface GoldSetThresholds {
+  readonly minSchemaValidityRate: number;
+  readonly minOutcomeAccuracy: number;
+  readonly minCitingPrecision: number;
+  readonly minCitingRecall: number;
+  readonly minEscalationRecall: number;
+}
+
+/**
+ * This synthetic, hand-authored gold set requires a perfect score:
+ * every case has one obviously-correct answer, so anything less than
+ * 1.0 means the deterministic pipeline regressed, not that a real
+ * model produced an imperfect-but-reasonable answer. Do not relax
+ * these to make a failing build pass -- fix the regression instead.
+ */
+export const GOLD_SET_V1_THRESHOLDS: GoldSetThresholds = {
+  minSchemaValidityRate: 1,
+  minOutcomeAccuracy: 1,
+  minCitingPrecision: 1,
+  minCitingRecall: 1,
+  minEscalationRecall: 1
+};
+
+export type GoldSetGate =
+  | { readonly passed: true }
+  | { readonly passed: false; readonly failures: readonly string[] };
+
+export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetThresholds): GoldSetGate {
+  const failures: string[] = [];
+  if (score.schemaValidityRate < thresholds.minSchemaValidityRate) {
+    failures.push(`schemaValidityRate ${score.schemaValidityRate} < ${thresholds.minSchemaValidityRate}`);
+  }
+  if (score.outcomeAccuracy < thresholds.minOutcomeAccuracy) {
+    failures.push(`outcomeAccuracy ${score.outcomeAccuracy} < ${thresholds.minOutcomeAccuracy}`);
+  }
+  if (score.citingPrecision < thresholds.minCitingPrecision) {
+    failures.push(`citingPrecision ${score.citingPrecision} < ${thresholds.minCitingPrecision}`);
+  }
+  if (score.citingRecall < thresholds.minCitingRecall) {
+    failures.push(`citingRecall ${score.citingRecall} < ${thresholds.minCitingRecall}`);
+  }
+  if (score.escalationRecall < thresholds.minEscalationRecall) {
+    failures.push(`escalationRecall ${score.escalationRecall} < ${thresholds.minEscalationRecall}`);
+  }
+  return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }
