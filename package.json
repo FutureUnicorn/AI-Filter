@@ -1,0 +1,33 @@
+{
+  "name": "signal-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "corepack pnpm run dev:web",
+    "dev:web": "corepack pnpm run build:packages && corepack pnpm --filter @signal-audit/web dev",
+    "dev:worker": "corepack pnpm run build:packages && corepack pnpm --filter @signal-audit/worker dev",
+    "lint": "eslint .",
+    "build:packages": "corepack pnpm --filter \"./packages/**\" -r build",
+    "typecheck": "corepack pnpm run build:packages && corepack pnpm -r --if-present typecheck",
+    "test": "corepack pnpm run build:packages && corepack pnpm run test:ts && corepack pnpm run test:python",
+    "test:ts": "node --test tests/architecture/workspace-structure.test.ts tests/integration/worker.test.ts",
+    "test:python": "uv run --cache-dir .cache/uv pytest -q",
+    "check:architecture": "depcruise --config dependency-cruiser.config.cjs apps packages && node tests/architecture/check-workspace-boundaries.mjs",
+    "build": "corepack pnpm -r --if-present build",
+    "check": "corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm check:architecture && corepack pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.10.1",
+    "dependency-cruiser": "18.2.0",
+    "eslint": "10.8.1",
+    "globals": "17.11.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0"
+  }
+}

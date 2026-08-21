@@ -22,16 +22,61 @@ What's allowed and useful right now is exactly what's in `scripts/`: a manual, s
 ## Repo layout
 
 ```
+apps/
+  web/                    — Next.js delivery shell
+  worker/                 — background-processing composition root
+packages/
+  domain/                 — framework- and vendor-neutral center
+  contracts/              — versionable boundary-contract area
+  db/                     — persistence adapter boundary
+  ai/                     — AI-provider adapter boundary
+  ingestion/              — file/parser adapter boundary
+  security/               — authentication/authorization adapter boundary
 docs/
   PRODUCT_BOUNDARY.md    — what this must never become, and why
   VALIDATION_STATUS.md   — current gate status (problem / value / payment / retention / economics)
+  architecture/          — repository dependency rules
   rubric_template.md     — the employer-approved criteria template used per role
+evals/                   — model-quality cases and synthetic datasets, separate from tests
 scripts/
   schema.py              — the structured evidence-item schema (single source of truth)
   extract_evidence.py    — LLM extraction: rubric + one application -> evidence items
   validate_citations.py  — exact-substring citation validator (the core trust mechanism)
   README.md              — how to run the manual pipeline end to end
+tests/                   — Python, architecture, integration, and synthetic fixture tests
 ```
+
+## TypeScript workspace
+
+### Prerequisites
+
+- Node.js 24 LTS
+- Corepack
+- Python 3.13 and `uv` for the existing concierge pipeline tests
+
+Enable the pinned pnpm version and install from the repository root:
+
+```bash
+corepack enable
+pnpm install --frozen-lockfile
+```
+
+Common commands:
+
+```bash
+pnpm dev:web             # start the Next.js shell
+pnpm dev:worker          # run the credential-free worker shell
+pnpm lint
+pnpm typecheck
+pnpm test                # TypeScript and existing Python tests
+pnpm check:architecture
+pnpm build
+pnpm check               # complete local quality gate
+```
+
+The domain is the stable center. Applications and vendor/framework adapters may depend inward on `@signal-audit/domain`; the domain must never depend on Next.js, database, AI, ingestion, security, test, or evaluation implementations. Cross-workspace imports use public `@signal-audit/*` package names, never sibling `src/` paths.
+
+See [`docs/architecture/repository-boundaries.md`](docs/architecture/repository-boundaries.md) for the complete dependency matrix and package-addition procedure.
 
 ## Core workflow (manual, for now)
 
