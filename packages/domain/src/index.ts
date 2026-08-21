@@ -463,3 +463,30 @@ export function checkInferenceBudget(
   }
   return { outcome: "ok" };
 }
+
+// ---- AF-42: inference kill switch ----
+//
+// A pure gate over state the caller already fetched -- no I/O here.
+// When engaged, callers must treat the block as retryable (see
+// packages/ai's killSwitchRetryOutcome), not a permanent failure:
+// "without losing queued work" means the switch pauses the pipeline,
+// it does not discard what was queued.
+
+export interface InferenceKillSwitchStatus {
+  readonly engaged: boolean;
+  readonly reason?: string;
+}
+
+export type InferenceCallGate =
+  | { readonly allowed: true }
+  | { readonly allowed: false; readonly reason: string };
+
+export function checkInferenceKillSwitch(status: InferenceKillSwitchStatus): InferenceCallGate {
+  if (!status.engaged) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    reason: status.reason ?? "Inference is currently halted by an operator kill switch."
+  };
+}
