@@ -339,3 +339,39 @@ export interface AuditEvent extends VersionedRecord {
   readonly requestId: string;
   readonly occurredAt: string;
 }
+
+// ---- AF-34: provider-neutral AI adapter ----
+//
+// This port is deliberately generic (an arbitrary JSON Schema in, an
+// arbitrary parsed JSON value out), not shaped around evidence
+// extraction specifically -- AF-35 owns the actual extraction schema
+// and prompt on top of this. Nothing here names OpenAI, so a future
+// provider swap only touches packages/ai's adapter implementation, never
+// this interface or any caller of it.
+
+export interface AiStructuredCallInput {
+  readonly promptVersion: string;
+  readonly schemaVersion: string;
+  readonly schemaName: string;
+  readonly jsonSchema: Record<string, unknown>;
+  readonly systemPrompt: string;
+  readonly userPrompt: string;
+}
+
+/** Recorded on every call so a later ticket (AF-40) can persist it. */
+export interface AiCallMetadata {
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly schemaVersion: string;
+  readonly schemaName: string;
+}
+
+export interface AiStructuredCallResult {
+  readonly output: unknown;
+  readonly metadata: AiCallMetadata;
+}
+
+export interface AiAdapter {
+  runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult>;
+}

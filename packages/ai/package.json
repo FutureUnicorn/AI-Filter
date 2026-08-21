@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@signal-audit/contracts": "workspace:*",
-    "@signal-audit/domain": "workspace:*"
+    "@signal-audit/domain": "workspace:*",
+    "openai": "7.5.0"
   }
 }
