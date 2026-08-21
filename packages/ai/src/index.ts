@@ -8,9 +8,13 @@ import type {
   AiCallMetadata,
   AiStructuredCallInput,
   AiStructuredCallResult,
+  ContradictedEvidence,
   DomainPort,
   EvidenceOutcome,
-  SourceCitation
+  PartiallySupportedEvidence,
+  SourceCitation,
+  SupportedEvidence,
+  UnclearEvidence
 } from "@signal-audit/domain";
 
 /** AI provider adapters will map provider data into domain-owned abstractions. */
@@ -352,4 +356,76 @@ export function routeModel(config: ModelRoutingConfig, signals: RoutingSignals):
   return reasons.length === 0
     ? { model: config.defaultModel, tier: "default", reasons: [] }
     : { model: config.escalationModel, tier: "escalated", reasons };
+}
+
+// ---- AF-38: exact-source citation validator ----
+//
+// Port and harden scripts/validate_citations.py -- the single
+// highest-leverage integrity check in the system. Ported: the same
+// core rule (a citing item's quote must exist verbatim in the source
+// text, and at the claimed offset if a valid one is given). Hardened
+// two ways: (1) most of the Python version's "does this state even
+// need a quote" branch is now structurally unreachable, not just
+// checked -- AF-13's EvidenceOutcome only lets a citing kind carry a
+// citation field at all, so not_found/processing/etc. cannot fail this
+// check by construction, they simply pass through unexamined; (2)
+// coverage extends to "unclear", which the ticket's own prose names
+// only three of, but which the Python POC's validator (and AF-13's own
+// domain model) already treats as a citing state requiring proof --
+// leaving it unvalidated would be a silent regression, not a narrower
+// scope.
+
+function isCitingEvidence(
+  outcome: EvidenceOutcome
+): outcome is SupportedEvidence | PartiallySupportedEvidence | ContradictedEvidence | UnclearEvidence {
+  return (
+    outcome.kind === "supported" ||
+    outcome.kind === "partially_supported" ||
+    outcome.kind === "contradicted" ||
+    outcome.kind === "unclear"
+  );
+}
+
+function toCitationInvalid(criterionId: string, rejectedCitation: SourceCitation, reason: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "citation_invalid",
+    criterionId,
+    reason,
+    rejectedCitation
+  };
+}
+
+/**
+ * Non-citing outcomes pass through unexamined -- there is nothing to
+ * validate and no citation field to inspect. A citing outcome whose
+ * quote fails this check is discarded and replaced with
+ * `citation_invalid`, carrying the rejected citation and why, ready for
+ * AF-39 to route to human review.
+ */
+export function validateCitation(outcome: EvidenceOutcome, sourceText: string): EvidenceOutcome {
+  if (!isCitingEvidence(outcome)) {
+    return outcome;
+  }
+
+  const { citation, criterionId } = outcome;
+
+  if (citation.quote.length === 0) {
+    return toCitationInvalid(criterionId, citation, "missing quote for a citing state");
+  }
+  if (!sourceText.includes(citation.quote)) {
+    return toCitationInvalid(
+      criterionId,
+      citation,
+      "quote not found verbatim in source text (likely hallucination)"
+    );
+  }
+  if (citation.offset >= 0 && citation.offset < sourceText.length) {
+    const window = sourceText.slice(citation.offset, citation.offset + citation.quote.length);
+    if (window !== citation.quote) {
+      return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
+    }
+  }
+
+  return outcome;
 }
