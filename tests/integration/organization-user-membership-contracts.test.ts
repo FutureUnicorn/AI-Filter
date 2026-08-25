@@ -56,6 +56,20 @@ test("a well-formed user parses successfully", () => {
   assert.equal(result.success, true);
 });
 
+test("userSchema lowercases mixed-case emails to match the stored-email CHECK", () => {
+  const result = userSchema.safeParse({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    userId,
+    email: "Recruiter@Acme.test",
+    displayName: "Ada Recruiter",
+    createdAt
+  });
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.email, "recruiter@acme.test");
+  }
+});
+
 test("userSchema rejects a malformed email and a malformed uuid", () => {
   assert.equal(
     userSchema.safeParse({
