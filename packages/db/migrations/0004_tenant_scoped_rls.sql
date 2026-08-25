@@ -8,17 +8,30 @@
 -- No application code sets app.current_org_id yet, so this policy is
 -- fail-closed and inert: current_setting(..., true) returns NULL when
 -- unset, and organization_id = NULL is never true, so every connection
--- that doesn't set it sees zero rows rather than every row.
+-- that doesn't set it sees zero rows rather than every row. An empty
+-- string after SET/RESET is treated the same as unset (NULLIF), because
+-- ''::uuid is not a valid uuid and would error instead of fail closed.
 --
 -- Known gap (see docs/architecture/tenant-isolation.md): AF-11's
 -- POSTGRES_USER is the official postgres image's bootstrap role, which
 -- is a superuser, and superusers always bypass RLS regardless of FORCE.
 -- This policy is verified correct against a genuine non-superuser role
 -- but is currently a no-op against the app's actual database role.
+--
+-- CREATE POLICY is not idempotent; the migrate service replays every
+-- .sql file on each local up, so drop-then-create keeps this replay-safe.
 
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS memberships_tenant_isolation ON memberships;
+
 CREATE POLICY memberships_tenant_isolation ON memberships
-  USING (organization_id = current_setting('app.current_org_id', true)::uuid)
-  WITH CHECK (organization_id = current_setting('app.current_org_id', true)::uuid);
+  USING (
+    NULLIF(current_setting('app.current_org_id', true), '') IS NOT NULL
+    AND organization_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+  )
+  WITH CHECK (
+    NULLIF(current_setting('app.current_org_id', true), '') IS NOT NULL
+    AND organization_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+  );

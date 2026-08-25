@@ -366,6 +366,12 @@ export function idempotencyErrorResponse(
 }
 
 // ---- AF-15: runtime validation for organization/user/membership ----
+//
+// users.email is stored lowercase (`CHECK (email = lower(email))`).
+// z.email() accepts Recruiter@acme.test; this schema lowercases so the
+// parsed value can be persisted without violating that constraint.
+
+export const storedEmailSchema = z.email().toLowerCase();
 
 export const organizationSchema = z.strictObject({
   schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
@@ -377,7 +383,7 @@ export const organizationSchema = z.strictObject({
 export const userSchema = z.strictObject({
   schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
   userId: z.uuid(),
-  email: z.email(),
+  email: storedEmailSchema,
   displayName: z.string().min(1),
   createdAt: z.iso.datetime()
 }) satisfies z.ZodType<User>;
@@ -400,11 +406,11 @@ export const membershipSchema = z.strictObject({
 // self-service "just let me in" path.
 
 export const requestMagicLinkInputSchema = z.strictObject({
-  email: z.email()
+  email: storedEmailSchema
 });
 
 export const createInviteInputSchema = z.strictObject({
-  email: z.email(),
+  email: storedEmailSchema,
   organizationId: z.uuid(),
   role: z.enum(MEMBERSHIP_ROLES)
 });
