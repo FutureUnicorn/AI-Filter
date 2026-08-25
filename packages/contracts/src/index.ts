@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import {
   ALLOWED_FILE_TYPES,
+  APPLICATION_IMPORT_FIELDS,
   AUDIT_ACTIONS,
   CONTRACT_SCHEMA_VERSION,
   FILE_INTAKE_STATUSES,
@@ -18,6 +19,7 @@ import type {
   AuditEvent,
   CitationInvalidEvidence,
   ContradictedEvidence,
+  CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRun,
   EvidenceOutcome,
@@ -566,3 +568,22 @@ export const canonicalTextExtractionSchema = z.strictObject({
   quality: z.enum(["full", "partial", "empty"]),
   createdAt: z.iso.datetime()
 }) satisfies z.ZodType<CanonicalTextExtraction>;
+
+// ---- AF-31: CSV mapping and ten-row preview ----
+
+export const csvColumnMappingEntrySchema = z.strictObject({
+  field: z.enum(APPLICATION_IMPORT_FIELDS),
+  csvColumnHeader: z.string().trim().min(1)
+}) satisfies z.ZodType<CsvColumnMapping>;
+
+/**
+ * mapping is optional: an empty POST body is how the recruiter discovers
+ * the file's headers before choosing one, not an error. Once a mapping is
+ * supplied it's validated for real (packages/domain's
+ * validateCsvColumnMapping) before any preview rows are computed.
+ */
+export const csvPreviewInputSchema = z.strictObject({
+  mapping: z.array(csvColumnMappingEntrySchema).max(APPLICATION_IMPORT_FIELDS.length).optional()
+});
+
+export type CsvPreviewInput = z.infer<typeof csvPreviewInputSchema>;
