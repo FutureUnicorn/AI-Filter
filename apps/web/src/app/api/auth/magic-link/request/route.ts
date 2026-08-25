@@ -7,7 +7,7 @@ import {
   withRequestId
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { createMagicLinkToken, getUserByEmail } from "@signal-audit/db";
+import { createMagicLinkToken, getMembershipsForUser, getUserByEmail } from "@signal-audit/db";
 import { createConsoleMagicLinkEmailSender, generateMagicLinkToken } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 
@@ -49,7 +49,11 @@ export async function POST(request: NextRequest): Promise<Response> {
     const config = loadEnvironmentConfig(process.env);
     const email = parsed.data.email.toLowerCase();
     const user = await getUserByEmail(config.database.url, config.database.schema, email);
-    if (user !== undefined) {
+    const memberships =
+      user === undefined
+        ? []
+        : await getMembershipsForUser(config.database.url, config.database.schema, user.userId);
+    if (user !== undefined && memberships.length > 0) {
       const generated = generateMagicLinkToken();
       await createMagicLinkToken(config.database.url, config.database.schema, {
         tokenHash: generated.tokenHash,

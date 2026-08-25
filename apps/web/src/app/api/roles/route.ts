@@ -56,7 +56,7 @@ export async function POST(request: NextRequest): Promise<Response> {
   try {
     const config = loadEnvironmentConfig(process.env);
     const memberships = await getMembershipsForUser(config.database.url, config.database.schema, userId);
-    const authorization = authorizeResourceAccess(memberships, parsed.data.organizationId, "manage_roles");
+    const authorization = authorizeResourceAccess(memberships, parsed.data.organizationId, "manage_roles", userId);
     const authError = resourceAuthorizationErrorResponse(authorization, requestId);
     if (authError !== undefined) {
       return Response.json(authError.body, {
@@ -115,7 +115,7 @@ export async function GET(request: NextRequest): Promise<Response> {
   try {
     const config = loadEnvironmentConfig(process.env);
     const memberships = await getMembershipsForUser(config.database.url, config.database.schema, userId);
-    const authorization = authorizeResourceAccess(memberships, parsed.data.organizationId, "review_candidates");
+    const authorization = authorizeResourceAccess(memberships, parsed.data.organizationId, "review_candidates", userId);
     const authError = resourceAuthorizationErrorResponse(authorization, requestId);
     if (authError !== undefined) {
       return Response.json(authError.body, {
