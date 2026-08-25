@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+
 import { z } from "zod";
 
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   CitationInvalidEvidence,
   ContradictedEvidence,
@@ -169,4 +172,180 @@ export function parseEvidenceOutcome(value: unknown): EvidenceOutcome {
 /** Never throws; inspect `.success` before using `.data`. */
 export function safeParseEvidenceOutcome(value: unknown) {
   return evidenceOutcomeSchema.safeParse(value);
+}
+
+// ---- AF-14: API error, request-ID, and idempotency conventions ----
+//
+// These are pure, framework-agnostic helpers: they take plain strings (an
+// HTTP method, a header value) and return plain data, so both apps/web
+// (Next.js Route Handlers) and apps/worker can adopt them without either
+// depending on the other's HTTP framework. Nothing here is wired into an
+// existing endpoint by this ticket; future endpoint tickets adopt it.
+
+const REQUEST_ID_HEADER_NAME = "X-Request-Id";
+const REQUEST_ID_PATTERN =
+  /^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+export type RequestId = string;
+
+/** Every response carries one of these; generate it once per request. */
+export function generateRequestId(): RequestId {
+  return `req_${randomUUID()}`;
+}
+
+export const requestIdSchema = z
+  .string()
+  .regex(REQUEST_ID_PATTERN, "must match req_<uuid>");
+
+/** Standard header name a request ID is carried under, in and out. */
+export const REQUEST_ID_HEADER = REQUEST_ID_HEADER_NAME;
+
+/** Attach the request ID header without disturbing any other headers. */
+export function withRequestId(headers: HeadersInit | undefined, requestId: RequestId): Headers {
+  const merged = new Headers(headers);
+  merged.set(REQUEST_ID_HEADER_NAME, requestId);
+  return merged;
+}
+
+/** Closed, stable set of machine-readable error codes for the whole API surface. */
+export const API_ERROR_CODES = [
+  "invalid_request",
+  "missing_idempotency_key",
+  "idempotency_key_conflict",
+  "unauthorized",
+  "forbidden",
+  "not_found",
+  "conflict",
+  "rate_limited",
+  "internal_error",
+  "service_unavailable"
+] as const;
+
+export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
+
+export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
+  invalid_request: 400,
+  missing_idempotency_key: 400,
+  idempotency_key_conflict: 409,
+  unauthorized: 401,
+  forbidden: 403,
+  not_found: 404,
+  conflict: 409,
+  rate_limited: 429,
+  internal_error: 500,
+  service_unavailable: 503
+};
+
+/** The one shape every error response on the API surface takes. */
+export interface ApiErrorBody {
+  readonly schemaVersion: ContractSchemaVersion;
+  readonly requestId: RequestId;
+  readonly error: {
+    readonly code: ApiErrorCode;
+    readonly message: string;
+    readonly details?: Record<string, unknown> | undefined;
+  };
+}
+
+export const apiErrorBodySchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  requestId: requestIdSchema,
+  error: z.strictObject({
+    code: z.enum(API_ERROR_CODES),
+    message: z.string().min(1),
+    details: z.record(z.string(), z.unknown()).optional()
+  })
+}) satisfies z.ZodType<ApiErrorBody>;
+
+export interface BuildApiErrorInput {
+  readonly requestId: RequestId;
+  readonly code: ApiErrorCode;
+  readonly message: string;
+  readonly details?: Record<string, unknown>;
+}
+
+export interface ApiErrorResponse {
+  readonly status: number;
+  readonly body: ApiErrorBody;
+}
+
+/** Build a status + body pair; callers hand `body` to their own JSON response. */
+export function buildApiError(input: BuildApiErrorInput): ApiErrorResponse {
+  return {
+    status: API_ERROR_STATUS[input.code],
+    body: {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      requestId: input.requestId,
+      error: {
+        code: input.code,
+        message: input.message,
+        ...(input.details === undefined ? {} : { details: input.details })
+      }
+    }
+  };
+}
+
+export type IdempotencyKey = string;
+
+export const idempotencyKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u, "must be 1-255 chars of letters, digits, '.', '_', '-'");
+
+/** Methods that require an Idempotency-Key; GET/HEAD/OPTIONS never do. */
+export const MUTATING_HTTP_METHODS = ["POST", "PUT", "PATCH", "DELETE"] as const;
+export type MutatingHttpMethod = (typeof MUTATING_HTTP_METHODS)[number];
+
+function isMutatingHttpMethod(method: string): method is MutatingHttpMethod {
+  return (MUTATING_HTTP_METHODS as readonly string[]).includes(method.toUpperCase());
+}
+
+/**
+ * Explicit, non-collapsing outcomes for the idempotency check, in the same
+ * spirit as EvidenceOutcome: "missing" and "invalid" are structurally
+ * distinct from "present", not different values of one status string.
+ */
+export type IdempotencyRequirement =
+  | { readonly required: false }
+  | { readonly required: true; readonly outcome: "present"; readonly key: IdempotencyKey }
+  | { readonly required: true; readonly outcome: "missing" }
+  | { readonly required: true; readonly outcome: "invalid"; readonly reason: string };
+
+export function checkIdempotencyRequirement(
+  method: string,
+  headerValue: string | null
+): IdempotencyRequirement {
+  if (!isMutatingHttpMethod(method)) {
+    return { required: false };
+  }
+  if (headerValue === null || headerValue.length === 0) {
+    return { required: true, outcome: "missing" };
+  }
+  const parsed = idempotencyKeySchema.safeParse(headerValue);
+  if (!parsed.success) {
+    const reason = parsed.error.issues[0]?.message ?? "invalid Idempotency-Key";
+    return { required: true, outcome: "invalid", reason };
+  }
+  return { required: true, outcome: "present", key: parsed.data };
+}
+
+/** The ready-to-send ApiError for a failed idempotency check, or undefined if it passed. */
+export function idempotencyErrorResponse(
+  requirement: IdempotencyRequirement,
+  requestId: RequestId
+): ApiErrorResponse | undefined {
+  if (!requirement.required || requirement.outcome === "present") {
+    return undefined;
+  }
+  if (requirement.outcome === "missing") {
+    return buildApiError({
+      requestId,
+      code: "missing_idempotency_key",
+      message: "Mutating requests require an Idempotency-Key header."
+    });
+  }
+  return buildApiError({
+    requestId,
+    code: "invalid_request",
+    message: `Idempotency-Key header is invalid: ${requirement.reason}`
+  });
 }
