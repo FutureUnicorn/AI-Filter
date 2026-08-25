@@ -265,21 +265,42 @@ export interface AppendAuditEventInput {
   readonly requestId: string;
 }
 
+/** Same format as contracts' requestIdSchema; duplicated here so db does not depend on contracts. */
+const AUDIT_REQUEST_ID_PATTERN =
+  /^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+/** Caller-owned client so an action and its audit row can share one transaction. */
+export type DatabaseQueryable = Pick<Client, "query">;
+
 export async function appendAuditEvent(
   databaseUrl: string,
   schema: string,
-  input: AppendAuditEventInput
+  input: AppendAuditEventInput,
+  existingClient?: DatabaseQueryable
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
-  try {
-    await client.connect();
+  if (!AUDIT_REQUEST_ID_PATTERN.test(input.requestId)) {
+    throw new Error("audit event request_id must match req_<uuid>");
+  }
+
+  const insert = async (client: DatabaseQueryable): Promise<void> => {
     await client.query(
       `INSERT INTO "${schema}".audit_events
          (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [input.organizationId, input.actorUserId, input.action, input.entityType, input.entityId, input.requestId]
     );
+  };
+
+  if (existingClient !== undefined) {
+    await insert(existingClient);
+    return;
+  }
+
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await insert(client);
   } finally {
     await client.end().catch(() => undefined);
   }
