@@ -243,6 +243,25 @@ function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   };
 }
 
+function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
+  return (
+    item.source.page_or_section.trim().length > 0 &&
+    item.source.offset >= 0 &&
+    item.quote.trim().length > 0
+  );
+}
+
+function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "invalid_citation",
+    message: "The model's citing item is missing a persistable source citation.",
+    retryable: true
+  };
+}
+
 function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
   const criterionId = item.criterion_id;
   switch (item.state) {
@@ -252,6 +271,9 @@ function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
     case "partially_supported":
     case "contradicted":
     case "unclear":
+      if (!citingCitationIsPersistable(item)) {
+        return invalidCitationOutcome(criterionId);
+      }
       return {
         schemaVersion: CONTRACT_SCHEMA_VERSION,
         kind: item.state,
