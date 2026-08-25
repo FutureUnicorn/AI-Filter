@@ -16,6 +16,14 @@ test("requestMagicLinkInputSchema accepts only an email, nothing else", () => {
   );
 });
 
+test("requestMagicLinkInputSchema lowercases mixed-case emails before they are persisted", () => {
+  const result = requestMagicLinkInputSchema.safeParse({ email: "User@Acme.test" });
+  assert.equal(result.success, true);
+  if (result.success) {
+    assert.equal(result.data.email, "user@acme.test");
+  }
+});
+
 test("createInviteInputSchema requires email, organizationId, and a valid role together", () => {
   const organizationId = "11111111-1111-4111-8111-111111111111";
   assert.equal(
