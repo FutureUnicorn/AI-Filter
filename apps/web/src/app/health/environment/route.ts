@@ -1,6 +1,7 @@
 import { loadEnvironmentConfig, publicEnvironmentSummary } from "@signal-audit/config";
 import { checkDatabaseConnection } from "@signal-audit/db";
 import { checkStorageConnection } from "@signal-audit/ingestion";
+import { logStructured } from "@signal-audit/security";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -32,8 +33,8 @@ export async function GET(): Promise<Response> {
         headers: { "Cache-Control": "no-store" }
       }
     );
-  } catch (error) {
-    console.error("Environment health check failed", error);
+  } catch {
+    logStructured("error", "web.environment_health_failed");
     return Response.json(
       {
         status: "misconfigured",

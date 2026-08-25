@@ -92,6 +92,22 @@ jobs:
     name: CI / Integration
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.10-alpine3.23
+        env:
+          POSTGRES_USER: signal_audit_ci
+          POSTGRES_PASSWORD: ci-only-password-20chars
+          POSTGRES_DB: signal_audit_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U signal_audit_ci -d signal_audit_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SIGNAL_AUDIT_RLS_DATABASE_URL: postgresql://signal_audit_ci:ci-only-password-20chars@127.0.0.1:5432/signal_audit_ci
     steps:
       - name: Check out the tested revision
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
