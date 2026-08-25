@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES, ROLE_STATUSES } from "@signal-audit/domain";
+import {
+  AUDIT_ACTIONS,
+  CONTRACT_SCHEMA_VERSION,
+  MAX_RUBRIC_CRITERIA,
+  MEMBERSHIP_ROLES,
+  MIN_RUBRIC_CRITERIA,
+  ROLE_STATUSES,
+  RUBRIC_STATUSES
+} from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   AuditEvent,
@@ -22,6 +30,8 @@ import type {
   QuarantinedEvidence,
   RetryingEvidence,
   Role,
+  Rubric,
+  RubricCriterion,
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
@@ -463,3 +473,36 @@ export const createRoleInputSchema = z.strictObject({
 });
 
 export type CreateRoleInput = z.infer<typeof createRoleInputSchema>;
+
+// ---- AF-25: rubric draft/edit ----
+
+export const rubricCriterionSchema = z.strictObject({
+  criterionId: z.string().min(1),
+  description: z.string().trim().min(1).max(500),
+  evidenceGuidance: z.string().trim().min(1).max(500)
+}) satisfies z.ZodType<RubricCriterion>;
+
+export const rubricSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  rubricId: z.uuid(),
+  roleId: z.uuid(),
+  version: z.number().int().min(1),
+  status: z.enum(RUBRIC_STATUSES),
+  criteria: z.array(rubricCriterionSchema),
+  approvedByUserId: z.uuid().optional(),
+  approvedAt: z.iso.datetime().optional(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime()
+}) satisfies z.ZodType<Rubric>;
+
+/**
+ * The 5-10 bound lives here, not only in AF-26's editor UI: an API caller
+ * that bypasses the UI (a script, a future integration) must not be able
+ * to save a 2-criterion or 40-criterion rubric just because the UI didn't
+ * stop it.
+ */
+export const upsertRubricDraftInputSchema = z.strictObject({
+  criteria: z.array(rubricCriterionSchema).min(MIN_RUBRIC_CRITERIA).max(MAX_RUBRIC_CRITERIA)
+});
+
+export type UpsertRubricDraftInput = z.infer<typeof upsertRubricDraftInputSchema>;

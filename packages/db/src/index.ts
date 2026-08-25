@@ -13,6 +13,9 @@ import type {
   MembershipRole,
   Role,
   RoleStatus,
+  Rubric,
+  RubricCriterion,
+  RubricStatus,
   User
 } from "@signal-audit/domain";
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
@@ -674,6 +677,154 @@ export async function listRolesForOrganization(
       createdByUserId: row.created_by_user_id,
       createdAt: row.created_at.toISOString()
     }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** A single role, for routes that need to resolve roleId -> organizationId
+ * before they can authorize the caller against it (e.g. AF-25's rubric
+ * route: the role, not the rubric, is what's scoped to an organization). */
+export async function getRoleById(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Role | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
+         FROM "${schema}".roles
+        WHERE role_id = $1`,
+      [roleId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-25: rubric draft/edit ----
+
+interface RubricRow {
+  readonly rubric_id: string;
+  readonly role_id: string;
+  readonly version: number;
+  readonly status: RubricStatus;
+  readonly criteria: readonly RubricCriterion[];
+  readonly approved_by_user_id: string | null;
+  readonly approved_at: Date | null;
+  readonly created_at: Date;
+  readonly updated_at: Date;
+}
+
+function rowToRubric(row: RubricRow): Rubric {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    rubricId: row.rubric_id,
+    roleId: row.role_id,
+    version: row.version,
+    status: row.status,
+    criteria: row.criteria,
+    ...(row.approved_by_user_id === null ? {} : { approvedByUserId: row.approved_by_user_id }),
+    ...(row.approved_at === null ? {} : { approvedAt: row.approved_at.toISOString() }),
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+const RUBRIC_COLUMNS =
+  "rubric_id, role_id, version, status, criteria, approved_by_user_id, approved_at, created_at, updated_at";
+
+/** The draft if one exists, else the highest-version published rubric, else undefined. */
+export async function getRubricForRole(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Rubric | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RubricRow>(
+      `SELECT ${RUBRIC_COLUMNS}
+         FROM "${schema}".rubrics
+        WHERE role_id = $1
+        ORDER BY (status = 'draft') DESC, version DESC
+        LIMIT 1`,
+      [roleId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToRubric(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export type UpsertDraftRubricOutcome =
+  | { readonly outcome: "saved"; readonly rubric: Rubric }
+  | { readonly outcome: "no_such_role" };
+
+/**
+ * Creates the role's first draft, or overwrites the existing one --
+ * never both in the same call, and never touches a published version.
+ * The role_id foreign key plus the one-draft-per-role partial unique
+ * index (migration 0010) are what make this safe under concurrent
+ * calls: a race to create the first draft fails one caller with a
+ * unique-violation rather than silently producing two drafts.
+ */
+export async function upsertDraftRubric(
+  databaseUrl: string,
+  schema: string,
+  roleId: string,
+  criteria: readonly RubricCriterion[]
+): Promise<UpsertDraftRubricOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const criteriaJson = JSON.stringify(criteria);
+    const updated = await client.query<RubricRow>(
+      `UPDATE "${schema}".rubrics
+          SET criteria = $2::jsonb, updated_at = CURRENT_TIMESTAMP
+        WHERE role_id = $1 AND status = 'draft'
+        RETURNING ${RUBRIC_COLUMNS}`,
+      [roleId, criteriaJson]
+    );
+    const updatedRow = updated.rows[0];
+    if (updatedRow !== undefined) {
+      return { outcome: "saved", rubric: rowToRubric(updatedRow) };
+    }
+
+    const roleExists = await client.query(`SELECT 1 FROM "${schema}".roles WHERE role_id = $1`, [roleId]);
+    if (roleExists.rows[0] === undefined) {
+      return { outcome: "no_such_role" };
+    }
+
+    const inserted = await client.query<RubricRow>(
+      `INSERT INTO "${schema}".rubrics (role_id, version, criteria)
+       VALUES ($1, COALESCE((SELECT MAX(version) FROM "${schema}".rubrics WHERE role_id = $1), 0) + 1, $2::jsonb)
+       RETURNING ${RUBRIC_COLUMNS}`,
+      [roleId, criteriaJson]
+    );
+    const insertedRow = inserted.rows[0];
+    if (insertedRow === undefined) {
+      throw new Error("rubric insert returned no row");
+    }
+    return { outcome: "saved", rubric: rowToRubric(insertedRow) };
   } finally {
     await client.end().catch(() => undefined);
   }

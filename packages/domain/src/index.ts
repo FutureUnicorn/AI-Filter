@@ -516,3 +516,39 @@ export interface Role extends VersionedRecord {
   readonly createdByUserId: string;
   readonly createdAt: string;
 }
+
+// ---- AF-25: rubric draft/edit ----
+//
+// A rubric's own `version` (a plain per-role integer, 1/2/3...) is a
+// different thing from CONTRACT_SCHEMA_VERSION on VersionedRecord: this
+// one is a product concept the recruiter sees ("rubric v2"), the other is
+// this codebase's own payload-shape version. Draft is the only status
+// AF-25 produces or edits; AF-27 owns the transition to published and the
+// immutability that follows it, so this type already has the fields that
+// transition needs (approvedByUserId/approvedAt) even though AF-25 never
+// sets them.
+
+export interface RubricCriterion {
+  readonly criterionId: string;
+  readonly description: string;
+  readonly evidenceGuidance: string;
+}
+
+export type RubricStatus = "draft" | "published";
+
+export const RUBRIC_STATUSES: readonly RubricStatus[] = ["draft", "published"] as const;
+
+export const MIN_RUBRIC_CRITERIA = 5;
+export const MAX_RUBRIC_CRITERIA = 10;
+
+export interface Rubric extends VersionedRecord {
+  readonly rubricId: string;
+  readonly roleId: string;
+  readonly version: number;
+  readonly status: RubricStatus;
+  readonly criteria: readonly RubricCriterion[];
+  readonly approvedByUserId?: string | undefined;
+  readonly approvedAt?: string | undefined;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
