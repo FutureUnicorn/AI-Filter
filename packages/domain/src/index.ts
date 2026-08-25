@@ -516,3 +516,94 @@ export interface Role extends VersionedRecord {
   readonly createdByUserId: string;
   readonly createdAt: string;
 }
+
+// ---- AF-24: recruiter roles-list view model ----
+//
+// The working-home view needs counts, rubric approval state, and import
+// readiness per role. Rubric (AF-25/27) and application/import (AF-28–33)
+// tables do not exist yet, so this is a derived view over Role plus the
+// facts a later ticket will supply -- not a new persistence shape.
+// Callers that don't have those facts yet pass "none" and empty counts;
+// the UI contract stays stable when those tickets land.
+
+/** Whether this role currently has an employer-approved rubric version. */
+export type RubricApprovalState = "none" | "draft" | "approved";
+
+export const RUBRIC_APPROVAL_STATES: readonly RubricApprovalState[] = [
+  "none",
+  "draft",
+  "approved"
+] as const;
+
+/**
+ * Why a role is not import-ready. Distinct reasons, not one generic
+ * "blocked" flag: the recruiter needs to know whether they still owe a
+ * rubric, the role hasn't been activated, or the role is closed.
+ */
+export type ImportBlockedReason = "no_approved_rubric" | "role_not_active" | "role_closed";
+
+export type ImportReadiness =
+  | { readonly outcome: "ready" }
+  | { readonly outcome: "blocked"; readonly reason: ImportBlockedReason };
+
+export const IMPORT_BLOCKED_REASONS: readonly ImportBlockedReason[] = [
+  "no_approved_rubric",
+  "role_not_active",
+  "role_closed"
+] as const;
+
+/** Pipeline counts shown on the working-home row. Zero until AF-32/33 persist imports. */
+export interface RolePipelineCounts {
+  readonly applications: number;
+  readonly processed: number;
+  readonly waiting: number;
+  readonly failed: number;
+}
+
+export const EMPTY_ROLE_PIPELINE_COUNTS: RolePipelineCounts = {
+  applications: 0,
+  processed: 0,
+  waiting: 0,
+  failed: 0
+};
+
+/**
+ * Closed first (terminal), then missing rubric (the thing the recruiter
+ * must do next), then draft-not-yet-active. AF-23's own comment: a draft
+ * role cannot accept imports; AF-27 is what moves it to active.
+ */
+export function deriveImportReadiness(
+  status: RoleStatus,
+  rubricApprovalState: RubricApprovalState
+): ImportReadiness {
+  if (status === "closed") {
+    return { outcome: "blocked", reason: "role_closed" };
+  }
+  if (rubricApprovalState !== "approved") {
+    return { outcome: "blocked", reason: "no_approved_rubric" };
+  }
+  if (status !== "active") {
+    return { outcome: "blocked", reason: "role_not_active" };
+  }
+  return { outcome: "ready" };
+}
+
+export interface RoleListItem {
+  readonly role: Role;
+  readonly counts: RolePipelineCounts;
+  readonly rubricApprovalState: RubricApprovalState;
+  readonly importReadiness: ImportReadiness;
+}
+
+export function toRoleListItem(
+  role: Role,
+  counts: RolePipelineCounts,
+  rubricApprovalState: RubricApprovalState
+): RoleListItem {
+  return {
+    role,
+    counts,
+    rubricApprovalState,
+    importReadiness: deriveImportReadiness(role.status, rubricApprovalState)
+  };
+}

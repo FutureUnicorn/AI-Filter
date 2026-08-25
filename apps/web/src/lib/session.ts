@@ -17,14 +17,20 @@ export function readSessionSecret(): string {
   return secret;
 }
 
-/** Returns the authenticated user's id, or undefined if there is no
- * valid session -- callers decide what "no session" means for their
- * route (most should respond `unauthorized`). */
-export function readSessionUserId(request: NextRequest): string | undefined {
-  const token = request.cookies.get(SESSION_COOKIE_NAME)?.value;
+/** Cookie-value form so server pages (next/headers `cookies()`) and
+ * Route Handlers share the same check. Does not change how the cookie
+ * is issued -- that stays in the AF-23 redeem route. */
+export function userIdFromSessionToken(token: string | undefined): string | undefined {
   if (token === undefined) {
     return undefined;
   }
   const verification = verifySessionToken(token, readSessionSecret());
   return verification.outcome === "valid" ? verification.userId : undefined;
+}
+
+/** Returns the authenticated user's id, or undefined if there is no
+ * valid session -- callers decide what "no session" means for their
+ * route (most should respond `unauthorized`). */
+export function readSessionUserId(request: NextRequest): string | undefined {
+  return userIdFromSessionToken(request.cookies.get(SESSION_COOKIE_NAME)?.value);
 }

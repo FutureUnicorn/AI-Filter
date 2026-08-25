@@ -6,6 +6,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  Organization,
   Role,
   RoleStatus,
   User
@@ -560,6 +561,18 @@ interface RoleRow {
   readonly created_at: Date;
 }
 
+function roleFromRow(row: RoleRow): Role {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    roleId: row.role_id,
+    organizationId: row.organization_id,
+    title: row.title,
+    status: row.status,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
 export async function createRole(
   databaseUrl: string,
   schema: string,
@@ -579,15 +592,73 @@ export async function createRole(
     if (row === undefined) {
       throw new Error("role insert returned no row");
     }
-    return {
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      roleId: row.role_id,
-      organizationId: row.organization_id,
-      title: row.title,
-      status: row.status,
-      createdByUserId: row.created_by_user_id,
-      createdAt: row.created_at.toISOString()
-    };
+    return roleFromRow(row);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Roles for one organization, newest first. Caller must already have
+ * authorized that the organizationId belongs to the session's user --
+ * this query does not check membership. */
+export async function listRolesForOrganization(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string
+): Promise<readonly Role[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
+         FROM "${schema}".roles
+        WHERE organization_id = $1
+        ORDER BY created_at DESC`,
+      [organizationId]
+    );
+    return result.rows.map(roleFromRow);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+interface OrganizationRow {
+  readonly organization_id: string;
+  readonly name: string;
+  readonly created_at: Date;
+}
+
+function organizationFromRow(row: OrganizationRow): Organization {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId: row.organization_id,
+    name: row.name,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+/** Organizations the caller already knows about from their own memberships.
+ * Empty `organizationIds` short-circuits rather than running `= ANY('{}')`. */
+export async function getOrganizationsByIds(
+  databaseUrl: string,
+  schema: string,
+  organizationIds: readonly string[]
+): Promise<readonly Organization[]> {
+  if (organizationIds.length === 0) {
+    return [];
+  }
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<OrganizationRow>(
+      `SELECT organization_id, name, created_at
+         FROM "${schema}".organizations
+        WHERE organization_id = ANY($1::uuid[])`,
+      [organizationIds]
+    );
+    return result.rows.map(organizationFromRow);
   } finally {
     await client.end().catch(() => undefined);
   }

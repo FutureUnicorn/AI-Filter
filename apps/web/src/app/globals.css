@@ -14,25 +14,26 @@ body {
 }
 
 main {
-  max-width: 48rem;
+  max-width: 64rem;
   margin: 0 auto;
-  padding: 8rem 2rem;
+  padding: 3rem 1.5rem 4rem;
 }
 
 h1 {
-  max-width: 18ch;
-  font-size: clamp(2.5rem, 7vw, 5rem);
-  line-height: 1;
-  letter-spacing: -0.05em;
+  margin: 0.35rem 0 0.75rem;
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  line-height: 1.05;
+  letter-spacing: -0.04em;
 }
 
 p {
   max-width: 42rem;
-  font-size: 1.125rem;
-  line-height: 1.6;
+  font-size: 1.05rem;
+  line-height: 1.55;
 }
 
 .eyebrow {
+  margin: 0;
   color: #176b57;
   font-size: 0.8rem;
   font-weight: 700;
@@ -44,4 +45,139 @@ code {
   border-radius: 0.25rem;
   background: #e3ebe8;
   padding: 0.1rem 0.3rem;
+}
+
+.panel,
+.workspace {
+  background: #ffffff;
+  border: 1px solid #d7e0dd;
+  border-radius: 0.75rem;
+  padding: 1.75rem;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 24rem;
+}
+
+label {
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}
+
+input,
+select {
+  border: 1px solid #b7c4c0;
+  border-radius: 0.4rem;
+  padding: 0.55rem 0.7rem;
+  background: #fff;
+}
+
+button {
+  align-self: flex-start;
+  border: 0;
+  border-radius: 0.4rem;
+  padding: 0.6rem 0.95rem;
+  background: #176b57;
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.notice,
+.empty {
+  color: #3b524c;
+}
+
+.error {
+  color: #8a1f1f;
+}
+
+.workspace-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.org-picker,
+.org-name {
+  font-size: 0.95rem;
+}
+
+.org-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.lede {
+  color: #3b524c;
+}
+
+.create-role {
+  margin: 1.25rem 0;
+}
+
+.create-role-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.create-role-row input {
+  flex: 1 1 16rem;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.7rem 0.55rem;
+  border-bottom: 1px solid #e3ebe8;
+  vertical-align: top;
+}
+
+th {
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #3b524c;
+}
+
+td.num {
+  font-variant-numeric: tabular-nums;
+}
+
+td.status {
+  text-transform: capitalize;
+}
+
+.session-meta {
+  margin-top: 1.5rem;
+  font-size: 0.8rem;
+  color: #6b7c77;
 }

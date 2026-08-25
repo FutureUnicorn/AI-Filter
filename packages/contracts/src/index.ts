@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES, ROLE_STATUSES } from "@signal-audit/domain";
+import {
+  AUDIT_ACTIONS,
+  CONTRACT_SCHEMA_VERSION,
+  IMPORT_BLOCKED_REASONS,
+  MEMBERSHIP_ROLES,
+  ROLE_STATUSES,
+  RUBRIC_APPROVAL_STATES
+} from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   AuditEvent,
@@ -22,6 +29,8 @@ import type {
   QuarantinedEvidence,
   RetryingEvidence,
   Role,
+  RoleListItem,
+  RolePipelineCounts,
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
@@ -457,3 +466,60 @@ export const createRoleInputSchema = z.strictObject({
 });
 
 export type CreateRoleInput = z.infer<typeof createRoleInputSchema>;
+
+// ---- AF-24: recruiter roles-list view ----
+
+export const listRolesQuerySchema = z.strictObject({
+  organizationId: z.uuid()
+});
+
+export type ListRolesQuery = z.infer<typeof listRolesQuerySchema>;
+
+export const rolePipelineCountsSchema = z.strictObject({
+  applications: z.number().int().min(0),
+  processed: z.number().int().min(0),
+  waiting: z.number().int().min(0),
+  failed: z.number().int().min(0)
+}) satisfies z.ZodType<RolePipelineCounts>;
+
+const importReadySchema = z.strictObject({
+  outcome: z.literal("ready")
+});
+
+const importBlockedSchema = z.strictObject({
+  outcome: z.literal("blocked"),
+  reason: z.enum(IMPORT_BLOCKED_REASONS)
+});
+
+export const importReadinessSchema = z.discriminatedUnion("outcome", [
+  importReadySchema,
+  importBlockedSchema
+]);
+
+export const roleListItemSchema = z.strictObject({
+  role: roleSchema,
+  counts: rolePipelineCountsSchema,
+  rubricApprovalState: z.enum(RUBRIC_APPROVAL_STATES),
+  importReadiness: importReadinessSchema
+}) satisfies z.ZodType<RoleListItem>;
+
+export const roleListResponseSchema = z.strictObject({
+  roles: z.array(roleListItemSchema)
+});
+
+export type RoleListResponse = z.infer<typeof roleListResponseSchema>;
+
+/**
+ * Signed-in working-home bootstrap: the caller's own memberships, plus
+ * the organizations those memberships point at (names, not inferred
+ * from a client-supplied id). No email -- this is shown in the UI and
+ * AF-21's logger deliberately has no email field either.
+ */
+export const sessionContextSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  userId: z.uuid(),
+  memberships: z.array(membershipSchema),
+  organizations: z.array(organizationSchema)
+});
+
+export type SessionContext = z.infer<typeof sessionContextSchema>;
