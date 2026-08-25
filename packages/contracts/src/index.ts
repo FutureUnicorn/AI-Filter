@@ -394,11 +394,11 @@ export const membershipSchema = z.strictObject({
 // self-service "just let me in" path.
 
 export const requestMagicLinkInputSchema = z.strictObject({
-  email: z.email()
+  email: storedEmailSchema
 });
 
 export const createInviteInputSchema = z.strictObject({
-  email: z.email(),
+  email: storedEmailSchema,
   organizationId: z.uuid(),
   role: z.enum(MEMBERSHIP_ROLES)
 });
