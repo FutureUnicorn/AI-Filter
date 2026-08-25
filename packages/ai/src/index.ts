@@ -596,6 +596,33 @@ function isCitingKind(kind: EvidenceOutcomeKind): boolean {
   return CITING_KINDS.has(kind);
 }
 
+/**
+ * A gold-set fixture is hand-authored, versioned, and locked -- a typo
+ * in one of its labels is a fixture bug, not a pipeline regression, and
+ * must never silently produce a passing (or falsely failing) score. Both
+ * expectedKinds and expectedReviewCriterionIds are asserted against the
+ * case's own rubricCriterionIds so a misspelled or stray key fails loud
+ * at eval time instead of being quietly invisible to every metric that
+ * only ever looks up expected labels by a real outcome's criterionId.
+ */
+function assertGoldSetCaseIntegrity(goldCase: GoldSetCase): void {
+  const criterionIds = new Set(goldCase.rubricCriterionIds);
+  for (const expectedCriterionId of Object.keys(goldCase.expectedKinds)) {
+    if (!criterionIds.has(expectedCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedKinds["${expectedCriterionId}"], which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+  for (const reviewCriterionId of goldCase.expectedReviewCriterionIds) {
+    if (!criterionIds.has(reviewCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedReviewCriterionIds entry "${reviewCriterionId}", which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+}
+
 export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let totalItems = 0;
   let validItems = 0;
@@ -608,14 +635,24 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let reviewCorrectlyFlagged = 0;
 
   for (const goldCase of cases) {
+    assertGoldSetCaseIntegrity(goldCase);
+
+    const parsedItems: EvidenceExtractionItem[] = [];
     for (const item of goldCase.simulatedExtraction) {
       totalItems += 1;
-      if (evidenceExtractionItemSchema.safeParse(item).success) {
+      const parsed = evidenceExtractionItemSchema.safeParse(item);
+      if (parsed.success) {
         validItems += 1;
+        parsedItems.push(parsed.data);
       }
     }
 
-    const mapped = mapRubricToEvidence(goldCase.rubricCriterionIds, goldCase.simulatedExtraction);
+    // Only schema-valid items reach the real mapping/validation pipeline:
+    // that pipeline assumes a well-formed EvidenceExtractionItem shape
+    // (mapExtractedItem's switch has no default because the type claims
+    // to be exhaustive), so a malformed fixture item must lower
+    // schemaValidityRate above, not crash everything below.
+    const mapped = mapRubricToEvidence(goldCase.rubricCriterionIds, parsedItems);
     const validated = mapped.map((outcome) => validateCitation(outcome, goldCase.sourceText));
 
     for (const outcome of validated) {
@@ -634,12 +671,20 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
       } else if (expectedCiting && !actualCiting) {
         falseNegative += 1;
       }
+    }
 
-      if (goldCase.expectedReviewCriterionIds.includes(outcome.criterionId)) {
-        reviewExpectedCount += 1;
-        if (routeForReview(outcome).needsReview) {
-          reviewCorrectlyFlagged += 1;
-        }
+    // Seeded from the case's own expected IDs, not discovered by
+    // iterating real outcomes: assertGoldSetCaseIntegrity above already
+    // guarantees every one of these IDs has a matching outcome (they are
+    // all drawn from rubricCriterionIds, and mapRubricToEvidence always
+    // produces exactly one outcome per rubric criterion), so the
+    // denominator can never be silently short.
+    const uniqueReviewCriterionIds = new Set(goldCase.expectedReviewCriterionIds);
+    reviewExpectedCount += uniqueReviewCriterionIds.size;
+    for (const reviewCriterionId of uniqueReviewCriterionIds) {
+      const outcome = validated.find((candidate) => candidate.criterionId === reviewCriterionId);
+      if (outcome !== undefined && routeForReview(outcome).needsReview) {
+        reviewCorrectlyFlagged += 1;
       }
     }
   }
