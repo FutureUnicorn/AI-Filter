@@ -216,9 +216,17 @@ export const evidenceExtractionItemSchema = z
       offset: z.number().int()
     })
   })
-  .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.length > 0), {
-    message: "quote must be empty only when state is not_found",
+  .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.trim().length > 0), {
+    message: "quote must be empty only when state is not_found, and citing quotes must contain non-whitespace",
     path: ["quote"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.page_or_section.trim().length > 0, {
+    message: "citing states require a nonempty page_or_section",
+    path: ["source", "page_or_section"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.offset >= 0, {
+    message: "citing states require a nonnegative offset",
+    path: ["source", "offset"]
   });
 
 export const evidenceExtractionResponseSchema = z.strictObject({
@@ -252,6 +260,25 @@ function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   };
 }
 
+function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
+  return (
+    item.source.page_or_section.trim().length > 0 &&
+    item.source.offset >= 0 &&
+    item.quote.trim().length > 0
+  );
+}
+
+function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "invalid_citation",
+    message: "The model's citing item is missing a persistable source citation.",
+    retryable: true
+  };
+}
+
 function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
   const criterionId = item.criterion_id;
   switch (item.state) {
@@ -261,6 +288,9 @@ function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
     case "partially_supported":
     case "contradicted":
     case "unclear":
+      if (!citingCitationIsPersistable(item)) {
+        return invalidCitationOutcome(criterionId);
+      }
       return {
         schemaVersion: CONTRACT_SCHEMA_VERSION,
         kind: item.state,
