@@ -717,12 +717,26 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
 // the regression suite (tests/) exists specifically so new bypasses
 // found later get added here as new cases, not just fixed once.
 
+/**
+ * `you are now (a|an)` and bare `system prompt` were originally
+ * unqualified, unlike every other entry here -- both matched ordinary
+ * resume language with no instructional intent at all ("Designed system
+ * prompts and evaluation tooling", "You are now a much stronger
+ * communicator"), which a real LLM/prompt-engineering candidate's resume
+ * would trigger on sight. Both are narrowed to the actual attack shape:
+ * a role-hijack addressed at an assistant/model/bot, or an instructional
+ * verb (ignore/disregard/override/bypass/forget) acting on the system
+ * prompt specifically. The bracket-marker and "reveal ... system prompt"
+ * patterns below already cover the other real system-prompt attack
+ * shapes, so this one only needs to add the "override it" shape they
+ * don't.
+ */
 const INJECTION_PATTERNS: readonly RegExp[] = [
   /ignore (all |any )?(the )?(previous|prior|above) instructions?/iu,
   /disregard (all |any )?(the )?(previous|prior|above) instructions?/iu,
-  /you are now (a|an)\b/iu,
+  /you are now (a|an) [\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b/iu,
   /new instructions?:/iu,
-  /system prompt/iu,
+  /(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system prompt/iu,
   /reveal (your |the )?(system prompt|instructions)/iu,
   /act as (a|an)\b.{0,40}(instead|from now)/iu,
   /do not (follow|apply|use) (the )?(rubric|criteria|scoring)/iu,
