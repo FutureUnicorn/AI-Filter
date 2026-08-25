@@ -83,3 +83,28 @@ test("logStructured emits to stderr for warn/error, not stdout", (t) => {
   assert.equal(logMock.mock.calls.length, 0);
   assert.equal(errorMock.mock.calls.length, 1);
 });
+
+test("redactPii does not corrupt input that contains literal text shaped like its own internal placeholder", () => {
+  // Two real UUIDs (so the internal span-collection mechanism has real
+  // work to do) plus literal text that looks exactly like the shape an
+  // older marker-based implementation would have generated internally
+  // (e.g. "__SA_ID_0__") -- that literal text must survive untouched,
+  // not get overwritten by an unrelated protected value.
+  const uuidA = "11111111-1111-4111-8111-111111111111";
+  const uuidB = "22222222-2222-4222-8222-222222222222";
+  const input = `${uuidA} literal text __SA_ID_0__ should survive ${uuidB}`;
+  const result = redactPii(input);
+  assert.equal(result, input);
+});
+
+test("redactPii preserves multiple protected spans without dropping the redaction between them", () => {
+  const uuid = "11111111-1111-4111-8111-111111111111";
+  const date = "2026-08-21";
+  const result = redactPii(`Created ${uuid} on ${date} from 192.0.2.1, contact recruiter@acme.test`);
+  assert.equal(result, `Created ${uuid} on ${date} from 192.0.2.1, contact [REDACTED]`);
+});
+
+test("buildLogEntry never redacts a valid event name, even with a long digit run", () => {
+  const entry = buildLogEntry("info", "job.batch.completed.1234567890123");
+  assert.equal(entry.message, "job.batch.completed.1234567890123");
+});

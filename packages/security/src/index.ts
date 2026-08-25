@@ -194,23 +194,62 @@ const ISO_DATE_PATTERN =
 const LOG_EVENT_NAME = /^[a-z][a-z0-9._-]*$/u;
 const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
-const PROTECT_PREFIX = "__SA_ID_";
-const PROTECT_SUFFIX = "__";
+
+interface ProtectedSpan {
+  readonly start: number;
+  readonly end: number;
+}
+
+/**
+ * Collects UUID/IPv4/ISO-date match spans by position, merging any that
+ * overlap. Positional, not textual: an earlier version of this function
+ * protected these by swapping in a placeholder marker string, then
+ * restoring it afterward -- which is unsafe, because if the ORIGINAL
+ * input already contains text shaped like that marker (adversarial or
+ * just coincidental), the restore step cannot tell a genuine
+ * placeholder from that coincidence and silently substitutes the wrong
+ * value in, or drops text, at that position. Spans make that whole
+ * collision class structurally impossible: nothing about the
+ * mechanism depends on what the input text itself contains.
+ */
+function collectProtectedSpans(value: string): readonly ProtectedSpan[] {
+  const spans: ProtectedSpan[] = [];
+  for (const pattern of [UUID_PATTERN, IPV4_PATTERN, ISO_DATE_PATTERN]) {
+    for (const match of value.matchAll(pattern)) {
+      if (match.index === undefined) {
+        continue;
+      }
+      spans.push({ start: match.index, end: match.index + match[0].length });
+    }
+  }
+  spans.sort((a, b) => a.start - b.start);
+  const merged: ProtectedSpan[] = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && span.start < last.end) {
+      merged[merged.length - 1] = { start: last.start, end: Math.max(last.end, span.end) };
+    } else {
+      merged.push(span);
+    }
+  }
+  return merged;
+}
+
+function redactBetweenSpans(segment: string): string {
+  return segment.replace(EMAIL_PATTERN, REDACTED).replace(PHONE_PATTERN, REDACTED);
+}
 
 export function redactPii(value: string): string {
-  const saved: string[] = [];
-  const protect = (match: string): string => {
-    saved.push(match);
-    return `${PROTECT_PREFIX}${saved.length - 1}${PROTECT_SUFFIX}`;
-  };
-  const protectedValue = value
-    .replace(UUID_PATTERN, protect)
-    .replace(IPV4_PATTERN, protect)
-    .replace(ISO_DATE_PATTERN, protect);
-  return protectedValue
-    .replace(EMAIL_PATTERN, REDACTED)
-    .replace(PHONE_PATTERN, REDACTED)
-    .replace(/__SA_ID_(\d+)__/g, (_full, index: string) => saved[Number(index)] ?? "");
+  const spans = collectProtectedSpans(value);
+  let result = "";
+  let cursor = 0;
+  for (const span of spans) {
+    result += redactBetweenSpans(value.slice(cursor, span.start));
+    result += value.slice(span.start, span.end);
+    cursor = span.end;
+  }
+  result += redactBetweenSpans(value.slice(cursor));
+  return result;
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -270,8 +309,15 @@ function pickLogContext(context: LogContext | undefined): LogContext | undefined
   return Object.keys(picked).length === 0 ? undefined : (picked as LogContext);
 }
 
+/**
+ * A message that already matches LOG_EVENT_NAME is a closed,
+ * developer-authored dotted key, never user data -- running it through
+ * redactPii as well can corrupt it (a long digit run inside the name
+ * getting spliced with "[REDACTED]"), turning a supposedly stable
+ * machine-parseable key into an unstable one.
+ */
 function eventNameOrRejected(message: string): string {
-  return LOG_EVENT_NAME.test(message) ? redactPii(message) : REJECTED_LOG_MESSAGE;
+  return LOG_EVENT_NAME.test(message) ? message : REJECTED_LOG_MESSAGE;
 }
 
 export function buildLogEntry(
