@@ -1,3 +1,8 @@
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type {
   AuditAction,
   DomainPort,
@@ -109,21 +114,72 @@ export interface CreateMagicLinkTokenInput {
   readonly expiresAt: Date;
 }
 
+async function emailHasMembership(
+  client: Client,
+  schema: string,
+  email: string
+): Promise<boolean> {
+  const found = await client.query(
+    `SELECT 1
+       FROM "${schema}".users u
+       INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+      WHERE u.email = $1
+      LIMIT 1`,
+    [email]
+  );
+  return found.rows[0] !== undefined;
+}
+
+async function provisionInvitedMembership(
+  client: Client,
+  schema: string,
+  email: string,
+  organizationId: string,
+  role: MembershipRole
+): Promise<void> {
+  const displayName = email.split("@")[0] || email;
+  const userResult = await client.query<{ user_id: string }>(
+    `INSERT INTO "${schema}".users (email, display_name)
+     VALUES ($1, $2)
+     ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+     RETURNING user_id`,
+    [email, displayName]
+  );
+  const userId = userResult.rows[0]?.user_id;
+  if (userId === undefined) {
+    throw new Error("invite redemption did not produce a user row");
+  }
+  await client.query(
+    `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (organization_id, user_id) DO NOTHING`,
+    [organizationId, userId, role]
+  );
+}
+
 export async function createMagicLinkToken(
   databaseUrl: string,
   schema: string,
   input: CreateMagicLinkTokenInput
 ): Promise<void> {
   assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
+    // A plain login token (no invite) is not a signup path: refuse to mint
+    // one for an email that has no user+membership pair. Invite tokens are
+    // the only way an unknown email becomes a member, and they name the
+    // organization and role up front.
+    if (input.invite === undefined && !(await emailHasMembership(client, schema, email))) {
+      throw new Error("login magic link requires an existing user with a membership");
+    }
     await client.query(
       `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
       [
         input.tokenHash,
-        input.email,
+        email,
         input.invite?.organizationId ?? null,
         input.invite?.role ?? null,
         input.expiresAt
@@ -137,42 +193,63 @@ export async function createMagicLinkToken(
 /**
  * Atomic single-use redemption: the UPDATE only ever matches a row once,
  * so two concurrent redemption attempts on the same token cannot both
- * succeed. If it matched nothing, a follow-up SELECT (no race risk,
- * purely diagnostic) reports whether the token never existed or was
- * already consumed/expired.
+ * succeed. Expiry is compared to database time (clock_timestamp()), not
+ * the caller's clock. If the token carries an invite, the user and
+ * membership are granted in the same transaction as consume -- a crash
+ * between those writes cannot leave the invite spent without a member.
+ * If it matched nothing, a follow-up SELECT (no race risk, purely
+ * diagnostic) reports whether the token never existed or was already
+ * consumed/expired.
  */
 export async function redeemMagicLinkToken(
   databaseUrl: string,
   schema: string,
-  tokenHash: string,
-  now: Date = new Date()
+  tokenHash: string
 ): Promise<MagicLinkRedemptionAttempt> {
   assertSafeSchema(schema);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    const redeemed = await client.query<MagicLinkTokenRow>(
-      `UPDATE "${schema}".magic_link_tokens
-          SET consumed_at = $2
-        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > $2
-        RETURNING email, organization_id, role, expires_at, consumed_at`,
-      [tokenHash, now]
-    );
-    const redeemedRow = redeemed.rows[0];
-    if (redeemedRow !== undefined) {
-      return { justRedeemed: true, record: mapMagicLinkTokenRow(redeemedRow) };
-    }
+    await client.query("BEGIN");
+    try {
+      const redeemed = await client.query<MagicLinkTokenRow>(
+        `UPDATE "${schema}".magic_link_tokens
+            SET consumed_at = clock_timestamp()
+          WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
+          RETURNING email, organization_id, role, expires_at, consumed_at`,
+        [tokenHash]
+      );
+      const redeemedRow = redeemed.rows[0];
+      if (redeemedRow !== undefined) {
+        const record = mapMagicLinkTokenRow(redeemedRow);
+        if (record.invite !== undefined) {
+          await provisionInvitedMembership(
+            client,
+            schema,
+            record.email.toLowerCase(),
+            record.invite.organizationId,
+            record.invite.role
+          );
+        }
+        await client.query("COMMIT");
+        return { justRedeemed: true, record };
+      }
 
-    const existing = await client.query<MagicLinkTokenRow>(
-      `SELECT email, organization_id, role, expires_at, consumed_at
-         FROM "${schema}".magic_link_tokens WHERE token_hash = $1`,
-      [tokenHash]
-    );
-    const existingRow = existing.rows[0];
-    return {
-      justRedeemed: false,
-      record: existingRow === undefined ? undefined : mapMagicLinkTokenRow(existingRow)
-    };
+      const existing = await client.query<MagicLinkTokenRow>(
+        `SELECT email, organization_id, role, expires_at, consumed_at
+           FROM "${schema}".magic_link_tokens WHERE token_hash = $1`,
+        [tokenHash]
+      );
+      await client.query("COMMIT");
+      const existingRow = existing.rows[0];
+      return {
+        justRedeemed: false,
+        record: existingRow === undefined ? undefined : mapMagicLinkTokenRow(existingRow)
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -193,21 +270,42 @@ export interface AppendAuditEventInput {
   readonly requestId: string;
 }
 
+/** Same format as contracts' requestIdSchema; duplicated here so db does not depend on contracts. */
+const AUDIT_REQUEST_ID_PATTERN =
+  /^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+/** Caller-owned client so an action and its audit row can share one transaction. */
+export type DatabaseQueryable = Pick<Client, "query">;
+
 export async function appendAuditEvent(
   databaseUrl: string,
   schema: string,
-  input: AppendAuditEventInput
+  input: AppendAuditEventInput,
+  existingClient?: DatabaseQueryable
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
-  try {
-    await client.connect();
+  if (!AUDIT_REQUEST_ID_PATTERN.test(input.requestId)) {
+    throw new Error("audit event request_id must match req_<uuid>");
+  }
+
+  const insert = async (client: DatabaseQueryable): Promise<void> => {
     await client.query(
       `INSERT INTO "${schema}".audit_events
          (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [input.organizationId, input.actorUserId, input.action, input.entityType, input.entityId, input.requestId]
     );
+  };
+
+  if (existingClient !== undefined) {
+    await insert(existingClient);
+    return;
+  }
+
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await insert(client);
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -259,5 +357,105 @@ export async function recordEvidenceExtractionRun(
     );
   } finally {
     await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-22: exercise memberships RLS with a real non-superuser role ----
+
+const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
+
+/**
+ * Creates a throwaway schema, applies the real 0002/0004 migrations, and
+ * proves a non-superuser role cannot read or write another organization's
+ * memberships, including when app.current_org_id is the empty string.
+ */
+export async function assertMembershipsTenantIsolation(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `rls_probe_${suffix}`;
+  const role = `rls_app_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    await admin.query(`CREATE ROLE ${role} NOSUPERUSER NOBYPASSRLS`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A'), ($2, 'Org B')`, [
+      orgA,
+      orgB
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1, 'a@acme.test', 'A'), ($2, 'b@acme.test', 'B')`,
+      [userA, userB]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($3, $4, 'owner')`,
+      [orgA, userA, orgB, userB]
+    );
+
+    const asProbe = async (orgId: string | undefined, sql: string, params: unknown[] = []) => {
+      await admin.query("BEGIN");
+      try {
+        await admin.query(`SET LOCAL ROLE ${role}`);
+        if (orgId !== undefined) {
+          await admin.query("SELECT set_config('app.current_org_id', $1, true)", [orgId]);
+        }
+        const result = await admin.query(sql, params);
+        await admin.query("COMMIT");
+        return result;
+      } catch (error) {
+        await admin.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    };
+
+    const unset = await asProbe(undefined, "SELECT organization_id FROM memberships");
+    if (unset.rows.length !== 0) {
+      throw new Error("memberships RLS must hide every row when app.current_org_id is unset");
+    }
+
+    const empty = await asProbe("", "SELECT organization_id FROM memberships");
+    if (empty.rows.length !== 0) {
+      throw new Error("memberships RLS must hide every row when app.current_org_id is empty");
+    }
+
+    const inA = await asProbe(orgA, "SELECT organization_id FROM memberships");
+    if (inA.rows.length !== 1 || inA.rows[0]?.organization_id !== orgA) {
+      throw new Error("memberships RLS must show only the current organization's rows");
+    }
+
+    const inB = await asProbe(orgB, "SELECT organization_id FROM memberships");
+    if (inB.rows.length !== 1 || inB.rows[0]?.organization_id !== orgB) {
+      throw new Error("memberships RLS must not leak sibling-organization rows");
+    }
+
+    let crossTenantWriteRejected = false;
+    try {
+      await asProbe(orgA, "INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')", [
+        orgB,
+        userA
+      ]);
+    } catch {
+      crossTenantWriteRejected = true;
+    }
+    if (!crossTenantWriteRejected) {
+      throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
   }
 }

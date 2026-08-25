@@ -50,6 +50,27 @@ test("a citing state with an empty quote is rejected", () => {
   assert.equal(result.success, false);
 });
 
+test("a citing state with a whitespace-only quote is rejected", () => {
+  const result = evidenceExtractionItemSchema.safeParse({ ...citingItem, quote: "   " });
+  assert.equal(result.success, false);
+});
+
+test("a citing state with an empty page_or_section is rejected", () => {
+  const result = evidenceExtractionItemSchema.safeParse({
+    ...citingItem,
+    source: { ...citingItem.source, page_or_section: "" }
+  });
+  assert.equal(result.success, false);
+});
+
+test("a citing state with a negative offset is rejected", () => {
+  const result = evidenceExtractionItemSchema.safeParse({
+    ...citingItem,
+    source: { ...citingItem.source, offset: -1 }
+  });
+  assert.equal(result.success, false);
+});
+
 test("an unrecognized property on an item is rejected", () => {
   const result = evidenceExtractionItemSchema.safeParse({ ...citingItem, confidence: 0.9 });
   assert.equal(result.success, false);

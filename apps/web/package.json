@@ -14,6 +14,7 @@
     "@signal-audit/db": "workspace:*",
     "@signal-audit/domain": "workspace:*",
     "@signal-audit/ingestion": "workspace:*",
+    "@signal-audit/security": "workspace:*",
     "next": "16.3.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
