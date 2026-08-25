@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import type {
   AuditAction,
   DomainPort,
+  FileIntake,
+  FileIntakeStatus,
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
   MagicLinkTokenRecord,
@@ -863,6 +865,130 @@ export async function publishRubric(
     );
     const row = result.rows[0];
     return row === undefined ? { outcome: "no_draft" } : { outcome: "published", rubric: rowToRubric(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-28: secure direct file upload ----
+
+export interface CreateFileIntakeInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly storageKey: string;
+  readonly declaredFilename: string;
+  readonly declaredMimeType: string;
+  readonly createdByUserId: string;
+}
+
+interface FileIntakeRow {
+  readonly intake_id: string;
+  readonly organization_id: string;
+  readonly role_id: string;
+  readonly storage_key: string;
+  readonly declared_filename: string;
+  readonly declared_mime_type: string;
+  readonly status: FileIntakeStatus;
+  readonly created_by_user_id: string;
+  readonly created_at: Date;
+}
+
+function rowToFileIntake(row: FileIntakeRow): FileIntake {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    intakeId: row.intake_id,
+    organizationId: row.organization_id,
+    roleId: row.role_id,
+    storageKey: row.storage_key,
+    declaredFilename: row.declared_filename,
+    declaredMimeType: row.declared_mime_type,
+    status: row.status,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const FILE_INTAKE_COLUMNS =
+  "intake_id, organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id, created_at";
+
+export async function createFileIntake(
+  databaseUrl: string,
+  schema: string,
+  input: CreateFileIntakeInput
+): Promise<FileIntake> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `INSERT INTO "${schema}".file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING ${FILE_INTAKE_COLUMNS}`,
+      [
+        input.organizationId,
+        input.roleId,
+        input.storageKey,
+        input.declaredFilename,
+        input.declaredMimeType,
+        input.createdByUserId
+      ]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("file intake insert returned no row");
+    }
+    return rowToFileIntake(row);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export async function getFileIntakeById(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<FileIntake | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `SELECT ${FILE_INTAKE_COLUMNS} FROM "${schema}".file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToFileIntake(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export type MarkFileIntakeUploadedOutcome =
+  | { readonly outcome: "uploaded"; readonly intake: FileIntake }
+  | { readonly outcome: "not_pending" };
+
+/** WHERE status = 'pending' makes this a one-shot transition: calling it
+ * twice (a retried client request, say) leaves the row exactly as the
+ * first call left it, reported honestly as not_pending rather than
+ * silently "succeeding" a second time. */
+export async function markFileIntakeUploaded(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<MarkFileIntakeUploadedOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `UPDATE "${schema}".file_intakes
+          SET status = 'uploaded'
+        WHERE intake_id = $1 AND status = 'pending'
+        RETURNING ${FILE_INTAKE_COLUMNS}`,
+      [intakeId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? { outcome: "not_pending" } : { outcome: "uploaded", intake: rowToFileIntake(row) };
   } finally {
     await client.end().catch(() => undefined);
   }
