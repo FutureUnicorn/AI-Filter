@@ -31,10 +31,13 @@ Until then, defense in depth is:
 `packages/db/migrations/0004_tenant_scoped_rls.sql` enables `ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` on `memberships`, with a policy keyed on the Postgres session setting `app.current_org_id`:
 
 ```sql
-USING (organization_id = current_setting('app.current_org_id', true)::uuid)
+USING (
+  NULLIF(current_setting('app.current_org_id', true), '') IS NOT NULL
+  AND organization_id = NULLIF(current_setting('app.current_org_id', true), '')::uuid
+)
 ```
 
-`current_setting(..., true)` returns `NULL` when the setting was never made, and `organization_id = NULL` is never true, so a connection that never sets `app.current_org_id` sees zero rows -- fail closed, not fail open. No application code sets this setting yet; that wiring is for whichever ticket builds the first real per-request database session (AF-19 or later).
+`current_setting(..., true)` returns `NULL` when the setting was never made. `NULLIF(..., '')` treats an empty string (what `SET`/`RESET` can leave behind) the same as unset, because `''::uuid` would error rather than match nothing. `organization_id = NULL` is never true, so a connection that never sets `app.current_org_id` sees zero rows -- fail closed, not fail open. No application code sets this setting yet; that wiring is for whichever ticket builds the first real per-request database session (AF-19 or later). The policy is dropped and recreated so replaying this file on every `local up` does not fail.
 
 ## Known gap: this policy does not apply to the current app database role
 
