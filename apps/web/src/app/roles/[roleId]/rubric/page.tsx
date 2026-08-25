@@ -49,6 +49,8 @@ export default function RubricEditorPage() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | undefined>(undefined);
+  const [publishing, setPublishing] = useState(false);
+  const [publishError, setPublishError] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,6 +121,35 @@ export default function RubricEditorPage() {
     }
   }
 
+  /**
+   * AF-27: a named human approves and freezes this version. approvedBy
+   * is never chosen client-side -- the server sets it from the session,
+   * this button only triggers the call.
+   */
+  async function publish() {
+    setPublishing(true);
+    setPublishError(undefined);
+    try {
+      const response = await fetch(`/api/roles/${roleId}/rubric/publish`, {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.randomUUID() }
+      });
+      const body = (await response.json()) as RubricResponse & { error?: { message: string } };
+      if (!response.ok) {
+        setPublishError(body.error?.message ?? `Publish failed (${response.status}).`);
+        return;
+      }
+      setCriteria(body.criteria.map((c) => ({ ...c })));
+      setState({ kind: "ready", status: body.status });
+    } catch (error) {
+      setPublishError(error instanceof Error ? error.message : "Publish failed.");
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  const canPublish = state.kind === "ready" && state.status === "draft";
+
   return (
     <main>
       <p className="eyebrow">Rubric</p>
@@ -162,6 +193,16 @@ export default function RubricEditorPage() {
             </p>
           )}
           {saveError !== undefined && <p role="alert">{saveError}</p>}
+
+          {canPublish && (
+            <p>
+              <button type="button" onClick={publish} disabled={publishing}>
+                {publishing ? "Publishing…" : "Approve and publish"}
+              </button>{" "}
+              <span>Freezes this version. Further changes start a new one.</span>
+            </p>
+          )}
+          {publishError !== undefined && <p role="alert">{publishError}</p>}
         </>
       )}
     </main>

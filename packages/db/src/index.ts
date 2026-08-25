@@ -830,6 +830,44 @@ export async function upsertDraftRubric(
   }
 }
 
+// ---- AF-27: named approval and immutable rubric publishing ----
+
+export type PublishRubricOutcome =
+  | { readonly outcome: "published"; readonly rubric: Rubric }
+  | { readonly outcome: "no_draft" };
+
+/**
+ * The UPDATE's own WHERE status = 'draft' is what makes "approve the
+ * current draft" atomic and race-free -- two concurrent publish calls
+ * can't both succeed, and once the first one wins, migration 0011's
+ * trigger makes the resulting row permanently unreachable to any future
+ * UPDATE, this function included.
+ */
+export async function publishRubric(
+  databaseUrl: string,
+  schema: string,
+  rubricId: string,
+  approvedByUserId: string
+): Promise<PublishRubricOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RubricRow>(
+      `UPDATE "${schema}".rubrics
+          SET status = 'published', approved_by_user_id = $2, approved_at = CURRENT_TIMESTAMP,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE rubric_id = $1 AND status = 'draft'
+        RETURNING ${RUBRIC_COLUMNS}`,
+      [rubricId, approvedByUserId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? { outcome: "no_draft" } : { outcome: "published", rubric: rowToRubric(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
