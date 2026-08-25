@@ -84,6 +84,9 @@ importers:
       '@signal-audit/ingestion':
         specifier: workspace:*
         version: link:../../packages/ingestion
+      '@signal-audit/security':
+        specifier: workspace:*
+        version: link:../../packages/security
 
   packages/ai:
     dependencies:

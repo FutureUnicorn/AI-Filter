@@ -15,6 +15,7 @@
     "@signal-audit/config": "workspace:*",
     "@signal-audit/db": "workspace:*",
     "@signal-audit/domain": "workspace:*",
-    "@signal-audit/ingestion": "workspace:*"
+    "@signal-audit/ingestion": "workspace:*",
+    "@signal-audit/security": "workspace:*"
   }
 }

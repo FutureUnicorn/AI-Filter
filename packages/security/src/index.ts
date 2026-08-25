@@ -85,11 +85,11 @@ export function verifyMagicLinkToken(
   return { outcome: "expired" };
 }
 
-/** Dev-only adapter: logs instead of sending real mail. No vendor is wired here. */
+/** Dev-only adapter: records that a link was queued. Never logs the recipient or raw token. */
 export function createConsoleMagicLinkEmailSender(): MagicLinkEmailSender {
   return {
-    async sendMagicLink({ email, link }): Promise<void> {
-      console.log(`[magic-link] ${email}: ${link}`);
+    async sendMagicLink(): Promise<void> {
+      logStructured("info", "magic_link.queued");
     }
   };
 }
@@ -116,17 +116,29 @@ export type ResourceAuthorization =
   | { readonly outcome: "no_membership" }
   | { readonly outcome: "insufficient_capability"; readonly role: MembershipRole };
 
+function canonicalizeUuid(value: string): string {
+  return value.toLowerCase();
+}
+
 /**
- * `memberships` must be the caller's own memberships, fetched
- * server-side for the authenticated user -- never memberships supplied
- * by or derived from the request body/params.
+ * `memberships` must be fetched server-side. The check is bound to
+ * `authenticatedUserId`: a row for a different user is ignored even if
+ * it is in the array, and UUID letter-case is not treated as a
+ * different identity.
  */
 export function authorizeResourceAccess(
   memberships: readonly Membership[],
   organizationId: string,
-  capability: Capability
+  capability: Capability,
+  authenticatedUserId: string
 ): ResourceAuthorization {
-  const membership = memberships.find((candidate) => candidate.organizationId === organizationId);
+  const callerId = canonicalizeUuid(authenticatedUserId);
+  const requestedOrgId = canonicalizeUuid(organizationId);
+  const membership = memberships.find(
+    (candidate) =>
+      canonicalizeUuid(candidate.userId) === callerId &&
+      canonicalizeUuid(candidate.organizationId) === requestedOrgId
+  );
   if (membership === undefined) {
     return { outcome: "no_membership" };
   }
@@ -165,22 +177,39 @@ export function resourceAuthorizationErrorResponse(
 
 // ---- AF-21: PII-safe structured logging ----
 //
-// Two independent layers, matching "structured, redacted logging only"
-// literally. Structured: LogContext is a closed set of IDs and
-// metadata -- there is no field here a candidate's name, resume text,
-// or contact info could be passed through, because the type doesn't
-// have one. Redacted: redactPii is a second, separate layer that scans
-// the message string (and any string context values) for email- and
-// phone-shaped substrings and masks them, because a message string can
-// always have PII interpolated into it by a caller, and a closed field
-// set alone cannot stop that.
+// Three layers, matching "structured, redacted logging only" literally.
+// Structured: LogContext is a closed set of IDs -- pickLogContext copies
+// only those keys at runtime, so an extra candidateName property cannot
+// ride along. Messages: only dotted event names are emitted; free text
+// (names, resume snippets, addresses) is replaced, not logged. Redacted:
+// redactPii still masks email- and phone-shaped substrings in allowed
+// fields, after protecting UUID / IPv4 / ISO-date correlation IDs.
 
-const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/gu;
+const EMAIL_PATTERN = /[^\s@]+@[^\s@]+\.[^\s@]+/gu;
 const PHONE_PATTERN = /\+?\d[\d\s().-]{7,}\d/gu;
+const UUID_PATTERN = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+const IPV4_PATTERN = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+const ISO_DATE_PATTERN =
+  /\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?\b/g;
+const LOG_EVENT_NAME = /^[a-z][a-z0-9._-]*$/u;
+const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
+const PROTECT_PREFIX = "\u0000SA";
 
 export function redactPii(value: string): string {
-  return value.replace(EMAIL_PATTERN, REDACTED).replace(PHONE_PATTERN, REDACTED);
+  const saved: string[] = [];
+  const protect = (match: string): string => {
+    saved.push(match);
+    return `${PROTECT_PREFIX}${saved.length - 1}\u0000`;
+  };
+  const protectedValue = value
+    .replace(UUID_PATTERN, protect)
+    .replace(IPV4_PATTERN, protect)
+    .replace(ISO_DATE_PATTERN, protect);
+  return protectedValue
+    .replace(EMAIL_PATTERN, REDACTED)
+    .replace(PHONE_PATTERN, REDACTED)
+    .replace(/\u0000SA(\d+)\u0000/g, (_full, index: string) => saved[Number(index)] ?? "");
 }
 
 // ---- AF-23 prerequisite: session issuance ----
@@ -300,15 +329,38 @@ export interface StructuredLogEntry {
   readonly context?: LogContext;
 }
 
-function redactContext(context: LogContext | undefined): LogContext | undefined {
+const LOG_CONTEXT_KEYS = [
+  "requestId",
+  "organizationId",
+  "actorUserId",
+  "action",
+  "entityType",
+  "entityId",
+  "statusCode",
+  "errorCode",
+  "durationMs"
+] as const;
+
+function pickLogContext(context: LogContext | undefined): LogContext | undefined {
   if (context === undefined) {
     return undefined;
   }
-  const redacted: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(context)) {
-    redacted[key] = typeof value === "string" ? redactPii(value) : value;
+  const picked: Record<string, unknown> = {};
+  for (const key of LOG_CONTEXT_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(context, key)) {
+      continue;
+    }
+    const value = context[key];
+    if (value === undefined) {
+      continue;
+    }
+    picked[key] = typeof value === "string" ? redactPii(value) : value;
   }
-  return redacted as LogContext;
+  return Object.keys(picked).length === 0 ? undefined : (picked as LogContext);
+}
+
+function eventNameOrRejected(message: string): string {
+  return LOG_EVENT_NAME.test(message) ? redactPii(message) : REJECTED_LOG_MESSAGE;
 }
 
 export function buildLogEntry(
@@ -317,10 +369,10 @@ export function buildLogEntry(
   context?: LogContext,
   now: Date = new Date()
 ): StructuredLogEntry {
-  const redactedContext = redactContext(context);
+  const redactedContext = pickLogContext(context);
   return {
     level,
-    message: redactPii(message),
+    message: eventNameOrRejected(message),
     timestamp: now.toISOString(),
     ...(redactedContext === undefined ? {} : { context: redactedContext })
   };
