@@ -57,6 +57,35 @@ export interface OpenAiResponsesClient {
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
+  /**
+   * Checked before every call; when it resolves `engaged: true`, the
+   * provider is never invoked. Optional only so the existing adapter
+   * tests (which don't care about kill-switch behavior) don't all need
+   * to supply one -- any real caller wiring this up for actual evidence
+   * extraction must pass one (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose InferenceKillSwitchRow
+   * shape already matches this exactly). Before this, nothing in the
+   * codebase called this at all, so engaging the kill switch halted
+   * nothing.
+   */
+  readonly checkKillSwitch?: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+/**
+ * Thrown instead of ever calling the provider when the kill switch is
+ * engaged. This adapter is generic (no concept of a criterionId or
+ * retry count), so it can only refuse the call and say why -- mapping
+ * that into an EvidenceOutcome (killSwitchRetryOutcome, below) is the
+ * caller's job, at whatever per-criterion layer actually knows those.
+ */
+export class InferenceKillSwitchEngagedError extends Error {
+  readonly reason: string | undefined;
+
+  constructor(reason: string | undefined) {
+    super(reason === undefined ? "Inference kill switch is engaged" : `Inference kill switch is engaged: ${reason}`);
+    this.name = "InferenceKillSwitchEngagedError";
+    this.reason = reason;
+  }
 }
 
 /**
@@ -97,6 +126,13 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      if (config.checkKillSwitch !== undefined) {
+        const status = await config.checkKillSwitch();
+        if (status.engaged) {
+          throw new InferenceKillSwitchEngagedError(status.reason);
+        }
+      }
+
       const response = await openai.responses.create({
         model: config.model,
         input: [
