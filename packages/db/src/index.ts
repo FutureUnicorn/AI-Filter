@@ -154,10 +154,16 @@ async function provisionInvitedMembership(
   if (userId === undefined) {
     throw new Error("invite redemption did not produce a user row");
   }
+  // DO UPDATE, not DO NOTHING: an invite that names a role is an explicit
+  // instruction from whoever had permission to create it (invite creation
+  // is where that authorization boundary lives, not redemption) -- silently
+  // keeping the old role on conflict would let a deliberate promotion
+  // (recruiter -> admin, say) redeem successfully while leaving the actual
+  // membership unchanged, with no error or signal to anyone.
   await client.query(
     `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
      VALUES ($1, $2, $3)
-     ON CONFLICT (organization_id, user_id) DO NOTHING`,
+     ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
 }
@@ -542,56 +548,6 @@ export async function getUserByEmail(
       [email]
     );
     return result.rows[0] === undefined ? undefined : rowToUser(result.rows[0]);
-  } finally {
-    await client.end().catch(() => undefined);
-  }
-}
-
-export interface CreateInvitedUserInput {
-  readonly email: string;
-  /** No display name travels with an invite; the local part of the email
-   * is a placeholder the user can change once they're in, not a real name. */
-  readonly displayName: string;
-  readonly organizationId: string;
-  readonly role: MembershipRole;
-}
-
-/** Both inserts happen in one transaction: either the user gains exactly
- * the membership their invite named, or neither row is created. */
-export async function createInvitedUser(
-  databaseUrl: string,
-  schema: string,
-  input: CreateInvitedUserInput
-): Promise<User> {
-  assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
-  try {
-    await client.connect();
-    await client.query("BEGIN");
-    try {
-      const userResult = await client.query<UserRow>(
-        `INSERT INTO "${schema}".users (email, display_name)
-         VALUES ($1, $2)
-         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-         RETURNING user_id, email, display_name, created_at`,
-        [input.email, input.displayName]
-      );
-      const row = userResult.rows[0];
-      if (row === undefined) {
-        throw new Error("user upsert returned no row");
-      }
-      await client.query(
-        `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (organization_id, user_id) DO NOTHING`,
-        [input.organizationId, row.user_id, input.role]
-      );
-      await client.query("COMMIT");
-      return rowToUser(row);
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
   } finally {
     await client.end().catch(() => undefined);
   }

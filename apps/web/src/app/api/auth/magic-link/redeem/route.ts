@@ -6,7 +6,7 @@ import {
   withRequestId
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { createInvitedUser, getUserByEmail, redeemMagicLinkToken } from "@signal-audit/db";
+import { getUserByEmail, redeemMagicLinkToken } from "@signal-audit/db";
 import {
   SESSION_COOKIE_NAME,
   createSessionToken,
@@ -24,12 +24,16 @@ export const runtime = "nodejs";
 const redeemInputSchema = z.strictObject({ token: z.string().min(1) });
 
 /**
- * A login token (no invite) must resolve to an existing user -- see the
- * comment on packages/db's createInvitedUser for why this isn't
- * papered over into silently creating one. An invite token creates the
- * user and membership together on first redemption; redeeming the same
- * invite again would already fail earlier, at the atomic
- * redeemMagicLinkToken step (already_consumed), before this code runs.
+ * redeemMagicLinkToken already provisions the user + membership for an
+ * invite token (packages/db's provisionInvitedMembership, inside the
+ * same transaction as consuming it) -- this route only ever reads the
+ * result back with getUserByEmail, for both the login and invite case.
+ * It must not provision again itself: an earlier version of this route
+ * called a second, separate provisioning function after redemption,
+ * which ran the same two inserts twice per invite redemption against
+ * two different connections. Redeeming the same invite again would
+ * already fail earlier, at the atomic redeemMagicLinkToken step
+ * (already_consumed), before this code runs.
  */
 export async function POST(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
@@ -67,15 +71,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const user =
-      verification.invite === undefined
-        ? await getUserByEmail(config.database.url, config.database.schema, verification.email)
-        : await createInvitedUser(config.database.url, config.database.schema, {
-            email: verification.email,
-            displayName: verification.email.split("@")[0] ?? verification.email,
-            organizationId: verification.invite.organizationId,
-            role: verification.invite.role
-          });
+    const user = await getUserByEmail(config.database.url, config.database.schema, verification.email);
     if (user === undefined) {
       const error = buildApiError({
         requestId,
