@@ -116,17 +116,29 @@ export type ResourceAuthorization =
   | { readonly outcome: "no_membership" }
   | { readonly outcome: "insufficient_capability"; readonly role: MembershipRole };
 
+function canonicalizeUuid(value: string): string {
+  return value.toLowerCase();
+}
+
 /**
- * `memberships` must be the caller's own memberships, fetched
- * server-side for the authenticated user -- never memberships supplied
- * by or derived from the request body/params.
+ * `memberships` must be fetched server-side. The check is bound to
+ * `authenticatedUserId`: a row for a different user is ignored even if
+ * it is in the array, and UUID letter-case is not treated as a
+ * different identity.
  */
 export function authorizeResourceAccess(
   memberships: readonly Membership[],
   organizationId: string,
-  capability: Capability
+  capability: Capability,
+  authenticatedUserId: string
 ): ResourceAuthorization {
-  const membership = memberships.find((candidate) => candidate.organizationId === organizationId);
+  const callerId = canonicalizeUuid(authenticatedUserId);
+  const requestedOrgId = canonicalizeUuid(organizationId);
+  const membership = memberships.find(
+    (candidate) =>
+      canonicalizeUuid(candidate.userId) === callerId &&
+      canonicalizeUuid(candidate.organizationId) === requestedOrgId
+  );
   if (membership === undefined) {
     return { outcome: "no_membership" };
   }
