@@ -647,6 +647,38 @@ export async function createRole(
   }
 }
 
+// ---- AF-24: recruiter roles list ----
+
+export async function listRolesForOrganization(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string
+): Promise<readonly Role[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
+         FROM "${schema}".roles
+        WHERE organization_id = $1
+        ORDER BY created_at DESC`,
+      [organizationId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
