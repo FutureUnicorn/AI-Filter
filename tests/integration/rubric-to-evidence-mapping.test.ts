@@ -84,6 +84,18 @@ test("a criterion_id the model invented outside the rubric is dropped, not surfa
   assert.equal(outcomes[0]?.criterionId, "python_production");
 });
 
+test("a citing item with empty page_or_section or a negative offset becomes extraction_error", () => {
+  const invalid: EvidenceExtractionItem = {
+    criterion_id: "python_production",
+    state: "supported",
+    quote: "Built and maintained Python microservices processing 2M+ events/day.",
+    source: { document: "resume.txt", page_or_section: "", offset: -1 }
+  };
+  const [outcome] = mapRubricToEvidence(["python_production"], [invalid]);
+  assert.equal(outcome?.kind, "extraction_error");
+  assert.equal(outcome?.kind === "extraction_error" ? outcome.errorCode : undefined, "invalid_citation");
+});
+
 test("every generated outcome is pinned to the same CONTRACT_SCHEMA_VERSION", () => {
   const outcomes = mapRubricToEvidence(
     ["a", "b", "c"],
