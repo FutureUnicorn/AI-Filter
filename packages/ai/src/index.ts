@@ -196,9 +196,17 @@ export const evidenceExtractionItemSchema = z
       offset: z.number().int()
     })
   })
-  .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.length > 0), {
-    message: "quote must be empty only when state is not_found",
+  .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.trim().length > 0), {
+    message: "quote must be empty only when state is not_found, and citing quotes must contain non-whitespace",
     path: ["quote"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.page_or_section.trim().length > 0, {
+    message: "citing states require a nonempty page_or_section",
+    path: ["source", "page_or_section"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.offset >= 0, {
+    message: "citing states require a nonnegative offset",
+    path: ["source", "offset"]
   });
 
 export const evidenceExtractionResponseSchema = z.strictObject({
