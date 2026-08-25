@@ -1,0 +1,4 @@
+{
+  "name": "AI-Filter (Signal Audit)",
+  "install": "curl -LsSf https://astral.sh/uv/install.sh | sh && . \"$HOME/.local/bin/env\" && uv sync"
+}
