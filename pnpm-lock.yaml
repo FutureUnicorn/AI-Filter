@@ -44,6 +44,9 @@ importers:
       '@signal-audit/ingestion':
         specifier: workspace:*
         version: link:../../packages/ingestion
+      '@signal-audit/security':
+        specifier: workspace:*
+        version: link:../../packages/security
       next:
         specifier: 16.3.2
         version: 16.3.2(@types/node@24.10.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -75,6 +78,9 @@ importers:
       '@signal-audit/ingestion':
         specifier: workspace:*
         version: link:../../packages/ingestion
+      '@signal-audit/security':
+        specifier: workspace:*
+        version: link:../../packages/security
 
   packages/ai:
     dependencies:
