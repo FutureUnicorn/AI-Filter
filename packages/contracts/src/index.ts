@@ -28,6 +28,8 @@ import type {
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
+  CanonicalTextExtraction,
+  CanonicalTextPage,
   FileIntake,
   ProcessingEvidence,
   QuarantinedEvidence,
@@ -546,3 +548,21 @@ export const requestFileUploadInputSchema = z.strictObject({
 });
 
 export type RequestFileUploadInput = z.infer<typeof requestFileUploadInputSchema>;
+
+// ---- AF-30: PDF/DOCX canonical text parser ----
+
+const canonicalTextPageSchema = z.strictObject({
+  pageNumber: z.number().int().min(1),
+  text: z.string(),
+  characterCount: z.number().int().min(0)
+}) satisfies z.ZodType<CanonicalTextPage>;
+
+export const canonicalTextExtractionSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  extractionId: z.uuid(),
+  intakeId: z.uuid(),
+  pages: z.array(canonicalTextPageSchema),
+  totalPages: z.number().int().min(1),
+  quality: z.enum(["full", "partial", "empty"]),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<CanonicalTextExtraction>;

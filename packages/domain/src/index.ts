@@ -731,3 +731,57 @@ export function evaluateFileValidation(input: FileValidationInput): FileValidati
   }
   return { outcome: "validated" };
 }
+
+// ---- AF-30: PDF/DOCX canonical text parser ----
+//
+// "Page-aware" means genuinely per-page for PDF (pages are a real,
+// stored concept there); a DOCX has no reliable page-break data without
+// a full layout engine, so it's always exactly one page here -- a real
+// limitation, documented rather than faked with an invented page count.
+//
+// "Visible quality/coverage state, not a silent best-effort extraction"
+// is why this is never just a string: a scanned/image-only PDF page
+// parses to an empty string with no error (there is nothing wrong, from
+// the parser's point of view, about a page with no text layer) -- if
+// that silently looked identical to a real empty page, a recruiter
+// would have no way to tell "this evidence extraction found nothing
+// because the résumé really says nothing here" apart from "because this
+// page was never actually readable text to begin with."
+
+export type CanonicalTextQuality = "full" | "partial" | "empty";
+
+const MIN_MEANINGFUL_PAGE_CHARACTERS = 20;
+
+export interface CanonicalTextPage {
+  readonly pageNumber: number;
+  readonly text: string;
+  readonly characterCount: number;
+}
+
+export interface CanonicalTextExtraction extends VersionedRecord {
+  readonly extractionId: string;
+  readonly intakeId: string;
+  readonly pages: readonly CanonicalTextPage[];
+  readonly totalPages: number;
+  readonly quality: CanonicalTextQuality;
+  readonly createdAt: string;
+}
+
+/**
+ * empty: no page has meaningful text (a scanned PDF with no OCR layer,
+ * or a genuinely blank document). partial: some pages do, some don't
+ * (a résumé with one image-only page mixed into otherwise real text).
+ * full: every page has meaningful text.
+ */
+export function evaluateCanonicalTextQuality(
+  pages: readonly { readonly characterCount: number }[]
+): CanonicalTextQuality {
+  if (pages.length === 0) {
+    return "empty";
+  }
+  const meaningfulPages = pages.filter((page) => page.characterCount >= MIN_MEANINGFUL_PAGE_CHARACTERS).length;
+  if (meaningfulPages === 0) {
+    return "empty";
+  }
+  return meaningfulPages < pages.length ? "partial" : "full";
+}
