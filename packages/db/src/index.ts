@@ -1,3 +1,8 @@
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type {
   AuditAction,
   DomainPort,
@@ -391,5 +396,105 @@ export async function setInferenceKillSwitch(
     );
   } finally {
     await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-22: exercise memberships RLS with a real non-superuser role ----
+
+const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
+
+/**
+ * Creates a throwaway schema, applies the real 0002/0004 migrations, and
+ * proves a non-superuser role cannot read or write another organization's
+ * memberships, including when app.current_org_id is the empty string.
+ */
+export async function assertMembershipsTenantIsolation(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `rls_probe_${suffix}`;
+  const role = `rls_app_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    await admin.query(`CREATE ROLE ${role} NOSUPERUSER NOBYPASSRLS`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A'), ($2, 'Org B')`, [
+      orgA,
+      orgB
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1, 'a@acme.test', 'A'), ($2, 'b@acme.test', 'B')`,
+      [userA, userB]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($3, $4, 'owner')`,
+      [orgA, userA, orgB, userB]
+    );
+
+    const asProbe = async (orgId: string | undefined, sql: string, params: unknown[] = []) => {
+      await admin.query("BEGIN");
+      try {
+        await admin.query(`SET LOCAL ROLE ${role}`);
+        if (orgId !== undefined) {
+          await admin.query("SELECT set_config('app.current_org_id', $1, true)", [orgId]);
+        }
+        const result = await admin.query(sql, params);
+        await admin.query("COMMIT");
+        return result;
+      } catch (error) {
+        await admin.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    };
+
+    const unset = await asProbe(undefined, "SELECT organization_id FROM memberships");
+    if (unset.rows.length !== 0) {
+      throw new Error("memberships RLS must hide every row when app.current_org_id is unset");
+    }
+
+    const empty = await asProbe("", "SELECT organization_id FROM memberships");
+    if (empty.rows.length !== 0) {
+      throw new Error("memberships RLS must hide every row when app.current_org_id is empty");
+    }
+
+    const inA = await asProbe(orgA, "SELECT organization_id FROM memberships");
+    if (inA.rows.length !== 1 || inA.rows[0]?.organization_id !== orgA) {
+      throw new Error("memberships RLS must show only the current organization's rows");
+    }
+
+    const inB = await asProbe(orgB, "SELECT organization_id FROM memberships");
+    if (inB.rows.length !== 1 || inB.rows[0]?.organization_id !== orgB) {
+      throw new Error("memberships RLS must not leak sibling-organization rows");
+    }
+
+    let crossTenantWriteRejected = false;
+    try {
+      await asProbe(orgA, "INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')", [
+        orgB,
+        userA
+      ]);
+    } catch {
+      crossTenantWriteRejected = true;
+    }
+    if (!crossTenantWriteRejected) {
+      throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
   }
 }

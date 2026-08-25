@@ -5,10 +5,11 @@ import { loadEnvironmentConfig, publicEnvironmentSummary } from "@signal-audit/c
 import { checkDatabaseConnection } from "@signal-audit/db";
 import { DOMAIN_LAYER_NAME } from "@signal-audit/domain";
 import { checkStorageConnection } from "@signal-audit/ingestion";
+import { logStructured } from "@signal-audit/security";
 
 export function startWorker(): string {
   const message = `Signal Audit worker ready; dependency center=${DOMAIN_LAYER_NAME}`;
-  console.log(message);
+  logStructured("info", "worker.ready");
   return message;
 }
 
@@ -46,8 +47,8 @@ export function createWorkerHealthServer(
         "Content-Type": "application/json"
       });
       response.end(JSON.stringify(result));
-    } catch (error) {
-      console.error("Worker environment health check failed", error);
+    } catch {
+      logStructured("error", "worker.environment_health_failed");
       response.writeHead(503, {
         "Cache-Control": "no-store",
         "Content-Type": "application/json"
@@ -63,6 +64,6 @@ if (entryPath !== undefined && import.meta.url === pathToFileURL(entryPath).href
   startWorker();
   const config = loadEnvironmentConfig(process.env);
   createWorkerHealthServer().listen(config.ports.worker, "0.0.0.0", () => {
-    console.log(`Worker health server listening on ${config.ports.worker}`);
+    logStructured("info", "worker.health_listening");
   });
 }
