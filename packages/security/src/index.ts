@@ -194,13 +194,14 @@ const ISO_DATE_PATTERN =
 const LOG_EVENT_NAME = /^[a-z][a-z0-9._-]*$/u;
 const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
-const PROTECT_PREFIX = "\u0000SA";
+const PROTECT_PREFIX = "__SA_ID_";
+const PROTECT_SUFFIX = "__";
 
 export function redactPii(value: string): string {
   const saved: string[] = [];
   const protect = (match: string): string => {
     saved.push(match);
-    return `${PROTECT_PREFIX}${saved.length - 1}\u0000`;
+    return `${PROTECT_PREFIX}${saved.length - 1}${PROTECT_SUFFIX}`;
   };
   const protectedValue = value
     .replace(UUID_PATTERN, protect)
@@ -209,7 +210,7 @@ export function redactPii(value: string): string {
   return protectedValue
     .replace(EMAIL_PATTERN, REDACTED)
     .replace(PHONE_PATTERN, REDACTED)
-    .replace(/\u0000SA(\d+)\u0000/g, (_full, index: string) => saved[Number(index)] ?? "");
+    .replace(/__SA_ID_(\d+)__/g, (_full, index: string) => saved[Number(index)] ?? "");
 }
 
 // ---- AF-23 prerequisite: session issuance ----
