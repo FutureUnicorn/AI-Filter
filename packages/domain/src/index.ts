@@ -1007,3 +1007,52 @@ export function canonicalizeCsvColumnMapping(mapping: readonly CsvColumnMapping[
   const sorted = [...mapping].sort((a, b) => a.field.localeCompare(b.field));
   return JSON.stringify(sorted.map((entry) => ({ field: entry.field, csvColumnHeader: entry.csvColumnHeader })));
 }
+
+// ---- AF-33: processing/failure status UI ----
+//
+// "waiting" only ever means "not finalized yet": AF-32's finalize is one
+// atomic transaction, not a queue that drains rows one at a time, so
+// there is no real in-progress state to report mid-import. Before
+// finalize every row is waiting; the instant it commits, none are --
+// they have all become processed, failed, or skipped in the same step.
+
+export interface ImportStatusSummary extends ImportFinalizationSummary {
+  readonly status: "waiting" | "finalized";
+  readonly waitingCount: number;
+}
+
+export function buildImportStatusSummary(
+  totalRows: number,
+  rows: readonly { readonly outcome: ImportRowOutcome }[]
+): ImportStatusSummary {
+  if (rows.length === 0) {
+    return {
+      status: "waiting",
+      totalRows,
+      processedCount: 0,
+      failedCount: 0,
+      skippedCount: 0,
+      waitingCount: totalRows
+    };
+  }
+  return { status: "finalized", ...summarizeImportRows(rows), waitingCount: 0 };
+}
+
+const CSV_FIELD_ESCAPE_PATTERN = /[",\n]/u;
+
+function escapeCsvField(value: string): string {
+  return CSV_FIELD_ESCAPE_PATTERN.test(value) ? `"${value.replace(/"/gu, '""')}"` : value;
+}
+
+/**
+ * The recruiter's "downloadable error list": only failed rows, since
+ * skipped rows were never meant to become applications (a blank spacer
+ * row needs no attention) and processed rows succeeded.
+ */
+export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
+  const header = "row_number,failure_reason";
+  const lines = rows
+    .filter((row): row is ImportRow & { readonly failureReason: string } => row.outcome === "failed")
+    .map((row) => `${row.rowNumber},${escapeCsvField(row.failureReason)}`);
+  return [header, ...lines].join("\n") + "\n";
+}
