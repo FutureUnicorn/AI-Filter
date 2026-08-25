@@ -616,14 +616,18 @@ export function scanCriterionForProtectedCharacteristicProxy(
 export const ALLOWED_FILE_TYPES = ["pdf", "docx", "csv"] as const;
 export type AllowedFileType = (typeof ALLOWED_FILE_TYPES)[number];
 
-export type FileIntakeStatus = "pending" | "uploaded" | "validated" | "quarantined" | "rejected";
+/** "imported" is added by AF-32, not AF-28: a CSV intake reaches it once
+ * (never again -- finalization is one-shot, same as every other
+ * transition here), pdf/docx intakes never reach it at all. */
+export type FileIntakeStatus = "pending" | "uploaded" | "validated" | "quarantined" | "rejected" | "imported";
 
 export const FILE_INTAKE_STATUSES: readonly FileIntakeStatus[] = [
   "pending",
   "uploaded",
   "validated",
   "quarantined",
-  "rejected"
+  "rejected",
+  "imported"
 ] as const;
 
 export interface FileIntake extends VersionedRecord {
@@ -915,4 +919,91 @@ export function buildCsvPreview(
     values: mapCsvRowToApplication(row, mapping)
   }));
   return { totalDataRows: rows.length, previewRows };
+}
+
+// ---- AF-32: idempotent import finalization ----
+//
+// The applications table this whole intake/validate/parse/preview
+// pipeline (AF-28-31) has been building toward. Every CSV data row gets
+// exactly one outcome, decided purely from the same mapped values AF-31
+// already computes: a row missing every required field is a blank
+// spacer row (skipped, not an error); a row missing only some of them
+// is a real but broken row the recruiter needs to see (failed); a row
+// with everything required present becomes a durable Application
+// (processed). "Nothing disappears silently" means every row gets one
+// of these three, never a fourth, silent option.
+
+export type ImportRowOutcome = "processed" | "failed" | "skipped";
+
+export const IMPORT_ROW_OUTCOMES: readonly ImportRowOutcome[] = ["processed", "failed", "skipped"] as const;
+
+export interface Application extends VersionedRecord {
+  readonly applicationId: string;
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly intakeId: string;
+  readonly sourceRowNumber: number;
+  readonly candidateFullName: string;
+  readonly candidateEmail: string;
+  readonly externalReferenceId?: string | undefined;
+  readonly appliedAt?: string | undefined;
+  readonly createdAt: string;
+}
+
+export interface ImportRow {
+  readonly importRowId: string;
+  readonly intakeId: string;
+  readonly rowNumber: number;
+  readonly outcome: ImportRowOutcome;
+  readonly applicationId?: string | undefined;
+  readonly failureReason?: string | undefined;
+}
+
+export type ImportRowClassification =
+  | { readonly outcome: "processed" }
+  | { readonly outcome: "failed"; readonly reason: string }
+  | { readonly outcome: "skipped" };
+
+/** Pure: given the same mapped values AF-31's preview already computes
+ * for a row, decides its fate without ever touching the database. */
+export function classifyCsvImportRow(
+  values: Readonly<Record<ApplicationImportField, string | undefined>>
+): ImportRowClassification {
+  const missingRequired = REQUIRED_APPLICATION_IMPORT_FIELDS.filter((field) => values[field] === undefined);
+  if (missingRequired.length === REQUIRED_APPLICATION_IMPORT_FIELDS.length) {
+    return { outcome: "skipped" };
+  }
+  if (missingRequired.length > 0) {
+    return { outcome: "failed", reason: `Missing required field(s): ${missingRequired.join(", ")}` };
+  }
+  return { outcome: "processed" };
+}
+
+export interface ImportFinalizationSummary {
+  readonly totalRows: number;
+  readonly processedCount: number;
+  readonly failedCount: number;
+  readonly skippedCount: number;
+}
+
+export function summarizeImportRows(
+  rows: readonly { readonly outcome: ImportRowOutcome }[]
+): ImportFinalizationSummary {
+  return {
+    totalRows: rows.length,
+    processedCount: rows.filter((row) => row.outcome === "processed").length,
+    failedCount: rows.filter((row) => row.outcome === "failed").length,
+    skippedCount: rows.filter((row) => row.outcome === "skipped").length
+  };
+}
+
+/**
+ * Order-independent, so a client resubmitting the same logical mapping
+ * with its entries in a different order still counts as the same
+ * mapping for idempotency-key comparison -- what matters is what it
+ * means, not the array order the client happened to send.
+ */
+export function canonicalizeCsvColumnMapping(mapping: readonly CsvColumnMapping[]): string {
+  const sorted = [...mapping].sort((a, b) => a.field.localeCompare(b.field));
+  return JSON.stringify(sorted.map((entry) => ({ field: entry.field, csvColumnHeader: entry.csvColumnHeader })));
 }

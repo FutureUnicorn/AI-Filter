@@ -8,9 +8,13 @@ import type {
   CanonicalTextExtraction,
   CanonicalTextPage,
   CanonicalTextQuality,
+  CsvColumnMapping,
   DomainPort,
   FileIntake,
   FileIntakeStatus,
+  ImportFinalizationSummary,
+  ImportRow,
+  ImportRowOutcome,
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
   MagicLinkTokenRecord,
@@ -23,7 +27,13 @@ import type {
   RubricStatus,
   User
 } from "@signal-audit/domain";
-import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import {
+  CONTRACT_SCHEMA_VERSION,
+  canonicalizeCsvColumnMapping,
+  classifyCsvImportRow,
+  mapCsvRowToApplication,
+  summarizeImportRows
+} from "@signal-audit/domain";
 import { Client } from "pg";
 
 /** Persistence adapters will implement domain-owned ports in this package. */
@@ -1126,6 +1136,186 @@ export async function getCanonicalTextExtractionByIntakeId(
       [intakeId]
     );
     return result.rows[0] === undefined ? undefined : rowToCanonicalTextExtraction(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-32: idempotent import finalization ----
+//
+// import_finalizations has UNIQUE(intake_id): at most one finalization
+// record can ever exist per intake. Locked with FOR UPDATE the moment
+// it's read, so two concurrent finalize calls for the same intake
+// serialize on this row instead of both racing past the "no existing
+// finalization" check and double-importing. A matching key AND mapping
+// is a genuine replay (returns the exact rows already recorded, does no
+// new work); anything else against an already-finalized intake is a
+// real conflict, not a silent overwrite of the first result.
+
+export interface FinalizeCsvImportInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly intakeId: string;
+  readonly idempotencyKey: string;
+  readonly mapping: readonly CsvColumnMapping[];
+  readonly rows: readonly Readonly<Record<string, string>>[];
+}
+
+export type FinalizeCsvImportOutcome =
+  | { readonly outcome: "finalized"; readonly summary: ImportFinalizationSummary; readonly rows: readonly ImportRow[] }
+  | { readonly outcome: "replayed"; readonly summary: ImportFinalizationSummary; readonly rows: readonly ImportRow[] }
+  | { readonly outcome: "conflict" }
+  | { readonly outcome: "not_validated" };
+
+interface ImportRowRow {
+  readonly import_row_id: string;
+  readonly intake_id: string;
+  readonly row_number: number;
+  readonly outcome: ImportRowOutcome;
+  readonly application_id: string | null;
+  readonly failure_reason: string | null;
+}
+
+function rowToImportRow(row: ImportRowRow): ImportRow {
+  return {
+    importRowId: row.import_row_id,
+    intakeId: row.intake_id,
+    rowNumber: row.row_number,
+    outcome: row.outcome,
+    ...(row.application_id === null ? {} : { applicationId: row.application_id }),
+    ...(row.failure_reason === null ? {} : { failureReason: row.failure_reason })
+  };
+}
+
+const IMPORT_ROW_COLUMNS = "import_row_id, intake_id, row_number, outcome, application_id, failure_reason";
+
+async function insertImportRow(
+  client: Client,
+  schema: string,
+  intakeId: string,
+  rowNumber: number,
+  classification: ReturnType<typeof classifyCsvImportRow>,
+  applicationId: string | undefined
+): Promise<ImportRow> {
+  const outcome = classification.outcome;
+  const failureReason = classification.outcome === "failed" ? classification.reason : null;
+  const result = await client.query<ImportRowRow>(
+    `INSERT INTO "${schema}".import_rows (intake_id, row_number, outcome, application_id, failure_reason)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING ${IMPORT_ROW_COLUMNS}`,
+    [intakeId, rowNumber, outcome, applicationId ?? null, failureReason]
+  );
+  const row = result.rows[0];
+  if (row === undefined) {
+    throw new Error("import row insert returned no row");
+  }
+  return rowToImportRow(row);
+}
+
+export async function finalizeCsvImport(
+  databaseUrl: string,
+  schema: string,
+  input: FinalizeCsvImportInput
+): Promise<FinalizeCsvImportOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const existing = await client.query<{ idempotency_key: string; mapping: CsvColumnMapping[] }>(
+        `SELECT idempotency_key, mapping FROM "${schema}".import_finalizations WHERE intake_id = $1 FOR UPDATE`,
+        [input.intakeId]
+      );
+      const existingRow = existing.rows[0];
+      if (existingRow !== undefined) {
+        const sameRequest =
+          existingRow.idempotency_key === input.idempotencyKey &&
+          canonicalizeCsvColumnMapping(existingRow.mapping) === canonicalizeCsvColumnMapping(input.mapping);
+        if (!sameRequest) {
+          await client.query("ROLLBACK");
+          return { outcome: "conflict" };
+        }
+        const rows = await client.query<ImportRowRow>(
+          `SELECT ${IMPORT_ROW_COLUMNS} FROM "${schema}".import_rows WHERE intake_id = $1 ORDER BY row_number`,
+          [input.intakeId]
+        );
+        await client.query("COMMIT");
+        const importRows = rows.rows.map(rowToImportRow);
+        return { outcome: "replayed", summary: summarizeImportRows(importRows), rows: importRows };
+      }
+
+      const transitioned = await client.query(
+        `UPDATE "${schema}".file_intakes SET status = 'imported' WHERE intake_id = $1 AND status = 'validated'`,
+        [input.intakeId]
+      );
+      if ((transitioned.rowCount ?? 0) === 0) {
+        await client.query("ROLLBACK");
+        return { outcome: "not_validated" };
+      }
+
+      const importRows: ImportRow[] = [];
+      for (const [index, csvRow] of input.rows.entries()) {
+        const rowNumber = index + 1;
+        const values = mapCsvRowToApplication(csvRow, input.mapping);
+        const classification = classifyCsvImportRow(values);
+        let applicationId: string | undefined;
+        if (classification.outcome === "processed") {
+          const inserted = await client.query<{ application_id: string }>(
+            `INSERT INTO "${schema}".applications
+               (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email, external_reference_id, applied_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING application_id`,
+            [
+              input.organizationId,
+              input.roleId,
+              input.intakeId,
+              rowNumber,
+              values.candidateFullName,
+              values.candidateEmail,
+              values.externalReferenceId ?? null,
+              values.appliedAt ?? null
+            ]
+          );
+          applicationId = inserted.rows[0]?.application_id;
+          if (applicationId === undefined) {
+            throw new Error("application insert returned no row");
+          }
+        }
+        importRows.push(await insertImportRow(client, schema, input.intakeId, rowNumber, classification, applicationId));
+      }
+
+      await client.query(
+        `INSERT INTO "${schema}".import_finalizations (intake_id, idempotency_key, mapping)
+         VALUES ($1, $2, $3::jsonb)`,
+        [input.intakeId, input.idempotencyKey, JSON.stringify(input.mapping)]
+      );
+
+      await client.query("COMMIT");
+      return { outcome: "finalized", summary: summarizeImportRows(importRows), rows: importRows };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export async function getImportRowsForIntake(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<readonly ImportRow[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<ImportRowRow>(
+      `SELECT ${IMPORT_ROW_COLUMNS} FROM "${schema}".import_rows WHERE intake_id = $1 ORDER BY row_number`,
+      [intakeId]
+    );
+    return result.rows.map(rowToImportRow);
   } finally {
     await client.end().catch(() => undefined);
   }
