@@ -197,12 +197,33 @@ const REDACTED = "[REDACTED]";
 const PROTECT_PREFIX = "__SA_ID_";
 const PROTECT_SUFFIX = "__";
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Pick a marker prefix that does not already occur in `value`. A fixed
+ * `__SA_ID_0__` token is legal in caller-supplied log context, and the
+ * restore pass would otherwise treat that text as an internal
+ * placeholder (delete it, or swap in a UUID/IP/date saved from
+ * elsewhere in the same string).
+ */
+function unusedProtectPrefix(value: string): string {
+  let serial = 0;
+  while (value.includes(`${PROTECT_PREFIX}${serial}_`)) {
+    serial += 1;
+  }
+  return `${PROTECT_PREFIX}${serial}_`;
+}
+
 export function redactPii(value: string): string {
   const saved: string[] = [];
+  const prefix = unusedProtectPrefix(value);
   const protect = (match: string): string => {
     saved.push(match);
-    return `${PROTECT_PREFIX}${saved.length - 1}${PROTECT_SUFFIX}`;
+    return `${prefix}${saved.length - 1}${PROTECT_SUFFIX}`;
   };
+  const restore = new RegExp(`${escapeRegExp(prefix)}(\\d+)${escapeRegExp(PROTECT_SUFFIX)}`, "g");
   const protectedValue = value
     .replace(UUID_PATTERN, protect)
     .replace(IPV4_PATTERN, protect)
@@ -210,7 +231,7 @@ export function redactPii(value: string): string {
   return protectedValue
     .replace(EMAIL_PATTERN, REDACTED)
     .replace(PHONE_PATTERN, REDACTED)
-    .replace(/__SA_ID_(\d+)__/g, (_full, index: string) => saved[Number(index)] ?? "");
+    .replace(restore, (_full, index: string) => saved[Number(index)] ?? "");
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
