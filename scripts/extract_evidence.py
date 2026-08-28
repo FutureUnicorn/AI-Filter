@@ -24,6 +24,7 @@ import sys
 
 from openai import OpenAI
 
+from prompt_injection import scan_for_prompt_injection
 from schema import EVIDENCE_RESPONSE_JSON_SCHEMA, EvidenceItem, EvidenceState, Source
 from validate_citations import validate_all
 
@@ -112,7 +113,30 @@ def extract_and_validate(
 
     Never returns an item claiming supporting evidence that isn't verbatim
     in the source text — that guarantee matters more than completeness.
+
+    The prompt-injection scan runs first, before any model call: a
+    detected indicator quarantines every criterion for this document and
+    the model is never invoked at all. Resumes are untrusted input
+    (SYSTEM_POLICY above already says this); a regex pre-filter can never
+    prove completeness, but what it catches never even reaches the model.
     """
+    scan = scan_for_prompt_injection(application_text)
+    if scan.detected:
+        print(
+            f"[QUARANTINED] {document_name}: prompt-injection indicator(s) detected: "
+            f"{', '.join(scan.matched_patterns)}",
+            file=sys.stderr,
+        )
+        return [
+            EvidenceItem(
+                criterion_id=criterion["criterion_id"],
+                state=EvidenceState.QUARANTINED,
+                quote="",
+                source=Source(document=document_name, page_or_section="", offset=-1),
+            )
+            for criterion in criteria
+        ]
+
     raw_items = extract_evidence(criteria, application_text, document_name, **kwargs)
     results = validate_all(raw_items, application_text)
 
