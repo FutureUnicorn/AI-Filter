@@ -105,6 +105,15 @@ test("an invalid Idempotency-Key is distinguished from a missing one", () => {
   assert.equal(idempotencyKeySchema.safeParse("has a space").success, false);
 });
 
+test("an explicitly empty Idempotency-Key header is invalid, not missing", () => {
+  // Headers.get() returns "" for a header the caller actually sent
+  // empty, distinct from null for a header never sent at all -- these
+  // are different mistakes and must not collapse into the same outcome.
+  const result = checkIdempotencyRequirement("PUT", "");
+  assert.equal(result.required, true);
+  assert.equal(result.required && result.outcome, "invalid");
+});
+
 test("a well-formed Idempotency-Key is echoed back exactly", () => {
   const result = checkIdempotencyRequirement("DELETE", "retry-2026-08-21_1");
   assert.deepEqual(result, { required: true, outcome: "present", key: "retry-2026-08-21_1" });

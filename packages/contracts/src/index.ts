@@ -393,7 +393,13 @@ export function checkIdempotencyRequirement(
   if (!isMutatingHttpMethod(method)) {
     return { required: false };
   }
-  if (headerValue === null || headerValue.length === 0) {
+  // Only an absent header is "missing" -- Headers.get() returns "" for a
+  // header the caller explicitly sent empty, which is a distinct mistake
+  // from never sending one at all. Let it fall through to the schema,
+  // which rejects "" for real (the regex requires at least one char) and
+  // reports it as "invalid" with an actual reason instead of collapsing
+  // it into the same bucket as not sending the header.
+  if (headerValue === null) {
     return { required: true, outcome: "missing" };
   }
   const parsed = idempotencyKeySchema.safeParse(headerValue);
