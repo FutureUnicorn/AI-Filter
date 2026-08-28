@@ -479,28 +479,109 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
 // branch calls assertUnreachableEvidenceOutcome, so a future
 // EvidenceOutcome kind forces a real decision here (a compile error)
 // instead of silently defaulting to "no review needed" -- fail closed,
-// never silently resolved. The ticket names four categories (failed
-// schema validation, failed citation checks, contradictions, injection
-// indicators); the mapping is citation_invalid (AF-38) for failed
-// citation checks, contradicted for contradictions, quarantined for
-// injection/malicious-input indicators, and extraction_error for a
-// call whose output couldn't be trusted at all (the closest
-// EvidenceOutcome analogue to "failed schema validation", since a
-// schema-invalid model response never becomes a mapped item in the
-// first place -- AF-36 only ever produces extraction_error for a
-// criterion it has nothing usable for). invalid_source/unsupported_file/
-// failed are included too: they are broken or incomplete evidence a
-// human needs to know about, not a clean result a reviewer can trust
-// without a flag. supported/partially_supported/not_found are
-// confident, validated results -- they still go through the ordinary
-// review flow (AF-5), just without this special flag. processing/
-// retrying have not resolved into anything yet.
+// never silently resolved.
+//
+// The ticket names four categories. Failed citation checks and
+// contradictions are EvidenceOutcome kinds (citation_invalid,
+// contradicted) and route from the switch. The other two are not
+// outcomes at all until this layer says so:
+//
+// * Failed schema validation never produces an EvidenceExtractionItem
+//   (evidenceExtractionResponseSchema rejects the payload first, and
+//   mapRubricToEvidence only sees already-valid items). Callers pass
+//   the parse failure itself into routeForReview, or convert it into
+//   per-criterion extraction_error records via
+//   outcomesForSchemaValidationFailure so the failure is persistable.
+// * Injection indicators are a routing signal (AF-37), not a
+//   quarantined outcome. A later supported/not_found result does not
+//   clear the signal -- pass injectionIndicatorDetected on the
+//   context so the original detection still fail-closes to review.
+//
+// invalid_source/unsupported_file/failed are included too: they are
+// broken or incomplete evidence a human needs to know about.
+// supported/partially_supported/not_found are confident, validated
+// results -- they still go through the ordinary review flow (AF-5),
+// just without this special flag, unless an injection signal is
+// attached. processing/retrying have not resolved into anything yet.
 
 export type ReviewRouting =
   | { readonly needsReview: false }
   | { readonly needsReview: true; readonly reason: string };
 
-export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
+export interface SchemaValidationIssue {
+  readonly path: string;
+  readonly message: string;
+}
+
+export interface SchemaValidationFailure {
+  readonly type: "schema_validation_failure";
+  readonly issues: readonly SchemaValidationIssue[];
+}
+
+export type ReviewRoutingInput = EvidenceOutcome | SchemaValidationFailure;
+
+export interface ReviewRoutingContext {
+  readonly injectionIndicatorDetected?: boolean;
+}
+
+export type ExtractionParseResult =
+  | { readonly ok: true; readonly items: readonly EvidenceExtractionItem[] }
+  | { readonly ok: false; readonly failure: SchemaValidationFailure };
+
+function schemaValidationFailureFromZod(error: z.ZodError): SchemaValidationFailure {
+  return {
+    type: "schema_validation_failure",
+    issues: error.issues.map((issue) => ({
+      path: issue.path.length === 0 ? "" : issue.path.map(String).join("."),
+      message: issue.message
+    }))
+  };
+}
+
+function summarizeSchemaValidationFailure(failure: SchemaValidationFailure): string {
+  if (failure.issues.length === 0) {
+    return "unknown schema error";
+  }
+  return failure.issues
+    .map((issue) => (issue.path.length === 0 ? issue.message : `${issue.path}: ${issue.message}`))
+    .join("; ");
+}
+
+export function isSchemaValidationFailure(input: ReviewRoutingInput): input is SchemaValidationFailure {
+  return "type" in input && input.type === "schema_validation_failure";
+}
+
+/** Accept the raw model payload and keep schema rejection as a first-class failure. */
+export function parseEvidenceExtractionResponse(value: unknown): ExtractionParseResult {
+  const parsed = evidenceExtractionResponseSchema.safeParse(value);
+  if (parsed.success) {
+    return { ok: true, items: parsed.data.items };
+  }
+  return { ok: false, failure: schemaValidationFailureFromZod(parsed.error) };
+}
+
+/**
+ * One persistable extraction_error per rubric criterion when the whole
+ * model response failed schema validation -- the same "exactly one
+ * outcome per criterion" rule as mapRubricToEvidence, so a rejected
+ * payload cannot disappear before human review.
+ */
+export function outcomesForSchemaValidationFailure(
+  rubricCriterionIds: readonly string[],
+  failure: SchemaValidationFailure
+): EvidenceOutcome[] {
+  const summary = summarizeSchemaValidationFailure(failure);
+  return rubricCriterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "schema_validation_failed",
+    message: `Model response failed schema validation: ${summary}`,
+    retryable: true
+  }));
+}
+
+function routeOutcomeForReview(outcome: EvidenceOutcome): ReviewRouting {
   switch (outcome.kind) {
     case "supported":
     case "partially_supported":
@@ -527,4 +608,33 @@ export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
     default:
       return assertUnreachableEvidenceOutcome(outcome);
   }
+}
+
+function withInjectionSignal(routing: ReviewRouting): ReviewRouting {
+  if (routing.needsReview) {
+    return {
+      needsReview: true,
+      reason: `${routing.reason} Injection indicator was also detected.`
+    };
+  }
+  return {
+    needsReview: true,
+    reason: "Injection indicator detected; this result cannot be trusted without human review."
+  };
+}
+
+export function routeForReview(
+  input: ReviewRoutingInput,
+  context: ReviewRoutingContext = {}
+): ReviewRouting {
+  if (isSchemaValidationFailure(input)) {
+    const routing: ReviewRouting = {
+      needsReview: true,
+      reason: `Model response failed schema validation: ${summarizeSchemaValidationFailure(input)}`
+    };
+    return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
+  }
+
+  const routing = routeOutcomeForReview(input);
+  return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
 }

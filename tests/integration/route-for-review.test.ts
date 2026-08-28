@@ -3,7 +3,11 @@ import test from "node:test";
 
 import { CONTRACT_SCHEMA_VERSION, EVIDENCE_OUTCOME_KINDS } from "../../packages/domain/src/index.ts";
 import type { EvidenceOutcome, EvidenceOutcomeKind } from "../../packages/domain/src/index.ts";
-import { routeForReview } from "../../packages/ai/src/index.ts";
+import {
+  outcomesForSchemaValidationFailure,
+  parseEvidenceExtractionResponse,
+  routeForReview
+} from "../../packages/ai/src/index.ts";
 
 const citation = { document: "d", pageOrSection: "p", offset: 0, quote: "q" };
 
@@ -98,18 +102,81 @@ test("every needs-review routing carries a non-empty, specific reason", () => {
   }
 });
 
-test("the four categories the ticket names explicitly map to their outcomes", () => {
-  // failed citation checks
+test("the four categories the ticket names explicitly map to review", () => {
   assert.equal(routeForReview(samples.citation_invalid).needsReview, true);
-  // contradictions
   assert.equal(routeForReview(samples.contradicted).needsReview, true);
-  // injection indicators (malicious-class quarantine)
-  assert.equal(routeForReview(samples.quarantined).needsReview, true);
-  // failed schema validation's closest EvidenceOutcome analogue
-  assert.equal(routeForReview(samples.extraction_error).needsReview, true);
+  assert.equal(
+    routeForReview(samples.supported, { injectionIndicatorDetected: true }).needsReview,
+    true
+  );
+  const parsed = parseEvidenceExtractionResponse({ items: "not-an-array" });
+  assert.equal(parsed.ok, false);
+  if (parsed.ok) {
+    return;
+  }
+  const schemaRouting = routeForReview(parsed.failure);
+  assert.equal(schemaRouting.needsReview, true);
+  if (schemaRouting.needsReview) {
+    assert.match(schemaRouting.reason, /schema validation/i);
+  }
 });
 
 test("a confident, validated result does not get the special review flag", () => {
   assert.equal(routeForReview(samples.supported).needsReview, false);
   assert.equal(routeForReview(samples.not_found).needsReview, false);
+});
+
+test("a schema-invalid model response is itself a review subject", () => {
+  const parsed = parseEvidenceExtractionResponse({
+    items: [{ criterion_id: "c", state: "supported" }]
+  });
+  assert.equal(parsed.ok, false);
+  if (parsed.ok) {
+    return;
+  }
+  const routing = routeForReview(parsed.failure);
+  assert.equal(routing.needsReview, true);
+  if (routing.needsReview) {
+    assert.match(routing.reason, /failed schema validation/i);
+  }
+});
+
+test("schema validation failure converts into one persistable extraction_error per criterion", () => {
+  const parsed = parseEvidenceExtractionResponse({ not: "the schema" });
+  assert.equal(parsed.ok, false);
+  if (parsed.ok) {
+    return;
+  }
+  const outcomes = outcomesForSchemaValidationFailure(["python", "aws"], parsed.failure);
+  assert.equal(outcomes.length, 2);
+  for (const outcome of outcomes) {
+    assert.equal(outcome.kind, "extraction_error");
+    if (outcome.kind === "extraction_error") {
+      assert.equal(outcome.errorCode, "schema_validation_failed");
+    }
+    const routing = routeForReview(outcome);
+    assert.equal(routing.needsReview, true);
+  }
+});
+
+test("an injection signal routes a later supported or not_found result to review", () => {
+  const supported = routeForReview(samples.supported, { injectionIndicatorDetected: true });
+  assert.equal(supported.needsReview, true);
+  if (supported.needsReview) {
+    assert.match(supported.reason, /injection indicator/i);
+  }
+  const notFound = routeForReview(samples.not_found, { injectionIndicatorDetected: true });
+  assert.equal(notFound.needsReview, true);
+  if (notFound.needsReview) {
+    assert.match(notFound.reason, /injection indicator/i);
+  }
+});
+
+test("an injection signal keeps an already-flagged outcome in review", () => {
+  const routing = routeForReview(samples.contradicted, { injectionIndicatorDetected: true });
+  assert.equal(routing.needsReview, true);
+  if (routing.needsReview) {
+    assert.match(routing.reason, /conflict/i);
+    assert.match(routing.reason, /injection indicator/i);
+  }
 });
