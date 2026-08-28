@@ -490,6 +490,11 @@ export interface SetInferenceKillSwitchInput {
  * engaging without a reason and an engagedByUserId is rejected there
  * regardless of what this function is called with, matching this
  * codebase's habit of enforcing an invariant at more than one layer.
+ *
+ * The UPDATE's rowCount is checked and throws on 0, mirroring
+ * getInferenceKillSwitchStatus's own fail-closed handling of a missing
+ * singleton row -- without this, a missing seed row would make this
+ * function silently report success while changing nothing at all.
  */
 export async function setInferenceKillSwitch(
   databaseUrl: string,
@@ -500,12 +505,15 @@ export async function setInferenceKillSwitch(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    await client.query(
+    const result = await client.query(
       `UPDATE "${schema}".inference_kill_switch
           SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = CURRENT_TIMESTAMP
         WHERE id = true`,
       [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
     );
+    if (result.rowCount === 0) {
+      throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+    }
   } finally {
     await client.end().catch(() => undefined);
   }

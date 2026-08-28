@@ -30,6 +30,12 @@ test("redactPii preserves UUIDs, request IDs, ISO dates, and IPv4 addresses", ()
   assert.equal(result, `${uuid} ${requestId} 2026-08-21 192.0.2.1`);
 });
 
+test("redactPii does not treat caller-supplied __SA_ID_n__ text as a restore marker", () => {
+  assert.equal(redactPii("entity-__SA_ID_0__"), "entity-__SA_ID_0__");
+  const uuid = "11111111-1111-4111-8111-111111111111";
+  assert.equal(redactPii(`entity-__SA_ID_0__ ${uuid}`), `entity-__SA_ID_0__ ${uuid}`);
+});
+
 test("buildLogEntry rejects free-text messages instead of logging interpolated PII", () => {
   const entry = buildLogEntry(
     "info",
