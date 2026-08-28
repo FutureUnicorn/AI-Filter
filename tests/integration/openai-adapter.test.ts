@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createOpenAiAdapter } from "../../packages/ai/src/index.ts";
+import { InferenceKillSwitchEngagedError, createOpenAiAdapter } from "../../packages/ai/src/index.ts";
 import type { OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 
 // No real API key, no network call: createOpenAiAdapter's second
@@ -95,4 +95,54 @@ test("different calls with different prompt/schema versions produce different me
   assert.equal(first.metadata.promptVersion, "v1");
   assert.equal(second.metadata.promptVersion, "v2");
   assert.equal(second.metadata.schemaVersion, "1.1.0");
+});
+
+// AF-42: before this, checkKillSwitch didn't exist and nothing in the
+// codebase called the kill-switch status check at all -- engaging it
+// halted nothing. These prove the provider is genuinely never reached
+// when engaged, not just that some error gets thrown.
+
+test("runStructuredCall never calls the provider when the kill switch is engaged", async () => {
+  let callCount = 0;
+  const client = fakeClient("{}");
+  const countingClient: OpenAiResponsesClient = {
+    responses: {
+      async create(params) {
+        callCount += 1;
+        return client.responses.create(params);
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: async () => ({ engaged: true, reason: "cost spike" }) },
+    countingClient
+  );
+  await assert.rejects(() => adapter.runStructuredCall(baseInput), InferenceKillSwitchEngagedError);
+  assert.equal(callCount, 0);
+});
+
+test("InferenceKillSwitchEngagedError carries the operator's reason", async () => {
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: async () => ({ engaged: true, reason: "bad release" }) },
+    fakeClient("{}")
+  );
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: unknown) => error instanceof InferenceKillSwitchEngagedError && error.reason === "bad release"
+  );
+});
+
+test("runStructuredCall proceeds normally when checkKillSwitch reports disengaged", async () => {
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: async () => ({ engaged: false }) },
+    fakeClient('{"items":[]}')
+  );
+  const result = await adapter.runStructuredCall(baseInput);
+  assert.deepEqual(result.output, { items: [] });
+});
+
+test("runStructuredCall proceeds normally when no checkKillSwitch is supplied at all", async () => {
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient('{"items":[]}'));
+  const result = await adapter.runStructuredCall(baseInput);
+  assert.deepEqual(result.output, { items: [] });
 });

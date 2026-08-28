@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { buildApiError } from "@signal-audit/contracts";
 import type { ApiErrorResponse, BoundaryContract, RequestId } from "@signal-audit/contracts";
@@ -197,12 +197,33 @@ const REDACTED = "[REDACTED]";
 const PROTECT_PREFIX = "__SA_ID_";
 const PROTECT_SUFFIX = "__";
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Pick a marker prefix that does not already occur in `value`. A fixed
+ * `__SA_ID_0__` token is legal in caller-supplied log context, and the
+ * restore pass would otherwise treat that text as an internal
+ * placeholder (delete it, or swap in a UUID/IP/date saved from
+ * elsewhere in the same string).
+ */
+function unusedProtectPrefix(value: string): string {
+  let serial = 0;
+  while (value.includes(`${PROTECT_PREFIX}${serial}_`)) {
+    serial += 1;
+  }
+  return `${PROTECT_PREFIX}${serial}_`;
+}
+
 export function redactPii(value: string): string {
   const saved: string[] = [];
+  const prefix = unusedProtectPrefix(value);
   const protect = (match: string): string => {
     saved.push(match);
-    return `${PROTECT_PREFIX}${saved.length - 1}${PROTECT_SUFFIX}`;
+    return `${prefix}${saved.length - 1}${PROTECT_SUFFIX}`;
   };
+  const restore = new RegExp(`${escapeRegExp(prefix)}(\\d+)${escapeRegExp(PROTECT_SUFFIX)}`, "g");
   const protectedValue = value
     .replace(UUID_PATTERN, protect)
     .replace(IPV4_PATTERN, protect)
@@ -210,97 +231,7 @@ export function redactPii(value: string): string {
   return protectedValue
     .replace(EMAIL_PATTERN, REDACTED)
     .replace(PHONE_PATTERN, REDACTED)
-    .replace(/__SA_ID_(\d+)__/g, (_full, index: string) => saved[Number(index)] ?? "");
-}
-
-// ---- AF-23 prerequisite: session issuance ----
-//
-// AF-16 built magic-link token generation and redemption but never an
-// HTTP-facing session -- there was nothing yet that needed to know "who
-// is calling" between requests. AF-23 is the first ticket that does
-// (role creation must be scoped to the caller's own organization), so
-// this completes AF-16's flow rather than starting a new one: redeem a
-// magic link once, then carry identity across requests as a signed,
-// stateless cookie. Not itself a numbered ticket -- flagged in the PR.
-//
-// Stateless by design: the payload only ever carries a userId and an
-// expiry, both signed with HMAC-SHA256. There is nothing here a stolen
-// but unmodified cookie can't already do (impersonate that user until
-// expiry), which is the same exposure any session cookie has; the token
-// carries no organization or role, so escalation still has to go
-// through authorizeResourceAccess and a real, server-fetched membership
-// on every request, never through anything the cookie itself claims.
-
-export const SESSION_COOKIE_NAME = "af_session";
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-
-interface SessionTokenPayload {
-  readonly userId: string;
-  readonly issuedAt: number;
-  readonly expiresAt: number;
-}
-
-function signSessionPayload(payloadB64: string, secret: string): string {
-  return createHmac("sha256", secret).update(payloadB64).digest("base64url");
-}
-
-export function createSessionToken(
-  userId: string,
-  secret: string,
-  now: Date = new Date(),
-  ttlMs: number = SESSION_TTL_MS
-): string {
-  const payload: SessionTokenPayload = {
-    userId,
-    issuedAt: now.getTime(),
-    expiresAt: now.getTime() + ttlMs
-  };
-  const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `${payloadB64}.${signSessionPayload(payloadB64, secret)}`;
-}
-
-export type SessionVerification =
-  | { readonly outcome: "valid"; readonly userId: string }
-  | { readonly outcome: "invalid" }
-  | { readonly outcome: "expired" };
-
-function isSessionTokenPayload(value: unknown): value is SessionTokenPayload {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as Record<string, unknown>).userId === "string" &&
-    typeof (value as Record<string, unknown>).expiresAt === "number"
-  );
-}
-
-export function verifySessionToken(
-  token: string,
-  secret: string,
-  now: Date = new Date()
-): SessionVerification {
-  const parts = token.split(".");
-  if (parts.length !== 2) {
-    return { outcome: "invalid" };
-  }
-  const [payloadB64, signature] = parts as [string, string];
-  const expected = Buffer.from(signSessionPayload(payloadB64, secret));
-  const actual = Buffer.from(signature);
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-    return { outcome: "invalid" };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
-  } catch {
-    return { outcome: "invalid" };
-  }
-  if (!isSessionTokenPayload(parsed)) {
-    return { outcome: "invalid" };
-  }
-  if (parsed.expiresAt <= now.getTime()) {
-    return { outcome: "expired" };
-  }
-  return { outcome: "valid", userId: parsed.userId };
+    .replace(restore, (_full, index: string) => saved[Number(index)] ?? "");
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
