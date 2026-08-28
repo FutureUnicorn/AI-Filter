@@ -22,7 +22,11 @@ export interface DomainPort {
 // organizationId is on every kind, not just the citing ones: an outcome
 // with no tenant attached cannot be safely attributed or isolated once
 // two employers happen to use the same criterionId (docs/PRODUCT_BOUNDARY.md's
-// tenant-ownership invariant). `citation?: never` on every non-citing kind
+// tenant-ownership invariant). candidateId is likewise on every kind: an
+// employer applies the same criterionId to many candidates, so without a
+// candidate identifier two candidates' outcomes for the same criterion are
+// indistinguishable -- organizationId alone only solves cross-tenant mixups,
+// not cross-candidate ones within a single tenant. `citation?: never` on every non-citing kind
 // closes a real gap the strict Zod schemas alone don't: TypeScript only
 // excess-property-checks fresh object literals, so a variable of a wider
 // type (or an adapter's typed mapping) could still structurally satisfy
@@ -48,6 +52,7 @@ export interface SourceCitation {
 export interface SupportedEvidence extends VersionedRecord {
   readonly kind: "supported";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation: SourceCitation;
 }
@@ -55,6 +60,7 @@ export interface SupportedEvidence extends VersionedRecord {
 export interface PartiallySupportedEvidence extends VersionedRecord {
   readonly kind: "partially_supported";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation: SourceCitation;
 }
@@ -68,6 +74,7 @@ export interface PartiallySupportedEvidence extends VersionedRecord {
 export interface ContradictedEvidence extends VersionedRecord {
   readonly kind: "contradicted";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation: SourceCitation;
   readonly conflictingCitation: SourceCitation;
@@ -77,6 +84,7 @@ export interface ContradictedEvidence extends VersionedRecord {
 export interface UnclearEvidence extends VersionedRecord {
   readonly kind: "unclear";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation: SourceCitation;
 }
@@ -85,6 +93,7 @@ export interface UnclearEvidence extends VersionedRecord {
 export interface NotFoundEvidence extends VersionedRecord {
   readonly kind: "not_found";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation?: never;
 }
@@ -93,6 +102,7 @@ export interface NotFoundEvidence extends VersionedRecord {
 export interface ProcessingEvidence extends VersionedRecord {
   readonly kind: "processing";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly citation?: never;
 }
@@ -101,6 +111,7 @@ export interface ProcessingEvidence extends VersionedRecord {
 export interface RetryingEvidence extends VersionedRecord {
   readonly kind: "retrying";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly attempt: number;
   readonly maxAttempts: number;
@@ -111,6 +122,7 @@ export interface RetryingEvidence extends VersionedRecord {
 export interface ExtractionErrorEvidence extends VersionedRecord {
   readonly kind: "extraction_error";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly errorCode: string;
   readonly message: string;
@@ -124,11 +136,17 @@ export interface ExtractionErrorEvidence extends VersionedRecord {
  * the whole point of this kind is to preserve what was actually rejected,
  * including a structurally malformed proposal (wrong field types, an
  * empty quote where a real one is required) that could never satisfy the
- * strict `SourceCitation` shape in the first place.
+ * strict `SourceCitation` shape in the first place. `unknown` here is the
+ * domain-level ceiling; packages/contracts' runtime schema narrows it
+ * further to JSON-serializable values only, so a value that would blow
+ * up at the actual persist/transport boundary (a bigint, a class
+ * instance) is still rejected even though it's structurally "just" a
+ * malformed citation.
  */
 export interface CitationInvalidEvidence extends VersionedRecord {
   readonly kind: "citation_invalid";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly reason: string;
   readonly rejectedCitation: unknown;
@@ -139,6 +157,7 @@ export interface CitationInvalidEvidence extends VersionedRecord {
 export interface InvalidSourceEvidence extends VersionedRecord {
   readonly kind: "invalid_source";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly reason: string;
   readonly citation?: never;
@@ -148,6 +167,7 @@ export interface InvalidSourceEvidence extends VersionedRecord {
 export interface UnsupportedFileEvidence extends VersionedRecord {
   readonly kind: "unsupported_file";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly reason: string;
   readonly citation?: never;
@@ -159,6 +179,7 @@ export type QuarantineClass = "malicious" | "unsupported" | "corrupt" | "persist
 export interface QuarantinedEvidence extends VersionedRecord {
   readonly kind: "quarantined";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly quarantineClass: QuarantineClass;
   readonly reason: string;
@@ -170,6 +191,7 @@ export interface QuarantinedEvidence extends VersionedRecord {
 export interface FailedEvidence extends VersionedRecord {
   readonly kind: "failed";
   readonly organizationId: string;
+  readonly candidateId: string;
   readonly criterionId: string;
   readonly errorCode: string;
   readonly message: string;

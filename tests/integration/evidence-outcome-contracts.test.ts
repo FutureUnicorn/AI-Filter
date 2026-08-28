@@ -12,6 +12,8 @@ import {
 } from "../../packages/contracts/src/index.ts";
 
 const ORG_ID = "11111111-1111-4111-8111-111111111111";
+const CANDIDATE_ID = "candidate_ada_lovelace";
+const OTHER_CANDIDATE_ID = "candidate_grace_hopper";
 
 const citation = {
   document: "resume.txt",
@@ -33,6 +35,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "supported",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     citation
   },
@@ -40,6 +43,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "partially_supported",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     citation
   },
@@ -47,6 +51,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "contradicted",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     citation,
     conflictingCitation
@@ -55,6 +60,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "unclear",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     citation
   },
@@ -62,18 +68,21 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "not_found",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "aws_certification"
   },
   processing: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "processing",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "aws_certification"
   },
   retrying: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "retrying",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     attempt: 1,
     maxAttempts: 3
@@ -82,6 +91,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     errorCode: "provider_unavailable",
     message: "AI provider returned 503 after all retries.",
@@ -91,6 +101,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "citation_invalid",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     reason: "quote not found verbatim in source",
     rejectedCitation: citation
@@ -99,6 +110,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "invalid_source",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     reason: "document was empty"
   },
@@ -106,6 +118,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "unsupported_file",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     reason: "format not supported"
   },
@@ -113,6 +126,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "quarantined",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     quarantineClass: "corrupt",
     reason: "archive failed integrity check",
@@ -122,6 +136,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "failed",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production",
     errorCode: "provider_unavailable",
     message: "AI provider returned 503 after all retries.",
@@ -153,6 +168,7 @@ test("supported requires a citation and is rejected without one", () => {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "supported" as const,
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production"
   };
   const result = safeParseEvidenceOutcome(withoutCitation);
@@ -174,6 +190,7 @@ test("an unrecognized kind matches no branch of the discriminated union", () => 
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "recommended_outcome",
     organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "python_production"
   });
   assert.equal(result.success, false);
@@ -212,10 +229,30 @@ test("contradicted requires citations for both sides of the conflict", () => {
     schemaVersion: samples.contradicted.schemaVersion,
     kind: samples.contradicted.kind,
     organizationId: samples.contradicted.organizationId,
+    candidateId: samples.contradicted.candidateId,
     criterionId: samples.contradicted.criterionId,
     citation: samples.contradicted.citation
   };
   assert.equal(safeParseEvidenceOutcome(withoutSecondCitation).success, false);
+});
+
+test("every outcome requires candidateId; a payload missing it is rejected", () => {
+  for (const kind of EVIDENCE_OUTCOME_KINDS) {
+    const { candidateId, ...withoutCandidate } = samples[kind];
+    assert.equal(candidateId, CANDIDATE_ID);
+    assert.equal(safeParseEvidenceOutcome(withoutCandidate).success, false, `expected ${kind} to require candidateId`);
+  }
+});
+
+test("two candidates' outcomes for the same organization and criterion stay distinguishable", () => {
+  const first = safeParseEvidenceOutcome({ ...samples.supported, candidateId: CANDIDATE_ID });
+  const second = safeParseEvidenceOutcome({ ...samples.supported, candidateId: OTHER_CANDIDATE_ID });
+  assert.equal(first.success, true);
+  assert.equal(second.success, true);
+  assert.notEqual(
+    first.success && second.success ? first.data.candidateId : undefined,
+    second.success ? second.data.candidateId : undefined
+  );
 });
 
 test("citation_invalid preserves a structurally malformed rejected citation, not just a well-formed one", () => {
@@ -225,6 +262,15 @@ test("citation_invalid preserves a structurally malformed rejected citation, not
   };
   const result = safeParseEvidenceOutcome(malformed);
   assert.equal(result.success, true);
+});
+
+test("citation_invalid still rejects a rejectedCitation that isn't JSON-serializable", () => {
+  const unserializable = {
+    ...samples.citation_invalid,
+    rejectedCitation: { document: "resume.txt", offset: 5n } // a bigint can never survive JSON.stringify
+  };
+  const result = safeParseEvidenceOutcome(unserializable);
+  assert.equal(result.success, false);
 });
 
 test("buildApiError rejects a malformed requestId instead of producing a contract-invalid body", () => {

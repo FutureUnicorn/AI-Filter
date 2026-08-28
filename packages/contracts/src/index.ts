@@ -48,10 +48,28 @@ const sourceCitationSchema = z.strictObject({
   quote: z.string().min(1)
 }) satisfies z.ZodType<SourceCitation>;
 
+/** Recursive JSON-value schema: restricts a field to values that can
+ * actually survive `JSON.stringify`/`Response.json`, without requiring
+ * any particular shape. Used both for `rejectedCitation` below (which
+ * must preserve a structurally malformed proposal, just not one
+ * containing something like a bigint that would throw at the transport
+ * boundary) and for `BuildApiErrorInput.details` further down. */
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema)
+  ])
+);
+
 const supportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("supported"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<SupportedEvidence>;
@@ -60,6 +78,7 @@ const partiallySupportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("partially_supported"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<PartiallySupportedEvidence>;
@@ -68,6 +87,7 @@ const contradictedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("contradicted"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema,
   conflictingCitation: sourceCitationSchema
@@ -77,6 +97,7 @@ const unclearEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("unclear"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<UnclearEvidence>;
@@ -85,6 +106,7 @@ const notFoundEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("not_found"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1)
 }) satisfies z.ZodType<NotFoundEvidence>;
 
@@ -92,6 +114,7 @@ const processingEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("processing"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1)
 }) satisfies z.ZodType<ProcessingEvidence>;
 
@@ -103,6 +126,7 @@ const retryingEvidenceSchema = z
     schemaVersion: schemaVersionSchema,
     kind: z.literal("retrying"),
     organizationId: z.uuid(),
+    candidateId: z.string().min(1),
     criterionId: z.string().min(1),
     attempt: z.number().int().min(1),
     maxAttempts: z.number().int().min(1)
@@ -116,6 +140,7 @@ const extractionErrorEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("extraction_error"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   errorCode: z.string().min(1),
   message: z.string().min(1),
@@ -126,15 +151,17 @@ const citationInvalidEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("citation_invalid"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   reason: z.string().min(1),
-  rejectedCitation: z.unknown()
+  rejectedCitation: jsonValueSchema
 }) satisfies z.ZodType<CitationInvalidEvidence>;
 
 const invalidSourceEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("invalid_source"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   reason: z.string().min(1)
 }) satisfies z.ZodType<InvalidSourceEvidence>;
@@ -143,6 +170,7 @@ const unsupportedFileEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("unsupported_file"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   reason: z.string().min(1)
 }) satisfies z.ZodType<UnsupportedFileEvidence>;
@@ -151,6 +179,7 @@ const quarantinedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("quarantined"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   quarantineClass: z.enum(["malicious", "unsupported", "corrupt", "persistent_failure"]),
   reason: z.string().min(1),
@@ -161,6 +190,7 @@ const failedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("failed"),
   organizationId: z.uuid(),
+  candidateId: z.string().min(1),
   criterionId: z.string().min(1),
   errorCode: z.string().min(1),
   message: z.string().min(1),
@@ -266,17 +296,6 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
  * type-check against `Record<string, unknown>` and then blow up at the
  * actual `Response.json`/`JSON.stringify` call site instead of here. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
-  z.union([
-    z.string(),
-    z.number(),
-    z.boolean(),
-    z.null(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema)
-  ])
-);
 
 /** The one shape every error response on the API surface takes. */
 export interface ApiErrorBody {
