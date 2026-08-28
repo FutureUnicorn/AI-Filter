@@ -143,10 +143,16 @@ async function provisionInvitedMembership(
   if (userId === undefined) {
     throw new Error("invite redemption did not produce a user row");
   }
+  // DO UPDATE, not DO NOTHING: an invite that names a role is an explicit
+  // instruction from whoever had permission to create it (invite creation
+  // is where that authorization boundary lives, not redemption) -- silently
+  // keeping the old role on conflict would let a deliberate promotion
+  // (recruiter -> admin, say) redeem successfully while leaving the actual
+  // membership unchanged, with no error or signal to anyone.
   await client.query(
     `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
      VALUES ($1, $2, $3)
-     ON CONFLICT (organization_id, user_id) DO NOTHING`,
+     ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
 }
