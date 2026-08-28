@@ -33,6 +33,19 @@ test("withRequestId sets the header without disturbing existing headers", () => 
   assert.equal(headers.get("content-type"), "application/json");
 });
 
+test("withRequestId refuses a malformed request id instead of emitting a contract-invalid header", () => {
+  // `RequestId` is a plain alias, so the compiler cannot stop this; a
+  // caller propagating an untrusted inbound X-Request-Id must fail here
+  // rather than emit a header that fails requestIdSchema.
+  for (const malformed of ["bad", "", "req_not-a-uuid", crypto.randomUUID()]) {
+    assert.throws(
+      () => withRequestId({}, malformed),
+      /withRequestId requires a well-formed RequestId/,
+      `expected withRequestId to reject ${JSON.stringify(malformed)}`
+    );
+  }
+});
+
 test("every API_ERROR_CODES entry has exactly one status in API_ERROR_STATUS", () => {
   assert.deepEqual(new Set(Object.keys(API_ERROR_STATUS)), new Set(API_ERROR_CODES));
 });
@@ -57,6 +70,38 @@ test("buildApiError carries optional details through when provided", () => {
     details: { field: "criterionId" }
   });
   assert.deepEqual(body.error.details, { field: "criterionId" });
+});
+
+test("buildApiError rejects a non-finite details value that would serialize to a different value", () => {
+  // TypeScript's `number` admits Infinity/NaN, so these calls type-check
+  // fully. Left unchecked they produced a body that failed the very
+  // apiErrorBodySchema this function advertises, and JSON.stringify
+  // turned them into `null` -- a silently changed value, not a rejection.
+  for (const nonFinite of [Infinity, -Infinity, NaN]) {
+    assert.throws(
+      () =>
+        buildApiError({
+          requestId: generateRequestId(),
+          code: "internal_error",
+          message: "Something broke.",
+          details: { count: nonFinite }
+        }),
+      /buildApiError produced a body that fails apiErrorBodySchema/,
+      `expected buildApiError to reject details: { count: ${String(nonFinite)} }`
+    );
+  }
+});
+
+test("buildApiError still accepts ordinary finite and nested JSON details", () => {
+  const details = { count: 42, ratio: -0.5, nested: { list: [1, 2, 3], flag: true, empty: null } };
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(body.error.details, details);
+  assert.equal(apiErrorBodySchema.safeParse(body).success, true);
 });
 
 test("apiErrorBodySchema rejects an unrecognized top-level property", () => {

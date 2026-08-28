@@ -57,7 +57,10 @@ const sourceCitationSchema = z.strictObject({
 const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string(),
-    z.number(),
+    // `.finite()` is explicit on purpose: TypeScript's `number` admits
+    // Infinity and NaN, neither of which survives JSON -- both serialize
+    // to `null`, silently changing the value at the transport boundary.
+    z.number().finite(),
     z.boolean(),
     z.null(),
     z.array(jsonValueSchema),
@@ -255,8 +258,19 @@ export const requestIdSchema = z
 /** Standard header name a request ID is carried under, in and out. */
 export const REQUEST_ID_HEADER = REQUEST_ID_HEADER_NAME;
 
-/** Attach the request ID header without disturbing any other headers. */
+/**
+ * Attach the request ID header without disturbing any other headers.
+ * `RequestId` is a plain alias, not a branded type, so the compiler
+ * cannot stop `withRequestId(headers, "bad")`. The guard below is the
+ * same boundary check `buildApiError` makes for the same reason: a
+ * caller that propagates an untrusted inbound `X-Request-Id` straight
+ * through fails loudly here instead of silently emitting a response
+ * header that fails `requestIdSchema`.
+ */
 export function withRequestId(headers: HeadersInit | undefined, requestId: RequestId): Headers {
+  if (!requestIdSchema.safeParse(requestId).success) {
+    throw new Error(`withRequestId requires a well-formed RequestId, got: ${requestId}`);
+  }
   const merged = new Headers(headers);
   merged.set(REQUEST_ID_HEADER_NAME, requestId);
   return merged;
@@ -294,7 +308,13 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
 /** Recursive JSON-value type: what `details` is restricted to. A caller
  * handing in a bigint, a class instance, or a function would previously
  * type-check against `Record<string, unknown>` and then blow up at the
- * actual `Response.json`/`JSON.stringify` call site instead of here. */
+ * actual `Response.json`/`JSON.stringify` call site instead of here.
+ *
+ * TypeScript cannot express "finite number", so `number` here still
+ * admits Infinity and NaN. `jsonValueSchema` rejects both at runtime,
+ * and `buildApiError` parses its constructed body through
+ * `apiErrorBodySchema` so a non-finite `details` value cannot escape as
+ * a body that serializes to a different value than it type-checked as. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 /** The one shape every error response on the API surface takes. */
@@ -332,13 +352,22 @@ export interface ApiErrorResponse {
 
 /**
  * Build a status + body pair; callers hand `body` to their own JSON
- * response. Both checks below guard this function's own contract, not
- * user input: every real call site generates `requestId` via
- * `generateRequestId()` and passes a literal `message`, so neither check
- * should ever actually fire in legitimate use -- they exist so a caller
- * that propagates an untrusted `X-Request-Id` straight through, or
- * constructs a blank message, fails loudly here instead of silently
- * producing a body that fails its own `apiErrorBodySchema`.
+ * response. The checks here guard this function's own contract, not user
+ * input: every real call site generates `requestId` via
+ * `generateRequestId()` and passes a literal `message`, so none of them
+ * should ever fire in legitimate use -- they exist so a caller that
+ * propagates an untrusted `X-Request-Id` straight through, constructs a
+ * blank message, or passes a `details` value that cannot survive JSON
+ * fails loudly here instead of silently producing a body that fails its
+ * own `apiErrorBodySchema`.
+ *
+ * The final `apiErrorBodySchema.safeParse` is what makes that promise
+ * total rather than partial. Checking `requestId` and `message`
+ * individually still left `details` unchecked, and `JsonValue`'s
+ * `number` member admits Infinity/NaN, so a fully type-checked
+ * `details: { count: Infinity }` produced a body that failed the very
+ * schema this function advertises and serialized as `{"count":null}` --
+ * a changed value, not a rejected one.
  */
 export function buildApiError(input: BuildApiErrorInput): ApiErrorResponse {
   if (!requestIdSchema.safeParse(input.requestId).success) {
@@ -347,18 +376,24 @@ export function buildApiError(input: BuildApiErrorInput): ApiErrorResponse {
   if (input.message.length === 0) {
     throw new Error("buildApiError requires a non-empty message");
   }
-  return {
-    status: API_ERROR_STATUS[input.code],
-    body: {
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      requestId: input.requestId,
-      error: {
-        code: input.code,
-        message: input.message,
-        ...(input.details === undefined ? {} : { details: input.details })
-      }
+  const body: ApiErrorBody = {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    requestId: input.requestId,
+    error: {
+      code: input.code,
+      message: input.message,
+      ...(input.details === undefined ? {} : { details: input.details })
     }
   };
+  const parsed = apiErrorBodySchema.safeParse(body);
+  if (!parsed.success) {
+    throw new Error(
+      `buildApiError produced a body that fails apiErrorBodySchema: ${parsed.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`
+    );
+  }
+  return { status: API_ERROR_STATUS[input.code], body };
 }
 
 export type IdempotencyKey = string;
