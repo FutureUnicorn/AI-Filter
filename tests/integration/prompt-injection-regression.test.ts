@@ -53,6 +53,14 @@ const LEGITIMATE_RESUME_SAMPLES: readonly { readonly label: string; readonly tex
   {
     label: "resume with an 'Act as' company/product name coincidence",
     text: "Consulted for Acting Studios Inc. as a backend engineer for eight months."
+  },
+  {
+    label: "LLM engineer resume mentioning 'system prompt' with no override verb",
+    text: "Designed system prompts and evaluation tooling for an internal LLM-based support assistant."
+  },
+  {
+    label: "performance-review quote using 'you are now a'",
+    text: "Manager feedback: you are now a much stronger communicator than last quarter."
   }
 ];
 
