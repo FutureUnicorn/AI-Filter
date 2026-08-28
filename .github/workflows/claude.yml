@@ -3,10 +3,11 @@
 #
 # Requires two things that are not in this file:
 #   1. The Claude GitHub App installed on this repository.
-#   2. A repository secret, ANTHROPIC_API_KEY (a Claude API key) or
-#      CLAUDE_CODE_OAUTH_TOKEN (a subscription token). For the OAuth token,
-#      swap the `anthropic_api_key` line below for
-#      `claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`.
+#   2. The repository secret CLAUDE_CODE_OAUTH_TOKEN, which this workflow
+#      authenticates with. Generate one with `claude setup-token`; it is tied
+#      to the Claude subscription of whoever runs that. To bill an API key
+#      instead, swap the `claude_code_oauth_token` line below for
+#      `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
 # Running `/install-github-app` from Claude Code in this repo does both.
 name: Claude Code
 
@@ -47,7 +48,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: |
             --system-prompt "You are reviewing AI-Filter, a pnpm/TypeScript workspace.
 
