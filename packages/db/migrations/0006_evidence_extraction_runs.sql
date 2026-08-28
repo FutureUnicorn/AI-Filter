@@ -36,6 +36,12 @@ CREATE INDEX IF NOT EXISTS evidence_extraction_runs_organization_id_idx
 CREATE INDEX IF NOT EXISTS evidence_extraction_runs_entity_idx
   ON evidence_extraction_runs (entity_type, entity_id);
 
+DROP TRIGGER IF EXISTS evidence_extraction_runs_append_only ON evidence_extraction_runs;
 CREATE TRIGGER evidence_extraction_runs_append_only
   BEFORE UPDATE OR DELETE ON evidence_extraction_runs
   FOR EACH ROW EXECUTE FUNCTION reject_append_only_mutation();
+
+DROP TRIGGER IF EXISTS evidence_extraction_runs_reject_truncate ON evidence_extraction_runs;
+CREATE TRIGGER evidence_extraction_runs_reject_truncate
+  BEFORE TRUNCATE ON evidence_extraction_runs
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
