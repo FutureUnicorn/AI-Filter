@@ -9,37 +9,50 @@ import {
   type EvidenceOutcomeKind
 } from "../../packages/domain/src/index.ts";
 
+const ORG_ID = "11111111-1111-4111-8111-111111111111";
+
 /** One minimal sample per kind, used only to prove the switch below is exhaustive. */
 const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   supported: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "supported",
+    organizationId: ORG_ID,
     criterionId: "c",
     citation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" }
   },
   partially_supported: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "partially_supported",
+    organizationId: ORG_ID,
     criterionId: "c",
     citation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" }
   },
   contradicted: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "contradicted",
+    organizationId: ORG_ID,
     criterionId: "c",
-    citation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" }
+    citation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" },
+    conflictingCitation: { document: "d2", pageOrSection: "p2", offset: 10, quote: "q2" }
   },
   unclear: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "unclear",
+    organizationId: ORG_ID,
     criterionId: "c",
     citation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" }
   },
-  not_found: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId: "c" },
-  processing: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "processing", criterionId: "c" },
+  not_found: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId: ORG_ID, criterionId: "c" },
+  processing: {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "processing",
+    organizationId: ORG_ID,
+    criterionId: "c"
+  },
   retrying: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "retrying",
+    organizationId: ORG_ID,
     criterionId: "c",
     attempt: 1,
     maxAttempts: 3
@@ -47,6 +60,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   extraction_error: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: ORG_ID,
     criterionId: "c",
     errorCode: "e",
     message: "m",
@@ -55,20 +69,29 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   citation_invalid: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "citation_invalid",
+    organizationId: ORG_ID,
     criterionId: "c",
     reason: "r",
     rejectedCitation: { document: "d", pageOrSection: "p", offset: 0, quote: "q" }
   },
-  invalid_source: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "invalid_source", criterionId: "c", reason: "r" },
+  invalid_source: {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "invalid_source",
+    organizationId: ORG_ID,
+    criterionId: "c",
+    reason: "r"
+  },
   unsupported_file: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "unsupported_file",
+    organizationId: ORG_ID,
     criterionId: "c",
     reason: "r"
   },
   quarantined: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "quarantined",
+    organizationId: ORG_ID,
     criterionId: "c",
     quarantineClass: "corrupt",
     reason: "r",
@@ -77,6 +100,7 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   failed: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "failed",
+    organizationId: ORG_ID,
     criterionId: "c",
     errorCode: "e",
     message: "m",
@@ -105,7 +129,6 @@ function describe(outcome: EvidenceOutcome): string {
     case "failed":
       return outcome.errorCode;
     case "citation_invalid":
-      return outcome.rejectedCitation.quote;
     case "invalid_source":
     case "unsupported_file":
       return outcome.reason;

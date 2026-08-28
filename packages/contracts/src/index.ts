@@ -23,7 +23,10 @@ import type {
   UnsupportedFileEvidence
 } from "@signal-audit/domain";
 
-/** Placeholder boundary shape; AF-13 owns real versioned runtime contracts. */
+/** Placeholder boundary shape; a later ticket beyond AF-13 owns wiring this
+ * into a real adapter boundary. The versioned runtime contracts themselves
+ * (evidenceOutcomeSchema and friends, below) are AF-13's actual deliverable
+ * and already live in this file. */
 export interface BoundaryContract {
   readonly domain: DomainPort;
   readonly version: string;
@@ -48,6 +51,7 @@ const sourceCitationSchema = z.strictObject({
 const supportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("supported"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<SupportedEvidence>;
@@ -55,6 +59,7 @@ const supportedEvidenceSchema = z.strictObject({
 const partiallySupportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("partially_supported"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<PartiallySupportedEvidence>;
@@ -62,13 +67,16 @@ const partiallySupportedEvidenceSchema = z.strictObject({
 const contradictedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("contradicted"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
-  citation: sourceCitationSchema
+  citation: sourceCitationSchema,
+  conflictingCitation: sourceCitationSchema
 }) satisfies z.ZodType<ContradictedEvidence>;
 
 const unclearEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("unclear"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   citation: sourceCitationSchema
 }) satisfies z.ZodType<UnclearEvidence>;
@@ -76,26 +84,38 @@ const unclearEvidenceSchema = z.strictObject({
 const notFoundEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("not_found"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1)
 }) satisfies z.ZodType<NotFoundEvidence>;
 
 const processingEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("processing"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1)
 }) satisfies z.ZodType<ProcessingEvidence>;
 
-const retryingEvidenceSchema = z.strictObject({
-  schemaVersion: schemaVersionSchema,
-  kind: z.literal("retrying"),
-  criterionId: z.string().min(1),
-  attempt: z.number().int().min(1),
-  maxAttempts: z.number().int().min(1)
-}) satisfies z.ZodType<RetryingEvidence>;
+/** attempt <= maxAttempts is a real invariant, not just two independent
+ * minimums: {attempt: 4, maxAttempts: 3} describes an already-exhausted
+ * retry budget, which is what the `failed` kind exists for. */
+const retryingEvidenceSchema = z
+  .strictObject({
+    schemaVersion: schemaVersionSchema,
+    kind: z.literal("retrying"),
+    organizationId: z.uuid(),
+    criterionId: z.string().min(1),
+    attempt: z.number().int().min(1),
+    maxAttempts: z.number().int().min(1)
+  })
+  .refine((value) => value.attempt <= value.maxAttempts, {
+    message: "attempt cannot exceed maxAttempts",
+    path: ["attempt"]
+  }) satisfies z.ZodType<RetryingEvidence>;
 
 const extractionErrorEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("extraction_error"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   errorCode: z.string().min(1),
   message: z.string().min(1),
@@ -105,14 +125,16 @@ const extractionErrorEvidenceSchema = z.strictObject({
 const citationInvalidEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("citation_invalid"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   reason: z.string().min(1),
-  rejectedCitation: sourceCitationSchema
+  rejectedCitation: z.unknown()
 }) satisfies z.ZodType<CitationInvalidEvidence>;
 
 const invalidSourceEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("invalid_source"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   reason: z.string().min(1)
 }) satisfies z.ZodType<InvalidSourceEvidence>;
@@ -120,6 +142,7 @@ const invalidSourceEvidenceSchema = z.strictObject({
 const unsupportedFileEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("unsupported_file"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   reason: z.string().min(1)
 }) satisfies z.ZodType<UnsupportedFileEvidence>;
@@ -127,19 +150,21 @@ const unsupportedFileEvidenceSchema = z.strictObject({
 const quarantinedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("quarantined"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   quarantineClass: z.enum(["malicious", "unsupported", "corrupt", "persistent_failure"]),
   reason: z.string().min(1),
-  operatorActionRequired: z.boolean()
+  operatorActionRequired: z.literal(true)
 }) satisfies z.ZodType<QuarantinedEvidence>;
 
 const failedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
   kind: z.literal("failed"),
+  organizationId: z.uuid(),
   criterionId: z.string().min(1),
   errorCode: z.string().min(1),
   message: z.string().min(1),
-  retryable: z.boolean()
+  retryable: z.literal(false)
 }) satisfies z.ZodType<FailedEvidence>;
 
 /**
@@ -236,6 +261,23 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
   service_unavailable: 503
 };
 
+/** Recursive JSON-value type: what `details` is restricted to. A caller
+ * handing in a bigint, a class instance, or a function would previously
+ * type-check against `Record<string, unknown>` and then blow up at the
+ * actual `Response.json`/`JSON.stringify` call site instead of here. */
+export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema)
+  ])
+);
+
 /** The one shape every error response on the API surface takes. */
 export interface ApiErrorBody {
   readonly schemaVersion: ContractSchemaVersion;
@@ -243,7 +285,7 @@ export interface ApiErrorBody {
   readonly error: {
     readonly code: ApiErrorCode;
     readonly message: string;
-    readonly details?: Record<string, unknown> | undefined;
+    readonly details?: Record<string, JsonValue> | undefined;
   };
 }
 
@@ -253,7 +295,7 @@ export const apiErrorBodySchema = z.strictObject({
   error: z.strictObject({
     code: z.enum(API_ERROR_CODES),
     message: z.string().min(1),
-    details: z.record(z.string(), z.unknown()).optional()
+    details: z.record(z.string(), jsonValueSchema).optional()
   })
 }) satisfies z.ZodType<ApiErrorBody>;
 
@@ -261,7 +303,7 @@ export interface BuildApiErrorInput {
   readonly requestId: RequestId;
   readonly code: ApiErrorCode;
   readonly message: string;
-  readonly details?: Record<string, unknown>;
+  readonly details?: Record<string, JsonValue>;
 }
 
 export interface ApiErrorResponse {
@@ -269,8 +311,23 @@ export interface ApiErrorResponse {
   readonly body: ApiErrorBody;
 }
 
-/** Build a status + body pair; callers hand `body` to their own JSON response. */
+/**
+ * Build a status + body pair; callers hand `body` to their own JSON
+ * response. Both checks below guard this function's own contract, not
+ * user input: every real call site generates `requestId` via
+ * `generateRequestId()` and passes a literal `message`, so neither check
+ * should ever actually fire in legitimate use -- they exist so a caller
+ * that propagates an untrusted `X-Request-Id` straight through, or
+ * constructs a blank message, fails loudly here instead of silently
+ * producing a body that fails its own `apiErrorBodySchema`.
+ */
 export function buildApiError(input: BuildApiErrorInput): ApiErrorResponse {
+  if (!requestIdSchema.safeParse(input.requestId).success) {
+    throw new Error(`buildApiError requires a well-formed RequestId, got: ${input.requestId}`);
+  }
+  if (input.message.length === 0) {
+    throw new Error("buildApiError requires a non-empty message");
+  }
   return {
     status: API_ERROR_STATUS[input.code],
     body: {
