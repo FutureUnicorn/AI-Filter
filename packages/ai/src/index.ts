@@ -58,6 +58,35 @@ export interface OpenAiResponsesClient {
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
+  /**
+   * Checked before every call; when it resolves `engaged: true`, the
+   * provider is never invoked. Optional only so the existing adapter
+   * tests (which don't care about kill-switch behavior) don't all need
+   * to supply one -- any real caller wiring this up for actual evidence
+   * extraction must pass one (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose InferenceKillSwitchRow
+   * shape already matches this exactly). Before this, nothing in the
+   * codebase called this at all, so engaging the kill switch halted
+   * nothing.
+   */
+  readonly checkKillSwitch?: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+/**
+ * Thrown instead of ever calling the provider when the kill switch is
+ * engaged. This adapter is generic (no concept of a criterionId or
+ * retry count), so it can only refuse the call and say why -- mapping
+ * that into an EvidenceOutcome (killSwitchRetryOutcome, below) is the
+ * caller's job, at whatever per-criterion layer actually knows those.
+ */
+export class InferenceKillSwitchEngagedError extends Error {
+  readonly reason: string | undefined;
+
+  constructor(reason: string | undefined) {
+    super(reason === undefined ? "Inference kill switch is engaged" : `Inference kill switch is engaged: ${reason}`);
+    this.name = "InferenceKillSwitchEngagedError";
+    this.reason = reason;
+  }
 }
 
 /**
@@ -98,6 +127,13 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      if (config.checkKillSwitch !== undefined) {
+        const status = await config.checkKillSwitch();
+        if (status.engaged) {
+          throw new InferenceKillSwitchEngagedError(status.reason);
+        }
+      }
+
       const response = await openai.responses.create({
         model: config.model,
         input: [
@@ -480,28 +516,109 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
 // branch calls assertUnreachableEvidenceOutcome, so a future
 // EvidenceOutcome kind forces a real decision here (a compile error)
 // instead of silently defaulting to "no review needed" -- fail closed,
-// never silently resolved. The ticket names four categories (failed
-// schema validation, failed citation checks, contradictions, injection
-// indicators); the mapping is citation_invalid (AF-38) for failed
-// citation checks, contradicted for contradictions, quarantined for
-// injection/malicious-input indicators, and extraction_error for a
-// call whose output couldn't be trusted at all (the closest
-// EvidenceOutcome analogue to "failed schema validation", since a
-// schema-invalid model response never becomes a mapped item in the
-// first place -- AF-36 only ever produces extraction_error for a
-// criterion it has nothing usable for). invalid_source/unsupported_file/
-// failed are included too: they are broken or incomplete evidence a
-// human needs to know about, not a clean result a reviewer can trust
-// without a flag. supported/partially_supported/not_found are
-// confident, validated results -- they still go through the ordinary
-// review flow (AF-5), just without this special flag. processing/
-// retrying have not resolved into anything yet.
+// never silently resolved.
+//
+// The ticket names four categories. Failed citation checks and
+// contradictions are EvidenceOutcome kinds (citation_invalid,
+// contradicted) and route from the switch. The other two are not
+// outcomes at all until this layer says so:
+//
+// * Failed schema validation never produces an EvidenceExtractionItem
+//   (evidenceExtractionResponseSchema rejects the payload first, and
+//   mapRubricToEvidence only sees already-valid items). Callers pass
+//   the parse failure itself into routeForReview, or convert it into
+//   per-criterion extraction_error records via
+//   outcomesForSchemaValidationFailure so the failure is persistable.
+// * Injection indicators are a routing signal (AF-37), not a
+//   quarantined outcome. A later supported/not_found result does not
+//   clear the signal -- pass injectionIndicatorDetected on the
+//   context so the original detection still fail-closes to review.
+//
+// invalid_source/unsupported_file/failed are included too: they are
+// broken or incomplete evidence a human needs to know about.
+// supported/partially_supported/not_found are confident, validated
+// results -- they still go through the ordinary review flow (AF-5),
+// just without this special flag, unless an injection signal is
+// attached. processing/retrying have not resolved into anything yet.
 
 export type ReviewRouting =
   | { readonly needsReview: false }
   | { readonly needsReview: true; readonly reason: string };
 
-export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
+export interface SchemaValidationIssue {
+  readonly path: string;
+  readonly message: string;
+}
+
+export interface SchemaValidationFailure {
+  readonly type: "schema_validation_failure";
+  readonly issues: readonly SchemaValidationIssue[];
+}
+
+export type ReviewRoutingInput = EvidenceOutcome | SchemaValidationFailure;
+
+export interface ReviewRoutingContext {
+  readonly injectionIndicatorDetected?: boolean;
+}
+
+export type ExtractionParseResult =
+  | { readonly ok: true; readonly items: readonly EvidenceExtractionItem[] }
+  | { readonly ok: false; readonly failure: SchemaValidationFailure };
+
+function schemaValidationFailureFromZod(error: z.ZodError): SchemaValidationFailure {
+  return {
+    type: "schema_validation_failure",
+    issues: error.issues.map((issue) => ({
+      path: issue.path.length === 0 ? "" : issue.path.map(String).join("."),
+      message: issue.message
+    }))
+  };
+}
+
+function summarizeSchemaValidationFailure(failure: SchemaValidationFailure): string {
+  if (failure.issues.length === 0) {
+    return "unknown schema error";
+  }
+  return failure.issues
+    .map((issue) => (issue.path.length === 0 ? issue.message : `${issue.path}: ${issue.message}`))
+    .join("; ");
+}
+
+export function isSchemaValidationFailure(input: ReviewRoutingInput): input is SchemaValidationFailure {
+  return "type" in input && input.type === "schema_validation_failure";
+}
+
+/** Accept the raw model payload and keep schema rejection as a first-class failure. */
+export function parseEvidenceExtractionResponse(value: unknown): ExtractionParseResult {
+  const parsed = evidenceExtractionResponseSchema.safeParse(value);
+  if (parsed.success) {
+    return { ok: true, items: parsed.data.items };
+  }
+  return { ok: false, failure: schemaValidationFailureFromZod(parsed.error) };
+}
+
+/**
+ * One persistable extraction_error per rubric criterion when the whole
+ * model response failed schema validation -- the same "exactly one
+ * outcome per criterion" rule as mapRubricToEvidence, so a rejected
+ * payload cannot disappear before human review.
+ */
+export function outcomesForSchemaValidationFailure(
+  rubricCriterionIds: readonly string[],
+  failure: SchemaValidationFailure
+): EvidenceOutcome[] {
+  const summary = summarizeSchemaValidationFailure(failure);
+  return rubricCriterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "schema_validation_failed",
+    message: `Model response failed schema validation: ${summary}`,
+    retryable: true
+  }));
+}
+
+function routeOutcomeForReview(outcome: EvidenceOutcome): ReviewRouting {
   switch (outcome.kind) {
     case "supported":
     case "partially_supported":
@@ -528,6 +645,35 @@ export function routeForReview(outcome: EvidenceOutcome): ReviewRouting {
     default:
       return assertUnreachableEvidenceOutcome(outcome);
   }
+}
+
+function withInjectionSignal(routing: ReviewRouting): ReviewRouting {
+  if (routing.needsReview) {
+    return {
+      needsReview: true,
+      reason: `${routing.reason} Injection indicator was also detected.`
+    };
+  }
+  return {
+    needsReview: true,
+    reason: "Injection indicator detected; this result cannot be trusted without human review."
+  };
+}
+
+export function routeForReview(
+  input: ReviewRoutingInput,
+  context: ReviewRoutingContext = {}
+): ReviewRouting {
+  if (isSchemaValidationFailure(input)) {
+    const routing: ReviewRouting = {
+      needsReview: true,
+      reason: `Model response failed schema validation: ${summarizeSchemaValidationFailure(input)}`
+    };
+    return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
+  }
+
+  const routing = routeOutcomeForReview(input);
+  return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
 }
 
 // ---- AF-42: inference kill switch ----
@@ -596,6 +742,33 @@ function isCitingKind(kind: EvidenceOutcomeKind): boolean {
   return CITING_KINDS.has(kind);
 }
 
+/**
+ * A gold-set fixture is hand-authored, versioned, and locked -- a typo
+ * in one of its labels is a fixture bug, not a pipeline regression, and
+ * must never silently produce a passing (or falsely failing) score. Both
+ * expectedKinds and expectedReviewCriterionIds are asserted against the
+ * case's own rubricCriterionIds so a misspelled or stray key fails loud
+ * at eval time instead of being quietly invisible to every metric that
+ * only ever looks up expected labels by a real outcome's criterionId.
+ */
+function assertGoldSetCaseIntegrity(goldCase: GoldSetCase): void {
+  const criterionIds = new Set(goldCase.rubricCriterionIds);
+  for (const expectedCriterionId of Object.keys(goldCase.expectedKinds)) {
+    if (!criterionIds.has(expectedCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedKinds["${expectedCriterionId}"], which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+  for (const reviewCriterionId of goldCase.expectedReviewCriterionIds) {
+    if (!criterionIds.has(reviewCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedReviewCriterionIds entry "${reviewCriterionId}", which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+}
+
 export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let totalItems = 0;
   let validItems = 0;
@@ -608,14 +781,24 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let reviewCorrectlyFlagged = 0;
 
   for (const goldCase of cases) {
+    assertGoldSetCaseIntegrity(goldCase);
+
+    const parsedItems: EvidenceExtractionItem[] = [];
     for (const item of goldCase.simulatedExtraction) {
       totalItems += 1;
-      if (evidenceExtractionItemSchema.safeParse(item).success) {
+      const parsed = evidenceExtractionItemSchema.safeParse(item);
+      if (parsed.success) {
         validItems += 1;
+        parsedItems.push(parsed.data);
       }
     }
 
-    const mapped = mapRubricToEvidence(goldCase.rubricCriterionIds, goldCase.simulatedExtraction);
+    // Only schema-valid items reach the real mapping/validation pipeline:
+    // that pipeline assumes a well-formed EvidenceExtractionItem shape
+    // (mapExtractedItem's switch has no default because the type claims
+    // to be exhaustive), so a malformed fixture item must lower
+    // schemaValidityRate above, not crash everything below.
+    const mapped = mapRubricToEvidence(goldCase.rubricCriterionIds, parsedItems);
     const validated = mapped.map((outcome) => validateCitation(outcome, goldCase.sourceText));
 
     for (const outcome of validated) {
@@ -634,12 +817,20 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
       } else if (expectedCiting && !actualCiting) {
         falseNegative += 1;
       }
+    }
 
-      if (goldCase.expectedReviewCriterionIds.includes(outcome.criterionId)) {
-        reviewExpectedCount += 1;
-        if (routeForReview(outcome).needsReview) {
-          reviewCorrectlyFlagged += 1;
-        }
+    // Seeded from the case's own expected IDs, not discovered by
+    // iterating real outcomes: assertGoldSetCaseIntegrity above already
+    // guarantees every one of these IDs has a matching outcome (they are
+    // all drawn from rubricCriterionIds, and mapRubricToEvidence always
+    // produces exactly one outcome per rubric criterion), so the
+    // denominator can never be silently short.
+    const uniqueReviewCriterionIds = new Set(goldCase.expectedReviewCriterionIds);
+    reviewExpectedCount += uniqueReviewCriterionIds.size;
+    for (const reviewCriterionId of uniqueReviewCriterionIds) {
+      const outcome = validated.find((candidate) => candidate.criterionId === reviewCriterionId);
+      if (outcome !== undefined && routeForReview(outcome).needsReview) {
+        reviewCorrectlyFlagged += 1;
       }
     }
   }
@@ -717,12 +908,26 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
 // the regression suite (tests/) exists specifically so new bypasses
 // found later get added here as new cases, not just fixed once.
 
+/**
+ * `you are now (a|an)` and bare `system prompt` were originally
+ * unqualified, unlike every other entry here -- both matched ordinary
+ * resume language with no instructional intent at all ("Designed system
+ * prompts and evaluation tooling", "You are now a much stronger
+ * communicator"), which a real LLM/prompt-engineering candidate's resume
+ * would trigger on sight. Both are narrowed to the actual attack shape:
+ * a role-hijack addressed at an assistant/model/bot, or an instructional
+ * verb (ignore/disregard/override/bypass/forget) acting on the system
+ * prompt specifically. The bracket-marker and "reveal ... system prompt"
+ * patterns below already cover the other real system-prompt attack
+ * shapes, so this one only needs to add the "override it" shape they
+ * don't.
+ */
 const INJECTION_PATTERNS: readonly RegExp[] = [
   /ignore (all |any )?(the )?(previous|prior|above) instructions?/iu,
   /disregard (all |any )?(the )?(previous|prior|above) instructions?/iu,
-  /you are now (a|an)\b/iu,
+  /you are now (a|an) [\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b/iu,
   /new instructions?:/iu,
-  /system prompt/iu,
+  /(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system prompt/iu,
   /reveal (your |the )?(system prompt|instructions)/iu,
   /act as (a|an)\b.{0,40}(instead|from now)/iu,
   /do not (follow|apply|use) (the )?(rubric|criteria|scoring)/iu,
