@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
+
+import { ShortcutHelp } from "../../../../lib/ShortcutHelp";
+import { useReviewKeyboard } from "../../../../lib/review-keyboard";
 
 interface QueueApplication {
   readonly applicationId: string;
@@ -78,6 +81,21 @@ export default function ApplicationReviewQueuePage() {
   const roleId = params.roleId;
   const [state, setState] = useState<QueueState>({ kind: "loading" });
   const [selected, setSelected] = useState<readonly QueueEntry["evidenceState"][]>([]);
+  const router = useRouter();
+  const entries = state.kind === "ready" ? state.queue.entries : [];
+  // AF-53: keyboard navigation over the rows actually shown, so the
+  // count follows AF-47's filters rather than the whole role.
+  const { focusedIndex, helpVisible } = useReviewKeyboard({
+    itemCount: entries.length,
+    onOpen: (index) => {
+      const target = entries[index];
+      if (target !== undefined && roleId !== undefined) {
+        router.push(
+          `/roles/${encodeURIComponent(roleId)}/applications/${encodeURIComponent(target.application.applicationId)}`
+        );
+      }
+    }
+  });
 
   useEffect(() => {
     if (roleId === undefined) {
@@ -129,6 +147,10 @@ export default function ApplicationReviewQueuePage() {
     <main>
       <p className="eyebrow">Review queue</p>
       <h1>Applications</h1>
+      <p>
+        <small>Keyboard: j/k to move, Enter to open, ? for all shortcuts.</small>
+      </p>
+      <ShortcutHelp visible={helpVisible} />
 
       {state.kind === "loading" && <p>Loading applications…</p>}
       {state.kind === "error" && <p role="alert">Could not load the review queue: {state.message}</p>}
@@ -185,8 +207,15 @@ export default function ApplicationReviewQueuePage() {
                 </tr>
               </thead>
               <tbody>
-                {state.queue.entries.map((entry) => (
-                  <tr key={entry.application.applicationId}>
+                {state.queue.entries.map((entry, index) => (
+                  <tr
+                    key={entry.application.applicationId}
+                    aria-selected={index === focusedIndex}
+                    // A focus ring the mouse user never sees is the point:
+                    // keyboard review is unusable if you cannot tell which
+                    // row you are on.
+                    style={index === focusedIndex ? { outline: "2px solid" } : undefined}
+                  >
                     <td>{entry.application.sourceRowNumber}</td>
                     <td>{entry.application.candidateFullName}</td>
                     <td>{entry.application.candidateEmail}</td>

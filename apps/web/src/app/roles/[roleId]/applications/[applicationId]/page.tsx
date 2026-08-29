@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 
+import { ShortcutHelp } from "../../../../../lib/ShortcutHelp";
+import { useReviewKeyboard } from "../../../../../lib/review-keyboard";
+
 interface SourceCitation {
   readonly document: string;
   readonly pageOrSection: string;
@@ -88,6 +91,14 @@ export default function EvidenceCardPage() {
   const { roleId, applicationId } = params;
   const [state, setState] = useState<CardState>({ kind: "loading" });
   const [workflow, setWorkflow] = useState<WorkflowStatus | undefined>(undefined);
+  const [revealedSource, setRevealedSource] = useState<number | undefined>(undefined);
+  const cards = state.kind === "ready" ? state.cards.cards : [];
+  // AF-53: "navigation between cards and source context" -- j/k moves
+  // between criterion cards, s reveals the citation for the focused one.
+  const { focusedIndex, helpVisible } = useReviewKeyboard({
+    itemCount: cards.length,
+    onRevealSource: (index) => setRevealedSource(index)
+  });
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {
@@ -144,6 +155,10 @@ export default function EvidenceCardPage() {
     <main>
       <p className="eyebrow">Evidence</p>
       <h1>Evidence for this application</h1>
+      <p>
+        <small>Keyboard: j/k to move between criteria, s to reveal the source, ? for all shortcuts.</small>
+      </p>
+      <ShortcutHelp visible={helpVisible} />
 
       {workflow !== undefined && (
         <p>
@@ -186,8 +201,13 @@ export default function EvidenceCardPage() {
             </small>
           </p>
 
-          {state.cards.cards.map((card) => (
-            <article key={card.criterionId} aria-label={`Evidence for ${card.criterionId}`}>
+          {state.cards.cards.map((card, index) => (
+            <article
+              key={card.criterionId}
+              aria-label={`Evidence for ${card.criterionId}`}
+              aria-current={index === focusedIndex ? "true" : undefined}
+              style={index === focusedIndex ? { outline: "2px solid" } : undefined}
+            >
               <h2>{card.criterionId}</h2>
               <p>
                 <strong>State:</strong> {card.kind}
@@ -238,6 +258,15 @@ export default function EvidenceCardPage() {
                         {entry.citation.offset}
                       </small>
                     </p>
+                    {revealedSource === index && (
+                      <p aria-live="polite">
+                        <small>
+                          Source context: {entry.citation.document}, {entry.citation.pageOrSection}, starting at
+                          character {entry.citation.offset}. The document itself is not rendered here — nothing links
+                          an application to its source file yet.
+                        </small>
+                      </p>
+                    )}
                   </figure>
                 ))
               )}
