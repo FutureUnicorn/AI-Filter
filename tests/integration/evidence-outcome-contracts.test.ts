@@ -289,6 +289,37 @@ test("citation_invalid rejects a circular rejectedCitation instead of overflowin
   assert.equal(result.success, false);
 });
 
+test("citation_invalid treats throwing property getters or proxy traps as validation failures", () => {
+  const throwingGetterObj = { document: "resume.txt" };
+  Object.defineProperty(throwingGetterObj, "badProp", {
+    get() {
+      throw new Error("enumerable getter blew up");
+    },
+    enumerable: true
+  });
+
+  const throwingProxyObj = new Proxy(
+    { document: "resume.txt" },
+    {
+      ownKeys() {
+        throw new Error("proxy trap blew up");
+      }
+    }
+  );
+
+  for (const malformedObj of [throwingGetterObj, throwingProxyObj]) {
+    let result: ReturnType<typeof safeParseEvidenceOutcome> | undefined;
+    assert.doesNotThrow(() => {
+      result = safeParseEvidenceOutcome({
+        ...samples.citation_invalid,
+        rejectedCitation: malformedObj
+      });
+    });
+    assert.ok(result !== undefined);
+    assert.equal(result.success, false);
+  }
+});
+
 test("buildApiError rejects a malformed requestId instead of producing a contract-invalid body", () => {
   assert.throws(() => buildApiError({ requestId: "not-a-real-request-id", code: "not_found", message: "x" }));
 });

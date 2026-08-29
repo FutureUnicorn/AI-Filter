@@ -66,10 +66,14 @@ function hasCircularJsonReference(value: unknown, ancestors = new WeakSet<object
     return true;
   }
   ancestors.add(value);
-  const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
-  const containsCycle = children.some((entry) => hasCircularJsonReference(entry, ancestors));
-  ancestors.delete(value);
-  return containsCycle;
+  try {
+    const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+    return children.some((entry) => hasCircularJsonReference(entry, ancestors));
+  } catch {
+    return true;
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 const recursiveJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
@@ -92,7 +96,11 @@ const recursiveJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 );
 
 const jsonValueSchema: z.ZodType<JsonValue> = z.custom<JsonValue>((value) => {
-  return !hasCircularJsonReference(value) && recursiveJsonValueSchema.safeParse(value).success;
+  try {
+    return !hasCircularJsonReference(value) && recursiveJsonValueSchema.safeParse(value).success;
+  } catch {
+    return false;
+  }
 }, { message: "must be a cycle-free JSON value" }) as z.ZodType<JsonValue>;
 
 const supportedEvidenceSchema = z.strictObject({
@@ -420,7 +428,7 @@ export function buildApiError(input: BuildApiErrorInput): ApiErrorResponse {
         .join("; ")}`
     );
   }
-  return { status: API_ERROR_STATUS[input.code], body };
+  return { status: API_ERROR_STATUS[input.code], body: parsed.data };
 }
 
 export type IdempotencyKey = string;

@@ -124,6 +124,21 @@ test("every accepted details value survives a JSON round trip unchanged", () => 
   assert.deepEqual(JSON.parse(JSON.stringify(body)), body);
 });
 
+test("buildApiError returns parsed.data so non-enumerable toJSON cannot hijack serialization", () => {
+  const details = { count: 42 };
+  Object.defineProperty(details, "toJSON", {
+    value: () => ({ hijacked: true }),
+    enumerable: false
+  });
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(body)).error.details, { count: 42 });
+});
+
 test("buildApiError still accepts ordinary finite and nested JSON details", () => {
   const details = { count: 42, ratio: -0.5, nested: { list: [1, 2, 3], flag: true, empty: null } };
   const { body } = buildApiError({
