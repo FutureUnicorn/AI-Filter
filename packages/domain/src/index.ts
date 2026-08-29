@@ -2193,7 +2193,16 @@ export const METRIC_LIMITATION_CODES = [
    * data is not the same KIND on both sides, and no amount of extra
    * sample fixes it.
    */
-  "baseline_self_reported"
+  "baseline_self_reported",
+  /**
+   * AF-56. Part of the ground truth was discarded because the
+   * adjudicator had seen this system's output, so it could not serve as
+   * an independent check. Like baseline_self_reported this is about the
+   * KIND of data, not the amount -- but it is a distinct claim: that one
+   * says the two sides were measured differently, this one says some of
+   * the reference side was thrown away as unusable.
+   */
+  "adjudication_not_independent"
 ] as const;
 
 export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
@@ -2306,6 +2315,176 @@ export function describeFailedDocumentRate(
     population: rate.uploaded,
     minimumSampleSize
   });
+}
+
+// ---- AF-56: qualified-candidate preservation ----
+//
+// "Percentage of independently-adjudicated strong candidates who were
+// also surfaced by the evidence workflow. Target >= 95%; this is the
+// North Star safety metric."
+//
+// This is the number that catches the product doing the one thing it
+// must never do: losing someone who should have been seen. Everything
+// below is shaped so that it cannot be made to look good by accident.
+//
+// **Surfacing is not the same as advancing, and must not be read from
+// decisions.** The tempting implementation uses AF-51's `advance`
+// decisions as the surfacing signal, because that data is right there.
+// It would be wrong in the most dangerous direction: it measures
+// recruiters rather than the workflow, so a badly broken pipeline scores
+// 100% on any week recruiters happened to advance the right people, and
+// a working one is punished whenever a human disagrees with the
+// adjudicator. A human declining a strong candidate is a real finding
+// and a different metric; the workflow did its job the moment it put
+// that candidate in front of them with evidence to read.
+//
+// **Independence is load-bearing, so it is represented rather than
+// assumed.** An adjudicator who saw our ranking is not ground truth; the
+// resulting number measures agreement with ourselves. Those
+// adjudications are dropped from the denominator, not down-weighted, and
+// the count is reported -- a wholly contaminated set therefore yields a
+// suppressed metric rather than a flattering one.
+
+export type AdjudicationVerdict = "strong" | "not_strong";
+
+export interface CandidateAdjudication {
+  readonly applicationId: string;
+  readonly verdict: AdjudicationVerdict;
+  /**
+   * Whether the adjudicator reached this verdict without seeing the
+   * workflow's output. Required, with no default: a default would be
+   * chosen once here and thereafter every adjudication of unknown
+   * provenance would silently acquire it.
+   */
+  readonly blindToWorkflowOutput: boolean;
+}
+
+export interface SurfacedCandidate {
+  readonly applicationId: string;
+  /**
+   * What the reviewer actually got. `null` when the workflow reached
+   * this candidate but produced no evidence at all.
+   */
+  readonly evidence: EvidenceStrengthSummary | null;
+}
+
+export interface QualifiedPreservation {
+  /** Preserved / adjudicated strong, over independent adjudications only. */
+  readonly preservationRate: number | null;
+  /** Independent strong adjudications: the denominator. */
+  readonly adjudicatedStrong: number;
+  /** Strong candidates the workflow surfaced with something to check. */
+  readonly preserved: number;
+  /**
+   * Reached review, but with nothing verifiable attached. Counted as a
+   * miss: a name with no evidence is not what "surfaced by the evidence
+   * workflow" claims, and treating it as a save would let a total
+   * extraction failure report 100% preservation.
+   */
+  readonly missedWithoutEvidence: number;
+  /** Never reached review at all -- lost upstream of the reviewer. */
+  readonly missedAbsent: number;
+  /** Strong adjudications discarded because the adjudicator was not blind. */
+  readonly excludedNotIndependent: number;
+}
+
+/**
+ * The two miss categories are kept apart deliberately. `missedAbsent`
+ * is an intake or pipeline loss and `missedWithoutEvidence` is an
+ * extraction-quality loss; they are fixed by different work, and a
+ * single "5% missed" figure tells nobody which. Collapsing them is the
+ * difference between a metric that reports and one that is actionable.
+ */
+export function summarizeQualifiedPreservation(
+  adjudications: readonly CandidateAdjudication[],
+  surfaced: readonly SurfacedCandidate[]
+): QualifiedPreservation {
+  const seen = new Set<string>();
+  for (const adjudication of adjudications) {
+    if (seen.has(adjudication.applicationId)) {
+      // Two verdicts for one candidate is not a tie to break: it would
+      // double-count that candidate in the denominator and silently
+      // reweight the metric toward whoever was adjudicated twice.
+      throw new Error(
+        `summarizeQualifiedPreservation received two adjudications for ${adjudication.applicationId}`
+      );
+    }
+    seen.add(adjudication.applicationId);
+  }
+
+  const evidenceByApplication = new Map<string, EvidenceStrengthSummary | null>();
+  for (const candidate of surfaced) {
+    evidenceByApplication.set(candidate.applicationId, candidate.evidence);
+  }
+
+  const strong = adjudications.filter((adjudication) => adjudication.verdict === "strong");
+  const independent = strong.filter((adjudication) => adjudication.blindToWorkflowOutput);
+
+  let preserved = 0;
+  let missedWithoutEvidence = 0;
+  let missedAbsent = 0;
+  for (const adjudication of independent) {
+    if (!evidenceByApplication.has(adjudication.applicationId)) {
+      missedAbsent += 1;
+      continue;
+    }
+    const evidence = evidenceByApplication.get(adjudication.applicationId) ?? null;
+    if (evidence === null || evidence.strength === "none") {
+      missedWithoutEvidence += 1;
+      continue;
+    }
+    preserved += 1;
+  }
+
+  return {
+    // null, never 1. An empty denominator means nothing was checked, and
+    // a metric whose safest-looking value is what you get for doing no
+    // work is worse than no metric.
+    preservationRate: independent.length === 0 ? null : preserved / independent.length,
+    adjudicatedStrong: independent.length,
+    preserved,
+    missedWithoutEvidence,
+    missedAbsent,
+    excludedNotIndependent: strong.length - independent.length
+  };
+}
+
+/**
+ * Preservation as a reportable metric.
+ *
+ * `population` is every strong adjudication and `sampleSize` is only the
+ * independent ones, so discarding contaminated ground truth shows up as
+ * a shrunken denominator on its own. The explicit limitation is still
+ * attached, because `population_incomplete` reads as "not yet counted"
+ * and these will never be counted.
+ */
+export function describeQualifiedPreservation(
+  preservation: QualifiedPreservation,
+  minimumSampleSize: number
+): MetricSample {
+  const sample = summarizeMetric({
+    metric: "qualified_candidate_preservation",
+    value: preservation.preservationRate,
+    sampleSize: preservation.adjudicatedStrong,
+    population: preservation.adjudicatedStrong + preservation.excludedNotIndependent,
+    minimumSampleSize
+  });
+  if (preservation.excludedNotIndependent === 0) {
+    return sample;
+  }
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "adjudication_not_independent",
+        detail:
+          `${preservation.excludedNotIndependent} strong adjudication(s) were excluded because the ` +
+          "adjudicator had seen the workflow's output; a verdict formed with our ranking in view " +
+          "measures agreement with ourselves rather than checking us"
+      }
+    ]
+  };
 }
 
 // ---- AF-55: review-time reduction ----
