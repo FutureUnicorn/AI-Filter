@@ -8,6 +8,7 @@ import {
   AUDIT_ACTIONS,
   CONTRACT_SCHEMA_VERSION,
   FILE_INTAKE_STATUSES,
+  IMPORT_ROW_OUTCOMES,
   MAX_RUBRIC_CRITERIA,
   MEMBERSHIP_ROLES,
   MIN_RUBRIC_CRITERIA,
@@ -16,6 +17,7 @@ import {
 } from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
+  Application,
   AuditEvent,
   CitationInvalidEvidence,
   ContradictedEvidence,
@@ -25,6 +27,7 @@ import type {
   EvidenceOutcome,
   ExtractionErrorEvidence,
   FailedEvidence,
+  ImportRow,
   InvalidSourceEvidence,
   Membership,
   NotFoundEvidence,
@@ -587,3 +590,41 @@ export const csvPreviewInputSchema = z.strictObject({
 });
 
 export type CsvPreviewInput = z.infer<typeof csvPreviewInputSchema>;
+
+// ---- AF-32: idempotent import finalization ----
+
+export const applicationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  applicationId: z.uuid(),
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  intakeId: z.uuid(),
+  sourceRowNumber: z.number().int().min(1),
+  candidateFullName: z.string().min(1),
+  candidateEmail: z.string().min(1),
+  externalReferenceId: z.string().min(1).optional(),
+  appliedAt: z.string().min(1).optional(),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Application>;
+
+export const importRowSchema = z.strictObject({
+  importRowId: z.uuid(),
+  intakeId: z.uuid(),
+  rowNumber: z.number().int().min(1),
+  outcome: z.enum(IMPORT_ROW_OUTCOMES),
+  applicationId: z.uuid().optional(),
+  failureReason: z.string().min(1).optional()
+}) satisfies z.ZodType<ImportRow>;
+
+/**
+ * mapping here is required (unlike AF-31's preview): finalizing without
+ * a mapping makes no sense, there is no discovery mode for this action.
+ * The Idempotency-Key header, not this body, is what makes a retry safe
+ * -- see packages/db's finalizeCsvImport for the actual replay-vs-
+ * conflict logic that key drives.
+ */
+export const finalizeCsvImportInputSchema = z.strictObject({
+  mapping: z.array(csvColumnMappingEntrySchema).min(1).max(APPLICATION_IMPORT_FIELDS.length)
+});
+
+export type FinalizeCsvImportInput = z.infer<typeof finalizeCsvImportInputSchema>;
