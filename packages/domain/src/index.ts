@@ -453,7 +453,7 @@ export interface AiStructuredCallInput {
   readonly promptVersion: string;
   readonly schemaVersion: string;
   readonly schemaName: string;
-  readonly jsonSchema: Record<string, unknown>;
+  readonly jsonSchema: unknown;
   readonly systemPrompt: string;
   readonly userPrompt: string;
 }
