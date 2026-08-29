@@ -215,7 +215,7 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
         additionalProperties: false,
         required: ["criterion_id", "state", "quote", "source"],
         properties: {
-          criterion_id: { type: "string" },
+          criterion_id: { type: "string", minLength: 1 },
           state: { type: "string", enum: EVIDENCE_EXTRACTION_STATES },
           quote: {
             type: "string",
