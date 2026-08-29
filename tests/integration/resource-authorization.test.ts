@@ -3,10 +3,18 @@ import test from "node:test";
 
 import { CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import type { Membership } from "../../packages/domain/src/index.ts";
+import { apiErrorBodySchema } from "../../packages/contracts/src/index.ts";
 import {
   authorizeResourceAccess,
   resourceAuthorizationErrorResponse
 } from "../../packages/security/src/index.ts";
+
+// A real request id. requestId was used here until AF-13 made buildApiError
+// validate its input, at which point these tests threw before asserting
+// anything -- and because no CI runs on this branch, they simply stayed
+// broken. Anything crossing the API boundary in a test has to satisfy the
+// same contract the product does.
+const requestId = "req_44444444-4444-4444-8444-444444444444";
 
 const orgA = "11111111-1111-4111-8111-111111111111";
 const orgB = "22222222-2222-4222-8222-222222222222";
@@ -85,13 +93,15 @@ test("UUID letter-case is not treated as a different organization or user", () =
 });
 
 test("no_membership maps to not_found so an org's existence is never confirmed to an outsider", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, "req_x");
+  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, requestId);
   assert.equal(response?.status, 404);
   assert.equal(response?.body.error.code, "not_found");
+  // Status mapping alone is not enough: without this, a body that violates
+  // apiErrorBodySchema passes as long as the code and status line up.
+  assert.equal(apiErrorBodySchema.safeParse(response?.body).success, true);
 });
 
 test("insufficient_capability maps to forbidden, and names the actual role", () => {
-  const requestId = "req_x";
   const response = resourceAuthorizationErrorResponse(
     { outcome: "insufficient_capability", role: "auditor" },
     requestId
@@ -99,9 +109,10 @@ test("insufficient_capability maps to forbidden, and names the actual role", () 
   assert.equal(response?.status, 403);
   assert.equal(response?.body.error.code, "forbidden");
   assert.match(response?.body.error.message ?? "", /auditor/);
+  assert.equal(apiErrorBodySchema.safeParse(response?.body).success, true);
 });
 
 test("authorized yields no error response", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, "req_x");
+  const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, requestId);
   assert.equal(response, undefined);
 });
