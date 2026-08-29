@@ -729,6 +729,13 @@ export interface GoldSetScore {
   readonly citingPrecision: number;
   readonly citingRecall: number;
   readonly escalationRecall: number;
+  /**
+   * Of everything routed to human review, how much genuinely warranted
+   * it. Recall alone cannot fail when routing over-escalates -- flagging
+   * every clean outcome scores a perfect recall -- so precision is what
+   * actually catches that regression.
+   */
+  readonly escalationPrecision: number;
 }
 
 const CITING_KINDS: ReadonlySet<EvidenceOutcomeKind> = new Set([
@@ -779,6 +786,7 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let falseNegative = 0;
   let reviewExpectedCount = 0;
   let reviewCorrectlyFlagged = 0;
+  let reviewIncorrectlyFlagged = 0;
 
   for (const goldCase of cases) {
     assertGoldSetCaseIntegrity(goldCase);
@@ -827,10 +835,21 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
     // denominator can never be silently short.
     const uniqueReviewCriterionIds = new Set(goldCase.expectedReviewCriterionIds);
     reviewExpectedCount += uniqueReviewCriterionIds.size;
-    for (const reviewCriterionId of uniqueReviewCriterionIds) {
-      const outcome = validated.find((candidate) => candidate.criterionId === reviewCriterionId);
-      if (outcome !== undefined && routeForReview(outcome).needsReview) {
+
+    // Every validated outcome is routed, not just the expected-review
+    // ones. Iterating only the expected IDs meant routeForReview was
+    // never called for negative examples, so a regression that flagged
+    // `supported` / `partially_supported` / `not_found` for review left
+    // escalationRecall at 1 and every other metric untouched -- the gate
+    // passed while the system sent ALL clean evidence to human review.
+    // Recording the false positives gives that failure a metric to trip.
+    for (const outcome of validated) {
+      const shouldEscalate = uniqueReviewCriterionIds.has(outcome.criterionId);
+      const didEscalate = routeForReview(outcome).needsReview;
+      if (shouldEscalate && didEscalate) {
         reviewCorrectlyFlagged += 1;
+      } else if (!shouldEscalate && didEscalate) {
+        reviewIncorrectlyFlagged += 1;
       }
     }
   }
@@ -841,7 +860,11 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
     outcomeAccuracy: totalCriteria === 0 ? 1 : correctKinds / totalCriteria,
     citingPrecision: truePositive + falsePositive === 0 ? 1 : truePositive / (truePositive + falsePositive),
     citingRecall: truePositive + falseNegative === 0 ? 1 : truePositive / (truePositive + falseNegative),
-    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount
+    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount,
+    escalationPrecision:
+      reviewCorrectlyFlagged + reviewIncorrectlyFlagged === 0
+        ? 1
+        : reviewCorrectlyFlagged / (reviewCorrectlyFlagged + reviewIncorrectlyFlagged)
   };
 }
 
@@ -851,6 +874,7 @@ export interface GoldSetThresholds {
   readonly minCitingPrecision: number;
   readonly minCitingRecall: number;
   readonly minEscalationRecall: number;
+  readonly minEscalationPrecision: number;
 }
 
 /**
@@ -865,7 +889,8 @@ export const GOLD_SET_V1_THRESHOLDS: GoldSetThresholds = {
   minOutcomeAccuracy: 1,
   minCitingPrecision: 1,
   minCitingRecall: 1,
-  minEscalationRecall: 1
+  minEscalationRecall: 1,
+  minEscalationPrecision: 1
 };
 
 export type GoldSetGate =
@@ -888,6 +913,9 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
   }
   if (score.escalationRecall < thresholds.minEscalationRecall) {
     failures.push(`escalationRecall ${score.escalationRecall} < ${thresholds.minEscalationRecall}`);
+  }
+  if (score.escalationPrecision < thresholds.minEscalationPrecision) {
+    failures.push(`escalationPrecision ${score.escalationPrecision} < ${thresholds.minEscalationPrecision}`);
   }
   return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }
