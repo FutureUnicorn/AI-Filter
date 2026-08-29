@@ -26,8 +26,8 @@ CREATE TABLE IF NOT EXISTS applications (
   role_id uuid NOT NULL REFERENCES roles (role_id) ON DELETE CASCADE,
   intake_id uuid NOT NULL REFERENCES file_intakes (intake_id) ON DELETE RESTRICT,
   source_row_number integer NOT NULL CHECK (source_row_number >= 1),
-  candidate_full_name text NOT NULL CHECK (length(trim(candidate_full_name)) > 0),
-  candidate_email text NOT NULL CHECK (length(trim(candidate_email)) > 0),
+  candidate_full_name text NOT NULL CHECK (candidate_full_name ~ '[^[:space:]]'),
+  candidate_email text NOT NULL CHECK (candidate_email ~ '[^[:space:]]'),
   external_reference_id text,
   applied_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -58,3 +58,33 @@ CREATE TABLE IF NOT EXISTS import_rows (
 );
 
 CREATE INDEX IF NOT EXISTS import_rows_intake_id_idx ON import_rows (intake_id);
+
+-- Postgres trim() strips SPACES ONLY, so `length(trim(x)) > 0` -- and
+-- `length(x) > 0` -- accept a value of tabs or newlines. Verified on a
+-- real database: length(trim(E'\t\n')) is 2, so E'\t\n' satisfied the
+-- old predicate for every column below while being blank to any human
+-- reading the record. `~ '[^[:space:]]'` asks the intended question:
+-- does this contain at least one non-whitespace character.
+--
+-- Applied twice: inline above for fresh databases, and as guarded ALTERs
+-- here for databases an earlier revision already created, where CREATE
+-- TABLE IF NOT EXISTS is a no-op. Guarded rather than DROP/ADD because
+-- this file replays on every startup and re-adding a CHECK revalidates
+-- every row under a strong lock (the AF-20 replay-cost finding).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'applications'::regclass AND conname = 'applications_candidate_full_name_nonblank'
+  ) THEN
+    ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_candidate_full_name_check;
+    ALTER TABLE applications ADD CONSTRAINT applications_candidate_full_name_nonblank CHECK (candidate_full_name ~ '[^[:space:]]');
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'applications'::regclass AND conname = 'applications_candidate_email_nonblank'
+  ) THEN
+    ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_candidate_email_check;
+    ALTER TABLE applications ADD CONSTRAINT applications_candidate_email_nonblank CHECK (candidate_email ~ '[^[:space:]]');
+  END IF;
+END $$;
