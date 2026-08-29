@@ -309,6 +309,34 @@ export function mapRubricToEvidence(
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
+  // The rubric IDs arrive as an unconstrained string[] with no upstream
+  // schema or branded type guaranteeing anything about them, so they are
+  // validated here rather than assumed. Both checks protect the promise
+  // this function makes about its OUTPUT:
+  //
+  // - An empty ID would produce an outcome whose criterionId is "",
+  //   which fails evidenceOutcomeSchema (criterionId requires at least
+  //   one character). Returning it would mean handing back a value
+  //   advertised as a persistable EvidenceOutcome that cannot actually
+  //   be persisted.
+  // - A repeated ID would emit several outcomes for the same criterion,
+  //   contradicting the one-outcome-per-criterion invariant and letting
+  //   a downstream consumer persist or count it twice.
+  //
+  // Rejecting rather than silently de-duplicating: a rubric containing
+  // the same criterion twice is a malformed rubric, and quietly
+  // collapsing it would hide that from whoever authored it.
+  const seen = new Set<string>();
+  for (const criterionId of rubricCriterionIds) {
+    if (criterionId.length === 0) {
+      throw new Error("mapRubricToEvidence requires non-empty rubric criterion IDs");
+    }
+    if (seen.has(criterionId)) {
+      throw new Error(`mapRubricToEvidence requires unique rubric criterion IDs; "${criterionId}" appears more than once`);
+    }
+    seen.add(criterionId);
+  }
+
   const itemsByCriterion = new Map<string, EvidenceExtractionItem[]>();
   for (const item of extractedItems) {
     const existing = itemsByCriterion.get(item.criterion_id);
