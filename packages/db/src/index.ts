@@ -1889,14 +1889,19 @@ export async function assertFailedDocumentRateAccuracy(databaseUrl: string): Pro
     // Noise that must not be counted: another role, and another tenant.
     await intake(orgA, roleOther, "quarantined");
     await intake(orgB, roleB, "quarantined");
-    // The one that makes the organization_id predicate load-bearing rather
-    // than decorative: file_intakes carries INDEPENDENT foreign keys to
-    // organizations and roles, with no composite (organization_id, role_id)
-    // constraint, so a row can sit in org B while pointing at org A's role.
-    // Filtering on role_id alone would fold that misattributed document
-    // into org A's pipeline health. (Same shape as the audit_events actor
-    // finding; flagged for whoever owns file_intakes.)
-    await intake(orgB, roleA, "quarantined");
+    // A misattributed row -- org B pointing at org A's role -- used to be
+    // insertable here, and this probe deliberately created one to prove the
+    // organization_id predicate was load-bearing. AF-28's composite foreign
+    // key on (role_id, organization_id) now rejects it at the schema level,
+    // so that scenario can no longer be constructed and the case has been
+    // removed rather than left as a test that cannot fail.
+    //
+    // The predicate itself is kept, but it is honestly defence in depth now,
+    // not the thing enforcing isolation: role_id is a globally unique
+    // primary key and the composite FK ties it to one organization, so
+    // filtering on role_id alone would already be correct. It stays because
+    // POL-011 is a tenant boundary and a query over tenant data should say
+    // which tenant it means. Removing it would fail no test today.
 
     const rate = await getFailedDocumentRate(databaseUrl, schema, orgA, roleA);
     const expected = {
@@ -1932,6 +1937,88 @@ export async function assertFailedDocumentRateAccuracy(databaseUrl: string): Pro
     const empty = await getFailedDocumentRate(databaseUrl, schema, orgA, roleB);
     if (empty.uploaded !== 0 || empty.failedRate !== null) {
       throw new Error(`cross-tenant role must be empty, got: ${JSON.stringify(empty)}`);
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+
+/**
+ * A file intake carries both a tenant column and a reference to a
+ * tenant-owned row. Constraining those separately lets a row sit in
+ * organization B while pointing at organization A's role, and the
+ * misattributed document then counts toward the wrong tenant's per-role
+ * figures -- AF-58's failed-document rate reads exactly this pair.
+ *
+ * Third occurrence of this defect class (audit_events on AF-20,
+ * evidence_outcomes on AF-48, this), so the property is worth pinning
+ * rather than trusting the migration to stay correct.
+ */
+export async function assertFileIntakeTenantIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `fi_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'U')`, [
+      userId,
+      `fi_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'A role',$3)`,
+      [roleA, orgA, userId]
+    );
+
+    const insert = async (organizationId: string, key: string): Promise<void> => {
+      await admin.query(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,'cv.pdf','application/pdf','validated',$4)`,
+        [organizationId, roleA, key, userId]
+      );
+    };
+
+    // The legitimate pairing must still work -- a constraint that rejects
+    // everything would pass the negative case for the wrong reason.
+    await insert(orgA, `ok-${suffix}`);
+
+    let rejected = false;
+    let message = "";
+    try {
+      await insert(orgB, `bad-${suffix}`);
+    } catch (error) {
+      rejected = true;
+      message = error instanceof Error ? error.message : String(error);
+    }
+    if (!rejected) {
+      throw new Error(
+        "a file intake in organization B must not be able to reference organization A's role; " +
+          "the (role_id, organization_id) pair is unconstrained"
+      );
+    }
+    if (!/foreign key|violates/i.test(message)) {
+      throw new Error(`expected a foreign-key violation naming the real obstacle, got: ${message}`);
     }
   } finally {
     try {
