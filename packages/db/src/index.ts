@@ -2438,7 +2438,70 @@ export async function assertEvidenceOutcomePersistence(databaseUrl: string): Pro
       }
     }
 
-    // 4. Append-only: nothing edits or erases a recorded outcome.
+    // 4. A payload that is not a JSON object, or that omits the key a
+    //    lifted column claims to mirror, is rejected. `=` was not enough:
+    //    `outcome ->> 'kind'` is NULL when the key is absent and a CHECK
+    //    only fails on FALSE, so a payload with no kind at all passed the
+    //    constraint meant to catch exactly that.
+    for (const payload of ['"just a string"', "[1,2]", '{"no_kind_key":true}', '{"kind":"supported"}']) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+           VALUES ($1, $2, 'python', 'supported', $3::jsonb)`,
+          [orgA, appA, payload]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a payload the lifted columns cannot mirror must be rejected: ${payload}`);
+      }
+    }
+
+    // 5. Evidence cannot be filed under one tenant against another
+    //    tenant's application. Independent foreign keys each hold on
+    //    their own while permitting exactly this pairing.
+    let misattributionRejected = false;
+    try {
+      await admin.query(
+        `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+         VALUES ($1, $2, 'python', 'not_found', $3::jsonb)`,
+        [orgB, appA, JSON.stringify(outcome("not_found", "python"))]
+      );
+    } catch {
+      misattributionRejected = true;
+    }
+    if (!misattributionRejected) {
+      throw new Error("org B must not be able to record evidence against org A's application");
+    }
+
+    // 6. Removing a parent reports the real obstacle. With ON DELETE
+    //    CASCADE the cascade issued a DELETE and this table's append-only
+    //    trigger rejected it, so the operator saw
+    //    "evidence_outcomes is append-only" for a table they never named.
+    //    0006 hit the same thing on audit_events.
+    for (const [label, statement, params] of [
+      ["application", `DELETE FROM applications WHERE application_id = $1`, [appA]],
+      ["organization", `DELETE FROM organizations WHERE organization_id = $1`, [orgA]]
+    ] as const) {
+      let message = "";
+      try {
+        await admin.query(statement, [...params]);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      if (message === "") {
+        throw new Error(`deleting a ${label} with recorded evidence must be refused`);
+      }
+      if (message.includes("append-only")) {
+        throw new Error(
+          `deleting a ${label} must report a foreign-key violation naming the real obstacle, not "${message}"`
+        );
+      }
+    }
+
+    // 7. Append-only: nothing edits or erases a recorded outcome.
     for (const statement of [
       `UPDATE evidence_outcomes SET kind = 'failed'`,
       `DELETE FROM evidence_outcomes`,
