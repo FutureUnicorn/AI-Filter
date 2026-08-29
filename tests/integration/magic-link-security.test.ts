@@ -86,11 +86,16 @@ test("an unconsumed but expired token is expired, not already_consumed", () => {
   assert.deepEqual(result, { outcome: "expired" });
 });
 
-test("createConsoleMagicLinkEmailSender does not log the recipient or the raw token", async (t) => {
+test("createConsoleMagicLinkEmailSender does not leak the recipient or raw token", async (t) => {
   const logMock = t.mock.method(console, "log", () => undefined);
-  const sender = createConsoleMagicLinkEmailSender();
+  const stderrMock = t.mock.method(process.stderr, "write", () => true);
+  const sender = createConsoleMagicLinkEmailSender("development");
   await sender.sendMagicLink({ email: "user@acme.test", link: "https://example.test/verify?token=abc" });
-  const dumped = logMock.mock.calls.map((call) => String(call.arguments[0])).join("\n");
+  const dumped = [
+    ...logMock.mock.calls.map((call) => String(call.arguments[0])),
+    ...stderrMock.mock.calls.map((call) => String(call.arguments[0]))
+  ].join("\n");
   assert.equal(dumped.includes("user@acme.test"), false);
   assert.equal(dumped.includes("token=abc"), false);
+  assert.equal(dumped.includes("token=[REDACTED]"), true);
 });
