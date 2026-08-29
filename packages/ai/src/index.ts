@@ -72,16 +72,13 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
   return {
     responses: {
       async create(params) {
-        if (!isOpenAiJsonSchema(params.text.format.schema)) {
-          throw new TypeError("OpenAI structured output requires an object JSON Schema.");
-        }
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
           text: {
             format: {
               ...params.text.format,
-              schema: params.text.format.schema
+              schema: params.text.format.schema as Record<string, unknown>
             }
           },
           store: params.store
