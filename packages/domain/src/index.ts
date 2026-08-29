@@ -605,3 +605,35 @@ export function scanCriterionForProtectedCharacteristicProxy(
     ({ category, pattern }) => ({ category, matchedPhrase: pattern.source })
   );
 }
+
+// ---- AF-28: secure direct file upload ----
+//
+// FileIntake tracks one upload attempt from "a URL was minted" through
+// (in later tickets) validated/quarantined/rejected. AF-28 only ever
+// produces pending and uploaded; the rest of this closed set exists now
+// so AF-29 doesn't need a second migration touching the status CHECK.
+
+export const ALLOWED_FILE_TYPES = ["pdf", "docx", "csv"] as const;
+export type AllowedFileType = (typeof ALLOWED_FILE_TYPES)[number];
+
+export type FileIntakeStatus = "pending" | "uploaded" | "validated" | "quarantined" | "rejected";
+
+export const FILE_INTAKE_STATUSES: readonly FileIntakeStatus[] = [
+  "pending",
+  "uploaded",
+  "validated",
+  "quarantined",
+  "rejected"
+] as const;
+
+export interface FileIntake extends VersionedRecord {
+  readonly intakeId: string;
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly storageKey: string;
+  readonly declaredFilename: string;
+  readonly declaredMimeType: string;
+  readonly status: FileIntakeStatus;
+  readonly createdByUserId: string;
+  readonly createdAt: string;
+}

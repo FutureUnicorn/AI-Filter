@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import type {
   AuditAction,
   DomainPort,
+  FileIntake,
+  FileIntakeStatus,
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
   MagicLinkTokenRecord,
@@ -939,6 +941,130 @@ export async function publishRubric(
   }
 }
 
+// ---- AF-28: secure direct file upload ----
+
+export interface CreateFileIntakeInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly storageKey: string;
+  readonly declaredFilename: string;
+  readonly declaredMimeType: string;
+  readonly createdByUserId: string;
+}
+
+interface FileIntakeRow {
+  readonly intake_id: string;
+  readonly organization_id: string;
+  readonly role_id: string;
+  readonly storage_key: string;
+  readonly declared_filename: string;
+  readonly declared_mime_type: string;
+  readonly status: FileIntakeStatus;
+  readonly created_by_user_id: string;
+  readonly created_at: Date;
+}
+
+function rowToFileIntake(row: FileIntakeRow): FileIntake {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    intakeId: row.intake_id,
+    organizationId: row.organization_id,
+    roleId: row.role_id,
+    storageKey: row.storage_key,
+    declaredFilename: row.declared_filename,
+    declaredMimeType: row.declared_mime_type,
+    status: row.status,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const FILE_INTAKE_COLUMNS =
+  "intake_id, organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id, created_at";
+
+export async function createFileIntake(
+  databaseUrl: string,
+  schema: string,
+  input: CreateFileIntakeInput
+): Promise<FileIntake> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `INSERT INTO "${schema}".file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING ${FILE_INTAKE_COLUMNS}`,
+      [
+        input.organizationId,
+        input.roleId,
+        input.storageKey,
+        input.declaredFilename,
+        input.declaredMimeType,
+        input.createdByUserId
+      ]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("file intake insert returned no row");
+    }
+    return rowToFileIntake(row);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export async function getFileIntakeById(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<FileIntake | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `SELECT ${FILE_INTAKE_COLUMNS} FROM "${schema}".file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToFileIntake(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export type MarkFileIntakeUploadedOutcome =
+  | { readonly outcome: "uploaded"; readonly intake: FileIntake }
+  | { readonly outcome: "not_pending" };
+
+/** WHERE status = 'pending' makes this a one-shot transition: calling it
+ * twice (a retried client request, say) leaves the row exactly as the
+ * first call left it, reported honestly as not_pending rather than
+ * silently "succeeding" a second time. */
+export async function markFileIntakeUploaded(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<MarkFileIntakeUploadedOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<FileIntakeRow>(
+      `UPDATE "${schema}".file_intakes
+          SET status = 'uploaded'
+        WHERE intake_id = $1 AND status = 'pending'
+        RETURNING ${FILE_INTAKE_COLUMNS}`,
+      [intakeId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? { outcome: "not_pending" } : { outcome: "uploaded", intake: rowToFileIntake(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
@@ -1275,6 +1401,87 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     }
     try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * A file intake carries both a tenant column and a reference to a
+ * tenant-owned row. Constraining those separately lets a row sit in
+ * organization B while pointing at organization A's role, and the
+ * misattributed document then counts toward the wrong tenant's per-role
+ * figures -- AF-58's failed-document rate reads exactly this pair.
+ *
+ * Third occurrence of this defect class (audit_events on AF-20,
+ * evidence_outcomes on AF-48, this), so the property is worth pinning
+ * rather than trusting the migration to stay correct.
+ */
+export async function assertFileIntakeTenantIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `fi_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'U')`, [
+      userId,
+      `fi_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'A role',$3)`,
+      [roleA, orgA, userId]
+    );
+
+    const insert = async (organizationId: string, key: string): Promise<void> => {
+      await admin.query(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,'cv.pdf','application/pdf','validated',$4)`,
+        [organizationId, roleA, key, userId]
+      );
+    };
+
+    // The legitimate pairing must still work -- a constraint that rejects
+    // everything would pass the negative case for the wrong reason.
+    await insert(orgA, `ok-${suffix}`);
+
+    let rejected = false;
+    let message = "";
+    try {
+      await insert(orgB, `bad-${suffix}`);
+    } catch (error) {
+      rejected = true;
+      message = error instanceof Error ? error.message : String(error);
+    }
+    if (!rejected) {
+      throw new Error(
+        "a file intake in organization B must not be able to reference organization A's role; " +
+          "the (role_id, organization_id) pair is unconstrained"
+      );
+    }
+    if (!/foreign key|violates/i.test(message)) {
+      throw new Error(`expected a foreign-key violation naming the real obstacle, got: ${message}`);
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }

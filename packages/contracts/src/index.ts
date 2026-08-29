@@ -3,8 +3,10 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import {
+  ALLOWED_FILE_TYPES,
   AUDIT_ACTIONS,
   CONTRACT_SCHEMA_VERSION,
+  FILE_INTAKE_STATUSES,
   MAX_RUBRIC_CRITERIA,
   MEMBERSHIP_ROLES,
   MIN_RUBRIC_CRITERIA,
@@ -26,6 +28,7 @@ import type {
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
+  FileIntake,
   ProcessingEvidence,
   QuarantinedEvidence,
   RetryingEvidence,
@@ -506,3 +509,36 @@ export const upsertRubricDraftInputSchema = z.strictObject({
 });
 
 export type UpsertRubricDraftInput = z.infer<typeof upsertRubricDraftInputSchema>;
+
+// ---- AF-28: secure direct file upload ----
+
+export const fileIntakeSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  intakeId: z.uuid(),
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  storageKey: z.string().min(1),
+  declaredFilename: z.string().min(1),
+  declaredMimeType: z.string().min(1),
+  status: z.enum(FILE_INTAKE_STATUSES),
+  createdByUserId: z.uuid(),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<FileIntake>;
+
+const ALLOWED_FILE_EXTENSION_PATTERN = new RegExp(`\\.(${ALLOWED_FILE_TYPES.join("|")})$`, "iu");
+
+/**
+ * Checks the declared filename's extension against the allowlist -- a
+ * cheap, purely-cosmetic gate on what the client claims, not a security
+ * boundary. AF-29 owns the real boundary: sniffing the uploaded bytes'
+ * actual type once they land, which is the only check a malicious client
+ * can't simply lie past by naming a file resume.pdf.
+ */
+export const requestFileUploadInputSchema = z.strictObject({
+  declaredFilename: z.string().trim().min(1).max(255).regex(ALLOWED_FILE_EXTENSION_PATTERN, {
+    message: `Filename must end in one of: ${ALLOWED_FILE_TYPES.join(", ")}`
+  }),
+  declaredMimeType: z.string().trim().min(1)
+});
+
+export type RequestFileUploadInput = z.infer<typeof requestFileUploadInputSchema>;
