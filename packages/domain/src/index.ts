@@ -1109,9 +1109,20 @@ export interface ApplicationQueueEntry {
 
 export interface ApplicationReviewQueue extends VersionedRecord {
   readonly roleId: string;
+  /**
+   * Counts always describe the whole role, never the filtered view.
+   * AF-47: a filter that also shrinks the totals cannot tell a recruiter
+   * how much it is hiding, and "3 applications" on a filtered screen
+   * reads as "this role has 3 applications". These stay whole so the UI
+   * can honestly say "showing 3 of 12".
+   */
   readonly totalCount: number;
   readonly pendingExtractionCount: number;
   readonly extractedCount: number;
+  /** Which states the caller asked for; empty means "no filter applied". */
+  readonly appliedStates: readonly ApplicationEvidenceState[];
+  /** entries.length, stated explicitly so a truncated response is detectable. */
+  readonly shownCount: number;
   readonly entries: readonly ApplicationQueueEntry[];
 }
 
@@ -1175,7 +1186,8 @@ export function compareApplicationsBySourceOrder(a: Application, b: Application)
 export function buildApplicationReviewQueue(
   roleId: string,
   applications: readonly Application[],
-  runs: readonly EvidenceExtractionRunRef[]
+  runs: readonly EvidenceExtractionRunRef[],
+  states: readonly ApplicationEvidenceState[] = []
 ): ApplicationReviewQueue {
   const runsByApplicationId = new Map<string, string[]>();
   for (const run of runs) {
@@ -1209,12 +1221,90 @@ export function buildApplicationReviewQueue(
       };
     });
 
+  // Filtering happens after the queue is built and after it is ordered,
+  // never as part of either. AF-46's order is a property of the whole
+  // queue, so a filtered view has to be a subsequence of it -- selecting
+  // rows must not be able to reorder the rows it keeps.
+  const requested = new Set(states);
+  const shown = requested.size === 0 ? entries : entries.filter((entry) => requested.has(entry.evidenceState));
+
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     roleId,
     totalCount: entries.length,
     pendingExtractionCount: entries.filter((entry) => entry.evidenceState === "pending_extraction").length,
     extractedCount: entries.filter((entry) => entry.evidenceState === "extracted").length,
-    entries
+    appliedStates: [...requested],
+    shownCount: shown.length,
+    entries: shown
   };
+}
+
+// ---- AF-47: explicit state filters ----
+//
+// "Filter by unreviewed/incomplete/contradiction/error state -- explicit
+// filters, never a hidden ranking."
+//
+// Of the four states the ticket names, exactly one is answerable from
+// data that exists. `unreviewed` is `pending_extraction`: no extraction
+// run has been recorded against the application (AF-40's
+// evidence_extraction_runs). `incomplete`, `contradiction` and `error`
+// are all per-criterion EvidenceOutcome kinds, and nothing persists
+// those -- EvidenceOutcome is a contract type the pipeline returns, with
+// no table behind it. Offering them as filters that quietly match
+// nothing would be worse than not offering them: a recruiter filtering
+// for contradictions and seeing an empty list would reasonably conclude
+// there are none.
+//
+// So the closed set below is the set that can be answered honestly, and
+// the UI shows the other three as unavailable with the reason, rather
+// than hiding them or faking them. When outcomes get a table this set
+// grows; nothing else about the mechanism has to change.
+//
+// The "never a hidden ranking" half is structural, not a promise:
+// filtering is applied to an already-ordered queue as a subsequence, so
+// selecting rows cannot reorder the rows it keeps, and the whole-role
+// counts are computed before filtering so the view can always say how
+// much it is hiding.
+
+export type ApplicationStateFilterParse =
+  | { readonly ok: true; readonly states: readonly ApplicationEvidenceState[] }
+  | { readonly ok: false; readonly unknownValues: readonly string[] };
+
+function isApplicationEvidenceState(value: string): value is ApplicationEvidenceState {
+  return (APPLICATION_EVIDENCE_STATES as readonly string[]).includes(value);
+}
+
+/**
+ * Parses the caller's requested filter, rejecting anything outside the
+ * closed set rather than dropping it.
+ *
+ * Silently ignoring an unrecognised value is how a filter becomes a lie:
+ * `?state=contradiction` would return every application, and the screen
+ * would present the full queue as if it were the contradictions. A
+ * misspelled or not-yet-supported filter has to fail loudly.
+ *
+ * Accepts repeated params and comma-separated values, trims surrounding
+ * whitespace, and treats an entirely absent filter as "no filter" -- but
+ * NOT an explicitly empty one, which is a caller mistake and reported as
+ * such.
+ */
+export function parseApplicationStateFilter(
+  rawValues: readonly string[]
+): ApplicationStateFilterParse {
+  const requested = rawValues
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  const unknownValues = [...new Set(requested.filter((value) => !isApplicationEvidenceState(value)))];
+  if (unknownValues.length > 0) {
+    return { ok: false, unknownValues };
+  }
+  // An explicitly present but empty filter (?state=) is a caller
+  // mistake, not "show everything" -- same distinction AF-14 draws
+  // between a missing and an empty Idempotency-Key header.
+  if (requested.length === 0 && rawValues.length > 0) {
+    return { ok: false, unknownValues: [""] };
+  }
+  return { ok: true, states: [...new Set(requested.filter(isApplicationEvidenceState))] };
 }

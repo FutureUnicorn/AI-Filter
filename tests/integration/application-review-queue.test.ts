@@ -67,15 +67,65 @@ test("counts that do not partition the total are rejected, not passed through to
   );
 });
 
-test("a totalCount that disagrees with the entries it shipped is rejected", () => {
+test("a shownCount that disagrees with the entries it shipped is rejected", () => {
   const queue = buildApplicationReviewQueue(roleId, [application("44444444-4444-4444-8444-444444444444", 1)], []);
   const truncated = { ...queue, entries: [] };
   const parsed = applicationReviewQueueSchema.safeParse(truncated);
   assert.equal(parsed.success, false);
   assert.match(
     parsed.error?.issues.map((issue) => issue.message).join(" ") ?? "",
-    /must match the number of entries/
+    /shownCount must match the number of entries/
   );
+});
+
+test("an unfiltered queue that hides applications it counted is rejected", () => {
+  // AF-47: with no filter applied there is nothing that could legitimately
+  // shrink the view, so shownCount < totalCount means entries were lost
+  // somewhere between the database and the response.
+  const queue = buildApplicationReviewQueue(roleId, [
+    application("44444444-4444-4444-8444-444444444444", 1),
+    application("55555555-5555-4555-8555-555555555555", 2)
+  ], []);
+  const lossy = { ...queue, shownCount: 1, entries: queue.entries.slice(0, 1) };
+  const parsed = applicationReviewQueueSchema.safeParse(lossy);
+  assert.equal(parsed.success, false);
+  assert.match(
+    parsed.error?.issues.map((issue) => issue.message).join(" ") ?? "",
+    /unfiltered queue must show every application it counted/
+  );
+});
+
+test("an entry that does not match the applied filter is rejected", () => {
+  // The filter has to actually be what was applied. A response claiming
+  // appliedStates: ["extracted"] while shipping a pending application is
+  // mislabelling its own contents.
+  const queue = buildApplicationReviewQueue(roleId, [application("44444444-4444-4444-8444-444444444444", 1)], []);
+  const mislabelled = { ...queue, appliedStates: ["extracted"], shownCount: 1 };
+  const parsed = applicationReviewQueueSchema.safeParse(mislabelled);
+  assert.equal(parsed.success, false);
+  assert.match(
+    parsed.error?.issues.map((issue) => issue.message).join(" ") ?? "",
+    /must match one of the applied state filters/
+  );
+});
+
+test("a filtered queue satisfies the contract", () => {
+  const queue = buildApplicationReviewQueue(
+    roleId,
+    [application("44444444-4444-4444-8444-444444444444", 1), application("55555555-5555-4555-8555-555555555555", 2)],
+    [
+      {
+        entityType: "application",
+        entityId: "44444444-4444-4444-8444-444444444444",
+        createdAt: "2026-08-29T13:00:00.000Z"
+      }
+    ],
+    ["extracted"]
+  );
+  assert.equal(queue.shownCount, 1);
+  assert.equal(queue.totalCount, 2);
+  const parsed = applicationReviewQueueSchema.safeParse(queue);
+  assert.ok(parsed.success, JSON.stringify(parsed.error?.issues));
 });
 
 test("an unknown evidence state is rejected rather than rendered as an empty cell", () => {

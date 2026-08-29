@@ -654,11 +654,26 @@ export const applicationReviewQueueSchema = z
     totalCount: z.number().int().min(0),
     pendingExtractionCount: z.number().int().min(0),
     extractedCount: z.number().int().min(0),
+    appliedStates: z.array(z.enum(APPLICATION_EVIDENCE_STATES)),
+    shownCount: z.number().int().min(0),
     entries: z.array(applicationQueueEntrySchema)
   })
   .refine((queue) => queue.pendingExtractionCount + queue.extractedCount === queue.totalCount, {
     message: "pendingExtractionCount and extractedCount must sum to totalCount"
   })
-  .refine((queue) => queue.entries.length === queue.totalCount, {
-    message: "totalCount must match the number of entries returned"
+  .refine((queue) => queue.entries.length === queue.shownCount, {
+    message: "shownCount must match the number of entries returned"
+  })
+  .refine((queue) => queue.shownCount <= queue.totalCount, {
+    message: "shownCount cannot exceed totalCount"
+  })
+  .refine((queue) => queue.appliedStates.length > 0 || queue.shownCount === queue.totalCount, {
+    message: "an unfiltered queue must show every application it counted"
+  })
+  .refine(
+    (queue) => queue.entries.every((entry) => queue.appliedStates.length === 0 || queue.appliedStates.includes(entry.evidenceState)),
+    { message: "every entry returned must match one of the applied state filters" }
+  )
+  .refine((queue) => new Set(queue.appliedStates).size === queue.appliedStates.length, {
+    message: "appliedStates must not repeat a state"
   });
