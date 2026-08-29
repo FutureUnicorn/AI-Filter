@@ -43,7 +43,14 @@ export interface OpenAiResponsesClient {
           strict: true;
         };
       };
-    }): Promise<{ output_text: string }>;
+      /** Provider-side retention. Always sent explicitly; see the call site. */
+      store: boolean;
+    }): Promise<{
+      output_text: string;
+      /** The model that actually served the request, which can differ
+       * from the requested one when that is a movable alias. */
+      model?: string | undefined;
+    }>;
   };
 }
 
@@ -68,12 +75,33 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
-          text: params.text
+          text: params.text,
+          store: params.store
         });
-        return { output_text: response.output_text };
+        // response.model is the model that actually served the call.
+        // Discarding it made records produced by different revisions of
+        // a movable alias indistinguishable after the alias moved.
+        return { output_text: response.output_text, model: response.model };
       }
     }
   };
+}
+
+/**
+ * The call reached the provider and completed, but `output_text` was not
+ * valid JSON (a structured-output refusal, a truncated response, an
+ * empty body). Carries the call's metadata so the caller can still
+ * record that the call happened -- and, once AF-41 adds token counts,
+ * what it cost -- rather than losing every trace of it to a throw.
+ */
+export class AiStructuredCallParseError extends Error {
+  readonly metadata: AiCallMetadata;
+
+  constructor(metadata: AiCallMetadata, cause: unknown) {
+    super(`Structured output for schema ${metadata.schemaName} was not valid JSON.`, { cause });
+    this.name = "AiStructuredCallParseError";
+    this.metadata = metadata;
+  }
 }
 
 export function createOpenAiAdapter(
@@ -97,17 +125,37 @@ export function createOpenAiAdapter(
             schema: input.jsonSchema,
             strict: true
           }
-        }
+        },
+        // The structured output carries verbatim quotes from candidate
+        // documents. The Responses API retains response objects by
+        // default, so omitting this silently created a provider-side
+        // copy of candidate material on every successful call. Opt out
+        // explicitly; retention must be a deliberate decision, not the
+        // consequence of leaving a parameter off.
+        store: false
       });
 
-      const output: unknown = JSON.parse(response.output_text);
+      // Built BEFORE parsing. A refusal, truncation or empty body is
+      // still a call that happened and was billed; constructing metadata
+      // afterwards meant JSON.parse threw first and the caller received
+      // no provider/model/prompt/schema information at all, defeating
+      // the requirement to record metadata on every call and leaving
+      // AF-40 unable to audit failed ones.
       const metadata: AiCallMetadata = {
         provider: "openai",
         model: config.model,
+        ...(response.model === undefined ? {} : { resolvedModel: response.model }),
         promptVersion: input.promptVersion,
         schemaVersion: input.schemaVersion,
         schemaName: input.schemaName
       };
+
+      let output: unknown;
+      try {
+        output = JSON.parse(response.output_text);
+      } catch (cause) {
+        throw new AiStructuredCallParseError(metadata, cause);
+      }
       return { output, metadata };
     }
   };
