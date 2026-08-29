@@ -69,7 +69,7 @@ pnpm dev:worker          # run the credential-free worker shell
 pnpm lint
 pnpm typecheck
 pnpm test:unit           # deterministic Python citation-validation tests
-pnpm test:integration    # credential-free worker/domain boundary test
+pnpm test:integration    # requires SIGNAL_AUDIT_RLS_DATABASE_URL; see below
 pnpm test                # unit and integration suites
 pnpm check:architecture
 pnpm build
@@ -95,6 +95,25 @@ Return the local database and storage to the known synthetic state with
 Preview, staging, production-shaped validation, secrets, cleanup, cost controls,
 and administrator-audit requirements are documented in
 [`docs/engineering/environments.md`](docs/engineering/environments.md).
+
+### Running `test:integration` locally
+
+`tests/integration/cross-tenant-access.test.ts` exercises the real memberships
+RLS policy (`packages/db/migrations/0004_tenant_scoped_rls.sql`) against a
+real, disposable Postgres schema -- it needs `SIGNAL_AUDIT_RLS_DATABASE_URL`
+set to any reachable Postgres connection string. The same local Postgres
+`pnpm dev:infra` already starts works: it creates its own throwaway schema
+inside whatever database you point it at, so pointing it at your local dev
+database is safe.
+
+```bash
+pnpm dev:infra
+SIGNAL_AUDIT_RLS_DATABASE_URL=postgresql://signal_audit_local:local-only-password@localhost:5432/signal_audit_local \
+  pnpm test:integration
+```
+
+CI's integration job sets this the same way against its own disposable
+database service.
 
 ## Continuous integration
 
