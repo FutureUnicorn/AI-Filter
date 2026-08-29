@@ -93,6 +93,9 @@ importers:
       openai:
         specifier: 7.5.0
         version: 7.5.0(@aws-sdk/credential-provider-node@3.972.80)(@smithy/signature-v4@5.7.2)(zod@4.4.3)
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
   packages/config:
     dependencies:

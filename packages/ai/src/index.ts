@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { z } from "zod";
 
 import type { BoundaryContract } from "@signal-audit/contracts";
 import type {
@@ -168,3 +169,106 @@ export function createOpenAiAdapter(
     }
   };
 }
+
+// ---- AF-35: factual extraction structured-output schema ----
+//
+// The states a model is actually asked to choose between when
+// extracting evidence for one criterion against one document. This is
+// a deliberate subset of packages/domain's EvidenceOutcome kinds
+// (AF-13): only the ones a model can genuinely decide from the text.
+// citation_invalid is assigned by the system after AF-38 checks the
+// quote against the source, and extraction_error/quarantined/
+// processing/retrying/invalid_source/unsupported_file/failed are
+// pipeline states that have nothing to do with what the model itself
+// returned. Excluding them from the model-facing schema is the point:
+// a model cannot self-report "the citation validator will reject me."
+
+export const EVIDENCE_EXTRACTION_SCHEMA_NAME = "evidence_response";
+export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "1.0.0";
+
+export const EVIDENCE_EXTRACTION_STATES = [
+  "supported",
+  "partially_supported",
+  "contradicted",
+  "not_found",
+  "unclear"
+] as const;
+
+export type EvidenceExtractionState = (typeof EVIDENCE_EXTRACTION_STATES)[number];
+
+/**
+ * Strict JSON Schema for OpenAI's `text.format` structured-output
+ * parameter (AF-34's adapter passes this straight through as
+ * `jsonSchema`). `additionalProperties: false` and every property
+ * listed in `required` everywhere, including nested objects, because
+ * OpenAI's strict mode requires both.
+ */
+export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["items"],
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["criterion_id", "state", "quote", "source"],
+        properties: {
+          criterion_id: { type: "string", minLength: 1 },
+          state: { type: "string", enum: EVIDENCE_EXTRACTION_STATES },
+          quote: {
+            type: "string",
+            description:
+              "Exact verbatim substring copied from the source document. Empty string only when state is not_found."
+          },
+          source: {
+            type: "object",
+            additionalProperties: false,
+            required: ["document", "page_or_section", "offset"],
+            properties: {
+              document: { type: "string" },
+              page_or_section: { type: "string" },
+              offset: { type: "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+/**
+ * Runtime validator for the model's raw (not-yet-trusted) output. This
+ * is intentionally separate from packages/contracts' versioned
+ * EvidenceOutcome schemas (AF-13): it validates an intermediate,
+ * model-facing shape, not the system's own persisted contract. AF-36
+ * owns mapping a validated item here into a real EvidenceOutcome.
+ */
+export const evidenceExtractionItemSchema = z
+  .strictObject({
+    criterion_id: z.string().min(1),
+    state: z.enum(EVIDENCE_EXTRACTION_STATES),
+    quote: z.string(),
+    source: z.strictObject({
+      document: z.string().min(1),
+      page_or_section: z.string(),
+      offset: z.number().int()
+    })
+  })
+  .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.trim().length > 0), {
+    message: "quote must be empty only when state is not_found, and citing quotes must contain non-whitespace",
+    path: ["quote"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.page_or_section.trim().length > 0, {
+    message: "citing states require a nonempty page_or_section",
+    path: ["source", "page_or_section"]
+  })
+  .refine((item) => item.state === "not_found" || item.source.offset >= 0, {
+    message: "citing states require a nonnegative offset",
+    path: ["source", "offset"]
+  });
+
+export const evidenceExtractionResponseSchema = z.strictObject({
+  items: z.array(evidenceExtractionItemSchema)
+});
