@@ -2317,6 +2317,122 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-66: support-access logging ----
+//
+// "Any time a founder/operator looks at a specific tenant's data for
+// support reasons, it's logged with a reason -- least-privilege, not
+// silent access."
+//
+// The load-bearing word is "any", and it is what makes this a
+// fail-closed authorization decision rather than a logging feature. A
+// log written on a best-effort basis after the read has happened does
+// not support the claim: every time the write failed, the access would
+// be silent. So authorizeSupportAccess denies unless a live grant is
+// produced, and the caller has nothing to pass that means "I looked
+// already".
+//
+// Support access is deliberately NOT a membership. Granting an operator
+// a membership row would work and would be wrong in a way that is hard
+// to undo -- the operator would become indistinguishable from the
+// customer's own staff in every capability check, audit event and RLS
+// policy. Nothing here consults memberships, and a support grant confers
+// no capability: it authorises looking, and only at the tenant named.
+
+export type SupportAccessDenialReason =
+  | "no_grant"
+  | "grant_expired"
+  | "grant_revoked"
+  | "grant_for_other_organization"
+  | "grant_for_other_operator";
+
+export interface SupportAccessGrant {
+  readonly grantId: string;
+  readonly organizationId: string;
+  readonly operatorUserId: string;
+  readonly reason: string;
+  readonly grantedByUserId: string;
+  readonly grantedAt: string;
+  readonly expiresAt: string;
+  readonly revokedAt?: string | undefined;
+}
+
+export interface SupportAccessRequest {
+  readonly organizationId: string;
+  readonly operatorUserId: string;
+  readonly entityType: string;
+  readonly entityId: string;
+}
+
+export type SupportAccessDecision =
+  | { readonly allowed: true; readonly grantId: string }
+  | { readonly allowed: false; readonly denialReason: SupportAccessDenialReason };
+
+/**
+ * The longest a single grant may run. Renewal is a new grant, which
+ * means a new reason and a new authoriser -- an extension would let one
+ * decision made once cover an arbitrarily long period.
+ */
+export const SUPPORT_ACCESS_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Fail-closed by construction: every path that is not an explicit,
+ * live, matching grant returns a denial. The denial reasons are a closed
+ * set because "why was I denied" is a question an operator will ask at
+ * 3am, and free text cannot be branched on or counted.
+ *
+ * `now` is passed rather than read, so a decision is reproducible and a
+ * test can sit exactly on an expiry boundary.
+ */
+export function authorizeSupportAccess(
+  grant: SupportAccessGrant | undefined,
+  request: SupportAccessRequest,
+  now: Date
+): SupportAccessDecision {
+  if (grant === undefined) {
+    return { allowed: false, denialReason: "no_grant" };
+  }
+  if (grant.organizationId !== request.organizationId) {
+    // Checked before expiry so that a stale grant for tenant A can never
+    // be reported as merely "expired" when it was also the wrong tenant.
+    return { allowed: false, denialReason: "grant_for_other_organization" };
+  }
+  if (grant.operatorUserId !== request.operatorUserId) {
+    return { allowed: false, denialReason: "grant_for_other_operator" };
+  }
+  if (grant.revokedAt !== undefined && Date.parse(grant.revokedAt) <= now.getTime()) {
+    return { allowed: false, denialReason: "grant_revoked" };
+  }
+  // <= rather than <: a grant is dead at its expiry instant, not one
+  // millisecond after. The boundary is the case someone will test.
+  if (Date.parse(grant.expiresAt) <= now.getTime()) {
+    return { allowed: false, denialReason: "grant_expired" };
+  }
+  return { allowed: true, grantId: grant.grantId };
+}
+
+/**
+ * A grant's reason is free text an operator typed, and it is retained.
+ * "Looking at Jane Doe's stuck upload" is the natural thing to write,
+ * which would quietly make the support log a candidate-data store --
+ * and one that outlives retention, since it is an audit record.
+ *
+ * Redacting at the boundary keeps the support log free of candidate
+ * content, which is what lets it be classified as holding none and
+ * retained as an audit trail. The redaction runs BEFORE storage rather
+ * than at read time, because a value that was never written cannot leak
+ * from a backup, a replica or a log shipper.
+ */
+export function prepareSupportAccessReason(reason: string, redact: (value: string) => string): string {
+  const redacted = redact(reason);
+  if (!/[^\s]/u.test(redacted)) {
+    // Mirrors 0022's CHECK. Rejected rather than defaulted: a support
+    // access whose stated reason is blank is exactly the silent access
+    // this ticket exists to prevent, wearing a row.
+    throw new Error("a support access reason must contain at least one non-whitespace character");
+  }
+  return redacted;
+}
+
 // ---- AF-63: deletion reconciliation ----
 //
 // "Scheduled job confirms every store that should be empty actually is;
@@ -2391,8 +2507,36 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "audit_samples",
   "audit_sample_members",
   "review_timing_spans",
-  "af11_synthetic_environment_fixture"
+  "af11_synthetic_environment_fixture",
+  // AF-66. These hold operator activity, not candidate content: the
+  // grant's reason is redacted through redactPii before storage
+  // (prepareSupportAccessReason) precisely so this classification is
+  // true, and entity_id is an identifier rather than candidate text --
+  // the same basis on which audit_events is exempt. If the redaction
+  // were ever removed, this exemption would become false, which is why
+  // the two are documented together.
+  "support_access_grants",
+  "support_access_events"
 ]);
+
+export type RetentionClassification = "planned" | "exempt" | "unclassified";
+
+/**
+ * Whether the retention plan accounts for a table at all.
+ *
+ * Exported so the architecture suite can assert that every table any
+ * migration creates is classified one way or the other. AF-63 catches an
+ * unclassified table at runtime, which is the right backstop but a slow
+ * one -- it needs a database, a scheduled run and someone reading the
+ * report. This makes the same omission fail at build time, when the
+ * person adding the table is still holding it.
+ */
+export function classifyRetentionTable(table: string): RetentionClassification {
+  if (RETENTION_SURFACES.some((surface) => surface === table)) {
+    return "planned";
+  }
+  return RETENTION_EXEMPT_TABLES.has(table) ? "exempt" : "unclassified";
+}
 
 export function reconcileRetention(
   plan: RetentionPlan,
