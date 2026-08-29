@@ -4374,3 +4374,217 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-63: observe what retention actually left behind ----
+
+/**
+ * Counts candidate-data rows older than the cutoff, and lists every table
+ * in the schema.
+ *
+ * The table listing is the part that matters. A reconciliation job driven
+ * only by a hand-maintained surface list inherits the blind spot of that
+ * list: a migration adding a table full of candidate text would be
+ * invisible to it, and the job would report all clear. Reading
+ * information_schema instead means a new table shows up as unclassified
+ * the first time this runs, which is a nuisance rather than a leak, and
+ * is the correct direction to fail in.
+ *
+ * canonical_text_extractions and import_rows carry no organization_id of
+ * their own, so they are scoped through file_intakes rather than counted
+ * globally -- counting them across tenants would make one noisy tenant
+ * look like everyone's problem.
+ */
+export async function observeRetentionResidue(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  cutoff: string
+): Promise<{ rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+
+    const tables = await client.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+        ORDER BY table_name`,
+      [schema]
+    );
+    const observedTables = tables.rows.map((row) => row.table_name);
+
+    // Only count surfaces that actually exist in this schema: the probe
+    // schemas used by other tests apply a subset of migrations, and a
+    // missing table there is not residue.
+    const present = new Set(observedTables);
+    const counts: Record<string, number> = {};
+    const scoped: ReadonlyArray<readonly [string, string]> = [
+      ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "canonical_text_extractions",
+        `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+           JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+          WHERE fi.organization_id = $1 AND cte.created_at <= $2`
+      ],
+      [
+        "import_rows",
+        `SELECT count(*) FROM "${schema}".import_rows ir
+           JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+          WHERE fi.organization_id = $1 AND ir.created_at <= $2`
+      ],
+      ["applications", `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "evidence_outcomes",
+        `SELECT count(*) FROM "${schema}".evidence_outcomes WHERE organization_id = $1 AND recorded_at <= $2`
+      ],
+      [
+        "candidate_decisions",
+        `SELECT count(*) FROM "${schema}".candidate_decisions WHERE organization_id = $1 AND decided_at <= $2`
+      ]
+    ];
+
+    for (const [surface, sql] of scoped) {
+      if (!present.has(surface)) {
+        continue;
+      }
+      const result = await client.query<{ count: string }>(sql, [organizationId, cutoff]);
+      const raw = result.rows[0]?.count ?? "0";
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        // count(*) is bigint and arrives as a string; Number() on a
+        // malformed value would yield NaN and quietly read as "no residue".
+        throw new Error(`observeRetentionResidue: ${surface} count is not a safe integer, got: ${raw}`);
+      }
+      counts[surface] = parsed;
+    }
+
+    return { rowsPastCutoffBySurface: counts, observedTables };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Builds a schema that exercises every claim AF-63's reconciliation
+ * makes, and returns the observations for tenant A.
+ *
+ * Lives here rather than in the test because `pg` is a packages/db
+ * dependency and the tests root has no database client of its own --
+ * the same reason assertMembershipsTenantIsolation and
+ * assertFailedDocumentRateAccuracy are shaped this way.
+ *
+ * The fixture deliberately includes a table created BEHIND the retention
+ * plan's back. If observeRetentionResidue read a hand-maintained list
+ * rather than information_schema, that table would be invisible and the
+ * job would report all clear while candidate text sat in it.
+ */
+export async function probeRetentionReconciliation(
+  databaseUrl: string,
+  cutoff: string
+): Promise<{
+  residue: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  residueBeforeAnyData: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  organizationId: string;
+}> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const roleB = "77777777-7777-4777-8777-777777777777";
+  const intakeA = "55555555-5555-4555-8555-555555555555";
+  const intakeB = "88888888-8888-4888-8888-888888888888";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `recon_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
+       VALUES ($1,$2,'Eng',$5), ($3,$4,'B role',$5)`,
+      [roleA, orgA, roleB, orgB, userId]
+    );
+
+    // Baseline: the plan's surfaces exist but hold nothing for tenant A.
+    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
+
+    // Tenant A's undeleted candidate data.
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+      [intakeA, orgA, roleA, `key-a-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1,'[{"text":"Jane Doe"}]'::jsonb,1,'full')`,
+      [intakeA]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, orgA, roleA, intakeA]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ('66666666-6666-4666-8666-666666666666',$1,$2,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe"}}'::jsonb)`,
+      [orgA, applicationId]
+    );
+
+    // Tenant B's data, which must not be counted against tenant A --
+    // canonical_text_extractions carries no organization_id of its own.
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Other.pdf','application/pdf','validated',$5)`,
+      [intakeB, orgB, roleB, `key-b-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1,'[{"text":"someone else"}]'::jsonb,1,'full')`,
+      [intakeB]
+    );
+
+    // A table the retention plan knows nothing about.
+    await admin.query(
+      `CREATE TABLE "${schema}".recruiter_scratch_notes (
+         note_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+         candidate_note text NOT NULL,
+         created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+       )`
+    );
+    await admin.query(`INSERT INTO "${schema}".recruiter_scratch_notes (candidate_note) VALUES ('Jane seemed strong')`);
+
+    const residue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
+    return { residue, residueBeforeAnyData, organizationId: orgA };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
