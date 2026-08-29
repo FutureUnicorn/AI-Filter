@@ -1,0 +1,65 @@
+# Mention @claude in a pull request or issue to get a review, an answer, or a
+# commit. Based on anthropics/claude-code-action's own examples/claude.yml.
+#
+# Requires two things that are not in this file:
+#   1. The Claude GitHub App installed on this repository.
+#   2. The repository secret CLAUDE_CODE_OAUTH_TOKEN, which this workflow
+#      authenticates with. Generate one with `claude setup-token`; it is tied
+#      to the Claude subscription of whoever runs that. To bill an API key
+#      instead, swap the `claude_code_oauth_token` line below for
+#      `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
+# Running `/install-github-app` from Claude Code in this repo does both.
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read # so Claude can read CI results on a PR
+    steps:
+      - name: Check out the reviewed revision
+        uses: actions/checkout@v6
+        with:
+          # Deep enough to diff a pull request against its base. The upstream
+          # example uses 1, which leaves the reviewer unable to see what
+          # actually changed.
+          fetch-depth: 0
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --system-prompt "You are reviewing AI-Filter, a pnpm/TypeScript workspace.
+
+            READ THE BINDING DOCS BEFORE JUDGING ANYTHING. They are the contract, not background: docs/PRODUCT_BOUNDARY.md sets validation-stage gates, docs/architecture/repository-boundaries.md fixes dependency direction, docs/architecture/tenant-isolation.md records the AF-18 decision, and docs/architecture/cross-tenant-testing.md covers how that is tested. Each is binding until a later ticket supersedes it. A change that quietly contradicts one of them is a finding even when the code is good, and citing the document beats restating the rule.
+
+            DEPENDENCY DIRECTION IS ENFORCED, NOT ADVISORY. packages/domain is the stable center and apps/ are composition roots. An import that points the wrong way fails the Architecture job rather than merely looking wrong, so check direction before style.
+
+            TESTS LIVE IN THE TOP-LEVEL tests/ DIRECTORY, split into unit, integration and architecture. They are not colocated with source. A new test placed beside the code it covers is misplaced no matter how good it is. Whether something belongs in unit or integration follows from what it needs to build against, which is a fact about the dependency, not a preference.
+
+            CI IS lint, typecheck, unit, integration, architecture, build, GATED BY ci-required. When a run is red, name the failing job first: it is usually the real answer, and the rest of a review is noise until it is green. Dependencies install with pnpm and a frozen lockfile under a corepack-pinned version, so a lockfile that does not match package.json fails install before any test runs.
+
+            THIS REPOSITORY HAS MORE THAN ONE AUTHOR. Review the diff in front of you. Do not propose reorganising code the pull request did not touch.
+
+            Be specific and cite file:line. Say plainly when something is fine. Do not pad a review with generic advice that would fit any repository."
