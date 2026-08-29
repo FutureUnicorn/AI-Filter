@@ -1,4 +1,9 @@
-import { buildApiError, evidenceOutcomeSchema, generateRequestId, withRequestId } from "@signal-audit/contracts";
+import {
+  buildApiError,
+  generateRequestId,
+  recordEvidenceCorrectionInputSchema,
+  withRequestId
+} from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
   correctEvidenceOutcome,
@@ -9,7 +14,7 @@ import {
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
-import { z } from "zod";
+import type { z } from "zod";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,11 +22,6 @@ export const runtime = "nodejs";
 interface RouteContext {
   readonly params: Promise<{ roleId: string; applicationId: string; criterionId: string }>;
 }
-
-const correctionInputSchema = z.strictObject({
-  outcome: evidenceOutcomeSchema,
-  reason: z.string().min(1)
-});
 
 /**
  * AF-49: record a recruiter's correction. Always an append -- the
@@ -37,6 +37,13 @@ const correctionInputSchema = z.strictObject({
  * contract before it reaches the database, so a correction cannot
  * introduce a shape the pipeline itself could not have produced -- a
  * hand-written outcome is still an outcome.
+ *
+ * AF-50: the reason is checked with the same predicate 0018 enforces,
+ * so "   " is a 400 here rather than a constraint violation surfacing as
+ * a 500 later. The actor is never taken from the request at all -- it is
+ * the session's own userId, so a caller cannot attribute a correction to
+ * someone else, and 0018's membership foreign key means that user must
+ * actually belong to the organization whose evidence they are changing.
  */
 export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
@@ -47,14 +54,14 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
 
-  let parsedBody: z.infer<typeof correctionInputSchema>;
+  let parsedBody: z.infer<typeof recordEvidenceCorrectionInputSchema>;
   try {
-    parsedBody = correctionInputSchema.parse(await request.json());
+    parsedBody = recordEvidenceCorrectionInputSchema.parse(await request.json());
   } catch {
     const error = buildApiError({
       requestId,
       code: "invalid_request",
-      message: "A correction needs a valid evidence outcome and a non-empty reason."
+      message: "A correction needs a valid evidence outcome and a reason containing at least one non-whitespace character."
     });
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }

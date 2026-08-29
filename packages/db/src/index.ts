@@ -2820,7 +2820,8 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
       "0012_file_intakes.sql",
       "0015_applications_and_import_finalization.sql",
       "0016_evidence_outcomes.sql",
-      "0017_evidence_corrections.sql"
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
     }
@@ -2834,6 +2835,14 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
     if (userId === undefined) {
       throw new Error("probe could not create a user");
     }
+    // AF-50: the corrector must be a member of the organization whose
+    // evidence they correct (0018's membership foreign key), so the
+    // probe has to create one. That this line is required is itself the
+    // constraint working.
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
     const role = await admin.query<{ role_id: string }>(
       `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
       [organizationId, userId]
@@ -2986,7 +2995,65 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
       throw new Error("the original must survive alongside whatever corrections were recorded");
     }
 
-    // 5. Nothing edits or erases a correction either.
+    // 5. AF-50: a reason must say something, and the person must have
+    //    standing. Every attempt uses its own primary key, because a
+    //    shared one lets a duplicate-key error masquerade as the
+    //    constraint under test -- which is exactly what happened the
+    //    first time these were checked by hand.
+    const outsider = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Outsider') RETURNING user_id`,
+      [`outsider_${suffix}@acme.test`]
+    );
+    const outsiderId = outsider.rows[0]?.user_id;
+    const headRow = await admin.query<{ evidence_outcome_id: string }>(
+      `SELECT evidence_outcome_id FROM evidence_outcomes WHERE criterion_id = 'postgres' ORDER BY recorded_at DESC LIMIT 1`
+    );
+    const headId = headRow.rows[0]?.evidence_outcome_id;
+    if (outsiderId === undefined || headId === undefined) {
+      throw new Error("probe could not set up the attribution cases");
+    }
+
+    const attributionCases: Array<[string, string, string | null]> = [
+      ["a spaces-only reason", userId, "   "],
+      ["an empty reason", userId, ""],
+      ["a tab-and-newline-only reason", userId, "\t\n "],
+      ["a corrector with no membership in this organization", outsiderId, "a real reason"]
+    ];
+    for (const [label, corrector, reason] of attributionCases) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO evidence_outcomes
+             (organization_id, application_id, criterion_id, kind, outcome,
+              corrected_by_user_id, correction_reason, supersedes_evidence_outcome_id)
+           VALUES ($1, $2, 'postgres', 'not_found', $3::jsonb, $4, $5, $6)`,
+          [organizationId, applicationId, JSON.stringify(outcomeOf("not_found", "postgres")), corrector, reason, headId]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`${label} must not be accepted as a correction`);
+      }
+    }
+
+    // 6. And the membership that attributes a correction cannot be
+    //    deleted out from under it -- offboarding must not orphan the
+    //    record of what someone changed.
+    let membershipDeleteRefused = false;
+    try {
+      await admin.query(`DELETE FROM memberships WHERE user_id = $1 AND organization_id = $2`, [
+        userId,
+        organizationId
+      ]);
+    } catch {
+      membershipDeleteRefused = true;
+    }
+    if (!membershipDeleteRefused) {
+      throw new Error("deleting the membership that attributes a correction must be refused");
+    }
+
+    // 7. Nothing edits or erases a correction either.
     for (const statement of [
       `UPDATE evidence_outcomes SET correction_reason = 'rewritten'`,
       `DELETE FROM evidence_outcomes`

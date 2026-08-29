@@ -1553,7 +1553,19 @@ export function buildCorrectedEvidenceCard(
   head: EvidenceRevision
 ): EvidenceCard {
   const card = buildEvidenceCard(head.outcome, head.recordedAt);
-  if (head.correctedByUserId === undefined || head.supersedesEvidenceOutcomeId === undefined) {
+  // AF-50: all three of who, why and what-it-replaced, or this is not
+  // reported as a correction at all. 0017 and 0018 make a partial one
+  // unrepresentable in the database, so reaching here means an
+  // incomplete read -- and a card that says "corrected" while unable to
+  // say by whom or why is exactly the unanswerable audit answer those
+  // constraints exist to prevent. Previously `reason` defaulted to ""
+  // here, which produced that card.
+  if (
+    head.correctedByUserId === undefined ||
+    head.supersedesEvidenceOutcomeId === undefined ||
+    head.correctionReason === undefined ||
+    !/\S/u.test(head.correctionReason)
+  ) {
     return card;
   }
   const previous = revisions.find(
@@ -1572,7 +1584,7 @@ export function buildCorrectedEvidenceCard(
     ...card,
     correction: {
       correctedByUserId: head.correctedByUserId,
-      reason: head.correctionReason ?? "",
+      reason: head.correctionReason,
       correctedAt: head.recordedAt,
       previousKind: previousCard.kind,
       previousCitations: previousCard.citations

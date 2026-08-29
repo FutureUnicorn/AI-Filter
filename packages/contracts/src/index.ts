@@ -677,3 +677,33 @@ export const applicationReviewQueueSchema = z
   .refine((queue) => new Set(queue.appliedStates).size === queue.appliedStates.length, {
     message: "appliedStates must not repeat a state"
   });
+
+// ---- AF-50: require correction reason and actor ----
+
+/**
+ * Mirrors 0018's CHECK exactly: a reason must contain at least one
+ * character that is not whitespace.
+ *
+ * Deliberately not `.min(1)`, which accepts "   ", and deliberately not
+ * `.trim().min(1)` either -- JavaScript's String.trim strips the full
+ * Unicode whitespace set while Postgres's trim() strips spaces only, so
+ * that pairing would make the two layers disagree in a direction the
+ * database is looser. Asking both "does this contain a non-whitespace
+ * character" makes them the same question.
+ *
+ * Verified against Postgres 17 rather than assumed: JS /\S/u and
+ * `~ '[^[:space:]]'` agree on U+00A0 (both whitespace), U+3000 (both
+ * whitespace) and U+200B (both non-whitespace). That last one is a
+ * shared gap, not a divergence -- a reason of a single zero-width space
+ * satisfies both. Left alone on purpose: closing it in TypeScript only
+ * would break the mirror this schema exists to maintain, and there is a
+ * test asserting the two layers still agree.
+ */
+export const correctionReasonSchema = z
+  .string()
+  .refine((value) => /\S/u.test(value), "must contain at least one non-whitespace character");
+
+export const recordEvidenceCorrectionInputSchema = z.strictObject({
+  outcome: evidenceOutcomeSchema,
+  reason: correctionReasonSchema
+});
