@@ -106,6 +106,9 @@ test("insufficient_capability maps to forbidden, and names the actual role", () 
 });
 
 test("authorized yields no error response", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, "req_x");
+  const response = resourceAuthorizationErrorResponse(
+    { outcome: "authorized", role: "owner" },
+    generateRequestId()
+  );
   assert.equal(response, undefined);
 });
