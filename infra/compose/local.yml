@@ -1,0 +1,11 @@
+services:
+  postgres:
+    networks: [private, public]
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+
+  storage:
+    networks: [private, public]
+    ports:
+      - "127.0.0.1:${STORAGE_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${STORAGE_CONSOLE_HOST_PORT:-9001}:9001"

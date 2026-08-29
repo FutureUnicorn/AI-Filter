@@ -1,0 +1,47 @@
+{
+  "name": "signal-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "corepack pnpm run dev:web",
+    "dev:web": "corepack pnpm run build:packages && node scripts/environment/dev.mjs web",
+    "dev:worker": "corepack pnpm run build:packages && node scripts/environment/dev.mjs worker",
+    "dev:infra": "node scripts/environment/cli.mjs local up",
+    "dev:infra:down": "node scripts/environment/cli.mjs local down",
+    "dev:reset": "node scripts/environment/cli.mjs local reset",
+    "db:migrate": "node scripts/environment/cli.mjs local migrate",
+    "db:seed": "node scripts/environment/cli.mjs local seed",
+    "env:smoke": "corepack pnpm run build:packages && node --env-file-if-exists=.env.local scripts/environment/smoke.mjs",
+    "preview:up": "node scripts/environment/cli.mjs preview up",
+    "preview:down": "node scripts/environment/cli.mjs preview down",
+    "preview:sweep": "node scripts/environment/cli.mjs preview sweep",
+    "lint": "eslint .",
+    "build:packages": "corepack pnpm --filter \"./packages/**\" -r build",
+    "typecheck": "corepack pnpm run build:packages && corepack pnpm -r --if-present typecheck && corepack pnpm run typecheck:tests",
+    "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit",
+    "test": "corepack pnpm run test:unit && corepack pnpm run test:integration",
+    "test:unit": "corepack pnpm run test:unit:ts && corepack pnpm run test:python",
+    "test:unit:ts": "node --test tests/unit/environment-config.test.ts tests/unit/environment-model.test.ts tests/unit/evidence-outcome-domain.test.ts tests/unit/organization-user-membership-domain.test.ts tests/unit/role-capabilities.test.ts",
+    "test:integration": "corepack pnpm run build:packages && node --test tests/integration/worker.test.ts tests/integration/environment-policy.test.ts tests/integration/evidence-outcome-contracts.test.ts tests/integration/api-conventions.test.ts tests/integration/organization-user-membership-contracts.test.ts tests/integration/magic-link-contracts.test.ts tests/integration/magic-link-security.test.ts tests/integration/resource-authorization.test.ts tests/integration/audit-event-contracts.test.ts tests/integration/pii-safe-logging.test.ts tests/integration/cross-tenant-access.test.ts tests/integration/openai-adapter.test.ts tests/integration/evidence-extraction-schema.test.ts tests/integration/rubric-to-evidence-mapping.test.ts",
+    "test:architecture": "node --test tests/architecture/workspace-structure.test.ts tests/architecture/ci-policy.test.ts tests/architecture/test-registration.test.ts",
+    "test:ts": "corepack pnpm run test:architecture && corepack pnpm run test:integration",
+    "test:python": "uv run --locked --cache-dir .cache/uv pytest -q tests/test_validate_citations.py",
+    "check:architecture": "depcruise --config dependency-cruiser.config.cjs apps packages && node tests/architecture/check-workspace-boundaries.mjs && corepack pnpm run test:architecture",
+    "build": "corepack pnpm -r --if-present build",
+    "check": "corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm check:architecture && corepack pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.10.1",
+    "dependency-cruiser": "18.2.0",
+    "eslint": "10.8.1",
+    "globals": "17.11.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0"
+  }
+}
