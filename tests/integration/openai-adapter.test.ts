@@ -161,3 +161,56 @@ test("runStructuredCall proceeds normally with the explicit disengaged marker", 
   const result = await adapter.runStructuredCall(baseInput);
   assert.deepEqual(result.output, { items: [] });
 });
+
+// ---- AF-41 Codex findings: usage must never be lost or under-counted ----
+
+test("a provider response with no usage fails closed instead of metering as zero tokens", async () => {
+  const noUsageClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        return { output_text: JSON.stringify({ items: [] }) };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter(
+    { apiKey: "unused", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, noUsageClient);
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: Error) => {
+      assert.equal(error.name, "AiUsageUnavailableError");
+      // The point of failing closed: an unknown-cost call must not be
+      // recordable as a free one.
+      assert.match(error.message, /zero-token/);
+      return true;
+    }
+  );
+});
+
+test("a non-JSON response still surfaces the call's real token usage to the caller", async () => {
+  // A refusal/truncation is still a billed call. Before this fix
+  // JSON.parse threw before metadata existed, so the caller had no
+  // counts to hand to recordInferenceUsage and retries of failing
+  // responses stayed invisible to the budget.
+  let calls = 0;
+  const refusingClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        calls += 1;
+        return { output_text: "I'm sorry, I can't help with that.", usage: { input_tokens: 310, output_tokens: 12 } };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter(
+    { apiKey: "unused", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, refusingClient);
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: Error & { metadata?: { usage?: { inputTokens: number; outputTokens: number }; model?: string } }) => {
+      assert.equal(error.name, "AiStructuredCallParseError");
+      assert.equal(error.metadata?.usage?.inputTokens, 310);
+      assert.equal(error.metadata?.usage?.outputTokens, 12);
+      assert.equal(error.metadata?.model, "gpt-5.6");
+      return true;
+    }
+  );
+  assert.equal(calls, 1);
+});

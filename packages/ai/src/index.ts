@@ -49,7 +49,9 @@ export interface OpenAiResponsesClient {
       };
     }): Promise<{
       output_text: string;
-      usage: { input_tokens: number; output_tokens: number };
+      /** Absent when the provider reported no usage. Never defaulted to
+       * zero: an unmetered billable call must not look free. */
+      usage?: { input_tokens: number; output_tokens: number } | undefined;
     }>;
   };
 }
@@ -124,16 +126,57 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
           input: params.input,
           text: params.text
         });
+        // Pass usage through as-is, including absent. Defaulting it to
+        // 0/0 here turned an unknown but potentially billable call into
+        // a legitimate free one: repeated responses in that state would
+        // never advance the ledger and could bypass the cap entirely.
+        // The adapter fails closed on it instead.
         return {
           output_text: response.output_text,
-          usage: {
-            input_tokens: response.usage?.input_tokens ?? 0,
-            output_tokens: response.usage?.output_tokens ?? 0
-          }
+          ...(response.usage === undefined || response.usage === null
+            ? {}
+            : {
+                usage: {
+                  input_tokens: response.usage.input_tokens,
+                  output_tokens: response.usage.output_tokens
+                }
+              })
         };
       }
     }
   };
+}
+
+/**
+ * The provider returned no usage data. Thrown rather than defaulted to
+ * zero so an unmetered call can never be mistaken for a free one; the
+ * caller decides whether to retry or halt, but it cannot silently
+ * under-count against the budget.
+ */
+export class AiUsageUnavailableError extends Error {
+  readonly model: string;
+
+  constructor(model: string) {
+    super(`Provider returned no usage for model ${model}; refusing to record it as a zero-token call.`);
+    this.name = "AiUsageUnavailableError";
+    this.model = model;
+  }
+}
+
+/**
+ * The call succeeded and was billed, but `output_text` was not valid
+ * JSON (a refusal, a truncated response, an empty body). Carries the
+ * call's metadata -- including real token usage -- so the caller can
+ * still record what the attempt cost before deciding whether to retry.
+ */
+export class AiStructuredCallParseError extends Error {
+  readonly metadata: AiCallMetadata;
+
+  constructor(metadata: AiCallMetadata, cause: unknown) {
+    super(`Structured output for schema ${metadata.schemaName} was not valid JSON.`, { cause });
+    this.name = "AiStructuredCallParseError";
+    this.metadata = metadata;
+  }
 }
 
 export function createOpenAiAdapter(
@@ -165,7 +208,22 @@ export function createOpenAiAdapter(
         }
       });
 
-      const output: unknown = JSON.parse(response.output_text);
+      // Fail closed on unknown usage. The provider has already been
+      // called and may already have billed for it, so the one thing this
+      // must not do is report it as a zero-token call: that would let a
+      // provider degradation return usage-less responses indefinitely
+      // while the ledger never advances and the cap never trips.
+      if (response.usage === undefined || response.usage === null) {
+        throw new AiUsageUnavailableError(config.model);
+      }
+
+      // Metadata is built BEFORE parsing, deliberately. A refused,
+      // truncated, empty or otherwise non-JSON `output_text` still
+      // represents a call that was made and billed; building metadata
+      // afterwards meant JSON.parse threw first and the caller was left
+      // with no token counts to hand to recordInferenceUsage, so retries
+      // of failing responses stayed invisible to the budget and could
+      // accumulate unbounded cost.
       const metadata: AiCallMetadata = {
         provider: "openai",
         model: config.model,
@@ -177,6 +235,13 @@ export function createOpenAiAdapter(
           outputTokens: response.usage.output_tokens
         }
       };
+
+      let output: unknown;
+      try {
+        output = JSON.parse(response.output_text);
+      } catch (cause) {
+        throw new AiStructuredCallParseError(metadata, cause);
+      }
       return { output, metadata };
     }
   };
