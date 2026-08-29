@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS organizations (
 
 CREATE TABLE IF NOT EXISTS users (
   user_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email text NOT NULL UNIQUE CHECK (email = lower(email) AND position('@' in email) > 1),
+  email text NOT NULL UNIQUE CHECK (email = lower(email) AND email ~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$'),
   display_name text NOT NULL CHECK (length(display_name) > 0),
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -30,4 +30,25 @@ CREATE TABLE IF NOT EXISTS memberships (
 );
 
 CREATE INDEX IF NOT EXISTS memberships_user_id_idx ON memberships (user_id);
-CREATE INDEX IF NOT EXISTS memberships_organization_id_idx ON memberships (organization_id);
+-- No separate organization_id index: UNIQUE (organization_id, user_id)
+-- already builds one whose leftmost column is organization_id, which
+-- serves every lookup a standalone index would. A second one only costs
+-- storage and an extra write per membership change. Dropped explicitly
+-- because earlier revisions of this file did create it.
+DROP INDEX IF EXISTS memberships_organization_id_idx;
+
+-- Replay-safe upgrades for databases created by an earlier revision of this
+-- file. CREATE TABLE IF NOT EXISTS above is a no-op once the table exists,
+-- so the stronger email constraint has to be applied as an explicit ALTER
+-- as well; the migrate service replays every .sql file on each startup, so
+-- both statements must tolerate already being applied.
+--
+-- The previous CHECK only required an '@' after the first character, which
+-- accepted 'a@', 'a@@b' and 'a@ b' -- values userSchema's z.email() rejects,
+-- so the database was not in fact mirroring the runtime contract it claimed
+-- to. This is a closer mirror, not a full RFC 5322 implementation: it
+-- requires a non-empty local part, exactly one '@', and a dotted domain with
+-- no whitespace anywhere.
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_check;
+ALTER TABLE users ADD CONSTRAINT users_email_check
+  CHECK (email = lower(email) AND email ~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$');
