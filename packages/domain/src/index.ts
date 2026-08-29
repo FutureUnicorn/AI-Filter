@@ -272,3 +272,96 @@ export const EVIDENCE_OUTCOME_KINDS: readonly EvidenceOutcomeKind[] = [
 export function assertUnreachableEvidenceOutcome(outcome: never): never {
   throw new Error(`Unhandled EvidenceOutcome kind: ${JSON.stringify(outcome)}`);
 }
+
+// ---- AF-15: organization, user, and membership schema ----
+//
+// Organization is the tenant/policy root. Users hold roles via
+// memberships; MembershipRole is a closed set, not a free-text string,
+// so an invalid role can't be typed into existence, only rejected by
+// both the TypeScript type and the database CHECK constraint. See
+// docs/PRODUCT_BOUNDARY.md POL-011: every future query over these
+// records must stay scoped by organizationId, never cross it.
+
+export type MembershipRole = "owner" | "admin" | "recruiter" | "auditor";
+
+export const MEMBERSHIP_ROLES: readonly MembershipRole[] = [
+  "owner",
+  "admin",
+  "recruiter",
+  "auditor"
+] as const;
+
+export interface Organization extends VersionedRecord {
+  readonly organizationId: string;
+  readonly name: string;
+  readonly createdAt: string;
+}
+
+export interface User extends VersionedRecord {
+  readonly userId: string;
+  readonly email: string;
+  readonly displayName: string;
+  readonly createdAt: string;
+}
+
+/** One membership per (organizationId, userId); a role change updates it in place. */
+export interface Membership extends VersionedRecord {
+  readonly membershipId: string;
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly role: MembershipRole;
+  readonly createdAt: string;
+}
+
+// ---- AF-16: invite-only magic-link authentication ----
+//
+// These are internal persistence-layer shapes shared between
+// packages/db (the atomic single-use redemption SQL) and
+// packages/security (the pure verification decision), not versioned
+// wire contracts -- they use real Date values, not ISO strings, and are
+// never passed through a Zod parse. There is no public self-service
+// signup: a token is either a plain login link for an existing user
+// (no invite) or an invite granting a specific role in a specific
+// organization on redemption.
+
+/** Present only when the token is an invite, not a plain login link. */
+export interface MagicLinkInvite {
+  readonly organizationId: string;
+  readonly role: MembershipRole;
+}
+
+export interface MagicLinkTokenRecord {
+  readonly email: string;
+  readonly invite?: MagicLinkInvite;
+  readonly expiresAt: Date;
+  readonly consumedAt?: Date;
+}
+
+/**
+ * The one honest answer to "was this atomic redemption attempt the call
+ * that consumed the token." `record` is undefined only when the token
+ * hash has never existed. This distinction can only be known by whoever
+ * ran the atomic UPDATE (packages/db); it is not recoverable from
+ * `record` alone, since a token this call just redeemed and a token
+ * redeemed earlier both end up with `consumedAt` set.
+ */
+export interface MagicLinkRedemptionAttempt {
+  readonly justRedeemed: boolean;
+  readonly record: MagicLinkTokenRecord | undefined;
+}
+
+/**
+ * Explicit, non-collapsing outcomes for verifying a magic-link token.
+ * "expired" and "already_consumed" are structurally distinct failure
+ * reasons, not the same rejected-token status string.
+ */
+export type MagicLinkVerification =
+  | { readonly outcome: "valid"; readonly email: string; readonly invite?: MagicLinkInvite }
+  | { readonly outcome: "expired" }
+  | { readonly outcome: "already_consumed" }
+  | { readonly outcome: "not_found" };
+
+/** Domain-owned port; packages/security provides a dev-only console adapter. */
+export interface MagicLinkEmailSender {
+  sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void>;
+}

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   CitationInvalidEvidence,
@@ -12,7 +12,9 @@ import type {
   ExtractionErrorEvidence,
   FailedEvidence,
   InvalidSourceEvidence,
+  Membership,
   NotFoundEvidence,
+  Organization,
   PartiallySupportedEvidence,
   ProcessingEvidence,
   QuarantinedEvidence,
@@ -20,7 +22,8 @@ import type {
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
-  UnsupportedFileEvidence
+  UnsupportedFileEvidence,
+  User
 } from "@signal-audit/domain";
 
 /** Placeholder boundary shape; a later ticket beyond AF-13 owns wiring this
@@ -508,3 +511,53 @@ export function idempotencyErrorResponse(
     message: `Idempotency-Key header is invalid: ${requirement.reason}`
   });
 }
+
+// ---- AF-15: runtime validation for organization/user/membership ----
+//
+// users.email is stored lowercase (`CHECK (email = lower(email))`).
+// z.email() accepts Recruiter@acme.test; this schema lowercases so the
+// parsed value can be persisted without violating that constraint.
+
+export const storedEmailSchema = z.email().toLowerCase();
+
+export const organizationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  organizationId: z.uuid(),
+  name: z.string().min(1),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Organization>;
+
+export const userSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  userId: z.uuid(),
+  email: storedEmailSchema,
+  displayName: z.string().min(1),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<User>;
+
+export const membershipSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  membershipId: z.uuid(),
+  organizationId: z.uuid(),
+  userId: z.uuid(),
+  role: z.enum(MEMBERSHIP_ROLES),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Membership>;
+
+// ---- AF-16: request shapes for invite-only magic-link authentication ----
+//
+// There is no signup schema: requestMagicLinkInputSchema only re-sends a
+// login link to an email that must already have a membership, and
+// createInviteInputSchema requires an inviter to name both the
+// organization and the role up front. Neither shape leaves room for a
+// self-service "just let me in" path.
+
+export const requestMagicLinkInputSchema = z.strictObject({
+  email: storedEmailSchema
+});
+
+export const createInviteInputSchema = z.strictObject({
+  email: storedEmailSchema,
+  organizationId: z.uuid(),
+  role: z.enum(MEMBERSHIP_ROLES)
+});
