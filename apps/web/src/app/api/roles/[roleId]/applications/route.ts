@@ -6,7 +6,12 @@ import {
   listApplicationsForRole,
   listEvidenceExtractionRunsForEntities
 } from "@signal-audit/db";
-import { APPLICATION_ENTITY_TYPE, buildApplicationReviewQueue } from "@signal-audit/domain";
+import {
+  APPLICATION_ENTITY_TYPE,
+  APPLICATION_EVIDENCE_STATES,
+  buildApplicationReviewQueue,
+  parseApplicationStateFilter
+} from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -42,6 +47,20 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
 
+  // AF-47: parsed before any database work, so a misspelled filter costs
+  // a 400 rather than a full queue read. Rejected rather than ignored --
+  // silently dropping `?state=contradiction` would return every
+  // application and present it as the contradictions.
+  const filter = parseApplicationStateFilter(new URL(request.url).searchParams.getAll("state"));
+  if (!filter.ok) {
+    const error = buildApiError({
+      requestId,
+      code: "invalid_request",
+      message: `Unsupported state filter: ${filter.unknownValues.map((value) => JSON.stringify(value)).join(", ")}. Supported: ${APPLICATION_EVIDENCE_STATES.join(", ")}.`
+    });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+  }
+
   try {
     const config = loadEnvironmentConfig(process.env);
     const role = await getRoleById(config.database.url, config.database.schema, roleId);
@@ -74,7 +93,7 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       applications.map((application) => application.applicationId)
     );
 
-    return Response.json(buildApplicationReviewQueue(role.roleId, applications, runs), {
+    return Response.json(buildApplicationReviewQueue(role.roleId, applications, runs, filter.states), {
       status: 200,
       headers: withRequestId(undefined, requestId)
     });
