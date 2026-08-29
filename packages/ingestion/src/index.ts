@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BoundaryContract } from "@signal-audit/contracts";
 import type { DomainPort } from "@signal-audit/domain";
 
@@ -32,10 +33,10 @@ function storageClient(options: StorageConnectionOptions): S3Client {
       accessKeyId: options.accessKeyId,
       secretAccessKey: options.secretAccessKey
     },
-    requestHandler: {
-      requestTimeout: 5_000,
-      connectionTimeout: 5_000
-    }
+    requestHandler: new NodeHttpHandler({
+      connectionTimeout: 5_000,
+      requestTimeout: 5_000
+    })
   });
 }
 

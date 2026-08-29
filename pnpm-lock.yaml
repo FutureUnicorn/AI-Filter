@@ -132,6 +132,9 @@ importers:
       '@signal-audit/domain':
         specifier: workspace:*
         version: link:../domain
+      '@smithy/node-http-handler':
+        specifier: 4.11.2
+        version: 4.11.2
 
   packages/security:
     dependencies:
