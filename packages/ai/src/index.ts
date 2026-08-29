@@ -450,8 +450,34 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
       "quote not found verbatim in source text (likely hallucination)"
     );
   }
-  if (citation.offset >= 0 && citation.offset < sourceText.length) {
-    const window = sourceText.slice(citation.offset, citation.offset + citation.quote.length);
+  // Offsets are compared in Unicode CODE POINTS, matching the Python
+  // validator this ports (scripts/validate_citations.py indexes Python
+  // strings, which are code-point indexed). JavaScript's slice indexes
+  // UTF-16 code units, so any astral character before the quote -- an
+  // emoji, many CJK extension characters -- shifts every later offset
+  // and the two implementations disagree. In "😀Built" the correct
+  // offset of "Built" is 1 in Python but 2 in UTF-16 units, so slicing
+  // by the Python offset started inside the surrogate pair and reported
+  // a valid citation as invalid.
+  const sourceCodePoints = [...sourceText];
+
+  // An offset at or past the end of the source is not "unverifiable", it
+  // is impossible. Previously the range guard skipped the check
+  // entirely for such values, so a claimed offset of 9999 passed
+  // validation unexamined as long as the quote appeared somewhere in the
+  // text -- preserving an impossible citation location as valid evidence.
+  if (citation.offset >= sourceCodePoints.length) {
+    return toCitationInvalid(
+      criterionId,
+      citation,
+      "claimed offset is past the end of the source text"
+    );
+  }
+
+  if (citation.offset >= 0) {
+    const window = sourceCodePoints
+      .slice(citation.offset, citation.offset + [...citation.quote].length)
+      .join("");
     if (window !== citation.quote) {
       return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
     }

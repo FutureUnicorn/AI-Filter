@@ -94,7 +94,16 @@ export interface CitationInvalidEvidence extends VersionedRecord {
   readonly kind: "citation_invalid";
   readonly criterionId: string;
   readonly reason: string;
-  readonly rejectedCitation: SourceCitation;
+  /**
+   * Deliberately NOT SourceCitation: the whole point of this kind is to
+   * preserve what was actually rejected, including a proposal that could
+   * never satisfy the strict shape in the first place (an empty quote,
+   * an out-of-range offset). Typing it as SourceCitation meant the
+   * validator produced `citation_invalid` outcomes that themselves
+   * failed evidenceOutcomeSchema and so could not be persisted or routed
+   * to human review -- the exact opposite of what this kind is for.
+   */
+  readonly rejectedCitation: unknown;
 }
 
 /** The source material itself could not be used (corrupt, empty, unreadable). */
