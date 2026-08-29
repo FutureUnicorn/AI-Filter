@@ -116,3 +116,21 @@ test("authorized yields no error response", () => {
   const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, requestId);
   assert.equal(response, undefined);
 });
+
+test("a malformed request id is refused rather than emitted in a response body", () => {
+  // The other half of why the fixture above had to change. Asserting the
+  // corrected fixture passes shows the suite is green again; asserting
+  // that `req_x` still throws is what stops the next person hitting a
+  // failure here from "fixing" it by loosening AF-13's validation
+  // instead of the fixture. An error body carrying a request id nothing
+  // can be correlated with is not much of an error report.
+  assert.throws(
+    () => resourceAuthorizationErrorResponse({ outcome: "no_membership" }, "req_x"),
+    /RequestId/
+  );
+});
+
+test("the request id reaches the error body verbatim, which is why it has to be well-formed", () => {
+  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, requestId);
+  assert.equal(response?.body.requestId, requestId);
+});
