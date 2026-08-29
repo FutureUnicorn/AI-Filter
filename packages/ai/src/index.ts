@@ -39,7 +39,7 @@ export interface OpenAiResponsesClient {
         format: {
           type: "json_schema";
           name: string;
-          schema: Record<string, unknown>;
+          schema: unknown;
           strict: true;
         };
       };
@@ -59,6 +59,10 @@ export interface OpenAiAdapterConfig {
   readonly model: string;
 }
 
+function isOpenAiJsonSchema(schema: unknown): schema is Record<string, unknown> {
+  return typeof schema === "object" && schema !== null && !Array.isArray(schema);
+}
+
 /**
  * The real OpenAI SDK's `responses.create` is overloaded (streaming vs.
  * non-streaming vs. base), so its class type is not directly assignable
@@ -75,7 +79,12 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
-          text: params.text,
+          text: {
+            format: {
+              ...params.text.format,
+              schema: params.text.format.schema as Record<string, unknown>
+            }
+          },
           store: params.store
         });
         // response.model is the model that actually served the call.
@@ -112,6 +121,9 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      if (!isOpenAiJsonSchema(input.jsonSchema)) {
+        throw new TypeError("OpenAI structured output requires an object JSON Schema.");
+      }
       const response = await openai.responses.create({
         model: config.model,
         input: [
@@ -206,7 +218,7 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
         additionalProperties: false,
         required: ["criterion_id", "state", "quote", "source"],
         properties: {
-          criterion_id: { type: "string" },
+          criterion_id: { type: "string", minLength: 1 },
           state: { type: "string", enum: EVIDENCE_EXTRACTION_STATES },
           quote: {
             type: "string",
