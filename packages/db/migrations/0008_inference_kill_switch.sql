@@ -1,7 +1,26 @@
--- AF-42: operator-triggered kill switch to halt all model calls
--- immediately (bad release, cost spike, provider incident). Global,
--- not per-tenant: an operator responding to an incident needs to halt
--- everything, not one organization at a time.
+-- AF-42: operator-triggered kill switch to halt model calls immediately
+-- (bad release, cost spike, provider incident).
+--
+-- SCOPE, stated precisely because the earlier wording ("global") was
+-- misleading: this switch halts every organization within ONE
+-- deployment's database. It is deliberately NOT a cross-deployment
+-- control plane. Per docs/architecture/tenant-isolation.md each pilot
+-- gets its own database, schema and credentials, and
+-- setInferenceKillSwitch acts on exactly the one databaseUrl it is
+-- given, so engaging it in one pilot leaves every other pilot running.
+--
+-- That is the intended trade-off, not an oversight: a central switch
+-- reaching across pilots would require a shared control plane with
+-- credentials into every pilot database, which is precisely the
+-- cross-tenant coupling the isolation model exists to prevent. The
+-- operational consequence an incident responder must know: during a
+-- provider incident or cost spike, engage the switch ONCE PER DEPLOYED
+-- PILOT. Should that ever become impractical at scale, the fix is a
+-- deliberate fan-out mechanism, not widening this row's reach.
+--
+-- Within one deployment it is genuinely global (not per-organization):
+-- an operator responding to an incident needs to halt everything, not
+-- one organization at a time.
 --
 -- `id boolean PRIMARY KEY DEFAULT true CHECK (id)` is a standard
 -- Postgres singleton-table pattern: id can only ever be `true`, and the

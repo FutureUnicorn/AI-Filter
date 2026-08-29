@@ -54,6 +54,27 @@ export interface BoundaryContract {
 
 const schemaVersionSchema = z.literal(CONTRACT_SCHEMA_VERSION);
 
+/** Recursive JSON-value type: restricts a field to values that can
+ * actually survive JSON.stringify / Response.json, without requiring any
+ * particular shape. Used for `rejectedCitation`, which must preserve a
+ * structurally malformed citation proposal (empty quote, impossible
+ * offset) while still refusing something like a bigint that would throw
+ * at the persist/transport boundary. */
+export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number().finite().refine((value) => !Object.is(value, -0), {
+      message: "must not be negative zero, which JSON serializes as 0"
+    }),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema)
+  ])
+);
+
 const sourceCitationSchema = z.strictObject({
   document: z.string().min(1),
   pageOrSection: z.string().min(1),
@@ -123,7 +144,7 @@ const citationInvalidEvidenceSchema = z.strictObject({
   kind: z.literal("citation_invalid"),
   criterionId: z.string().min(1),
   reason: z.string().min(1),
-  rejectedCitation: sourceCitationSchema
+  rejectedCitation: jsonValueSchema
 }) satisfies z.ZodType<CitationInvalidEvidence>;
 
 const invalidSourceEvidenceSchema = z.strictObject({
