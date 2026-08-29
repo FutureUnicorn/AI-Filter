@@ -17,6 +17,26 @@ class EvidenceState(str, Enum):
     NOT_FOUND = "not_found"
     UNCLEAR = "unclear"
     EXTRACTION_ERROR = "extraction_error"
+    # Never a state the model is asked to produce (see MODEL_FACING_STATES
+    # below) -- assigned only by extract_evidence.py's own pre-model
+    # prompt-injection scan, the same way packages/ai's
+    # quarantineForInjection builds a "quarantined" outcome without the
+    # model ever being consulted.
+    QUARANTINED = "quarantined"
+
+
+# The subset of EvidenceState the model's structured-output schema is
+# allowed to return. QUARANTINED is deliberately excluded: it is decided
+# before the model ever runs, never something a compromised or confused
+# model call could produce on its own.
+MODEL_FACING_STATES: tuple[EvidenceState, ...] = (
+    EvidenceState.SUPPORTED,
+    EvidenceState.PARTIALLY_SUPPORTED,
+    EvidenceState.CONTRADICTED,
+    EvidenceState.NOT_FOUND,
+    EvidenceState.UNCLEAR,
+    EvidenceState.EXTRACTION_ERROR,
+)
 
 
 @dataclass(frozen=True)
@@ -45,7 +65,7 @@ EVIDENCE_ITEM_JSON_SCHEMA = {
         "criterion_id": {"type": "string"},
         "state": {
             "type": "string",
-            "enum": [s.value for s in EvidenceState],
+            "enum": [s.value for s in MODEL_FACING_STATES],
         },
         "quote": {
             "type": "string",
