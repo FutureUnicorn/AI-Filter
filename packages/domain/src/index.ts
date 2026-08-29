@@ -1841,3 +1841,142 @@ export function selectAuditSample(
     sampledApplicationIds: ordered.slice(0, Math.max(0, size)).map((candidate) => candidate.applicationId)
   };
 }
+
+// ---- AF-53: keyboard-first review navigation ----
+//
+// "Recruiters reviewing hundreds of applications need keyboard-driven
+// navigation between cards and source context, not mouse-only review."
+//
+// The decision layer lives here, in a pure function, for a reason worth
+// stating: this repository has no DOM test infrastructure -- no jsdom,
+// no testing-library, tests run under node --test. Keyboard handling
+// written directly into a component would therefore be shipped
+// untested, and the parts most likely to be wrong are not the event
+// plumbing but the RULES: which keys are claimed, when they are not
+// claimed, and where the boundaries are. Those are decidable without a
+// browser, so they are decided here and exhaustively tested, and the
+// component is left as thin glue over them.
+
+export type ReviewKeyAction =
+  | "next"
+  | "previous"
+  | "first"
+  | "last"
+  | "open"
+  | "reveal-source"
+  | "help"
+  | "none";
+
+export interface ReviewKeyEvent {
+  readonly key: string;
+  readonly ctrlKey?: boolean;
+  readonly metaKey?: boolean;
+  readonly altKey?: boolean;
+  /**
+   * True when focus is inside a text field or contenteditable region.
+   * The caller determines this from the DOM; this module will not guess.
+   */
+  readonly editingText?: boolean;
+}
+
+/**
+ * Two refusals come before any binding is considered, and they matter
+ * more than the bindings do.
+ *
+ * A shortcut that fires while a recruiter is typing a correction
+ * rationale eats their input -- and AF-50 requires that rationale, so
+ * the damage lands on the one field the system insists on. `editingText`
+ * suppresses everything.
+ *
+ * A shortcut that fires with Ctrl, Meta or Alt held steals a browser or
+ * operating-system binding: Cmd+K, Ctrl+F, Alt+Left. An application
+ * that takes those is harder to use with a keyboard, not easier, which
+ * inverts the ticket. Shift is NOT in that list on purpose -- `?` and
+ * `G` require it on most layouts, so refusing Shift would refuse two of
+ * the bindings below.
+ */
+export function resolveReviewKeyAction(event: ReviewKeyEvent): ReviewKeyAction {
+  if (event.editingText === true) {
+    return "none";
+  }
+  if (event.ctrlKey === true || event.metaKey === true || event.altKey === true) {
+    return "none";
+  }
+  switch (event.key) {
+    case "j":
+    case "ArrowDown":
+      return "next";
+    case "k":
+    case "ArrowUp":
+      return "previous";
+    case "g":
+    case "Home":
+      return "first";
+    case "G":
+    case "End":
+      return "last";
+    case "Enter":
+      return "open";
+    case "s":
+      return "reveal-source";
+    case "?":
+      return "help";
+    default:
+      return "none";
+  }
+}
+
+/**
+ * Clamped, never wrapped.
+ *
+ * A review queue that loops from the last candidate back to the first
+ * re-presents people who have already been looked at as though they are
+ * new, and gives no signal that the list ended. In a tool whose whole
+ * purpose is that a human actually saw each candidate, silently
+ * restarting is the wrong failure. Reaching the end and staying there
+ * is legible; wrapping is not.
+ */
+export function nextReviewIndex(action: ReviewKeyAction, currentIndex: number, itemCount: number): number {
+  if (itemCount <= 0) {
+    return -1;
+  }
+  const clamp = (index: number): number => Math.min(Math.max(index, 0), itemCount - 1);
+  switch (action) {
+    case "next":
+      return clamp(currentIndex + 1);
+    case "previous":
+      return clamp(currentIndex - 1);
+    case "first":
+      return 0;
+    case "last":
+      return itemCount - 1;
+    case "open":
+    case "reveal-source":
+    case "help":
+    case "none":
+      return clamp(currentIndex);
+    default:
+      return clamp(currentIndex);
+  }
+}
+
+export interface ReviewShortcut {
+  readonly keys: readonly string[];
+  readonly description: string;
+}
+
+/**
+ * Published so the UI renders the same list the resolver implements,
+ * rather than a hand-maintained copy that drifts. A keyboard interface
+ * nobody can discover is a mouse-only interface with extra steps, so
+ * this is part of the feature rather than documentation of it.
+ */
+export const REVIEW_SHORTCUTS: readonly ReviewShortcut[] = [
+  { keys: ["j", "↓"], description: "Next" },
+  { keys: ["k", "↑"], description: "Previous" },
+  { keys: ["g", "Home"], description: "First" },
+  { keys: ["G", "End"], description: "Last" },
+  { keys: ["Enter"], description: "Open the focused item" },
+  { keys: ["s"], description: "Reveal the source citation for the focused card" },
+  { keys: ["?"], description: "Show these shortcuts" }
+];
