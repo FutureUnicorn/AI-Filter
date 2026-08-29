@@ -85,11 +85,34 @@ export function verifyMagicLinkToken(
   return { outcome: "expired" };
 }
 
-/** Dev-only adapter: records that a link was queued. Never logs the recipient or raw token. */
-export function createConsoleMagicLinkEmailSender(): MagicLinkEmailSender {
+/**
+ * Local-development adapter. It has to actually deliver something: an
+ * earlier revision only emitted the `magic_link.queued` event and
+ * dropped both inputs, which reports success to the caller while making
+ * sign-in impossible -- the developer has no way to reach the link.
+ *
+ * Delivery here is "write it to stderr", and deliberately NOT through
+ * logStructured: a magic link is a bearer credential and the recipient
+ * is PII, so it must never enter the structured log stream that gets
+ * shipped and retained. It goes straight to the local terminal instead,
+ * and only ever in a non-hosted environment -- constructing this sender
+ * for staging or production throws rather than printing a credential
+ * where it could be captured.
+ */
+export function createConsoleMagicLinkEmailSender(appEnv: string = "development"): MagicLinkEmailSender {
+  if (appEnv === "staging" || appEnv === "production") {
+    throw new Error(
+      "createConsoleMagicLinkEmailSender is local-development only; a hosted environment needs a real email adapter"
+    );
+  }
   return {
-    async sendMagicLink(): Promise<void> {
+    async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
+      // Structured log records that delivery happened, with no PII in it.
       logStructured("info", "magic_link.queued");
+      // The link itself, to the terminal only, never to the log stream.
+      process.stderr.write(
+        `\n[dev magic link] to: ${input.email}\n[dev magic link] open: ${input.link}\n\n`
+      );
     }
   };
 }
@@ -186,31 +209,148 @@ export function resourceAuthorizationErrorResponse(
 // fields, after protecting UUID / IPv4 / ISO-date correlation IDs.
 
 const EMAIL_PATTERN = /[^\s@]+@[^\s@]+\.[^\s@]+/gu;
-const PHONE_PATTERN = /\+?\d[\d\s().-]{7,}\d/gu;
+/**
+ * Bounded on purpose. An earlier `/\+?\d[\d\s().-]{7,}\d/` had no upper
+ * limit and treated whitespace as an interior character, so it matched
+ * any run of digits/spaces/dots/dashes -- including straight across
+ * several space-separated correlation IDs (`<uuid> <iso-date> <ipv4>`
+ * matched as one 70-character "phone number", which then defeated every
+ * protected span it covered). Capping total digits at 15 (E.164's
+ * maximum) and allowing at most two separator characters between digits
+ * keeps a match inside a single real token, so it can no longer swallow
+ * neighbouring identifiers.
+ */
+const PHONE_PATTERN = /\+?\d(?:[ ().-]{0,2}\d){6,14}/gu;
 const UUID_PATTERN = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
 const IPV4_PATTERN = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 const ISO_DATE_PATTERN =
   /\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?\b/g;
-const LOG_EVENT_NAME = /^[a-z][a-z0-9._-]*$/u;
 const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
-const PROTECT_PREFIX = "__SA_ID_";
-const PROTECT_SUFFIX = "__";
 
+/**
+ * Closed set of event names this system is allowed to log, not a
+ * character-class pattern. A pattern is not a PII boundary: any
+ * user-derived text made only of permitted characters passes it, so
+ * `buildLogEntry("info", "alice.smith")` or `"ssn.123-45-6789"` would
+ * log that value verbatim as the message. Only names registered here
+ * can ever be emitted; anything else becomes REJECTED_LOG_MESSAGE.
+ * Adding a log line means adding its event name here, deliberately.
+ */
+export const LOG_EVENT_NAMES = [
+  "log.rejected_message",
+  "magic_link.queued",
+  "web.environment_health_failed",
+  "worker.environment_health_failed",
+  "worker.health_listening",
+  "worker.ready"
+] as const;
+
+export type LogEventName = (typeof LOG_EVENT_NAMES)[number];
+
+const LOG_EVENT_NAME_SET: ReadonlySet<string> = new Set<string>(LOG_EVENT_NAMES);
+
+interface Span {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** Sorts by position and coalesces overlapping or touching spans. */
+function mergeSpans(spans: readonly Span[]): readonly Span[] {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: Span[] = [];
+  for (const span of sorted) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && span.start <= last.end) {
+      merged[merged.length - 1] = { start: last.start, end: Math.max(last.end, span.end) };
+    } else {
+      merged.push(span);
+    }
+  }
+  return merged;
+}
+
+function collectSpans(value: string, patterns: readonly RegExp[]): readonly Span[] {
+  const spans: Span[] = [];
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      if (match.index === undefined || match[0].length === 0) {
+        continue;
+      }
+      spans.push({ start: match.index, end: match.index + match[0].length });
+    }
+  }
+  return mergeSpans(spans);
+}
+
+const overlaps = (a: Span, b: Span): boolean => a.start < b.end && b.start < a.end;
+
+/** True when at least one digit of `span` falls outside every span in `covers`. */
+function hasDigitOutside(value: string, span: Span, covers: readonly Span[]): boolean {
+  for (let index = span.start; index < span.end; index += 1) {
+    const character = value[index];
+    if (character === undefined || character < "0" || character > "9") {
+      continue;
+    }
+    if (!covers.some((cover) => index >= cover.start && index < cover.end)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Positional, never textual. An earlier revision protected correlation
+ * IDs by swapping in a `__SA_ID_n__` marker string and restoring it
+ * afterward, which is unsafe two ways: input that already contains
+ * marker-shaped text gets silently corrupted (the restore step cannot
+ * tell a real placeholder from a coincidence), and deleting a forged
+ * marker can *join* two short digit runs into a phone number that then
+ * escapes redaction entirely. Spans remove that whole class: nothing
+ * about the mechanism depends on what the input text contains.
+ *
+ * The overlap rule is the second half, and the subtler one. Protecting
+ * an ID span unconditionally is also wrong: an email or phone can
+ * *contain* something ID-shaped (`user@192.0.2.1`, `user@2026-08-21.com`,
+ * `Call +1 2026-08-21 now`), and carving the ID out mid-token leaves the
+ * PII pattern unable to match the whole thing, so the PII leaks
+ * verbatim. So a protected span only survives when every PII match
+ * touching it is fully inside it -- that keeps a UUID or ISO date that
+ * merely *looks* phone-shaped (`11111111-1111-4111-8111-111111111111`)
+ * intact, while letting a genuine email/phone that swallows an ID-shaped
+ * substring lose to redaction, which is the safe direction to fail.
+ */
 export function redactPii(value: string): string {
-  const saved: string[] = [];
-  const protect = (match: string): string => {
-    saved.push(match);
-    return `${PROTECT_PREFIX}${saved.length - 1}${PROTECT_SUFFIX}`;
-  };
-  const protectedValue = value
-    .replace(UUID_PATTERN, protect)
-    .replace(IPV4_PATTERN, protect)
-    .replace(ISO_DATE_PATTERN, protect);
-  return protectedValue
-    .replace(EMAIL_PATTERN, REDACTED)
-    .replace(PHONE_PATTERN, REDACTED)
-    .replace(/__SA_ID_(\d+)__/g, (_full, index: string) => saved[Number(index)] ?? "");
+  // Emails are whitespace-delimited and unambiguous, so they always win:
+  // this is what stops `user@192.0.2.1` or `user@2026-08-21.com` from
+  // leaking because an identifier-shaped substring got carved out of the
+  // middle and left the email pattern unable to match the whole token.
+  const emailSpans = collectSpans(value, [EMAIL_PATTERN]);
+  const protectedSpans = collectSpans(value, [UUID_PATTERN, IPV4_PATTERN, ISO_DATE_PATTERN]).filter(
+    (candidate) => !emailSpans.some((email) => overlaps(candidate, email))
+  );
+
+  // A phone match only counts when at least one of its digits is not
+  // already part of a recognized identifier. Without that test the loose
+  // phone shape happily starts inside one UUID and runs on through the
+  // next identifier, so `<uuid> <uuid> <iso-date> <ipv4>` reads as a
+  // single "phone number" and every real correlation ID in the string is
+  // destroyed. With it, digits belonging entirely to identifiers are
+  // left alone, while `Call +1 2026-08-21 now` is still redacted -- the
+  // leading `1` sits outside the date, which is what makes it a phone
+  // number rather than a date sitting on its own.
+  const phoneSpans = collectSpans(value, [PHONE_PATTERN]).filter((phone) =>
+    hasDigitOutside(value, phone, protectedSpans)
+  );
+
+  let result = "";
+  let cursor = 0;
+  for (const span of mergeSpans([...emailSpans, ...phoneSpans])) {
+    result += value.slice(cursor, span.start);
+    result += REDACTED;
+    cursor = span.end;
+  }
+  return result + value.slice(cursor);
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -252,6 +392,36 @@ const LOG_CONTEXT_KEYS = [
   "durationMs"
 ] as const;
 
+const UUID_ONLY = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+const REQUEST_ID_ONLY = /^req_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+/** Lowercase machine token: an action, entity type, or error code. */
+const SAFE_TOKEN = /^[a-z][a-z0-9._-]{0,63}$/u;
+
+/**
+ * Per-field validators, because an allowlist of *keys* is not a PII
+ * boundary on its own. Two real gaps it leaves open: a non-string value
+ * was previously copied through untouched, so `{ durationMs: { email:
+ * "x@y.test" } }` serialized the email intact; and a correctly-typed
+ * string was only run through redactPii, which by design only masks
+ * email/phone shapes, so `{ entityId: "Alice Smith" }`, `{ action:
+ * "Interview Jane Doe" }` and `{ entityId: "555-1234" }` all passed
+ * through verbatim. Each field now has to look like the identifier or
+ * code it claims to be; anything else is replaced with REDACTED rather
+ * than dropped, so the key's presence still shows up in the log and the
+ * bad call site is findable.
+ */
+const LOG_CONTEXT_VALIDATORS: Readonly<Record<(typeof LOG_CONTEXT_KEYS)[number], (value: unknown) => boolean>> = {
+  requestId: (value) => typeof value === "string" && REQUEST_ID_ONLY.test(value),
+  organizationId: (value) => typeof value === "string" && UUID_ONLY.test(value),
+  actorUserId: (value) => typeof value === "string" && UUID_ONLY.test(value),
+  action: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
+  entityType: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
+  entityId: (value) => typeof value === "string" && (UUID_ONLY.test(value) || SAFE_TOKEN.test(value)),
+  errorCode: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
+  statusCode: (value) => typeof value === "number" && Number.isInteger(value),
+  durationMs: (value) => typeof value === "number" && Number.isFinite(value) && value >= 0
+};
+
 function pickLogContext(context: LogContext | undefined): LogContext | undefined {
   if (context === undefined) {
     return undefined;
@@ -265,13 +435,28 @@ function pickLogContext(context: LogContext | undefined): LogContext | undefined
     if (value === undefined) {
       continue;
     }
-    picked[key] = typeof value === "string" ? redactPii(value) : value;
+    // redactPii stays as a second layer for the string fields it applies
+    // to, but the validator above is what actually decides whether a
+    // value is loggable at all.
+    picked[key] = LOG_CONTEXT_VALIDATORS[key](value)
+      ? typeof value === "string"
+        ? redactPii(value)
+        : value
+      : REDACTED;
   }
   return Object.keys(picked).length === 0 ? undefined : (picked as LogContext);
 }
 
+/**
+ * Only a name registered in LOG_EVENT_NAMES is emitted. Anything else
+ * (including user-derived text that happens to look like a dotted key)
+ * collapses to REJECTED_LOG_MESSAGE, so the message field can never
+ * carry caller data. A registered name is developer-authored and needs
+ * no redaction -- running one through redactPii could corrupt it, since
+ * a long digit run inside a name would get spliced with "[REDACTED]".
+ */
 function eventNameOrRejected(message: string): string {
-  return LOG_EVENT_NAME.test(message) ? redactPii(message) : REJECTED_LOG_MESSAGE;
+  return LOG_EVENT_NAME_SET.has(message) ? message : REJECTED_LOG_MESSAGE;
 }
 
 export function buildLogEntry(
