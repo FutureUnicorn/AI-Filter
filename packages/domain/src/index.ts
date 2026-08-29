@@ -94,7 +94,16 @@ export interface CitationInvalidEvidence extends VersionedRecord {
   readonly kind: "citation_invalid";
   readonly criterionId: string;
   readonly reason: string;
-  readonly rejectedCitation: SourceCitation;
+  /**
+   * Deliberately NOT SourceCitation: the whole point of this kind is to
+   * preserve what was actually rejected, including a proposal that could
+   * never satisfy the strict shape in the first place (an empty quote,
+   * an out-of-range offset). Typing it as SourceCitation meant the
+   * validator produced `citation_invalid` outcomes that themselves
+   * failed evidenceOutcomeSchema and so could not be persisted or routed
+   * to human review -- the exact opposite of what this kind is for.
+   */
+  readonly rejectedCitation: unknown;
 }
 
 /** The source material itself could not be used (corrupt, empty, unreadable). */
@@ -373,7 +382,17 @@ export interface AiCallUsage {
  */
 export interface AiCallMetadata {
   readonly provider: string;
+  /** The model the caller ASKED for, which may be a movable alias. */
   readonly model: string;
+  /**
+   * The model the provider reports as having actually served the call.
+   * Recorded separately because `model` alone is not reproducible: once
+   * a movable alias is repointed, records produced by different model
+   * revisions become indistinguishable, which defeats the audit and
+   * experiment-reproducibility purpose of storing model metadata at all.
+   * Absent when the provider does not report it.
+   */
+  readonly resolvedModel?: string | undefined;
   readonly promptVersion: string;
   readonly schemaVersion: string;
   readonly schemaName: string;

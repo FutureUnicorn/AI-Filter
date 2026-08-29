@@ -47,8 +47,13 @@ export interface OpenAiResponsesClient {
           strict: true;
         };
       };
+      /** Provider-side retention. Always sent explicitly; see the call site. */
+      store: boolean;
     }): Promise<{
       output_text: string;
+      /** The model that actually served the request, which can differ
+       * from the requested one when that is a movable alias. */
+      model?: string | undefined;
       /** Absent when the provider reported no usage. Never defaulted to
        * zero: an unmetered billable call must not look free. */
       usage?: { input_tokens: number; output_tokens: number } | undefined;
@@ -77,15 +82,21 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
-          text: params.text
+          text: params.text,
+          store: params.store
         });
-        // Pass usage through as-is, including absent. Defaulting it to
-        // 0/0 here turned an unknown but potentially billable call into
-        // a legitimate free one: repeated responses in that state would
+        // response.model is the model that actually served the call.
+        // Discarding it made records produced by different revisions of
+        // a movable alias indistinguishable after the alias moved.
+        //
+        // Usage is passed through as-is, including absent. Defaulting it
+        // to 0/0 turned an unknown but potentially billable call into a
+        // legitimate free one: repeated responses in that state would
         // never advance the ledger and could bypass the cap entirely.
         // The adapter fails closed on it instead.
         return {
           output_text: response.output_text,
+          model: response.model,
           ...(response.usage === undefined || response.usage === null
             ? {}
             : {
@@ -153,7 +164,14 @@ export function createOpenAiAdapter(
             schema: input.jsonSchema,
             strict: true
           }
-        }
+        },
+        // The structured output carries verbatim quotes from candidate
+        // documents. The Responses API retains response objects by
+        // default, so omitting this silently created a provider-side
+        // copy of candidate material on every successful call. Opt out
+        // explicitly; retention must be a deliberate decision, not the
+        // consequence of leaving a parameter off.
+        store: false
       });
 
       // Fail closed on unknown usage. The provider has already been
@@ -175,6 +193,7 @@ export function createOpenAiAdapter(
       const metadata: AiCallMetadata = {
         provider: "openai",
         model: config.model,
+        ...(response.model === undefined ? {} : { resolvedModel: response.model }),
         promptVersion: input.promptVersion,
         schemaVersion: input.schemaVersion,
         schemaName: input.schemaName,
@@ -391,6 +410,34 @@ export function mapRubricToEvidence(
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
+  // The rubric IDs arrive as an unconstrained string[] with no upstream
+  // schema or branded type guaranteeing anything about them, so they are
+  // validated here rather than assumed. Both checks protect the promise
+  // this function makes about its OUTPUT:
+  //
+  // - An empty ID would produce an outcome whose criterionId is "",
+  //   which fails evidenceOutcomeSchema (criterionId requires at least
+  //   one character). Returning it would mean handing back a value
+  //   advertised as a persistable EvidenceOutcome that cannot actually
+  //   be persisted.
+  // - A repeated ID would emit several outcomes for the same criterion,
+  //   contradicting the one-outcome-per-criterion invariant and letting
+  //   a downstream consumer persist or count it twice.
+  //
+  // Rejecting rather than silently de-duplicating: a rubric containing
+  // the same criterion twice is a malformed rubric, and quietly
+  // collapsing it would hide that from whoever authored it.
+  const seen = new Set<string>();
+  for (const criterionId of rubricCriterionIds) {
+    if (criterionId.length === 0) {
+      throw new Error("mapRubricToEvidence requires non-empty rubric criterion IDs");
+    }
+    if (seen.has(criterionId)) {
+      throw new Error(`mapRubricToEvidence requires unique rubric criterion IDs; "${criterionId}" appears more than once`);
+    }
+    seen.add(criterionId);
+  }
+
   const itemsByCriterion = new Map<string, EvidenceExtractionItem[]>();
   for (const item of extractedItems) {
     const existing = itemsByCriterion.get(item.criterion_id);
@@ -528,8 +575,34 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
       "quote not found verbatim in source text (likely hallucination)"
     );
   }
-  if (citation.offset >= 0 && citation.offset < sourceText.length) {
-    const window = sourceText.slice(citation.offset, citation.offset + citation.quote.length);
+  // Offsets are compared in Unicode CODE POINTS, matching the Python
+  // validator this ports (scripts/validate_citations.py indexes Python
+  // strings, which are code-point indexed). JavaScript's slice indexes
+  // UTF-16 code units, so any astral character before the quote -- an
+  // emoji, many CJK extension characters -- shifts every later offset
+  // and the two implementations disagree. In "😀Built" the correct
+  // offset of "Built" is 1 in Python but 2 in UTF-16 units, so slicing
+  // by the Python offset started inside the surrogate pair and reported
+  // a valid citation as invalid.
+  const sourceCodePoints = [...sourceText];
+
+  // An offset at or past the end of the source is not "unverifiable", it
+  // is impossible. Previously the range guard skipped the check
+  // entirely for such values, so a claimed offset of 9999 passed
+  // validation unexamined as long as the quote appeared somewhere in the
+  // text -- preserving an impossible citation location as valid evidence.
+  if (citation.offset >= sourceCodePoints.length) {
+    return toCitationInvalid(
+      criterionId,
+      citation,
+      "claimed offset is past the end of the source text"
+    );
+  }
+
+  if (citation.offset >= 0) {
+    const window = sourceCodePoints
+      .slice(citation.offset, citation.offset + [...citation.quote].length)
+      .join("");
     if (window !== citation.quote) {
       return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
     }
