@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createOpenAiAdapter } from "../../packages/ai/src/index.ts";
+import type { AiCallMetadata } from "../../packages/domain/src/index.ts";
 import type { OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 
 // No real API key, no network call: createOpenAiAdapter's second
@@ -81,4 +82,60 @@ test("different calls with different prompt/schema versions produce different me
   assert.equal(first.metadata.promptVersion, "v1");
   assert.equal(second.metadata.promptVersion, "v2");
   assert.equal(second.metadata.schemaVersion, "1.1.0");
+});
+
+// ---- AF-34 Codex findings ----
+
+test("candidate calls opt out of provider-side response retention", async () => {
+  // The structured output carries verbatim quotes from candidate
+  // documents, and the Responses API stores response objects by default,
+  // so omitting `store` silently created a provider-retained copy of
+  // candidate material on every successful call.
+  const capture: { params?: unknown } = {};
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}", capture));
+  await adapter.runStructuredCall(baseInput);
+  assert.equal((capture.params as { store: boolean }).store, false);
+});
+
+test("metadata records the provider-resolved model, not just the requested alias", async () => {
+  // config.model may be a movable alias; response.model is what actually
+  // served the call. Without it, records from different revisions of the
+  // same alias are indistinguishable after the alias moves.
+  const aliasClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        return { output_text: "{}", model: "gpt-5.6-2026-08-01" };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, aliasClient);
+  const result = await adapter.runStructuredCall(baseInput);
+  assert.equal(result.metadata.model, "gpt-5.6");
+  assert.equal(result.metadata.resolvedModel, "gpt-5.6-2026-08-01");
+});
+
+test("a non-JSON response still carries full call metadata to the caller", async () => {
+  // A refusal or truncation is still a call that happened. Building
+  // metadata after JSON.parse meant the throw destroyed every trace of
+  // it, leaving AF-40 unable to audit failed calls.
+  const refusingClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        return { output_text: "I'm sorry, I can't help with that.", model: "gpt-5.6-2026-08-01" };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, refusingClient);
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: Error & { metadata?: AiCallMetadata }) => {
+      assert.equal(error.name, "AiStructuredCallParseError");
+      assert.equal(error.metadata?.provider, "openai");
+      assert.equal(error.metadata?.model, "gpt-5.6");
+      assert.equal(error.metadata?.resolvedModel, "gpt-5.6-2026-08-01");
+      assert.equal(error.metadata?.promptVersion, baseInput.promptVersion);
+      assert.equal(error.metadata?.schemaName, baseInput.schemaName);
+      return true;
+    }
+  );
 });
