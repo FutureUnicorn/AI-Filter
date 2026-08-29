@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { generateRequestId } from "../../packages/contracts/src/index.ts";
 import { CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import type { Membership } from "../../packages/domain/src/index.ts";
 import {
@@ -85,13 +86,16 @@ test("UUID letter-case is not treated as a different organization or user", () =
 });
 
 test("no_membership maps to not_found so an org's existence is never confirmed to an outsider", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, "req_x");
+  const response = resourceAuthorizationErrorResponse(
+    { outcome: "no_membership" },
+    generateRequestId()
+  );
   assert.equal(response?.status, 404);
   assert.equal(response?.body.error.code, "not_found");
 });
 
 test("insufficient_capability maps to forbidden, and names the actual role", () => {
-  const requestId = "req_x";
+  const requestId = generateRequestId();
   const response = resourceAuthorizationErrorResponse(
     { outcome: "insufficient_capability", role: "auditor" },
     requestId
