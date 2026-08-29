@@ -21,18 +21,45 @@ ALTER TABLE audit_events ADD CONSTRAINT audit_events_organization_id_fkey
 
 ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_actor_membership_fkey;
 
-CREATE OR REPLACE FUNCTION reject_audit_event_without_membership() RETURNS trigger AS $$
+-- The function is pinned to the schema it is installed into, captured at
+-- migration time via current_schema(). Without that pin the unqualified
+-- `memberships` reference resolves against whatever search_path the
+-- CALLER happens to have. That breaks for real: migrations run with
+-- PGOPTIONS="-c search_path=$DATABASE_SCHEMA" (infra/compose/runtime.yml),
+-- but the application connects with no search_path at all and fully
+-- qualifies its own table names instead (packages/db). So in any
+-- environment where DATABASE_SCHEMA is not `public` -- every preview
+-- environment, per scripts/environment/model.mjs -- PL/pgSQL would fall
+-- back to `$user, public` and every audit insert would fail with
+-- `relation "memberships" does not exist`.
+--
+-- Built through format()/EXECUTE because the schema name is only known
+-- at apply time; %I quotes it as an identifier. pg_temp is pinned last,
+-- which is the standard guard against search_path capture.
+DO $migration$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM memberships
-     WHERE organization_id = NEW.organization_id
-       AND user_id = NEW.actor_user_id
-  ) THEN
-    RAISE EXCEPTION 'audit_events.actor_user_id must be a member of audit_events.organization_id';
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+  EXECUTE format(
+    $definition$
+      CREATE OR REPLACE FUNCTION reject_audit_event_without_membership() RETURNS trigger
+      LANGUAGE plpgsql
+      SET search_path = %I, pg_temp
+      AS $body$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM memberships
+           WHERE organization_id = NEW.organization_id
+             AND user_id = NEW.actor_user_id
+        ) THEN
+          RAISE EXCEPTION 'audit_events.actor_user_id must be a member of audit_events.organization_id';
+        END IF;
+        RETURN NEW;
+      END;
+      $body$;
+    $definition$,
+    current_schema()
+  );
+END
+$migration$;
 
 DROP TRIGGER IF EXISTS audit_events_require_membership ON audit_events;
 CREATE TRIGGER audit_events_require_membership
