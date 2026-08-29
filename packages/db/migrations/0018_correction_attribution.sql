@@ -28,14 +28,19 @@ BEGIN
       ADD CONSTRAINT evidence_outcomes_correction_reason_not_blank
       -- Two things this deliberately does NOT use.
       --
-      -- Not `length(trim(x)) > 0`, which is the convention elsewhere in
-      -- these migrations (0009's kill-switch reason, roles.title,
-      -- candidate_full_name) and is weaker than it reads: Postgres trim()
-      -- strips spaces only, so a reason of E'\t\n' has length 2 after
-      -- trimming and passes. Verified on Postgres 17 -- it was the first
-      -- version of this constraint and it accepted a tab-and-newline
-      -- reason. `~ '[^[:space:]]'` asks the question actually intended:
-      -- does this contain at least one character that is not whitespace.
+      -- Not `length(trim(x)) > 0`. Postgres trim() strips spaces only,
+      -- so a reason of E'\t\n' has length 2 after trimming and passes --
+      -- verified on Postgres 17, because that was the first version of
+      -- this constraint and it accepted a tab-and-newline reason.
+      -- `~ '[^[:space:]]'` asks the question actually intended: does
+      -- this contain at least one character that is not whitespace.
+      --
+      -- 0010_kill_switch_reason_non_whitespace.sql reached the same
+      -- conclusion for AF-42's operator reason, and its comment names
+      -- the same root cause. This is the established predicate for
+      -- "non-blank" in this schema, not a departure from convention;
+      -- the columns still using length(trim(...)) are the ones that
+      -- have not caught up.
       --
       -- Not a naked predicate either. `length(trim(NULL)) > 0` is NULL
       -- and a CHECK only fails on FALSE, so the bare form would admit
