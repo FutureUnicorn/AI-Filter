@@ -1980,3 +1980,93 @@ export const REVIEW_SHORTCUTS: readonly ReviewShortcut[] = [
   { keys: ["s"], description: "Reveal the source citation for the focused card" },
   { keys: ["?"], description: "Show these shortcuts" }
 ];
+
+// ---- AF-54: capture recruiter review timing ----
+//
+// "Time-per-application in the review queue, needed as the baseline for
+// the review-time-reduction metric."
+//
+// This module produces the INPUTS to a metric, not the metric. AF-60
+// owns the reporting envelope -- sample size, population, suppression
+// below a minimum, stated limitations -- and defines MetricSample and
+// summarizeMetric for it. That branch runs parallel to this one rather
+// than beneath it, so its types are not importable here yet;
+// ReviewTimingSummary below is deliberately shaped to be handed
+// straight to summarizeMetric when the two lines meet, and should be
+// replaced by that call rather than grown its own reporting rules.
+
+export interface ReviewTimingSpan {
+  readonly applicationId: string;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+export interface ReviewTimingSummary {
+  /**
+   * Median, not mean. A handful of interrupted reviews -- a lunch break
+   * with the tab open, a call mid-candidate -- drags a mean far above
+   * anything a recruiter experiences, and this number's whole job is to
+   * be the honest "before" in a before/after claim. An inflated
+   * baseline makes any later improvement look better than it was, which
+   * is the specific way this metric could flatter the product.
+   */
+  readonly medianActiveMs: number | null;
+  /** Applications with at least one usable span. The denominator. */
+  readonly sampleSize: number;
+  /** Applications in scope, whether or not they were ever opened. */
+  readonly population: number;
+  /** Spans excluded because an idle cutoff ended them. */
+  readonly truncatedSpanCount: number;
+}
+
+/**
+ * Time is summed per application across visits, then a median is taken
+ * across applications -- not a median across raw spans.
+ *
+ * The distinction matters and is easy to get backwards. A candidate
+ * opened three times for twenty seconds each took a minute to review,
+ * not twenty seconds; a median over spans would report the latter and
+ * understate the baseline. Summing first, then taking the median, keeps
+ * "time per application" meaning what it says.
+ *
+ * Truncated spans are counted but NOT summed. An idle cutoff means the
+ * reviewer stopped looking and we do not know when, so the span's active
+ * time is a lower bound rather than a measurement. Including it would
+ * bias the baseline downward -- again in the direction that flatters a
+ * later improvement -- and excluding it silently would hide how much
+ * data was dropped, which is why the count is reported.
+ */
+export function summarizeReviewTiming(
+  spans: readonly ReviewTimingSpan[],
+  population: number
+): ReviewTimingSummary {
+  const truncatedSpanCount = spans.filter((span) => span.truncatedByIdle).length;
+  const usable = spans.filter((span) => !span.truncatedByIdle);
+
+  const totalByApplication = new Map<string, number>();
+  for (const span of usable) {
+    totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
+  }
+
+  const totals = [...totalByApplication.values()].sort((left, right) => left - right);
+  const sampleSize = totals.length;
+  return {
+    // null, never 0, when there is nothing to measure. A zero would read
+    // as "reviews take no time" and is the kind of number that gets
+    // quoted out of its context.
+    medianActiveMs: sampleSize === 0 ? null : median(totals),
+    sampleSize,
+    population,
+    truncatedSpanCount
+  };
+}
+
+function median(sortedValues: readonly number[]): number {
+  const middle = Math.floor(sortedValues.length / 2);
+  if (sortedValues.length % 2 === 1) {
+    return sortedValues[middle] ?? 0;
+  }
+  const lower = sortedValues[middle - 1] ?? 0;
+  const upper = sortedValues[middle] ?? 0;
+  return (lower + upper) / 2;
+}
