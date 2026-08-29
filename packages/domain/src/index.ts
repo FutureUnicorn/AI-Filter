@@ -1120,15 +1120,58 @@ export interface ApplicationReviewQueue extends VersionedRecord {
  * for them. Never touches the database, so the ordering and counting
  * rules are testable without one.
  *
- * Ordering is (createdAt, sourceRowNumber, applicationId): a queue whose
- * order changes between two identical requests is a bug on its own, so
- * this pins a total order rather than leaving it to the database's
- * scan order. sourceRowNumber alone is not unique -- two intakes both
- * have a row 1 -- and applicationId is the final tiebreak so the order
- * is total, not merely stable-ish. AF-46 owns "preserve original
- * applicant ordering" as a product rule and may refine this; what it
- * must not have to fix first is nondeterminism.
+ * Ordering is AF-46's guarantee: see compareApplicationsBySourceOrder.
  */
+// ---- AF-46: preserve original applicant ordering ----
+//
+// "Default queue order matches original application order, not a hidden
+// score." There is no score to sort by, and this is the ticket that
+// makes that a guarantee rather than an accident of what the database
+// happened to return.
+//
+// The order the employer gave us is reconstructed from three columns,
+// in this priority:
+//
+//  1. createdAt -- which is a per-INTAKE key, not a per-row one.
+//     AF-32's finalize inserts every application for one CSV inside a
+//     single transaction, and `DEFAULT CURRENT_TIMESTAMP` is transaction
+//     *start* time, so every row from one import shares one identical
+//     value. It orders imports against each other; it says nothing
+//     about rows within an import.
+//  2. intakeId -- the tiebreak that actually matters. Because createdAt
+//     is shared, two imports whose transactions began at the same
+//     instant collide on it, and without this the next comparison would
+//     be sourceRowNumber: intake A's row 1, intake B's row 1, A's row 2,
+//     B's row 2. That interleaves two employers' import batches into one
+//     another and is precisely the "order is not the original order"
+//     failure this ticket exists to prevent. Comparing intakeId first
+//     keeps each import contiguous; which of the two tied imports comes
+//     first is arbitrary but stable, and never interleaved.
+//  3. sourceRowNumber -- the row's position in the file the employer
+//     uploaded. Within one import this is the original order, exactly.
+//
+// applicationId is a final tiebreak only, and should be unreachable:
+// two applications sharing an intake and a row number would mean
+// finalize ran twice for one row, which AF-32's idempotency prevents.
+// It is here so the comparator is a total order under every input,
+// including malformed ones, rather than leaving ties to the engine's
+// sort stability.
+//
+// Deliberately NOT part of the ordering: appliedAt. It is optional (the
+// employer may not supply it), self-reported, and sorting by it would
+// silently reorder a recruiter's queue away from the file they uploaded
+// -- a different order, not the original one. Nothing here ranks,
+// scores, or prioritises; POL-003 forbids a score field existing at all,
+// and there is no column in this comparison that could act as one.
+export function compareApplicationsBySourceOrder(a: Application, b: Application): number {
+  return (
+    a.createdAt.localeCompare(b.createdAt) ||
+    a.intakeId.localeCompare(b.intakeId) ||
+    a.sourceRowNumber - b.sourceRowNumber ||
+    a.applicationId.localeCompare(b.applicationId)
+  );
+}
+
 export function buildApplicationReviewQueue(
   roleId: string,
   applications: readonly Application[],
@@ -1148,12 +1191,7 @@ export function buildApplicationReviewQueue(
   }
 
   const entries = [...applications]
-    .sort(
-      (a, b) =>
-        a.createdAt.localeCompare(b.createdAt) ||
-        a.sourceRowNumber - b.sourceRowNumber ||
-        a.applicationId.localeCompare(b.applicationId)
-    )
+    .sort(compareApplicationsBySourceOrder)
     .map((application): ApplicationQueueEntry => {
       const runTimes = runsByApplicationId.get(application.applicationId) ?? [];
       if (runTimes.length === 0) {

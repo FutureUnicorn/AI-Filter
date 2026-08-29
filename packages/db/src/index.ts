@@ -32,6 +32,7 @@ import type {
 import {
   CONTRACT_SCHEMA_VERSION,
   canonicalizeCsvColumnMapping,
+  compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   mapCsvRowToApplication,
   summarizeImportRows
@@ -1797,7 +1798,7 @@ export async function listApplicationsForRole(
               candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
          FROM "${schema}".applications
         WHERE organization_id = $1 AND role_id = $2
-        ORDER BY created_at, source_row_number, application_id`,
+        ORDER BY created_at, intake_id, source_row_number, application_id`,
       [organizationId, roleId]
     );
     return result.rows.map(rowToApplication);
@@ -2017,6 +2018,152 @@ export async function assertApplicationQueueTenantIsolation(databaseUrl: string)
     const noIds = await listEvidenceExtractionRunsForEntities(unreachable, schema, orgA, "application", []);
     if (noIds.length !== 0) {
       throw new Error("an empty entity list must return nothing");
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-46: proves the SQL ordering and compareApplicationsBySourceOrder
+ * agree, against the one fixture where a weaker ORDER BY silently
+ * differs.
+ *
+ * AF-32's finalize inserts every application for one CSV in a single
+ * transaction, and `DEFAULT CURRENT_TIMESTAMP` is transaction-start
+ * time, so every row of an import shares one created_at. This probe
+ * writes two imports with a *deliberately identical* created_at, which
+ * is what makes the tiebreak observable: without intake_id ahead of
+ * source_row_number the two imports interleave as A1, B1, A2, B2, and
+ * with a random application_id tiebreak the interleaving is not even
+ * stable between runs. Both are the "queue order is not the original
+ * order" failure this ticket exists to prevent.
+ */
+export async function assertApplicantOrderingPreserved(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `apporder_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const sharedCreatedAt = "2026-08-29T12:00:00.000Z";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A')`, [organizationId]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Probe') RETURNING user_id`,
+      [`apporder_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Role', $2) RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    if (roleId === undefined) {
+      throw new Error("probe could not create a role");
+    }
+
+    // Two intakes, three rows each, inserted in a deliberately jumbled
+    // sequence so a missing ORDER BY would show up as insertion order.
+    const intakeIds: string[] = [];
+    for (const label of ["first", "second"]) {
+      const intake = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'applicants.csv', 'text/csv', $4) RETURNING intake_id`,
+        [organizationId, roleId, `probe/${suffix}/${label}.csv`, userId]
+      );
+      const intakeId = intake.rows[0]?.intake_id;
+      if (intakeId === undefined) {
+        throw new Error("probe could not create a file intake");
+      }
+      intakeIds.push(intakeId);
+    }
+    const [firstIntakeId, secondIntakeId] = intakeIds as [string, string];
+
+    const writes: Array<[string, number]> = [
+      [secondIntakeId, 2],
+      [firstIntakeId, 3],
+      [secondIntakeId, 1],
+      [firstIntakeId, 1],
+      [secondIntakeId, 3],
+      [firstIntakeId, 2]
+    ];
+    for (const [intakeId, rowNumber] of writes) {
+      await admin.query(
+        `INSERT INTO applications
+           (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          organizationId,
+          roleId,
+          intakeId,
+          rowNumber,
+          `Candidate ${rowNumber}`,
+          `c${rowNumber}-${intakeId.slice(0, 4)}@acme.test`,
+          sharedCreatedAt
+        ]
+      );
+    }
+
+    const listed = await listApplicationsForRole(databaseUrl, schema, organizationId, roleId);
+    if (listed.length !== 6) {
+      throw new Error(`probe expected 6 applications, got ${listed.length}`);
+    }
+
+    // 1. Each import is one unbroken run -- never interleaved.
+    const intakeSequence = listed.map((application) => application.intakeId);
+    const runs = intakeSequence.filter((intakeId, index) => intakeId !== intakeSequence[index - 1]);
+    if (runs.length !== new Set(intakeSequence).size) {
+      throw new Error(
+        `two imports sharing a created_at were interleaved by the database: ${intakeSequence
+          .map((intakeId) => intakeId.slice(0, 4))
+          .join(",")}`
+      );
+    }
+
+    // 2. Within each run, the file's own row order, ascending.
+    for (const intakeId of new Set(intakeSequence)) {
+      const rowNumbers = listed
+        .filter((application) => application.intakeId === intakeId)
+        .map((application) => application.sourceRowNumber);
+      if (rowNumbers.join(",") !== "1,2,3") {
+        throw new Error(`rows within one import must keep file order, got ${rowNumbers.join(",")}`);
+      }
+    }
+
+    // 3. The database and the domain comparator agree exactly. This is
+    // the assertion that stops the two drifting: either one alone can be
+    // "an order", but the queue is only the original order if they match.
+    const sortedInDomain = [...listed].sort(compareApplicationsBySourceOrder).map((a) => a.applicationId);
+    if (sortedInDomain.join(",") !== listed.map((a) => a.applicationId).join(",")) {
+      throw new Error("SQL ORDER BY and compareApplicationsBySourceOrder disagree about the queue order");
+    }
+
+    // 4. Stable across repeated reads, so a recruiter refreshing the page
+    // never sees candidates move.
+    const again = await listApplicationsForRole(databaseUrl, schema, organizationId, roleId);
+    if (again.map((a) => a.applicationId).join(",") !== listed.map((a) => a.applicationId).join(",")) {
+      throw new Error("two identical reads returned different queue orders");
     }
   } finally {
     try {
