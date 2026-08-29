@@ -105,3 +105,36 @@ test("every generated outcome is pinned to the same CONTRACT_SCHEMA_VERSION", ()
     assert.equal(outcome.schemaVersion, outcomes[0]?.schemaVersion);
   }
 });
+
+// ---- AF-36 Codex findings: validate rubric IDs before building outcomes ----
+
+test("an empty rubric criterion ID is rejected rather than producing an unpersistable outcome", () => {
+  // mapRubricToEvidence([""], []) previously returned an extraction_error
+  // whose criterionId was "", which fails evidenceOutcomeSchema -- a value
+  // advertised as a persistable EvidenceOutcome that cannot be persisted.
+  assert.throws(() => mapRubricToEvidence([""], []), /non-empty rubric criterion IDs/);
+  assert.throws(() => mapRubricToEvidence(["python_production", ""], []), /non-empty rubric criterion IDs/);
+});
+
+test("a duplicated rubric criterion ID is rejected rather than emitting two outcomes for it", () => {
+  // Mapping the array directly emitted one outcome per occurrence,
+  // breaking the one-outcome-per-criterion invariant and letting a
+  // downstream consumer persist or count the same criterion twice.
+  assert.throws(
+    () => mapRubricToEvidence(["python_production", "python_production"], []),
+    /unique rubric criterion IDs.*python_production/
+  );
+});
+
+test("every returned outcome still validates against the persisted contract", () => {
+  // The property the two rejections above exist to protect.
+  const outcomes = mapRubricToEvidence(["python_production", "aws_certification"], []);
+  assert.equal(outcomes.length, 2);
+  for (const outcome of outcomes) {
+    assert.ok(outcome.criterionId.length > 0);
+  }
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.criterionId),
+    ["python_production", "aws_certification"]
+  );
+});
