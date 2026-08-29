@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import {
   ALLOWED_FILE_TYPES,
+  APPLICATION_EVIDENCE_STATES,
   APPLICATION_IMPORT_FIELDS,
   AUDIT_ACTIONS,
   CONTRACT_SCHEMA_VERSION,
@@ -18,6 +19,7 @@ import {
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   Application,
+  ApplicationQueueEntry,
   AuditEvent,
   CitationInvalidEvidence,
   ContradictedEvidence,
@@ -628,3 +630,35 @@ export const finalizeCsvImportInputSchema = z.strictObject({
 });
 
 export type FinalizeCsvImportInput = z.infer<typeof finalizeCsvImportInputSchema>;
+
+// ---- AF-45: tenant-scoped application review queue ----
+
+export const applicationQueueEntrySchema = z.strictObject({
+  application: applicationSchema,
+  evidenceState: z.enum(APPLICATION_EVIDENCE_STATES),
+  extractionRunCount: z.number().int().min(0),
+  lastExtractionAt: z.iso.datetime().optional()
+}) satisfies z.ZodType<ApplicationQueueEntry>;
+
+/**
+ * The counts are validated as a partition, not as three free integers:
+ * a response where pendingExtractionCount + extractedCount does not
+ * equal totalCount is describing a queue that cannot exist, and the
+ * contract should reject it rather than let a UI render a total that
+ * disagrees with its own breakdown.
+ */
+export const applicationReviewQueueSchema = z
+  .strictObject({
+    schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+    roleId: z.uuid(),
+    totalCount: z.number().int().min(0),
+    pendingExtractionCount: z.number().int().min(0),
+    extractedCount: z.number().int().min(0),
+    entries: z.array(applicationQueueEntrySchema)
+  })
+  .refine((queue) => queue.pendingExtractionCount + queue.extractedCount === queue.totalCount, {
+    message: "pendingExtractionCount and extractedCount must sum to totalCount"
+  })
+  .refine((queue) => queue.entries.length === queue.totalCount, {
+    message: "totalCount must match the number of entries returned"
+  });

@@ -4,12 +4,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
+  Application,
   AuditAction,
   CanonicalTextExtraction,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
   DomainPort,
+  EvidenceExtractionRunRef,
   FileIntake,
   FileIntakeStatus,
   ImportFinalizationSummary,
@@ -1728,6 +1730,297 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     }
     try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-45: tenant-scoped application review queue ----
+
+interface ApplicationRow {
+  readonly application_id: string;
+  readonly organization_id: string;
+  readonly role_id: string;
+  readonly intake_id: string;
+  readonly source_row_number: number;
+  readonly candidate_full_name: string;
+  readonly candidate_email: string;
+  readonly external_reference_id: string | null;
+  readonly applied_at: Date | null;
+  readonly created_at: Date;
+}
+
+function rowToApplication(row: ApplicationRow): Application {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    applicationId: row.application_id,
+    organizationId: row.organization_id,
+    roleId: row.role_id,
+    intakeId: row.intake_id,
+    sourceRowNumber: row.source_row_number,
+    candidateFullName: row.candidate_full_name,
+    candidateEmail: row.candidate_email,
+    ...(row.external_reference_id === null ? {} : { externalReferenceId: row.external_reference_id }),
+    ...(row.applied_at === null ? {} : { appliedAt: row.applied_at.toISOString() }),
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+/**
+ * Scoped by BOTH role_id and organization_id, deliberately.
+ *
+ * role_id alone would be sufficient today, since a role belongs to
+ * exactly one organization and the route resolves the role before
+ * authorizing against its organization. But that makes tenant isolation
+ * depend on a caller getting a two-step lookup right every time, which
+ * is precisely the shape of an IDOR: pass a sibling tenant's roleId and
+ * the query itself has nothing to object to. Requiring the caller to
+ * state which organization it believes it is acting for means a
+ * mismatch returns zero rows instead of another tenant's candidates.
+ * The organization_id column is already on the table (AF-32), so this
+ * costs nothing.
+ */
+export async function listApplicationsForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<readonly Application[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<ApplicationRow>(
+      `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+              candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+         FROM "${schema}".applications
+        WHERE organization_id = $1 AND role_id = $2
+        ORDER BY created_at, source_row_number, application_id`,
+      [organizationId, roleId]
+    );
+    return result.rows.map(rowToApplication);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * One query for the whole page of applications rather than one per
+ * application: a role with a thousand imported candidates would
+ * otherwise open a thousand connections to render a single screen.
+ *
+ * Returns only the fields the queue reads. entity_id is text (AF-40's
+ * table is generic over entity types), so the uuid list is cast rather
+ * than compared across types -- comparing text to uuid would error, and
+ * casting the *column* instead would discard the index.
+ */
+export async function listEvidenceExtractionRunsForEntities(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  entityType: string,
+  entityIds: readonly string[]
+): Promise<readonly EvidenceExtractionRunRef[]> {
+  assertSafeSchema(schema);
+  if (entityIds.length === 0) {
+    return [];
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ entity_type: string; entity_id: string; created_at: Date }>(
+      `SELECT entity_type, entity_id, created_at
+         FROM "${schema}".evidence_extraction_runs
+        WHERE organization_id = $1 AND entity_type = $2 AND entity_id = ANY($3::text[])`,
+      [organizationId, entityType, [...entityIds]]
+    );
+    return result.rows.map((row) => ({
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-45: proves the review queue is genuinely tenant-scoped against a
+ * real database, not just in the shape of its TypeScript.
+ *
+ * The claim that matters is the IDOR one. `listApplicationsForRole`
+ * takes both organizationId and roleId even though roleId alone
+ * identifies a role, and this is what makes that redundancy pay: it
+ * asserts that org A's identifier paired with org B's roleId returns
+ * nothing. Without the organization_id predicate that pairing would
+ * return B's candidates in full, and the only thing standing between a
+ * caller and another tenant's applicants would be the route remembering
+ * to resolve the role first -- an invariant no test can see.
+ */
+export async function assertApplicationQueueTenantIsolation(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `appq_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A'), ($2, 'Org B')`, [
+      orgA,
+      orgB
+    ]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Probe') RETURNING user_id`,
+      [`appq_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+
+    const roleIds: Record<string, string> = {};
+    const intakeIds: Record<string, string> = {};
+    for (const [label, organizationId] of [
+      ["a", orgA],
+      ["b", orgB]
+    ] as const) {
+      const role = await admin.query<{ role_id: string }>(
+        `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, $2, $3) RETURNING role_id`,
+        [organizationId, `Role ${label}`, userId]
+      );
+      const roleId = role.rows[0]?.role_id;
+      if (roleId === undefined) {
+        throw new Error("probe could not create a role");
+      }
+      roleIds[label] = roleId;
+      const intake = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'applicants.csv', 'text/csv', $4) RETURNING intake_id`,
+        [organizationId, roleId, `probe/${suffix}/${label}.csv`, userId]
+      );
+      const intakeId = intake.rows[0]?.intake_id;
+      if (intakeId === undefined) {
+        throw new Error("probe could not create a file intake");
+      }
+      intakeIds[label] = intakeId;
+      await admin.query(
+        `INSERT INTO applications
+           (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, 1, $4, $5), ($1, $2, $3, 2, $6, $7)`,
+        [
+          organizationId,
+          roleId,
+          intakeId,
+          `${label.toUpperCase()} First`,
+          `${label}-first@acme.test`,
+          `${label.toUpperCase()} Second`,
+          `${label}-second@acme.test`
+        ]
+      );
+    }
+
+    const roleIdA = roleIds["a"];
+    const roleIdB = roleIds["b"];
+    if (roleIdA === undefined || roleIdB === undefined) {
+      throw new Error("probe did not create both roles");
+    }
+
+    const ownTenant = await listApplicationsForRole(databaseUrl, schema, orgA, roleIdA);
+    if (ownTenant.length !== 2) {
+      throw new Error(`a role's own organization must see its applications, got ${ownTenant.length}`);
+    }
+    if (ownTenant.some((application) => application.organizationId !== orgA)) {
+      throw new Error("listApplicationsForRole returned a row belonging to another organization");
+    }
+
+    // The IDOR probe: a real roleId from a sibling tenant, paired with
+    // the caller's own organizationId.
+    const crossTenant = await listApplicationsForRole(databaseUrl, schema, orgA, roleIdB);
+    if (crossTenant.length !== 0) {
+      throw new Error(
+        `org A paired with org B's roleId must return nothing, got ${crossTenant.length} of B's applications`
+      );
+    }
+    // And the mirror: B's organization with A's role.
+    const mirrored = await listApplicationsForRole(databaseUrl, schema, orgB, roleIdA);
+    if (mirrored.length !== 0) {
+      throw new Error(`org B paired with org A's roleId must return nothing, got ${mirrored.length}`);
+    }
+
+    // Ordering is asserted from SQL too, not only in the pure builder:
+    // the ORDER BY and buildApplicationReviewQueue's sort have to agree,
+    // or the queue silently reshuffles when the database changes plan.
+    const rowNumbers = ownTenant.map((application) => application.sourceRowNumber);
+    if (rowNumbers.join(",") !== "1,2") {
+      throw new Error(`applications must come back in import order, got ${rowNumbers.join(",")}`);
+    }
+
+    const applicationIdA = ownTenant[0]?.applicationId;
+    if (applicationIdA === undefined) {
+      throw new Error("probe expected at least one application for org A");
+    }
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs
+         (organization_id, entity_type, entity_id, provider, model, prompt_version,
+          extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1, 'application', $2, 'openai', 'test-model', '1.0.0', '1.0.0', 'evidence_response', '1')`,
+      [orgA, applicationIdA]
+    );
+    // Same entity id, another organization: an extraction run must not
+    // cross tenants any more than an application does.
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs
+         (organization_id, entity_type, entity_id, provider, model, prompt_version,
+          extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1, 'application', $2, 'openai', 'test-model', '1.0.0', '1.0.0', 'evidence_response', '1')`,
+      [orgB, applicationIdA]
+    );
+
+    const runs = await listEvidenceExtractionRunsForEntities(databaseUrl, schema, orgA, "application", [
+      applicationIdA
+    ]);
+    if (runs.length !== 1) {
+      throw new Error(`extraction runs must be organization-scoped, got ${runs.length} for one org's application`);
+    }
+
+    const otherType = await listEvidenceExtractionRunsForEntities(databaseUrl, schema, orgA, "file_intake", [
+      applicationIdA
+    ]);
+    if (otherType.length !== 0) {
+      throw new Error("extraction runs must be filtered by entity type in SQL, not only in the builder");
+    }
+
+    // The empty-list short circuit, tested for what it actually buys.
+    // Asserting "[] in, [] out" against a working database proves
+    // nothing -- `entity_id = ANY('{}')` matches nothing either way, so
+    // that assertion passes with the short circuit deleted. What the
+    // guard really prevents is opening a connection to render a role
+    // that has no applications at all, so this points it at a host that
+    // cannot resolve: it returns [] if the guard is there and throws if
+    // it is not.
+    const unreachable = "postgresql://probe@af45-must-not-connect.invalid:5432/none";
+    const noIds = await listEvidenceExtractionRunsForEntities(unreachable, schema, orgA, "application", []);
+    if (noIds.length !== 0) {
+      throw new Error("an empty entity list must return nothing");
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }

@@ -1056,3 +1056,127 @@ export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
     .map((row) => `${row.rowNumber},${escapeCsvField(row.failureReason)}`);
   return [header, ...lines].join("\n") + "\n";
 }
+
+// ---- AF-45: tenant-scoped application review queue ----
+//
+// The recruiter's main working view for one role: every imported
+// application and where it currently sits in evidence processing.
+//
+// The honest scope of "evidence-processing state" here, because it is
+// narrower than the ticket's wording suggests and that is deliberate.
+// AF-13 defines a rich EvidenceOutcome union (supported, contradicted,
+// unclear, citation_invalid, quarantined, ...), but nothing persists
+// those: it is a contract type the pipeline returns, with no table
+// behind it. The only durable evidence that extraction ran against an
+// entity is AF-40's evidence_extraction_runs. So this reports the two
+// states actually derivable from stored data and says so, rather than
+// adding a per-criterion status column the database cannot back. When
+// evidence outcomes get a table, this union gains members; it is not
+// retrofitted with guesses now. That is the same call AF-24 made for
+// rubric approval and import readiness on the roles list.
+
+/**
+ * The entity_type an evidence_extraction_runs row uses when the entity
+ * is an application. Nothing writes those rows for applications yet, so
+ * this constant exists to stop the reader and the eventual writer from
+ * each inventing their own string -- a mismatch there would show every
+ * application as pending_extraction forever, with no error anywhere.
+ */
+export const APPLICATION_ENTITY_TYPE = "application";
+
+export type ApplicationEvidenceState = "pending_extraction" | "extracted";
+
+export const APPLICATION_EVIDENCE_STATES: readonly ApplicationEvidenceState[] = [
+  "pending_extraction",
+  "extracted"
+] as const;
+
+/** Just the fields the queue needs from an extraction run; the full row
+ * carries model/prompt/schema/rubric versions this view never shows. */
+export interface EvidenceExtractionRunRef {
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly createdAt: string;
+}
+
+export interface ApplicationQueueEntry {
+  readonly application: Application;
+  readonly evidenceState: ApplicationEvidenceState;
+  readonly extractionRunCount: number;
+  /** Most recent run for this application, when at least one exists. */
+  readonly lastExtractionAt?: string | undefined;
+}
+
+export interface ApplicationReviewQueue extends VersionedRecord {
+  readonly roleId: string;
+  readonly totalCount: number;
+  readonly pendingExtractionCount: number;
+  readonly extractedCount: number;
+  readonly entries: readonly ApplicationQueueEntry[];
+}
+
+/**
+ * Pure: pairs a role's applications with whatever extraction runs exist
+ * for them. Never touches the database, so the ordering and counting
+ * rules are testable without one.
+ *
+ * Ordering is (createdAt, sourceRowNumber, applicationId): a queue whose
+ * order changes between two identical requests is a bug on its own, so
+ * this pins a total order rather than leaving it to the database's
+ * scan order. sourceRowNumber alone is not unique -- two intakes both
+ * have a row 1 -- and applicationId is the final tiebreak so the order
+ * is total, not merely stable-ish. AF-46 owns "preserve original
+ * applicant ordering" as a product rule and may refine this; what it
+ * must not have to fix first is nondeterminism.
+ */
+export function buildApplicationReviewQueue(
+  roleId: string,
+  applications: readonly Application[],
+  runs: readonly EvidenceExtractionRunRef[]
+): ApplicationReviewQueue {
+  const runsByApplicationId = new Map<string, string[]>();
+  for (const run of runs) {
+    if (run.entityType !== APPLICATION_ENTITY_TYPE) {
+      continue;
+    }
+    const existing = runsByApplicationId.get(run.entityId);
+    if (existing === undefined) {
+      runsByApplicationId.set(run.entityId, [run.createdAt]);
+    } else {
+      existing.push(run.createdAt);
+    }
+  }
+
+  const entries = [...applications]
+    .sort(
+      (a, b) =>
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.sourceRowNumber - b.sourceRowNumber ||
+        a.applicationId.localeCompare(b.applicationId)
+    )
+    .map((application): ApplicationQueueEntry => {
+      const runTimes = runsByApplicationId.get(application.applicationId) ?? [];
+      if (runTimes.length === 0) {
+        return { application, evidenceState: "pending_extraction", extractionRunCount: 0 };
+      }
+      // Max by string comparison is safe here: these are ISO-8601 UTC
+      // timestamps produced by toISOString(), so lexical order is
+      // chronological order for every value this can receive.
+      const lastExtractionAt = runTimes.reduce((latest, current) => (current > latest ? current : latest));
+      return {
+        application,
+        evidenceState: "extracted",
+        extractionRunCount: runTimes.length,
+        lastExtractionAt
+      };
+    });
+
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    roleId,
+    totalCount: entries.length,
+    pendingExtractionCount: entries.filter((entry) => entry.evidenceState === "pending_extraction").length,
+    extractedCount: entries.filter((entry) => entry.evidenceState === "extracted").length,
+    entries
+  };
+}
