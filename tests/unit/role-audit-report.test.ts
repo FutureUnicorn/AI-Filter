@@ -157,7 +157,38 @@ test("the audit sample tells the employer how to reproduce it", () => {
   // re-run the selection and get the same candidates.
   const rendered = renderRoleAuditReport(report());
   assert.match(rendered, /10 of 60 eligible candidates, drawn with seed pilot-1/);
-  assert.match(rendered, /reproduces the same sample/);
+  assert.match(rendered, /re-run the selection with that seed and reproduce the same sample/);
+});
+
+test("the report says who else can reproduce the sample, not just that it is reproducible", () => {
+  // The seed is a reconstruction key: anyone holding the role's candidate
+  // list can recompute exactly which candidates were sampled. Verified
+  // empirically, not assumed. That is the point for the employer, whose
+  // data it is, and inert for a stranger holding neither -- but it makes
+  // the report unsafe to forward to a third party with an overlapping
+  // candidate set. The reader is the one choosing who to forward it to,
+  // so the warning has to reach them, not just a ticket.
+  const rendered = renderRoleAuditReport(report());
+  assert.match(rendered, /should not be forwarded to a party that holds candidate data of its own/);
+});
+
+test("the published seed really does reconstruct the sample, which is why the warning is there", () => {
+  // A negative control baked in: if selectAuditSample ever stopped being
+  // seed-deterministic, the warning would be false and this fails rather
+  // than leaving a scary sentence nobody re-checked.
+  const candidates = Array.from({ length: 30 }, (_, index) => ({
+    applicationId: `aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+    strength: (index % 2 === 0 ? "weak" : "none") as "weak" | "none"
+  }));
+  const drawn = selectAuditSample(candidates, "pilot-1", 5);
+  const provenance = describeAuditSampleProvenance(drawn);
+  const recomputed = selectAuditSample(candidates, provenance.seed, provenance.sampledCount);
+  assert.deepEqual(recomputed.sampledApplicationIds, drawn.sampledApplicationIds);
+  assert.notDeepEqual(
+    selectAuditSample(candidates, "a-different-seed", provenance.sampledCount).sampledApplicationIds,
+    drawn.sampledApplicationIds,
+    "without the seed the sample is not recoverable, which is what keeps a bare leak inert"
+  );
 });
 
 test("no audit sample renders as an explicit statement, not silence", () => {

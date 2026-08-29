@@ -2507,8 +2507,21 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
   } else {
     lines.push(
       `  ${report.auditSample.sampledCount} of ${report.auditSample.eligibleCount} eligible candidates, ` +
-        `drawn with seed ${report.auditSample.seed}. Re-running the selection with that seed reproduces ` +
-        `the same sample.`
+        `drawn with seed ${report.auditSample.seed}.`
+    );
+    // The seed is a reconstruction key, not just a provenance label:
+    // anyone who ALSO holds this role's candidate list can recompute
+    // exactly which candidates were sampled -- verified, not assumed.
+    // That is precisely what makes the draw auditable for the employer,
+    // whose data it is, and it is inert for a stranger holding neither.
+    // But it means the report is not safe to hand to a third party with
+    // an overlapping candidate set, which is a plausible thing to do with
+    // a pilot report. Said here rather than only in a ticket, because the
+    // person choosing who to forward this to is the person reading it.
+    lines.push(
+      `  Anyone holding this role's candidate list can re-run the selection with that seed and ` +
+        `reproduce the same sample. That is what makes the draw auditable -- and why this report ` +
+        `should not be forwarded to a party that holds candidate data of its own.`
     );
   }
 
