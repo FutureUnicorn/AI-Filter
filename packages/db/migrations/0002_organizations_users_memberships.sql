@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS organizations (
 CREATE TABLE IF NOT EXISTS users (
   user_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   email text NOT NULL UNIQUE CHECK (email = lower(email) AND email ~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$'),
-  display_name text NOT NULL CHECK (length(display_name) > 0),
+  display_name text NOT NULL CHECK (display_name ~ '[^[:space:]]'),
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -52,3 +52,26 @@ DROP INDEX IF EXISTS memberships_organization_id_idx;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_check;
 ALTER TABLE users ADD CONSTRAINT users_email_check
   CHECK (email = lower(email) AND email ~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$');
+
+-- Postgres trim() strips SPACES ONLY, so `length(trim(x)) > 0` -- and
+-- `length(x) > 0` -- accept a value of tabs or newlines. Verified on a
+-- real database: length(trim(E'\t\n')) is 2, so E'\t\n' satisfied the
+-- old predicate for every column below while being blank to any human
+-- reading the record. `~ '[^[:space:]]'` asks the intended question:
+-- does this contain at least one non-whitespace character.
+--
+-- Applied twice: inline above for fresh databases, and as guarded ALTERs
+-- here for databases an earlier revision already created, where CREATE
+-- TABLE IF NOT EXISTS is a no-op. Guarded rather than DROP/ADD because
+-- this file replays on every startup and re-adding a CHECK revalidates
+-- every row under a strong lock (the AF-20 replay-cost finding).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'users'::regclass AND conname = 'users_display_name_nonblank'
+  ) THEN
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_display_name_check;
+    ALTER TABLE users ADD CONSTRAINT users_display_name_nonblank CHECK (display_name ~ '[^[:space:]]');
+  END IF;
+END $$;
