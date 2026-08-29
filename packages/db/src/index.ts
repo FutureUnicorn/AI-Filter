@@ -4249,3 +4249,128 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-61: prove the retention purge blockers against the real schema ----
+
+/**
+ * The domain's retention plan claims certain surfaces cannot be purged.
+ * This proves it, rather than leaving the claim resting on my reading of
+ * the migrations -- the same two-readings-must-agree shape as AF-57's
+ * card/metric check, applied to a claim that will end up in a privacy
+ * notice.
+ *
+ * If a future migration ever unblocks one of these paths, the assertion
+ * that it still fails is what makes that visible. A retention plan that
+ * says "blocked" about something now deletable is a different kind of
+ * wrong, but still wrong.
+ */
+export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<Record<string, string>> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `ret_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const failures: Record<string, string> = {};
+
+  const expectRejected = async (label: string, sql: string): Promise<void> => {
+    try {
+      await admin.query(sql);
+      throw new Error(`assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("assertRetentionPurgeBlockers:")) {
+        throw error;
+      }
+      failures[label] = message;
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `ret_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+      [intakeId, org, roleId, `key-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, org, roleId, intakeId]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1,$2,$3,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [outcomeId, org, applicationId]
+    );
+
+    await expectRejected(
+      "evidence_outcomes:delete",
+      `DELETE FROM evidence_outcomes WHERE evidence_outcome_id = '${outcomeId}'`
+    );
+    await expectRejected(
+      "evidence_outcomes:redact",
+      `UPDATE evidence_outcomes SET outcome = '{"kind":"supported","criterionId":"python"}'::jsonb
+        WHERE evidence_outcome_id = '${outcomeId}'`
+    );
+    await expectRejected(
+      "applications:delete",
+      `DELETE FROM applications WHERE application_id = '${applicationId}'`
+    );
+    await expectRejected(
+      "file_intakes:delete",
+      `DELETE FROM file_intakes WHERE intake_id = '${intakeId}'`
+    );
+
+    // The candidate's data is all still here, which is the point.
+    const surviving = await admin.query<{ candidate_full_name: string }>(
+      `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
+      [applicationId]
+    );
+    if (surviving.rows[0]?.candidate_full_name !== "Jane Doe") {
+      throw new Error("assertRetentionPurgeBlockers: expected the candidate row to have survived every purge attempt");
+    }
+    return failures;
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
