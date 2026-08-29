@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "../../packages/domain/src/index.ts";
 import {
@@ -128,5 +131,123 @@ test("every schema is pinned to CONTRACT_SCHEMA_VERSION; a stale version is reje
       createdAt
     }).success,
     false
+  );
+});
+
+// ---- AF-15 review: the database and the contract must agree on email ----
+//
+// The PR claimed these two layers mirror one another. They did not: the
+// migration's CHECK was `position('@' in email) > 1`, which only asserts
+// that an '@' appears after the first character, so 'a@', 'a@@b' and
+// 'a@ b' were all accepted by Postgres while userSchema rejected them.
+// Verified as accepted on Postgres 17 before the fix, and rejected after.
+//
+// This branch's CI has no Postgres service, so the SQL side cannot be
+// exercised here. What this does instead is keep the claim honest in the
+// two ways that are checkable without a database: the contract layer
+// really does reject the whole corpus, and the migration really does
+// carry the pattern that was verified against that same corpus. Weaken
+// either side and one of these fails.
+
+const MIGRATION_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../packages/db/migrations/0002_organizations_users_memberships.sql"
+);
+
+/** The exact pattern verified against Postgres 17 for this corpus. */
+const VERIFIED_SQL_EMAIL_PATTERN = "'^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$'";
+
+const MALFORMED_EMAILS = [
+  "a@", // no domain at all -- accepted by the old CHECK
+  "a@@b", // two '@' -- accepted by the old CHECK
+  "a@ b", // whitespace inside -- accepted by the old CHECK
+  "@example.com", // empty local part
+  "a@b" // undotted domain
+];
+
+// Case is the one place the two layers deliberately do NOT mirror, and
+// leaving it out of the corpus above is the point rather than an
+// oversight: storedEmailSchema accepts 'Ok@Example.com' and normalises
+// it to lowercase, and the database CHECK requires `email = lower(email)`
+// because normalisation has already happened by the time a row is
+// written. Both are right; they are enforcing the same invariant at
+// different ends of the same pipe.
+
+const WELL_FORMED_EMAILS = ["ok@example.com", "first.last@sub.example.co.uk", "a_b-c@example.org"];
+
+test("the contract layer rejects every malformed address the database now rejects", () => {
+  for (const email of MALFORMED_EMAILS) {
+    assert.equal(
+      userSchema.safeParse({
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        userId,
+        email,
+        displayName: "Casey Rivera",
+        createdAt
+      }).success,
+      false,
+      `expected userSchema to reject ${JSON.stringify(email)}`
+    );
+  }
+});
+
+test("neither layer rejects an address that is simply valid", () => {
+  for (const email of WELL_FORMED_EMAILS) {
+    assert.equal(
+      userSchema.safeParse({
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        userId,
+        email,
+        displayName: "Casey Rivera",
+        createdAt
+      }).success,
+      true,
+      `expected userSchema to accept ${JSON.stringify(email)}`
+    );
+  }
+});
+
+test("the migration still carries the email pattern that was verified against Postgres", () => {
+  // Not a substitute for running the SQL -- it is a tripwire. Someone
+  // relaxing the CHECK back toward `position('@' in email)` would restore
+  // the exact mismatch this review found, and no other test on this
+  // branch would notice.
+  const migration = readFileSync(MIGRATION_PATH, "utf8");
+  assert.ok(
+    migration.includes(VERIFIED_SQL_EMAIL_PATTERN),
+    "0002's users email CHECK no longer uses the verified pattern"
+  );
+  // Comment lines are stripped first: the migration deliberately quotes
+  // the old `position('@' in email)` check in prose to explain what was
+  // wrong with it, and a naive substring search would trip on its own
+  // documentation.
+  const executable = migration
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  assert.ok(
+    !executable.includes("position('@' in email)"),
+    "0002 reintroduced the position('@' in email) check, which accepts 'a@', 'a@@b' and 'a@ b'"
+  );
+});
+
+test("memberships keeps exactly one index per distinct access path", () => {
+  // UNIQUE (organization_id, user_id) already indexes organization_id as
+  // its leftmost column. Confirmed on Postgres 17 with 40,000 rows: with
+  // memberships_organization_id_idx dropped, the planner uses
+  // memberships_organization_id_user_id_key for the identical query and
+  // the same plan shape, never a sequential scan. user_id is not a
+  // leftmost prefix of anything, so its own index stays.
+  const migration = readFileSync(MIGRATION_PATH, "utf8")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  assert.ok(
+    migration.includes("CREATE INDEX IF NOT EXISTS memberships_user_id_idx"),
+    "memberships still needs its user_id index; that access path has no other cover"
+  );
+  assert.ok(
+    !migration.includes("CREATE INDEX IF NOT EXISTS memberships_organization_id_idx"),
+    "memberships_organization_id_idx duplicates the UNIQUE (organization_id, user_id) access path"
   );
 });
