@@ -2185,7 +2185,15 @@ export const METRIC_LIMITATION_CODES = [
   /** A denominator exists but is too small for the stated threshold. */
   "below_minimum_sample",
   /** Some of the population is excluded from the denominator (e.g. still in flight). */
-  "population_incomplete"
+  "population_incomplete",
+  /**
+   * AF-55. One side of a comparison is a figure the customer supplied
+   * rather than one this system measured. Distinct from the three codes
+   * above, which are all about how much data there is: this one says the
+   * data is not the same KIND on both sides, and no amount of extra
+   * sample fixes it.
+   */
+  "baseline_self_reported"
 ] as const;
 
 export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
@@ -2298,4 +2306,118 @@ export function describeFailedDocumentRate(
     population: rate.uploaded,
     minimumSampleSize
   });
+}
+
+// ---- AF-55: review-time reduction ----
+//
+// "Compare assisted review time against the employer's own baseline
+// process. Target >= 50%."
+//
+// This is the headline number of the whole product, which makes it the
+// number most worth making hard to overstate. Two things about it are
+// structurally awkward and are represented here rather than explained
+// in a slide footnote.
+//
+// First, the two sides are not measured the same way. The assisted
+// figure is instrumented: focused milliseconds, idle time excluded,
+// summed per application (AF-54). The baseline is usually the employer
+// telling us what they think their old process cost. Those are not
+// like for like, and the difference runs one way -- a remembered "about
+// fifteen minutes a CV" includes interruptions our number deliberately
+// excludes. So the comparison flatters us by default, and the source of
+// the baseline travels with the result instead of being forgotten.
+//
+// Second, the target is 50%. A threshold attached to a metric creates
+// pressure to report a number that clears it, so nothing here takes a
+// target as an argument or returns a pass/fail: this module reports the
+// reduction and refuses to report one it cannot support. Whether the
+// number cleared a bar is a separate question asked by whoever is
+// entitled to ask it.
+
+export const REVIEW_TIME_BASELINE_SOURCES = [
+  /**
+   * The employer's own account of their pre-assist process. An estimate,
+   * not a measurement, and usually a generous one.
+   */
+  "employer_reported",
+  /**
+   * Timing spans this system recorded before assisted review was turned
+   * on for the role. Measured the same way as the assisted side.
+   */
+  "measured_preassist"
+] as const;
+
+export type ReviewTimeBaselineSource = (typeof REVIEW_TIME_BASELINE_SOURCES)[number];
+
+export interface ReviewTimeBaseline {
+  readonly source: ReviewTimeBaselineSource;
+  /** Median time per application under the employer's prior process. */
+  readonly medianActiveMs: number;
+}
+
+/**
+ * Assisted review time against a baseline, as a reportable metric.
+ *
+ * The value is the fraction of baseline time removed: 0.5 means half the
+ * time, 1 would mean instant, and it is deliberately allowed to go
+ * NEGATIVE when assisted review is slower. Clamping at zero is the
+ * obvious defensive move and it would be the wrong one -- "we made
+ * review 20% slower" is the single most important thing this metric can
+ * ever say, and a floor at zero would render it as "no improvement" and
+ * lose it.
+ *
+ * The denominator handed to summarizeMetric is applications with usable
+ * timing, not spans. AF-54 drops idle-truncated spans, so an application
+ * whose only visit was truncated never reaches the sample -- which shows
+ * up as `population_incomplete` rather than quietly shrinking the base
+ * the median was drawn from.
+ */
+export function describeReviewTimeReduction(
+  assisted: ReviewTimingSummary,
+  baseline: ReviewTimeBaseline,
+  minimumSampleSize: number
+): MetricSample {
+  if (!Number.isFinite(baseline.medianActiveMs) || baseline.medianActiveMs <= 0) {
+    // Not a suppressed metric but a throw: a zero or negative baseline
+    // makes the ratio meaningless rather than unavailable, and returning
+    // `value: null` here would hide a caller bug behind the same
+    // "insufficient data" banner that honest small samples get.
+    throw new Error(
+      `describeReviewTimeReduction requires a positive baseline medianActiveMs, got: ${baseline.medianActiveMs}`
+    );
+  }
+
+  const assistedMedian = assisted.medianActiveMs;
+  const sample = summarizeMetric({
+    metric: "review_time_reduction",
+    value:
+      assistedMedian === null
+        ? null
+        : (baseline.medianActiveMs - assistedMedian) / baseline.medianActiveMs,
+    sampleSize: assisted.sampleSize,
+    population: assisted.population,
+    minimumSampleSize
+  });
+
+  if (baseline.source !== "employer_reported") {
+    return sample;
+  }
+  // Attached even when the value is suppressed. The caveat is a property
+  // of how the comparison was constructed, not of whether this
+  // particular sample happened to be big enough, and a reader who sees
+  // the limitation appear and disappear with sample size would
+  // reasonably conclude it was about sample size.
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "baseline_self_reported",
+        detail:
+          `the ${baseline.medianActiveMs}ms baseline is the employer's own estimate of their prior process, ` +
+          "not a measurement taken by this system; it likely includes interruptions that the assisted " +
+          "figure excludes, which biases the comparison in favour of a larger reduction"
+      }
+    ]
+  };
 }

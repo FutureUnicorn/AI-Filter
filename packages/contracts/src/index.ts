@@ -14,6 +14,7 @@ import {
   MAX_RUBRIC_CRITERIA,
   MEMBERSHIP_ROLES,
   METRIC_LIMITATION_CODES,
+  REVIEW_TIME_BASELINE_SOURCES,
   MIN_RUBRIC_CRITERIA,
   ROLE_STATUSES,
   RUBRIC_STATUSES
@@ -41,6 +42,7 @@ import type {
   Membership,
   MetricLimitation,
   MetricSample,
+  ReviewTimeBaseline,
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
@@ -803,3 +805,23 @@ export const metricSampleSchema = metricSampleObjectSchema
       path: ["value"]
     }
   );
+
+/**
+ * AF-55. The baseline half of the review-time comparison, validated at the
+ * boundary because -- unlike every other number in this file -- it does not
+ * originate inside the system. It is what an employer told us their old
+ * process cost.
+ *
+ * `.positive()` rather than `.min(0)`: a zero baseline is not a small
+ * baseline, it is a division by zero dressed as data, and it would yield an
+ * infinite reduction that `metricSampleSchema` would then reject one layer
+ * later with a message about finiteness that says nothing about the cause.
+ *
+ * `source` is required and has no default. A default would be chosen once,
+ * here, and thereafter every baseline of unknown provenance would silently
+ * acquire it -- which is exactly the fact this ticket needs to keep visible.
+ */
+export const reviewTimeBaselineSchema = z.strictObject({
+  source: z.enum(REVIEW_TIME_BASELINE_SOURCES),
+  medianActiveMs: z.number().positive().finite()
+}) satisfies z.ZodType<ReviewTimeBaseline>;
