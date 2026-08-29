@@ -1,0 +1,20 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "paths": {
+      "@signal-audit/ai": ["../packages/ai/src/index.ts"],
+      "@signal-audit/config": ["../packages/config/src/index.ts"],
+      "@signal-audit/contracts": ["../packages/contracts/src/index.ts"],
+      "@signal-audit/db": ["../packages/db/src/index.ts"],
+      "@signal-audit/domain": ["../packages/domain/src/index.ts"],
+      "@signal-audit/ingestion": ["../packages/ingestion/src/index.ts"],
+      "@signal-audit/security": ["../packages/security/src/index.ts"]
+    }
+  },
+  "include": ["unit/**/*.ts", "integration/**/*.ts", "architecture/**/*.ts"]
+}
