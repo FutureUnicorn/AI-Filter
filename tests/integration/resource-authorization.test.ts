@@ -11,6 +11,7 @@ import {
 const orgA = "11111111-1111-4111-8111-111111111111";
 const orgB = "22222222-2222-4222-8222-222222222222";
 const callerUserId = "44444444-4444-4444-8444-444444444444";
+const requestId = "req_66666666-6666-4666-8666-666666666666";
 
 function membership(
   organizationId: string,
@@ -85,13 +86,12 @@ test("UUID letter-case is not treated as a different organization or user", () =
 });
 
 test("no_membership maps to not_found so an org's existence is never confirmed to an outsider", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, "req_x");
+  const response = resourceAuthorizationErrorResponse({ outcome: "no_membership" }, requestId);
   assert.equal(response?.status, 404);
   assert.equal(response?.body.error.code, "not_found");
 });
 
 test("insufficient_capability maps to forbidden, and names the actual role", () => {
-  const requestId = "req_x";
   const response = resourceAuthorizationErrorResponse(
     { outcome: "insufficient_capability", role: "auditor" },
     requestId
@@ -102,6 +102,6 @@ test("insufficient_capability maps to forbidden, and names the actual role", () 
 });
 
 test("authorized yields no error response", () => {
-  const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, "req_x");
+  const response = resourceAuthorizationErrorResponse({ outcome: "authorized", role: "owner" }, requestId);
   assert.equal(response, undefined);
 });
