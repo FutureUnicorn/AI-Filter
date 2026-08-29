@@ -144,10 +144,41 @@ async function provisionInvitedMembership(
   if (userId === undefined) {
     throw new Error("invite redemption did not produce a user row");
   }
+  // Applying the invited role (below) makes one destructive direction
+  // reachable that DO NOTHING made impossible: a re-invite naming a
+  // non-owner role for the organization's only owner would leave it with
+  // zero owners and no way back, because granting `owner` is itself an
+  // owner-level action. So the upsert only gets to be unconditional in
+  // the direction that cannot strand an organization. FOR UPDATE locks
+  // the owner rows for the rest of this transaction, so two concurrent
+  // demotions cannot each see the other's owner and both proceed.
+  if (role !== "owner") {
+    const owners = await client.query<{ user_id: string }>(
+      `SELECT user_id
+         FROM "${schema}".memberships
+        WHERE organization_id = $1 AND role = 'owner'
+        FOR UPDATE`,
+      [organizationId]
+    );
+    const ownerIds = owners.rows.map((owner) => owner.user_id);
+    if (ownerIds.length === 1 && ownerIds[0] === userId) {
+      throw new Error(
+        `invite would demote the last owner of organization ${organizationId} to ${role}; ` +
+          `promote another owner before changing this membership`
+      );
+    }
+  }
+
+  // DO UPDATE, not DO NOTHING: an invite that names a role is an explicit
+  // instruction from whoever had permission to create it (invite creation
+  // is where that authorization boundary lives, not redemption) -- silently
+  // keeping the old role on conflict would let a deliberate promotion
+  // (recruiter -> admin, say) redeem successfully while leaving the actual
+  // membership unchanged, with no error or signal to anyone.
   await client.query(
     `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
      VALUES ($1, $2, $3)
-     ON CONFLICT (organization_id, user_id) DO NOTHING`,
+     ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
 }
