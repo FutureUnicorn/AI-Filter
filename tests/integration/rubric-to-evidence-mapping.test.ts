@@ -63,8 +63,11 @@ test("not_found maps with no citation field at all", () => {
 });
 
 test("a criterion the model omitted becomes extraction_error, never a silently invented not_found", () => {
-  const [outcome] = mapRubricToEvidence(context, ["python_production", "aws_certification"], [citing("python_production", "supported")]);
-  const missing = mapRubricToEvidence(context, ["aws_certification"], [])[0];
+  const [outcome, missing] = mapRubricToEvidence(
+    context,
+    ["python_production", "aws_certification"],
+    [citing("python_production", "supported")]
+  );
   assert.equal(missing?.kind, "extraction_error");
   assert.equal(missing?.kind === "extraction_error" ? missing.errorCode : undefined, "model_omitted_criterion");
   assert.equal(outcome?.kind, "supported");
