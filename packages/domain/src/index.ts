@@ -2317,6 +2317,204 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-59: role-level audit report ----
+//
+// "The actual pilot deliverable: time saved, preservation, precision,
+// corrections, and failures for one role, in a form an employer can read
+// without a login."
+//
+// Two properties of "without a login" drive everything here.
+//
+// **It is unauthenticated, so it must carry no candidate identifiers.**
+// A role-level report is an aggregate by definition, and the moment one
+// applicationId reaches it, a link forwarded to a recruiter's personal
+// inbox has leaked a named candidate outside the tenant (POL-011). The
+// report type is therefore shaped so that no candidate identifier can be
+// placed in it -- AuditSampleProvenance exists precisely to strip the
+// sampled ids off AF-52's selection -- rather than relying on whoever
+// renders it to leave them out.
+//
+// **It is read without anyone present to explain it.** Every guard the
+// metric tickets added lives in `limitations`, and a renderer that shows
+// `value` and drops them undoes all of it: a suppressed metric would
+// render as blank, and blank next to four real numbers reads as zero or
+// as nothing to report. So the report holds MetricSample values whole,
+// and renderRoleAuditReport prints the caveats with the number rather
+// than beside it.
+//
+// The five figures the ticket names are REQUIRED KEYS, not an array. A
+// section that is merely absent from a customer-facing report reads as
+// "no problems here", which is the most expensive way this document
+// could be wrong. Absent becomes an explicit "not measured" line.
+//
+// Deliberately NOT decided here: how the report reaches the employer.
+// An unauthenticated URL is a real security design -- token lifetime,
+// revocation, whether the link survives the pilot -- and belongs with
+// AF-64's privacy work and a human sign-off, not inside a reporting
+// helper. This module produces the artifact and says nothing about
+// delivery.
+
+export const ROLE_AUDIT_METRICS = [
+  "review_time_reduction",
+  "qualified_candidate_preservation",
+  "evidence_precision_live_pilot",
+  "failed_document_rate"
+] as const;
+
+export type RoleAuditMetric = (typeof ROLE_AUDIT_METRICS)[number];
+
+/**
+ * AF-52's selection with the sampled application ids removed.
+ *
+ * The employer needs to see that the sample was drawn honestly -- the
+ * seed makes it reproducible and eligibleCount shows what it was drawn
+ * from -- and needs none of the identities to see that. Constructed by a
+ * function rather than assembled at call sites so there is exactly one
+ * place where the ids are dropped.
+ */
+export interface AuditSampleProvenance {
+  readonly seed: string;
+  readonly eligibleCount: number;
+  readonly sampledCount: number;
+}
+
+export function describeAuditSampleProvenance(selection: AuditSampleSelection): AuditSampleProvenance {
+  return {
+    seed: selection.seed,
+    eligibleCount: selection.eligibleCount,
+    sampledCount: selection.sampledApplicationIds.length
+  };
+}
+
+/** The correction figures AF-57 produces, without the precision rate. */
+export interface CorrectionSummary {
+  readonly reviewedItems: number;
+  readonly correctedItems: number;
+  readonly correctionEvents: number;
+}
+
+export interface RoleAuditReport extends VersionedRecord {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly generatedAt: string;
+  /** Every named metric, present as null when it was never computed. */
+  readonly metrics: Readonly<Record<RoleAuditMetric, MetricSample | null>>;
+  readonly corrections: CorrectionSummary | null;
+  readonly auditSample: AuditSampleProvenance | null;
+}
+
+export interface BuildRoleAuditReportInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly generatedAt: string;
+  readonly metrics: Readonly<Record<RoleAuditMetric, MetricSample | null>>;
+  readonly corrections: CorrectionSummary | null;
+  readonly auditSample: AuditSampleProvenance | null;
+}
+
+export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
+  for (const metric of ROLE_AUDIT_METRICS) {
+    const sample = input.metrics[metric];
+    if (sample !== null && sample.metric !== metric) {
+      // A sample filed under the wrong key would be rendered with the
+      // wrong heading -- a preservation figure labelled as precision is
+      // worse than a missing one, because it is believable.
+      throw new Error(
+        `buildRoleAuditReport: metrics.${metric} carries a sample for "${sample.metric}"`
+      );
+    }
+  }
+  if (input.corrections !== null && input.corrections.correctedItems > input.corrections.reviewedItems) {
+    throw new Error(
+      "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
+    );
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId: input.organizationId,
+    roleId: input.roleId,
+    generatedAt: input.generatedAt,
+    metrics: { ...input.metrics },
+    corrections: input.corrections,
+    auditSample: input.auditSample
+  };
+}
+
+const ROLE_AUDIT_METRIC_HEADINGS: Readonly<Record<RoleAuditMetric, string>> = {
+  review_time_reduction: "Review time saved",
+  qualified_candidate_preservation: "Qualified candidates preserved",
+  evidence_precision_live_pilot: "Evidence precision",
+  failed_document_rate: "Documents that could not be processed"
+};
+
+function formatPercentage(value: number): string {
+  // One decimal place, and the sign kept: a negative review-time
+  // reduction means the tool made review slower, and dropping the sign
+  // would turn the most important result this report can carry into its
+  // opposite.
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+/**
+ * Plain text, because the audience reads it without a login and quite
+ * possibly without a browser that renders our CSS.
+ *
+ * A suppressed metric prints "not enough data to report" and its reason.
+ * It never prints an empty value: blank beside four real numbers reads
+ * as zero, and zero is a claim.
+ */
+export function renderRoleAuditReport(report: RoleAuditReport): string {
+  const lines: string[] = [
+    `Evidence audit report`,
+    `Role: ${report.roleId}`,
+    `Generated: ${report.generatedAt}`,
+    ``
+  ];
+
+  for (const metric of ROLE_AUDIT_METRICS) {
+    const sample = report.metrics[metric];
+    lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
+    if (sample === null) {
+      lines.push(`  Not measured for this role.`);
+      lines.push(``);
+      continue;
+    }
+    lines.push(
+      sample.value === null
+        ? `  Not enough data to report.`
+        : `  ${formatPercentage(sample.value)} (from ${sample.sampleSize} of ${sample.population})`
+    );
+    for (const limitation of sample.limitations) {
+      lines.push(`  Note: ${limitation.detail}`);
+    }
+    lines.push(``);
+  }
+
+  lines.push(`Corrections`);
+  if (report.corrections === null) {
+    lines.push(`  Not measured for this role.`);
+  } else {
+    lines.push(
+      `  ${report.corrections.correctedItems} of ${report.corrections.reviewedItems} reviewed evidence items ` +
+        `were corrected, across ${report.corrections.correctionEvents} correction(s).`
+    );
+  }
+  lines.push(``);
+
+  lines.push(`Audit sample`);
+  if (report.auditSample === null) {
+    lines.push(`  No audit sample was drawn for this role.`);
+  } else {
+    lines.push(
+      `  ${report.auditSample.sampledCount} of ${report.auditSample.eligibleCount} eligible candidates, ` +
+        `drawn with seed ${report.auditSample.seed}. Re-running the selection with that seed reproduces ` +
+        `the same sample.`
+    );
+  }
+
+  return lines.join("\n") + "\n";
+}
+
 // ---- AF-57: evidence precision / correction rate ----
 //
 // "Share of evidence items a recruiter had to correct. Target >= 98%
