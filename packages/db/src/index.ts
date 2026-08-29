@@ -187,6 +187,31 @@ async function provisionInvitedMembership(
   // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
   // sharing the connection.
   await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+  // Applying the invited role (below) makes one destructive direction
+  // reachable that DO NOTHING made impossible: a re-invite naming a
+  // non-owner role for the organization's only owner would leave it with
+  // zero owners and no way back, because granting `owner` is itself an
+  // owner-level action. So the upsert only gets to be unconditional in
+  // the direction that cannot strand an organization. FOR UPDATE locks
+  // the owner rows for the rest of this transaction, so two concurrent
+  // demotions cannot each see the other's owner and both proceed.
+  if (role !== "owner") {
+    const owners = await client.query<{ user_id: string }>(
+      `SELECT user_id
+         FROM "${schema}".memberships
+        WHERE organization_id = $1 AND role = 'owner'
+        FOR UPDATE`,
+      [organizationId]
+    );
+    const ownerIds = owners.rows.map((owner) => owner.user_id);
+    if (ownerIds.length === 1 && ownerIds[0] === userId) {
+      throw new Error(
+        `invite would demote the last owner of organization ${organizationId} to ${role}; ` +
+          `promote another owner before changing this membership`
+      );
+    }
+  }
+
   // DO UPDATE, not DO NOTHING: an invite that names a role is an explicit
   // instruction from whoever had permission to create it (invite creation
   // is where that authorization boundary lives, not redemption) -- silently
@@ -634,8 +659,15 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
     }
   } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
@@ -776,18 +808,109 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
       );
     }
 
-    // And app.current_org_id must not survive the redemption transaction:
-    // a pooled connection reused for another organization would otherwise
-    // inherit this one's tenant scope.
-    const leaked = await admin.query<{ leaked: string }>(
-      `SELECT coalesce(nullif(current_setting('app.current_org_id', true), ''), '') AS leaked`
+    // A re-invite that would strand the organization with no owner is
+    // refused, loudly, and leaves the existing membership untouched.
+    await admin.query(`UPDATE memberships SET role = 'owner' WHERE organization_id = $1`, [organizationId]);
+    await admin.query(
+      `DELETE FROM memberships
+        WHERE organization_id = $1
+          AND user_id <> (SELECT user_id FROM users WHERE email = $2)`,
+      [organizationId, invitedEmail]
     );
-    if (leaked.rows[0]?.leaked !== "") {
-      throw new Error("app.current_org_id must be transaction-local and must not leak past redemption");
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-demote-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "recruiter" },
+      expiresAt
+    });
+    let demotionError: unknown;
+    try {
+      await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-demote-${suffix}`);
+    } catch (error) {
+      demotionError = error;
+    }
+    if (demotionError === undefined) {
+      throw new Error("demoting the last owner of an organization must be refused, not applied silently");
+    }
+    const afterRefusal = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterRefusal.rows[0]?.role !== "owner") {
+      throw new Error(
+        `a refused demotion must roll back and leave the membership intact, got: ${JSON.stringify(afterRefusal.rows)}`
+      );
+    }
+
+    // app.current_org_id must not survive the transaction that sets it.
+    //
+    // Scope of this check, stated exactly: it verifies the *mechanism*
+    // provisionInvitedMembership relies on -- that is_local => true is
+    // discarded at COMMIT and is_local => false is not -- on a connection
+    // this probe holds open across that COMMIT. It does not observe
+    // provisionInvitedMembership's own connection, because
+    // redeemMagicLinkToken opens and ends that one itself, so nothing
+    // outside can read its settings after the fact. Flipping is_local in
+    // provisionInvitedMembership therefore does NOT fail this assertion;
+    // that argument rests on reading the call, which is one line away.
+    //
+    // Worth being blunt about why that residual gap is acceptable today:
+    // every entry point in this module constructs its own Client and
+    // ends it in a finally, so there is no pool for a stale setting to
+    // leak into. is_local => true is the right thing to write anyway --
+    // it is correct the day a pool is introduced, and this check is what
+    // proves that keyword still means what the comment claims.
+    //
+    // An earlier version of this assertion ran on `admin`, which never
+    // called set_config at all. current_setting is per-connection, so it
+    // passed no matter what, and measured nothing. The is_local => false
+    // leg below is the control that keeps this one honest: if a
+    // session-scoped setting did not survive COMMIT either, the
+    // assertion above would again be measuring nothing.
+    const scoped = new Client({ connectionString: probeDatabaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await scoped.connect();
+      const readOrgSetting = async (): Promise<string> => {
+        const row = await scoped.query<{ value: string }>(
+          `SELECT coalesce(nullif(current_setting('app.current_org_id', true), ''), '') AS value`
+        );
+        return row.rows[0]?.value ?? "";
+      };
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error("set_config must take effect inside its own transaction");
+      }
+      await scoped.query("COMMIT");
+      const afterCommit = await readOrgSetting();
+      if (afterCommit !== "") {
+        throw new Error(
+          `app.current_org_id must be transaction-local; it survived COMMIT on the same connection as ${afterCommit}`
+        );
+      }
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, false)`, [organizationId]);
+      await scoped.query("COMMIT");
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error(
+          "control failed: a session-scoped set_config should survive COMMIT, so the transaction-local assertion above proves nothing"
+        );
+      }
+    } finally {
+      await scoped.end().catch(() => undefined);
     }
   } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
