@@ -111,7 +111,14 @@ export function createConsoleMagicLinkEmailSender(appEnv: string = "development"
       logStructured("info", "magic_link.queued");
       // Keep the local developer hint non-sensitive: even terminal output must
       // avoid exposing the raw recipient or bearer token.
-      const safeLink = input.link.replace(/([?&])token=[^&]+/i, "$1token=[REDACTED]");
+      //
+      // The `g` flag is load-bearing, not tidiness. Without it only the
+      // FIRST token parameter is redacted, so a link carrying the
+      // parameter twice -- which nothing rejects, since a duplicated
+      // query parameter is well-formed -- printed the second one to the
+      // terminal in full. A redaction that stops at the first match is a
+      // leak for every input the author did not picture.
+      const safeLink = input.link.replace(/([?&])token=[^&]*/gi, "$1token=[REDACTED]");
       process.stderr.write(`\n[dev magic link] to: [REDACTED_EMAIL]\n[dev magic link] open: ${safeLink}\n\n`);
     }
   };
