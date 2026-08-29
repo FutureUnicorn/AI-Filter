@@ -281,10 +281,11 @@ test("citation_invalid rejects a circular rejectedCitation instead of overflowin
     quote: "Built and maintained Python microservices processing 2M+ events/day."
   };
   circular.self = circular;
-  let result: ReturnType<typeof safeParseEvidenceOutcome>;
+  let result: ReturnType<typeof safeParseEvidenceOutcome> | undefined;
   assert.doesNotThrow(() => {
     result = safeParseEvidenceOutcome({ ...samples.citation_invalid, rejectedCitation: circular });
   });
+  assert.ok(result !== undefined);
   assert.equal(result.success, false);
 });
 

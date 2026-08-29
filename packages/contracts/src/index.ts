@@ -58,18 +58,18 @@ const sourceCitationSchema = z.strictObject({
  * A cycle check runs before the recursive Zod parse itself: a self-referential
  * object is still a `Record` at the type level, but it can never survive JSON
  * and would otherwise overflow the stack while walking the graph. */
-function hasCircularJsonReference(value: unknown, seen = new WeakSet<object>()): boolean {
+function hasCircularJsonReference(value: unknown, ancestors = new WeakSet<object>()): boolean {
   if (value === null || typeof value !== "object") {
     return false;
   }
-  if (seen.has(value)) {
+  if (ancestors.has(value)) {
     return true;
   }
-  seen.add(value);
-  if (Array.isArray(value)) {
-    return value.some((entry) => hasCircularJsonReference(entry, seen));
-  }
-  return Object.values(value).some((entry) => hasCircularJsonReference(entry, seen));
+  ancestors.add(value);
+  const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  const containsCycle = children.some((entry) => hasCircularJsonReference(entry, ancestors));
+  ancestors.delete(value);
+  return containsCycle;
 }
 
 const recursiveJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
