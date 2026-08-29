@@ -962,6 +962,10 @@ interface FileIntakeRow {
   readonly status: FileIntakeStatus;
   readonly created_by_user_id: string;
   readonly created_at: Date;
+  readonly sniffed_mime_type: string | null;
+  readonly size_bytes: string | null;
+  readonly sha256_hash: string | null;
+  readonly rejection_reason: string | null;
 }
 
 function rowToFileIntake(row: FileIntakeRow): FileIntake {
@@ -975,12 +979,16 @@ function rowToFileIntake(row: FileIntakeRow): FileIntake {
     declaredMimeType: row.declared_mime_type,
     status: row.status,
     createdByUserId: row.created_by_user_id,
-    createdAt: row.created_at.toISOString()
+    createdAt: row.created_at.toISOString(),
+    ...(row.sniffed_mime_type === null ? {} : { sniffedMimeType: row.sniffed_mime_type }),
+    ...(row.size_bytes === null ? {} : { sizeBytes: Number(row.size_bytes) }),
+    ...(row.sha256_hash === null ? {} : { sha256Hash: row.sha256_hash }),
+    ...(row.rejection_reason === null ? {} : { rejectionReason: row.rejection_reason })
   };
 }
 
 const FILE_INTAKE_COLUMNS =
-  "intake_id, organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id, created_at";
+  "intake_id, organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id, created_at, sniffed_mime_type, size_bytes, sha256_hash, rejection_reason";
 
 export async function createFileIntake(
   databaseUrl: string,
@@ -1060,6 +1068,48 @@ export async function markFileIntakeUploaded(
     );
     const row = result.rows[0];
     return row === undefined ? { outcome: "not_pending" } : { outcome: "uploaded", intake: rowToFileIntake(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface RecordFileValidationInput {
+  readonly sniffedMimeType: string | undefined;
+  readonly sizeBytes: number;
+  readonly sha256Hash: string;
+  readonly validation: { readonly outcome: "validated" } | { readonly outcome: "quarantined"; readonly reason: string };
+}
+
+export type RecordFileValidationOutcome =
+  | { readonly outcome: "recorded"; readonly intake: FileIntake }
+  | { readonly outcome: "not_uploaded" };
+
+/** WHERE status = 'uploaded' is the same one-shot pattern as
+ * markFileIntakeUploaded -- validation can only run once against a
+ * freshly-uploaded object, never re-run against something already
+ * validated/quarantined/rejected (which would let a second, more
+ * lenient pass override a real quarantine finding). */
+export async function recordFileValidationResult(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string,
+  input: RecordFileValidationInput
+): Promise<RecordFileValidationOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const newStatus: FileIntakeStatus = input.validation.outcome === "validated" ? "validated" : "quarantined";
+    const rejectionReason = input.validation.outcome === "validated" ? null : input.validation.reason;
+    const result = await client.query<FileIntakeRow>(
+      `UPDATE "${schema}".file_intakes
+          SET status = $2, sniffed_mime_type = $3, size_bytes = $4, sha256_hash = $5, rejection_reason = $6
+        WHERE intake_id = $1 AND status = 'uploaded'
+        RETURNING ${FILE_INTAKE_COLUMNS}`,
+      [intakeId, newStatus, input.sniffedMimeType ?? null, input.sizeBytes, input.sha256Hash, rejectionReason]
+    );
+    const row = result.rows[0];
+    return row === undefined ? { outcome: "not_uploaded" } : { outcome: "recorded", intake: rowToFileIntake(row) };
   } finally {
     await client.end().catch(() => undefined);
   }

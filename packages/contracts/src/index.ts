@@ -522,7 +522,11 @@ export const fileIntakeSchema = z.strictObject({
   declaredMimeType: z.string().min(1),
   status: z.enum(FILE_INTAKE_STATUSES),
   createdByUserId: z.uuid(),
-  createdAt: z.iso.datetime()
+  createdAt: z.iso.datetime(),
+  sniffedMimeType: z.string().min(1).optional(),
+  sizeBytes: z.number().int().min(0).optional(),
+  sha256Hash: z.string().min(1).optional(),
+  rejectionReason: z.string().min(1).optional()
 }) satisfies z.ZodType<FileIntake>;
 
 const ALLOWED_FILE_EXTENSION_PATTERN = new RegExp(`\\.(${ALLOWED_FILE_TYPES.join("|")})$`, "iu");

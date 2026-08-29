@@ -636,4 +636,98 @@ export interface FileIntake extends VersionedRecord {
   readonly status: FileIntakeStatus;
   readonly createdByUserId: string;
   readonly createdAt: string;
+  /** Set once AF-29's validation has actually run; absent before that. */
+  readonly sniffedMimeType?: string | undefined;
+  readonly sizeBytes?: number | undefined;
+  readonly sha256Hash?: string | undefined;
+  readonly rejectionReason?: string | undefined;
+}
+
+// ---- AF-29: file allowlist, MIME validation, hash and quarantine ----
+//
+// Pure decision logic only -- packages/ingestion owns fetching the
+// object, sniffing its real bytes, hashing, and reading a ZIP's central
+// directory (all of which need real I/O and a third-party sniffer);
+// this function just decides, given those already-gathered facts,
+// whether the file is safe to hand to AF-30's parser.
+
+export const MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB
+
+/** Real MIME types file-type actually reports for the three allowed
+ * extensions -- deliberately not the client-declared Content-Type,
+ * which is exactly what a disguised file lies about. */
+export const ALLOWED_SNIFFED_MIME_TYPES: Readonly<Record<AllowedFileType, string>> = {
+  pdf: "application/pdf",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  csv: "text/csv"
+};
+
+/**
+ * A ZIP whose central directory declares an uncompressed size wildly
+ * larger than the file actually uploaded is the classic zip-bomb shape
+ * (one tiny compressed entry, an enormous declared uncompressed size).
+ * Bounded two ways, either one is enough to flag: an absolute cap
+ * (protects even a large legitimate upload) and a compression-ratio cap
+ * (protects a small upload from claiming to unpack to something absurd).
+ */
+export const MAX_DOCX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024; // 200 MiB
+export const MAX_DOCX_COMPRESSION_RATIO = 200;
+
+export interface FileValidationInput {
+  readonly declaredFilename: string;
+  /** undefined when file-type recognized no known signature at all. */
+  readonly sniffedMimeType: string | undefined;
+  readonly sizeBytes: number;
+  /** undefined for a non-ZIP-based file (a CSV, or a PDF); present (from
+   * packages/ingestion's central-directory scan) whenever the sniffed
+   * type is ZIP-based, i.e. docx. */
+  readonly zipUncompressedBytes?: number | undefined;
+}
+
+export type FileValidationOutcome =
+  | { readonly outcome: "validated" }
+  | { readonly outcome: "quarantined"; readonly reason: string };
+
+export function evaluateFileValidation(input: FileValidationInput): FileValidationOutcome {
+  if (input.sizeBytes > MAX_FILE_UPLOAD_BYTES) {
+    return {
+      outcome: "quarantined",
+      reason: `File is ${input.sizeBytes} bytes, over the ${MAX_FILE_UPLOAD_BYTES}-byte limit.`
+    };
+  }
+  if (input.sniffedMimeType === undefined) {
+    return { outcome: "quarantined", reason: "Could not identify the file's real type from its contents." };
+  }
+  const allowedType = (Object.entries(ALLOWED_SNIFFED_MIME_TYPES) as [AllowedFileType, string][]).find(
+    ([, mimeType]) => mimeType === input.sniffedMimeType
+  );
+  if (allowedType === undefined) {
+    return {
+      outcome: "quarantined",
+      reason: `Sniffed type ${input.sniffedMimeType} is not on the allowlist (pdf, docx, csv).`
+    };
+  }
+  const [fileType] = allowedType;
+  if (!input.declaredFilename.toLowerCase().endsWith(`.${fileType}`)) {
+    return {
+      outcome: "quarantined",
+      reason: `Filename claims a different type than its real content (sniffed as ${fileType}).`
+    };
+  }
+  if (input.zipUncompressedBytes !== undefined) {
+    if (input.zipUncompressedBytes > MAX_DOCX_UNCOMPRESSED_BYTES) {
+      return {
+        outcome: "quarantined",
+        reason: `Archive declares ${input.zipUncompressedBytes} uncompressed bytes, over the ${MAX_DOCX_UNCOMPRESSED_BYTES}-byte cap.`
+      };
+    }
+    const ratio = input.zipUncompressedBytes / Math.max(input.sizeBytes, 1);
+    if (ratio > MAX_DOCX_COMPRESSION_RATIO) {
+      return {
+        outcome: "quarantined",
+        reason: `Archive's compression ratio (${ratio.toFixed(1)}x) exceeds the ${MAX_DOCX_COMPRESSION_RATIO}x archive-bomb threshold.`
+      };
+    }
+  }
+  return { outcome: "validated" };
 }
