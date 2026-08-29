@@ -464,6 +464,20 @@ export interface SetInferenceKillSwitchInput {
   readonly engaged: boolean;
   readonly reason?: string;
   readonly engagedByUserId?: string;
+  /**
+   * Required to audit the transition. Every engage/disengage overwrites
+   * the singleton row -- including its actor, reason and timestamp -- so
+   * without an audit row the previous incident-control action leaves no
+   * trace at all once the next transition happens. `audit_events`
+   * already covers consequential `admin_action`s explicitly, and the
+   * transition plus its audit row now commit in ONE transaction, so a
+   * flipped switch can never exist without the record of who flipped it.
+   */
+  readonly audit: {
+    readonly organizationId: string;
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
 }
 
 /**
@@ -486,14 +500,38 @@ export async function setInferenceKillSwitch(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    const result = await client.query(
-      `UPDATE "${schema}".inference_kill_switch
-          SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = CURRENT_TIMESTAMP
-        WHERE id = true`,
-      [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
-    );
-    if (result.rowCount === 0) {
-      throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+    await client.query("BEGIN");
+    try {
+      const result = await client.query(
+        `UPDATE "${schema}".inference_kill_switch
+            SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = clock_timestamp()
+          WHERE id = true`,
+        [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
+      );
+      if (result.rowCount === 0) {
+        throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+      }
+      // Same transaction, on the same client: the switch cannot end up
+      // flipped without the audit row recording who did it, and a
+      // failure here rolls the transition back rather than leaving an
+      // unattributed change behind.
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.audit.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "inference_kill_switch",
+          entityId: input.engaged ? "engaged" : "disengaged",
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
     }
   } finally {
     await client.end().catch(() => undefined);

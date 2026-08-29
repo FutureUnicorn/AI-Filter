@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { InferenceKillSwitchEngagedError, createOpenAiAdapter } from "../../packages/ai/src/index.ts";
-import type { OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
+import { InferenceKillSwitchEngagedError, alwaysDisengagedKillSwitch, createOpenAiAdapter } from "../../packages/ai/src/index.ts";
+import type { OpenAiAdapterConfig, OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 
 // No real API key, no network call: createOpenAiAdapter's second
 // parameter accepts anything shaped like OpenAiResponsesClient, which
@@ -37,13 +37,13 @@ const baseInput = {
 };
 
 test("runStructuredCall parses the client's output_text as JSON", async () => {
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient('{"items":[]}'));
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, fakeClient('{"items":[]}'));
   const result = await adapter.runStructuredCall(baseInput);
   assert.deepEqual(result.output, { items: [] });
 });
 
 test("runStructuredCall records provider/model/prompt/schema metadata on every call", async () => {
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}"));
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, fakeClient("{}"));
   const result = await adapter.runStructuredCall(baseInput);
   assert.deepEqual(result.metadata, {
     provider: "openai",
@@ -57,7 +57,7 @@ test("runStructuredCall records provider/model/prompt/schema metadata on every c
 
 test("runStructuredCall surfaces the provider's real token usage, not an estimate", async () => {
   const adapter = createOpenAiAdapter(
-    { apiKey: "sk-test", model: "gpt-5.6" },
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch },
     fakeClient("{}", undefined, { input_tokens: 900, output_tokens: 150 })
   );
   const result = await adapter.runStructuredCall(baseInput);
@@ -66,7 +66,7 @@ test("runStructuredCall surfaces the provider's real token usage, not an estimat
 
 test("runStructuredCall sends the system and user prompts as separate messages, in order", async () => {
   const capture: { params?: unknown } = {};
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}", capture));
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, fakeClient("{}", capture));
   await adapter.runStructuredCall(baseInput);
   const params = capture.params as { input: Array<{ role: string; content: string }> };
   assert.deepEqual(params.input, [
@@ -77,7 +77,7 @@ test("runStructuredCall sends the system and user prompts as separate messages, 
 
 test("runStructuredCall requests strict structured JSON output with the caller's schema and name", async () => {
   const capture: { params?: unknown } = {};
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}", capture));
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, fakeClient("{}", capture));
   await adapter.runStructuredCall(baseInput);
   const params = capture.params as {
     text: { format: { type: string; name: string; schema: unknown; strict: boolean } };
@@ -89,7 +89,7 @@ test("runStructuredCall requests strict structured JSON output with the caller's
 });
 
 test("different calls with different prompt/schema versions produce different metadata", async () => {
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}"));
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch }, fakeClient("{}"));
   const first = await adapter.runStructuredCall(baseInput);
   const second = await adapter.runStructuredCall({ ...baseInput, promptVersion: "v2", schemaVersion: "1.1.0" });
   assert.equal(first.metadata.promptVersion, "v1");
@@ -141,8 +141,23 @@ test("runStructuredCall proceeds normally when checkKillSwitch reports disengage
   assert.deepEqual(result.output, { items: [] });
 });
 
-test("runStructuredCall proceeds normally when no checkKillSwitch is supplied at all", async () => {
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient('{"items":[]}'));
+test("an adapter cannot be constructed without a kill-switch check", () => {
+  // This test previously asserted the OPPOSITE -- that an adapter with
+  // no check "proceeds normally" -- which was precisely the unchecked
+  // path that left the kill switch unable to halt anything.
+  // checkKillSwitch is now required, so omitting it is a compile error;
+  // the only way past it is the explicitly-named marker below, which
+  // greps cleanly so every bypass is visible.
+  // @ts-expect-error checkKillSwitch is required and must not be omissible
+  const invalid: OpenAiAdapterConfig = { apiKey: "sk-test", model: "gpt-5.6" };
+  assert.equal(invalid.model, "gpt-5.6");
+});
+
+test("runStructuredCall proceeds normally with the explicit disengaged marker", async () => {
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch },
+    fakeClient('{"items":[]}')
+  );
   const result = await adapter.runStructuredCall(baseInput);
   assert.deepEqual(result.output, { items: [] });
 });

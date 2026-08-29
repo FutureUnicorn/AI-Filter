@@ -54,21 +54,39 @@ export interface OpenAiResponsesClient {
   };
 }
 
+/**
+ * Explicit "this call site genuinely has no kill switch" marker, for
+ * tests and for adapters constructed outside the inference path. Named
+ * so that grepping for it finds every place the control is bypassed --
+ * which an optional field silently hid.
+ */
+export const alwaysDisengagedKillSwitch = async (): Promise<{ readonly engaged: boolean }> => ({
+  engaged: false
+});
+
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
   /**
    * Checked before every call; when it resolves `engaged: true`, the
-   * provider is never invoked. Optional only so the existing adapter
-   * tests (which don't care about kill-switch behavior) don't all need
-   * to supply one -- any real caller wiring this up for actual evidence
-   * extraction must pass one (e.g. `() => getInferenceKillSwitchStatus(
-   * databaseUrl, schema)` from packages/db, whose InferenceKillSwitchRow
-   * shape already matches this exactly). Before this, nothing in the
-   * codebase called this at all, so engaging the kill switch halted
-   * nothing.
+   * provider is never invoked.
+   *
+   * REQUIRED, not optional. While it was optional, every construction
+   * using the original `{ apiKey, model }` shape still compiled and
+   * called the provider without consulting the database, so engaging
+   * the switch could not reliably halt inference -- which is the entire
+   * point of the control. Making it mandatory means an adapter that
+   * skips the check cannot be built at all: it is a compile error.
+   *
+   * The caller injects it (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose row shape already
+   * matches). Injection rather than a direct import keeps packages/ai
+   * free of a dependency on packages/db, which the architecture rules
+   * forbid. Tests that genuinely do not exercise the switch pass
+   * `alwaysDisengagedKillSwitch` so the omission is explicit and
+   * greppable rather than silent.
    */
-  readonly checkKillSwitch?: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
 }
 
 /**
@@ -126,11 +144,9 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
-      if (config.checkKillSwitch !== undefined) {
-        const status = await config.checkKillSwitch();
-        if (status.engaged) {
-          throw new InferenceKillSwitchEngagedError(status.reason);
-        }
+      const status = await config.checkKillSwitch();
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
       }
 
       const response = await openai.responses.create({
