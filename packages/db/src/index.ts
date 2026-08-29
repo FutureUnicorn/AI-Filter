@@ -10,6 +10,7 @@ import type {
   CanonicalTextQuality,
   CsvColumnMapping,
   DomainPort,
+  FailedDocumentRate,
   FileIntake,
   FileIntakeStatus,
   ImportFinalizationSummary,
@@ -32,6 +33,7 @@ import {
   canonicalizeCsvColumnMapping,
   classifyCsvImportRow,
   mapCsvRowToApplication,
+  summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
 import { Client } from "pg";
@@ -1734,6 +1736,218 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-58: failed-document rate ----
+
+/**
+ * Per-role pipeline health. Scoped by organization first, not only by
+ * role: role_id is a uuid and would be unguessable in practice, but
+ * POL-011 is a tenant boundary, not an obscurity argument, so the
+ * organization is part of the predicate rather than assumed from it.
+ *
+ * The LEFT JOIN is what distinguishes "extraction ran and found nothing"
+ * (quality = 'empty', a failure) from "extraction has not run yet" (no
+ * row at all, still in flight). An INNER JOIN would silently drop the
+ * second group and make the rate look better than it is.
+ */
+export async function getFailedDocumentRate(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<FailedDocumentRate> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      uploaded: string;
+      quarantined: string;
+      rejected: string;
+      extraction_empty: string;
+      extraction_succeeded: string;
+    }>(
+      `SELECT
+         count(*) FILTER (WHERE fi.status <> 'pending') AS uploaded,
+         count(*) FILTER (WHERE fi.status = 'quarantined') AS quarantined,
+         count(*) FILTER (WHERE fi.status = 'rejected') AS rejected,
+         count(*) FILTER (WHERE fi.status = 'validated' AND cte.quality = 'empty') AS extraction_empty,
+         count(*) FILTER (WHERE fi.status = 'validated' AND cte.quality IN ('full', 'partial'))
+           AS extraction_succeeded
+       FROM "${schema}".file_intakes fi
+       LEFT JOIN "${schema}".canonical_text_extractions cte ON cte.intake_id = fi.intake_id
+       WHERE fi.organization_id = $1 AND fi.role_id = $2`,
+      [organizationId, roleId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      // Aggregates always produce exactly one row, so no row means the
+      // query did not run as written rather than "this role has no files".
+      throw new Error("getFailedDocumentRate: aggregate query returned no row");
+    }
+    // count(*) is bigint, which node-postgres hands back as a string.
+    // Number() on an out-of-range or malformed value would silently
+    // produce NaN or a rounded float and poison every derived figure.
+    const toCount = (value: string, column: string): number => {
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new Error(`getFailedDocumentRate: ${column} is not a safe non-negative integer, got: ${value}`);
+      }
+      return parsed;
+    };
+    return summarizeFailedDocuments(organizationId, roleId, {
+      uploaded: toCount(row.uploaded, "uploaded"),
+      quarantined: toCount(row.quarantined, "quarantined"),
+      rejected: toCount(row.rejected, "rejected"),
+      extractionEmpty: toCount(row.extraction_empty, "extraction_empty"),
+      extractionSucceeded: toCount(row.extraction_succeeded, "extraction_succeeded")
+    });
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-58 review probe. The counting rules only mean anything against a
+ * real schema: the LEFT JOIN, the `FILTER` predicates and the
+ * status/quality CHECK constraints are all database behaviour, and a
+ * hand-built fake would just restate the SQL I am trying to test.
+ *
+ * Three claims, each of which was wrong under an obvious simpler query:
+ *   1. A validated intake with NO extraction row is in flight, not a
+ *      failure -- an INNER JOIN or a `cte.quality IS DISTINCT FROM 'full'`
+ *      predicate would count it as failed.
+ *   2. `pending` never counts as an uploaded document at all.
+ *   3. The result is scoped to one organization AND one role; a second
+ *      role, and a second tenant's identical data, must not leak in.
+ */
+export async function assertFailedDocumentRateAccuracy(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `fdr_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const roleOther = "44444444-4444-4444-8444-444444444444";
+  const roleB = "55555555-5555-4555-8555-555555555555";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'U')`, [
+      userId,
+      `probe_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
+       VALUES ($1,$2,'A role',$4), ($3,$2,'Other role',$4), ($5,$6,'B role',$4)`,
+      [roleA, orgA, roleOther, userId, roleB, orgB]
+    );
+
+    let seq = 0;
+    const intake = async (organizationId: string, roleId: string, status: string): Promise<string> => {
+      seq += 1;
+      const result = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,'cv.pdf','application/pdf',$4,$5) RETURNING intake_id`,
+        [organizationId, roleId, `key-${suffix}-${seq}`, status, userId]
+      );
+      return result.rows[0]!.intake_id;
+    };
+    const extraction = async (intakeId: string, quality: string): Promise<void> => {
+      await admin.query(
+        `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+         VALUES ($1, '[]'::jsonb, 1, $2)`,
+        [intakeId, quality]
+      );
+    };
+
+    // Role A: 1 quarantined, 1 rejected, 1 empty extraction (all failures),
+    // 1 full + 1 partial (successes), 1 validated-but-unextracted and
+    // 1 uploaded (both in flight), 1 pending (not a document at all).
+    await intake(orgA, roleA, "quarantined");
+    await intake(orgA, roleA, "rejected");
+    await extraction(await intake(orgA, roleA, "validated"), "empty");
+    await extraction(await intake(orgA, roleA, "validated"), "full");
+    await extraction(await intake(orgA, roleA, "validated"), "partial");
+    await intake(orgA, roleA, "validated"); // extraction has not run yet
+    await intake(orgA, roleA, "uploaded");
+    await intake(orgA, roleA, "pending");
+    // Noise that must not be counted: another role, and another tenant.
+    await intake(orgA, roleOther, "quarantined");
+    await intake(orgB, roleB, "quarantined");
+    // A misattributed row -- org B pointing at org A's role -- used to be
+    // insertable here, and this probe deliberately created one to prove the
+    // organization_id predicate was load-bearing. AF-28's composite foreign
+    // key on (role_id, organization_id) now rejects it at the schema level,
+    // so that scenario can no longer be constructed and the case has been
+    // removed rather than left as a test that cannot fail.
+    //
+    // The predicate itself is kept, but it is honestly defence in depth now,
+    // not the thing enforcing isolation: role_id is a globally unique
+    // primary key and the composite FK ties it to one organization, so
+    // filtering on role_id alone would already be correct. It stays because
+    // POL-011 is a tenant boundary and a query over tenant data should say
+    // which tenant it means. Removing it would fail no test today.
+
+    const rate = await getFailedDocumentRate(databaseUrl, schema, orgA, roleA);
+    const expected = {
+      uploaded: 7,
+      quarantined: 1,
+      rejected: 1,
+      extractionEmpty: 1,
+      extractionSucceeded: 2,
+      failed: 3,
+      resolved: 5,
+      inFlight: 2
+    };
+    for (const [key, want] of Object.entries(expected)) {
+      const got = (rate as unknown as Record<string, number>)[key];
+      if (got !== want) {
+        throw new Error(
+          `assertFailedDocumentRateAccuracy: ${key} expected ${want}, got ${got} (full: ${JSON.stringify(rate)})`
+        );
+      }
+    }
+    if (rate.failedRate === null || Math.abs(rate.failedRate - 3 / 5) > 1e-12) {
+      throw new Error(`expected failedRate 0.6, got ${rate.failedRate}`);
+    }
+
+    // A role with documents but none resolved has no rate at all.
+    await intake(orgA, roleOther, "uploaded");
+    const otherRole = await getFailedDocumentRate(databaseUrl, schema, orgA, roleOther);
+    if (otherRole.quarantined !== 1 || otherRole.uploaded !== 2) {
+      throw new Error(`role scoping leaked: ${JSON.stringify(otherRole)}`);
+    }
+
+    // An organization/role pair that does not exist is empty, not an error.
+    const empty = await getFailedDocumentRate(databaseUrl, schema, orgA, roleB);
+    if (empty.uploaded !== 0 || empty.failedRate !== null) {
+      throw new Error(`cross-tenant role must be empty, got: ${JSON.stringify(empty)}`);
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
 
 /**
  * A file intake carries both a tenant column and a reference to a

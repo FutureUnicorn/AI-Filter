@@ -1056,3 +1056,92 @@ export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
     .map((row) => `${row.rowNumber},${escapeCsvField(row.failureReason)}`);
   return [header, ...lines].join("\n") + "\n";
 }
+
+// ---- AF-58: failed-document rate ----
+//
+// "Share of uploaded documents that failed" needs a denominator that is
+// honest about what it does not yet know. A document that has arrived but
+// whose validation or extraction has not run yet is not a success and not
+// a failure -- counting it either way makes the rate move on its own as
+// the pipeline drains, which is the opposite of a leading indicator.
+//
+// So the rate is over documents with a TERMINAL outcome, and everything
+// still in flight is reported separately rather than folded in. AF-60
+// ("show sample sizes and limitations") wants exactly this shape: the
+// number, and enough context to know whether to trust it yet.
+
+/** Raw per-role counts, as read from file_intakes joined to extractions. */
+export interface FailedDocumentCounts {
+  /** Intakes past 'pending': a file actually arrived. */
+  readonly uploaded: number;
+  readonly quarantined: number;
+  readonly rejected: number;
+  /** Validated, extraction ran, and produced no usable text. */
+  readonly extractionEmpty: number;
+  /** Validated, extraction ran, and produced full or partial text. */
+  readonly extractionSucceeded: number;
+}
+
+export interface FailedDocumentRate extends VersionedRecord {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly uploaded: number;
+  /** quarantined + rejected + extractionEmpty. */
+  readonly failed: number;
+  readonly quarantined: number;
+  readonly rejected: number;
+  readonly extractionEmpty: number;
+  readonly extractionSucceeded: number;
+  /** Terminal outcomes only -- the denominator of `failedRate`. */
+  readonly resolved: number;
+  /** Uploaded but not yet quarantined, rejected, or extracted. */
+  readonly inFlight: number;
+  /**
+   * failed / resolved, or null when nothing has resolved yet. Null rather
+   * than 0: "no documents have finished" and "no documents failed" are
+   * different claims, and reporting the first as the second would make an
+   * empty role look perfectly healthy.
+   */
+  readonly failedRate: number | null;
+}
+
+export function summarizeFailedDocuments(
+  organizationId: string,
+  roleId: string,
+  counts: FailedDocumentCounts
+): FailedDocumentRate {
+  const values = [
+    counts.uploaded,
+    counts.quarantined,
+    counts.rejected,
+    counts.extractionEmpty,
+    counts.extractionSucceeded
+  ];
+  if (values.some((value) => !Number.isInteger(value) || value < 0)) {
+    throw new Error(`summarizeFailedDocuments requires non-negative integer counts, got: ${JSON.stringify(counts)}`);
+  }
+  const failed = counts.quarantined + counts.rejected + counts.extractionEmpty;
+  const resolved = failed + counts.extractionSucceeded;
+  if (resolved > counts.uploaded) {
+    // Every terminal state is reached by an uploaded document, so this is
+    // a contradiction in the input, not a rounding artefact. Failing here
+    // beats emitting a rate above 1 or a negative inFlight.
+    throw new Error(
+      `summarizeFailedDocuments: resolved (${resolved}) exceeds uploaded (${counts.uploaded}); counts are inconsistent`
+    );
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId,
+    roleId,
+    uploaded: counts.uploaded,
+    failed,
+    quarantined: counts.quarantined,
+    rejected: counts.rejected,
+    extractionEmpty: counts.extractionEmpty,
+    extractionSucceeded: counts.extractionSucceeded,
+    resolved,
+    inFlight: counts.uploaded - resolved,
+    failedRate: resolved === 0 ? null : failed / resolved
+  };
+}
