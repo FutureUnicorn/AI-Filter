@@ -95,13 +95,20 @@ const recursiveJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   ])
 );
 
-const jsonValueSchema: z.ZodType<JsonValue> = z.custom<JsonValue>((value) => {
+const jsonValueSchema: z.ZodType<JsonValue> = z.unknown().transform((value, context) => {
   try {
-    return !hasCircularJsonReference(value) && recursiveJsonValueSchema.safeParse(value).success;
+    if (!hasCircularJsonReference(value)) {
+      const parsed = recursiveJsonValueSchema.safeParse(value);
+      if (parsed.success) {
+        return parsed.data;
+      }
+    }
   } catch {
-    return false;
+    // Report traversal/parsing exceptions as validation failures below.
   }
-}, { message: "must be a cycle-free JSON value" }) as z.ZodType<JsonValue>;
+  context.addIssue({ code: "custom", message: "must be a cycle-free JSON value" });
+  return z.NEVER;
+});
 
 const supportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
