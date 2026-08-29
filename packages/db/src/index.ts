@@ -371,6 +371,24 @@ export interface RecordInferenceUsageInput {
   readonly outputTokens: number;
 }
 
+/**
+ * Rejects a negative delta before it reaches the upsert. The table's
+ * CHECK only sees the RESULT of the addition, so once a row has a
+ * positive total, recording -50 against 100 silently lowers usage to 50:
+ * a faulty or untrusted caller could walk the meter backwards and
+ * postpone the cap indefinitely.
+ */
+function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
+  for (const [field, value] of [
+    ["inputTokens", input.inputTokens],
+    ["outputTokens", input.outputTokens]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`recordInferenceUsage requires a non-negative integer ${field}, got: ${value}`);
+    }
+  }
+}
+
 /** Increments the existing row for this (organization, model, period), or creates it. */
 export async function recordInferenceUsage(
   databaseUrl: string,
@@ -378,6 +396,7 @@ export async function recordInferenceUsage(
   input: RecordInferenceUsageInput
 ): Promise<void> {
   assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
@@ -421,6 +440,79 @@ export async function getInferenceUsage(
     return {
       inputTokens: row === undefined ? 0 : Number(row.input_tokens),
       outputTokens: row === undefined ? 0 : Number(row.output_tokens)
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
+  /** Cap on (input + output) tokens for this organization/model/period. */
+  readonly maxTotalTokens: number;
+}
+
+export type ReserveInferenceBudgetOutcome =
+  | { readonly outcome: "reserved"; readonly totalTokensAfter: number }
+  | { readonly outcome: "cap_exceeded"; readonly totalTokensBefore: number; readonly maxTotalTokens: number };
+
+/**
+ * Atomic check-and-reserve. Reading the total with getInferenceUsage and
+ * then incrementing with recordInferenceUsage cannot be made safe by the
+ * caller: each opens its own connection, so they cannot share a
+ * transaction, and concurrent requests near the cap all read the same
+ * pre-increment total, all pass the check, and the burst spends
+ * arbitrarily far past the budget.
+ *
+ * Doing both in one statement closes that window. The INSERT ... ON
+ * CONFLICT DO UPDATE takes a row lock on conflict, so concurrent callers
+ * serialize on it, and the WHERE clause re-evaluates the cap against the
+ * row's committed value at that moment -- not against a total read
+ * earlier. When the guard fails the UPDATE affects no row, RETURNING is
+ * empty, and we report cap_exceeded instead of over-spending.
+ */
+export async function reserveInferenceBudget(
+  databaseUrl: string,
+  schema: string,
+  input: ReserveInferenceBudgetInput
+): Promise<ReserveInferenceBudgetOutcome> {
+  assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
+  const requested = input.inputTokens + input.outputTokens;
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const reserved = await client.query<{ total_tokens: string }>(
+      `INSERT INTO "${schema}".inference_usage_ledger
+         (organization_id, model, period_start, input_tokens, output_tokens)
+       SELECT $1, $2, $3, $4, $5
+        WHERE $6::bigint <= $7::bigint
+       ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+         input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+         output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+         updated_at = clock_timestamp()
+        WHERE "${schema}".inference_usage_ledger.input_tokens
+            + "${schema}".inference_usage_ledger.output_tokens
+            + $6::bigint <= $7::bigint
+       RETURNING (input_tokens + output_tokens)::bigint AS total_tokens`,
+      [
+        input.organizationId,
+        input.model,
+        input.periodStart,
+        input.inputTokens,
+        input.outputTokens,
+        requested,
+        input.maxTotalTokens
+      ]
+    );
+    const row = reserved.rows[0];
+    if (row !== undefined) {
+      return { outcome: "reserved", totalTokensAfter: Number(row.total_tokens) };
+    }
+    const current = await getInferenceUsage(databaseUrl, schema, input);
+    return {
+      outcome: "cap_exceeded",
+      totalTokensBefore: current.inputTokens + current.outputTokens,
+      maxTotalTokens: input.maxTotalTokens
     };
   } finally {
     await client.end().catch(() => undefined);
