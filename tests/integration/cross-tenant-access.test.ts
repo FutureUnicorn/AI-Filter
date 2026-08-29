@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { CAPABILITIES, CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import type { Membership, MembershipRole } from "../../packages/domain/src/index.ts";
-import { assertMembershipsTenantIsolation } from "../../packages/db/src/index.ts";
+import { assertMagicLinkRlsSafety, assertMembershipsTenantIsolation } from "../../packages/db/src/index.ts";
 import {
   authorizeResourceAccess,
   resourceAuthorizationErrorResponse
@@ -98,4 +98,18 @@ test("memberships RLS rejects cross-tenant reads and writes for a non-superuser 
     );
   }
   await assertMembershipsTenantIsolation(databaseUrl);
+});
+
+test("the magic-link auth path stays correct under a role that RLS actually applies to", async () => {
+  // The login lookup is cross-organization by nature, so AF-18's per-org
+  // policy hides every row from it; before this, that silently became
+  // "this email has no membership" and would have rejected every real
+  // sign-in the moment the app stopped connecting as a superuser.
+  const databaseUrl = process.env.SIGNAL_AUDIT_RLS_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.length === 0) {
+    assert.fail(
+      "SIGNAL_AUDIT_RLS_DATABASE_URL must be set so CI exercises the magic-link path under real row-level security"
+    );
+  }
+  await assertMagicLinkRlsSafety(databaseUrl);
 });
