@@ -311,10 +311,32 @@ function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
   );
 }
 
-function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
+/**
+ * Who the outcomes are about.
+ *
+ * AF-13's review added organizationId and candidateId to every
+ * EvidenceOutcome kind, because outcomes sharing a criterionId cannot
+ * otherwise be attributed to a tenant or a candidate -- and POL-011
+ * requires candidate records stay employer-scoped. This function
+ * constructs outcomes, so it has to be told; there is nothing in a
+ * rubric or a model response that carries it.
+ *
+ * Passed as one object rather than two positional strings on purpose:
+ * two adjacent same-typed parameters are transposable at a call site
+ * with nothing to catch it, and transposing these two attributes a
+ * candidate's evidence to the wrong organization.
+ */
+export interface EvidenceSubject {
+  readonly organizationId: string;
+  readonly candidateId: string;
+}
+
+function invalidCitationOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "invalid_citation",
     message: "The model's citing item is missing a persistable source citation.",
@@ -322,31 +344,74 @@ function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
+function mapExtractedItem(subject: EvidenceSubject, item: EvidenceExtractionItem): EvidenceOutcome {
   const criterionId = item.criterion_id;
+  // Written out per branch rather than spread from a shared object: with
+  // a spread, `kind: item.state` is a union and TypeScript stops
+  // distributing over EvidenceOutcome's discriminated members, so the
+  // whole thing fails to narrow. The repetition is what keeps the
+  // exhaustiveness real.
+  const { organizationId, candidateId } = subject;
   switch (item.state) {
     case "not_found":
-      return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+      return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId, candidateId, criterionId };
+    case "contradicted":
+      // A second defect CI surfaced alongside the missing attribution,
+      // and it is not a typing nuisance.
+      //
+      // AF-13's review made ContradictedEvidence carry BOTH sides of the
+      // conflict -- citation AND conflictingCitation -- because a
+      // contradiction a reviewer can only see one half of is not
+      // reviewable. An extraction item carries one quote. So a single
+      // item can no longer produce a persistable contradicted outcome,
+      // and constructing one with the second side missing would hand
+      // back a value that fails evidenceOutcomeSchema.
+      //
+      // Reported as a retryable extraction_error naming the real reason,
+      // rather than downgraded to `unclear`: a model that found
+      // conflicting evidence and a model that found ambiguous evidence
+      // are saying different things, and collapsing them would lose the
+      // signal this criterion most needs a human for. AF-35's
+      // model-facing schema has to grow a second quote for the
+      // contradicted state before this can map properly.
+      if (!citingCitationIsPersistable(item)) {
+        return invalidCitationOutcome(subject, criterionId);
+      }
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "extraction_error",
+        organizationId,
+        candidateId,
+        criterionId,
+        errorCode: "contradiction_missing_conflicting_citation",
+        message:
+          "The model reported a contradiction but the extraction schema supplies only one quote; " +
+          "a persistable contradicted outcome requires both sides of the conflict.",
+        retryable: true
+      };
     case "supported":
     case "partially_supported":
-    case "contradicted":
     case "unclear":
       if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(criterionId);
+        return invalidCitationOutcome(subject, criterionId);
       }
       return {
         schemaVersion: CONTRACT_SCHEMA_VERSION,
         kind: item.state,
+        organizationId,
+        candidateId,
         criterionId,
         citation: citationFrom(item)
       };
   }
 }
 
-function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
+function omittedCriterionOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "model_omitted_criterion",
     message: "The model's response did not include this criterion.",
@@ -354,10 +419,12 @@ function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function duplicateCriterionOutcome(criterionId: string, count: number): EvidenceOutcome {
+function duplicateCriterionOutcome(subject: EvidenceSubject, criterionId: string, count: number): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "duplicate_criterion_response",
     message: `The model returned ${count} responses for one criterion.`,
@@ -366,9 +433,20 @@ function duplicateCriterionOutcome(criterionId: string, count: number): Evidence
 }
 
 export function mapRubricToEvidence(
+  subject: EvidenceSubject,
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
+  // Validated for the same reason the criterion IDs below are, and the
+  // comment there states it: this function advertises its output as
+  // persistable EvidenceOutcomes, and evidenceOutcomeSchema requires a
+  // uuid organizationId and a non-empty candidateId. Constructing
+  // outcomes carrying an empty attribution would hand back values that
+  // cannot actually be persisted, and the failure would surface far from
+  // here.
+  if (subject.organizationId.trim().length === 0 || subject.candidateId.trim().length === 0) {
+    throw new Error("mapRubricToEvidence requires a non-empty organizationId and candidateId");
+  }
   // The rubric IDs arrive as an unconstrained string[] with no upstream
   // schema or branded type guaranteeing anything about them, so they are
   // validated here rather than assumed. Both checks protect the promise
@@ -411,11 +489,11 @@ export function mapRubricToEvidence(
     const matches = itemsByCriterion.get(criterionId) ?? [];
     const [firstMatch, ...rest] = matches;
     if (firstMatch === undefined) {
-      return omittedCriterionOutcome(criterionId);
+      return omittedCriterionOutcome(subject, criterionId);
     }
     if (rest.length > 0) {
-      return duplicateCriterionOutcome(criterionId, matches.length);
+      return duplicateCriterionOutcome(subject, criterionId, matches.length);
     }
-    return mapExtractedItem(firstMatch);
+    return mapExtractedItem(subject, firstMatch);
   });
 }
