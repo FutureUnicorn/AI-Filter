@@ -785,3 +785,134 @@ export function evaluateCanonicalTextQuality(
   }
   return meaningfulPages < pages.length ? "partial" : "full";
 }
+
+// ---- AF-31: CSV mapping and ten-row preview ----
+//
+// No "applications" table exists yet (AF-32 is what first creates one),
+// so this is a closed, deliberately small set of fields a recruiter can
+// map a CSV column onto -- just enough for AF-32 to have something real
+// to finalize against. Everything here is pure: packages/ingestion owns
+// actually parsing the CSV's bytes into headers/rows (a real I/O and
+// third-party-library concern); this only ever operates on already-
+// parsed strings.
+
+export const APPLICATION_IMPORT_FIELDS = [
+  "candidateFullName",
+  "candidateEmail",
+  "externalReferenceId",
+  "appliedAt"
+] as const;
+export type ApplicationImportField = (typeof APPLICATION_IMPORT_FIELDS)[number];
+
+/** externalReferenceId and appliedAt are optional: not every recruiter's
+ * export has a tracking ID or an applied-date column. */
+export const REQUIRED_APPLICATION_IMPORT_FIELDS: readonly ApplicationImportField[] = [
+  "candidateFullName",
+  "candidateEmail"
+] as const;
+
+export const MAX_CSV_PREVIEW_ROWS = 10;
+
+export interface CsvColumnMapping {
+  readonly field: ApplicationImportField;
+  readonly csvColumnHeader: string;
+}
+
+export type CsvMappingValidationOutcome =
+  | { readonly outcome: "valid" }
+  | { readonly outcome: "invalid"; readonly reasons: readonly string[] };
+
+/**
+ * Checked against the file's actual header row, not just the mapping's
+ * own internal shape: a header the recruiter picked has to still exist
+ * in the CSV, every required field has to be covered, and nothing can
+ * be mapped twice in either direction (two fields fed from the same
+ * column, or the same field fed from two columns) since either would
+ * silently produce wrong data rather than fail loudly.
+ */
+export function validateCsvColumnMapping(
+  headers: readonly string[],
+  mapping: readonly CsvColumnMapping[]
+): CsvMappingValidationOutcome {
+  const reasons: string[] = [];
+
+  const duplicateHeaders = headers.filter((header, index) => headers.indexOf(header) !== index);
+  if (duplicateHeaders.length > 0) {
+    reasons.push(`CSV header row has duplicate column names, so column-based mapping is ambiguous: ${duplicateHeaders.join(", ")}`);
+  }
+
+  if (mapping.length === 0) {
+    reasons.push("At least one column must be mapped.");
+  }
+
+  const seenFields = new Set<ApplicationImportField>();
+  const seenHeaders = new Set<string>();
+  for (const entry of mapping) {
+    if (seenFields.has(entry.field)) {
+      reasons.push(`Field "${entry.field}" is mapped from more than one column.`);
+    }
+    seenFields.add(entry.field);
+
+    if (seenHeaders.has(entry.csvColumnHeader)) {
+      reasons.push(`Column "${entry.csvColumnHeader}" is mapped to more than one field.`);
+    }
+    seenHeaders.add(entry.csvColumnHeader);
+
+    if (!headers.includes(entry.csvColumnHeader)) {
+      reasons.push(`Column "${entry.csvColumnHeader}" does not exist in this CSV's header row.`);
+    }
+  }
+
+  for (const requiredField of REQUIRED_APPLICATION_IMPORT_FIELDS) {
+    if (!seenFields.has(requiredField)) {
+      reasons.push(`Required field "${requiredField}" is not mapped to any column.`);
+    }
+  }
+
+  return reasons.length === 0 ? { outcome: "valid" } : { outcome: "invalid", reasons };
+}
+
+/** Blank/whitespace-only cells map to undefined, not "", so a recruiter
+ * previewing the import sees an honest gap rather than an empty string
+ * that looks like real (but empty) data. */
+export function mapCsvRowToApplication(
+  row: Readonly<Record<string, string>>,
+  mapping: readonly CsvColumnMapping[]
+): Readonly<Record<ApplicationImportField, string | undefined>> {
+  const result: Record<ApplicationImportField, string | undefined> = {
+    candidateFullName: undefined,
+    candidateEmail: undefined,
+    externalReferenceId: undefined,
+    appliedAt: undefined
+  };
+  for (const entry of mapping) {
+    const rawValue = row[entry.csvColumnHeader];
+    const trimmed = rawValue?.trim();
+    result[entry.field] = trimmed === undefined || trimmed === "" ? undefined : trimmed;
+  }
+  return result;
+}
+
+export interface CsvPreviewRow {
+  readonly rowNumber: number;
+  readonly values: Readonly<Record<ApplicationImportField, string | undefined>>;
+}
+
+export interface CsvPreviewResult {
+  readonly totalDataRows: number;
+  readonly previewRows: readonly CsvPreviewRow[];
+}
+
+/** Only ever previews, never persists -- AF-32 is where an accepted
+ * mapping is actually applied to every row and turned into durable
+ * application records. */
+export function buildCsvPreview(
+  rows: readonly Readonly<Record<string, string>>[],
+  mapping: readonly CsvColumnMapping[]
+): CsvPreviewResult {
+  const previewRows = rows.slice(0, MAX_CSV_PREVIEW_ROWS).map((row, index) => ({
+    rowNumber: index + 1,
+    values: mapCsvRowToApplication(row, mapping)
+  }));
+  return { totalDataRows: rows.length, previewRows };
+}
