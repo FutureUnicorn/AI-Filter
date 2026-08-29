@@ -1,0 +1,54 @@
+name: Staging Environment
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [develop]
+    types: [completed]
+
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Staging / Deploy
+    if: >-
+      vars.AF11_ENABLE_HOSTED_ENVIRONMENTS == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'develop'
+    runs-on: [self-hosted, linux, x64, signal-audit-staging]
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    env:
+      AF11_ENABLE_HOSTED_ENVIRONMENTS: ${{ vars.AF11_ENABLE_HOSTED_ENVIRONMENTS }}
+      ADMIN_AUDIT_REFERENCE: ${{ vars.ADMIN_AUDIT_REFERENCE }}
+      ADMIN_ROLE_ALLOWLIST: ${{ vars.ADMIN_ROLE_ALLOWLIST }}
+      COST_CONTROL_OWNER: ${{ vars.COST_CONTROL_OWNER }}
+      COST_CONTROL_REFERENCE: ${{ vars.COST_CONTROL_REFERENCE }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      STORAGE_ACCESS_KEY_ID: ${{ secrets.STORAGE_ACCESS_KEY_ID }}
+      STORAGE_SECRET_ACCESS_KEY: ${{ secrets.STORAGE_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Check out the exact revision that passed CI
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Verify and deploy staging
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          node scripts/environment/cli.mjs staging up --sha "$TESTED_SHA"

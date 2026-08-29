@@ -1,0 +1,89 @@
+name: Preview Environment
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  pull_request_target:
+    branches: [develop]
+    types: [closed]
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: preview-${{ github.event.workflow_run.pull_requests[0].number || github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Preview / Deploy
+    if: >-
+      vars.AF11_ENABLE_HOSTED_ENVIRONMENTS == 'true' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0] != null &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, signal-audit-preview]
+    timeout-minutes: 30
+    environment:
+      name: preview/pr-${{ github.event.workflow_run.pull_requests[0].number }}
+      url: https://pr-${{ github.event.workflow_run.pull_requests[0].number }}.${{ vars.PREVIEW_BASE_DOMAIN }}
+    steps:
+      - name: Check out the exact revision that passed CI
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Verify and deploy isolated preview
+        env:
+          PREVIEW_BASE_DOMAIN: ${{ vars.PREVIEW_BASE_DOMAIN }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          node scripts/environment/cli.mjs preview up --pr "$PR_NUMBER" --sha "$TESTED_SHA"
+
+  cleanup:
+    name: Preview / Cleanup
+    if: >-
+      vars.AF11_ENABLE_HOSTED_ENVIRONMENTS == 'true' &&
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'closed'
+    runs-on: [self-hosted, linux, x64, signal-audit-preview]
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted cleanup code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Remove the closed PR environment
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/environment/cli.mjs preview down --pr "$PR_NUMBER"
+
+  sweep:
+    name: Preview / Stale Cleanup
+    if: >-
+      vars.AF11_ENABLE_HOSTED_ENVIRONMENTS == 'true' &&
+      github.event_name == 'schedule'
+    runs-on: [self-hosted, linux, x64, signal-audit-preview]
+    timeout-minutes: 20
+    steps:
+      - name: Check out trusted cleanup code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Remove orphaned preview environments
+        env:
+          PREVIEW_TTL_HOURS: ${{ vars.PREVIEW_TTL_HOURS || '72' }}
+        run: node scripts/environment/cli.mjs preview sweep --ttl-hours "$PREVIEW_TTL_HOURS"

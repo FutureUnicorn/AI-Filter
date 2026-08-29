@@ -1,0 +1,14 @@
+.git
+.github
+.cache
+.next
+.pytest_cache
+.runtime
+.venv
+**/.env
+**/.env.local
+**/dist
+**/node_modules
+coverage
+data
+*.applicant.txt
