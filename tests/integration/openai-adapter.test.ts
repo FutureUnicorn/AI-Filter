@@ -75,6 +75,16 @@ test("runStructuredCall requests strict structured JSON output with the caller's
   assert.deepEqual(params.text.format.schema, baseInput.jsonSchema);
 });
 
+test("runStructuredCall rejects JSON Schemas unsupported by OpenAI", async () => {
+  const capture: { params?: unknown } = {};
+  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}", capture));
+  await assert.rejects(() => adapter.runStructuredCall({ ...baseInput, jsonSchema: true }), {
+    name: "TypeError",
+    message: "OpenAI structured output requires an object JSON Schema."
+  });
+  assert.equal(capture.params, undefined);
+});
+
 test("different calls with different prompt/schema versions produce different metadata", async () => {
   const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}"));
   const first = await adapter.runStructuredCall(baseInput);

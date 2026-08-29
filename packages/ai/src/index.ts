@@ -36,7 +36,7 @@ export interface OpenAiResponsesClient {
         format: {
           type: "json_schema";
           name: string;
-          schema: Record<string, unknown>;
+          schema: unknown;
           strict: true;
         };
       };
@@ -56,6 +56,10 @@ export interface OpenAiAdapterConfig {
   readonly model: string;
 }
 
+function isOpenAiJsonSchema(schema: unknown): schema is Record<string, unknown> {
+  return typeof schema === "object" && schema !== null && !Array.isArray(schema);
+}
+
 /**
  * The real OpenAI SDK's `responses.create` is overloaded (streaming vs.
  * non-streaming vs. base), so its class type is not directly assignable
@@ -72,7 +76,12 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
-          text: params.text,
+          text: {
+            format: {
+              ...params.text.format,
+              schema: params.text.format.schema as Record<string, unknown>
+            }
+          },
           store: params.store
         });
         // response.model is the model that actually served the call.
@@ -109,6 +118,9 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      if (!isOpenAiJsonSchema(input.jsonSchema)) {
+        throw new TypeError("OpenAI structured output requires an object JSON Schema.");
+      }
       const response = await openai.responses.create({
         model: config.model,
         input: [

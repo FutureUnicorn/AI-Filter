@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+// A real request id. A placeholder was used here until AF-13's buildApiError
+// began validating its input, at which point these two tests threw before
+// asserting anything. Same fixture bug as AF-19's resource-authorization
+// suite, in a second file -- it surfaces on each branch at the moment the
+// validating buildApiError merges up, so a suite being green today is not
+// evidence that its fixtures are sound.
+const requestId = "req_44444444-4444-4444-8444-444444444444";
+
 import { CAPABILITIES, CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import type { Membership, MembershipRole } from "../../packages/domain/src/index.ts";
+import { apiErrorBodySchema } from "../../packages/contracts/src/index.ts";
 import { assertMembershipsTenantIsolation } from "../../packages/db/src/index.ts";
 import {
   authorizeResourceAccess,
@@ -75,9 +84,10 @@ test("write-shaped capability (record_decision) is rejected cross-tenant exactly
 test("every cross-tenant no_membership rejection reaches the API as 404, never 403", () => {
   const memberships = [membership(orgA, "owner")];
   const authorization = authorizeResourceAccess(memberships, orgB, "access_admin_settings", callerUserId);
-  const response = resourceAuthorizationErrorResponse(authorization, "req_x");
+  const response = resourceAuthorizationErrorResponse(authorization, requestId);
   assert.equal(response?.status, 404);
   assert.equal(response?.body.error.code, "not_found");
+  assert.equal(apiErrorBodySchema.safeParse(response?.body).success, true);
   // Specifically not 403/forbidden: that would confirm Org B exists to a caller who has no relationship to it.
   assert.notEqual(response?.status, 403);
 });
@@ -85,9 +95,10 @@ test("every cross-tenant no_membership rejection reaches the API as 404, never 4
 test("a genuine same-tenant capability shortfall is 403, distinct from the cross-tenant 404 case", () => {
   const memberships = [membership(orgA, "auditor")];
   const authorization = authorizeResourceAccess(memberships, orgA, "review_candidates", callerUserId);
-  const response = resourceAuthorizationErrorResponse(authorization, "req_x");
+  const response = resourceAuthorizationErrorResponse(authorization, requestId);
   assert.equal(response?.status, 403);
   assert.equal(response?.body.error.code, "forbidden");
+  assert.equal(apiErrorBodySchema.safeParse(response?.body).success, true);
 });
 
 test("memberships RLS rejects cross-tenant reads and writes for a non-superuser role", async () => {
