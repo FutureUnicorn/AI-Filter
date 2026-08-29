@@ -2317,6 +2317,179 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-63: deletion reconciliation ----
+//
+// "Scheduled job confirms every store that should be empty actually is;
+// produces a reconciliation report so deletion drift is caught, not
+// assumed."
+//
+// AF-61 produced a static plan of what retention intends. This checks
+// what is actually there, which is a different question, and given
+// AF-61's finding the honest first answer is "everything". That is the
+// point: the plan says deletion is blocked, and reconciliation makes
+// that a standing measurement rather than a claim someone made once.
+//
+// **The failure this is really guarding against is a surface nobody
+// classified.** A reconciliation that only checks the tables someone
+// remembered to list inherits the exact blind spot of the plan it is
+// checking -- if a future migration adds a table holding candidate text
+// and nobody adds it to RETENTION_SURFACES, a list-driven job reports
+// "all clear" while the data sits there. So reconciliation takes the
+// tables observed in the live schema and reports anything the plan does
+// not classify as its own finding. An unclassified surface is not
+// automatically a leak; it is automatically unreviewed, which is the
+// thing that must not be silent.
+
+export type ReconciliationFindingKind =
+  /** A surface the plan says should be emptied still holds rows past the cutoff. */
+  | "residue_present"
+  /** A surface the plan already admits it cannot purge. Expected, still reported. */
+  | "blocked_as_planned"
+  /** A table exists in the schema that the retention plan does not classify at all. */
+  | "unclassified_surface";
+
+export interface ReconciliationFinding {
+  readonly kind: ReconciliationFindingKind;
+  readonly surface: string;
+  readonly rowsPastCutoff: number;
+  readonly detail: string;
+}
+
+export interface RetentionResidue {
+  /** Rows older than the cutoff still present, per surface name. */
+  readonly rowsPastCutoffBySurface: Readonly<Record<string, number>>;
+  /** Every table observed in the live schema, however named. */
+  readonly observedTables: readonly string[];
+}
+
+export interface ReconciliationReport {
+  readonly organizationId: string;
+  readonly cutoff: string;
+  readonly findings: readonly ReconciliationFinding[];
+  /** True when nothing at all needs a human: no residue and no unclassified table. */
+  readonly clean: boolean;
+  readonly statement: string;
+}
+
+/**
+ * Tables that legitimately hold no candidate-derived data and are not
+ * expected to appear in a retention plan. Listed explicitly rather than
+ * pattern-matched, so adding a table is a decision someone makes here
+ * rather than something a prefix rule silently absorbs.
+ */
+const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
+  "organizations",
+  "users",
+  "memberships",
+  "roles",
+  "rubrics",
+  "magic_link_tokens",
+  "evidence_extraction_runs",
+  "inference_usage_ledger",
+  "inference_kill_switch",
+  "import_finalizations",
+  "audit_samples",
+  "audit_sample_members",
+  "review_timing_spans",
+  "af11_synthetic_environment_fixture"
+]);
+
+export function reconcileRetention(
+  plan: RetentionPlan,
+  residue: RetentionResidue
+): ReconciliationReport {
+  const findings: ReconciliationFinding[] = [];
+  const planned = new Map(plan.surfaces.map((surface) => [String(surface.surface), surface]));
+
+  for (const surface of plan.surfaces) {
+    const rows = residue.rowsPastCutoffBySurface[surface.surface] ?? 0;
+    if (rows === 0) {
+      continue;
+    }
+    if (surface.disposition === "purge") {
+      findings.push({
+        kind: "residue_present",
+        surface: surface.surface,
+        rowsPastCutoff: rows,
+        detail:
+          `${rows} row(s) older than the cutoff remain in a surface the plan says is purgeable. ` +
+          `Either the purge did not run or it did not cover this surface.`
+      });
+      continue;
+    }
+    if (surface.disposition === "no_candidate_data") {
+      continue;
+    }
+    findings.push({
+      kind: "blocked_as_planned",
+      surface: surface.surface,
+      rowsPastCutoff: rows,
+      detail: `${rows} row(s) retained past the cutoff, as the plan predicts: ${surface.detail}`
+    });
+  }
+
+  for (const table of residue.observedTables) {
+    if (planned.has(table) || RETENTION_EXEMPT_TABLES.has(table)) {
+      continue;
+    }
+    findings.push({
+      kind: "unclassified_surface",
+      surface: table,
+      rowsPastCutoff: residue.rowsPastCutoffBySurface[table] ?? 0,
+      detail:
+        `Table "${table}" exists in the schema but the retention plan does not classify it. ` +
+        `It may hold candidate data that nothing is accounting for. Classify it in ` +
+        `RETENTION_SURFACES or add it to the exempt list, so the decision is recorded either way.`
+    });
+  }
+
+  // `clean` is deliberately NOT satisfied by blocked_as_planned findings
+  // alone -- those are expected, and a report that called them clean
+  // would go green while candidate data sits there indefinitely, which is
+  // exactly the drift this job exists to surface.
+  const needsAttention = findings.filter((finding) => finding.kind !== "blocked_as_planned");
+  const blocked = findings.filter((finding) => finding.kind === "blocked_as_planned");
+
+  return {
+    organizationId: plan.organizationId,
+    cutoff: plan.cutoff,
+    findings,
+    clean: needsAttention.length === 0 && blocked.length === 0,
+    statement: buildReconciliationStatement(needsAttention, blocked)
+  };
+}
+
+function buildReconciliationStatement(
+  needsAttention: readonly ReconciliationFinding[],
+  blocked: readonly ReconciliationFinding[]
+): string {
+  const parts: string[] = [];
+  const unclassified = needsAttention.filter((finding) => finding.kind === "unclassified_surface");
+  const residue = needsAttention.filter((finding) => finding.kind === "residue_present");
+  if (residue.length > 0) {
+    parts.push(
+      `${residue.length} surface(s) that should have been purged still hold data: ` +
+        residue.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (unclassified.length > 0) {
+    parts.push(
+      `${unclassified.length} table(s) are not classified by the retention plan: ` +
+        unclassified.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      `${blocked.length} surface(s) retain data past the cutoff because deletion is blocked: ` +
+        blocked.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (parts.length === 0) {
+    return "Every surface the retention plan covers is empty past the cutoff, and no table is unclassified.";
+  }
+  return parts.join(". ") + ".";
+}
+
 // ---- AF-61: retention policy ----
 //
 // "Default retention window for raw candidate data (e.g. 30-90 days),
