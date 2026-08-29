@@ -137,11 +137,41 @@ export interface CreateMagicLinkTokenInput {
   readonly expiresAt: Date;
 }
 
+/**
+ * The membership lookup below is unavoidably cross-organization: a plain
+ * login token names no organization, so there is no app.current_org_id
+ * to scope it with. AF-18's memberships policy requires exactly that
+ * setting (0004_tenant_scoped_rls.sql), so under a role RLS actually
+ * applies to, the SELECT returns zero rows for *every* email -- and the
+ * caller would reject every legitimate login with "no membership".
+ *
+ * Today that does not happen, because AF-11's app role is the postgres
+ * image's bootstrap superuser and superusers bypass RLS -- the migration
+ * documents this as a known gap. But "the security control is currently
+ * inert" is not something to depend on silently: the moment the role is
+ * tightened, this must fail loudly and say what to change, not lock out
+ * the entire user base behind an error that claims their account does
+ * not exist.
+ */
+async function assertMembershipLookupVisible(client: Client, schema: string): Promise<void> {
+  const rls = await client.query<{ active: boolean }>(
+    `SELECT row_security_active('"${schema}".memberships'::regclass) AS active`
+  );
+  if (rls.rows[0]?.active === true) {
+    throw new Error(
+      `cannot verify membership for a login magic link: row-level security is active on "${schema}".memberships ` +
+        `for the current database role, so the cross-organization lookup a login token requires can never match. ` +
+        `Grant this role BYPASSRLS, or move the lookup into a SECURITY DEFINER function owned by the table owner.`
+    );
+  }
+}
+
 async function emailHasMembership(
   client: Client,
   schema: string,
   email: string
 ): Promise<boolean> {
+  await assertMembershipLookupVisible(client, schema);
   const found = await client.query(
     `SELECT 1
        FROM "${schema}".users u
@@ -172,6 +202,39 @@ async function provisionInvitedMembership(
   if (userId === undefined) {
     throw new Error("invite redemption did not produce a user row");
   }
+  // Unlike the login lookup, an invite names its organization, so there
+  // is a correct value for AF-18's memberships policy -- whose WITH CHECK
+  // would otherwise reject this INSERT outright under a role RLS applies
+  // to. is_local = true ties it to the enclosing transaction (this is
+  // only ever called inside redeemMagicLinkToken's BEGIN/COMMIT), so it
+  // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
+  // sharing the connection.
+  await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+  // Applying the invited role (below) makes one destructive direction
+  // reachable that DO NOTHING made impossible: a re-invite naming a
+  // non-owner role for the organization's only owner would leave it with
+  // zero owners and no way back, because granting `owner` is itself an
+  // owner-level action. So the upsert only gets to be unconditional in
+  // the direction that cannot strand an organization. FOR UPDATE locks
+  // the owner rows for the rest of this transaction, so two concurrent
+  // demotions cannot each see the other's owner and both proceed.
+  if (role !== "owner") {
+    const owners = await client.query<{ user_id: string }>(
+      `SELECT user_id
+         FROM "${schema}".memberships
+        WHERE organization_id = $1 AND role = 'owner'
+        FOR UPDATE`,
+      [organizationId]
+    );
+    const ownerIds = owners.rows.map((owner) => owner.user_id);
+    if (ownerIds.length === 1 && ownerIds[0] === userId) {
+      throw new Error(
+        `invite would demote the last owner of organization ${organizationId} to ${role}; ` +
+          `promote another owner before changing this membership`
+      );
+    }
+  }
+
   // DO UPDATE, not DO NOTHING: an invite that names a role is an explicit
   // instruction from whoever had permission to create it (invite creation
   // is where that authorization boundary lives, not redemption) -- silently
@@ -1421,6 +1484,249 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-43 review follow-up: proves the magic-link auth path behaves
+ * correctly under a database role that RLS actually applies to -- not
+ * only under the bootstrap superuser that bypasses it. Two independent
+ * claims, both of which were broken before:
+ *
+ *  1. A plain login token's membership lookup is unavoidably
+ *     cross-organization, so AF-18's per-org policy hides every row from
+ *     it. It must fail with a message naming the real cause, never
+ *     degrade into "this email has no membership" -- which would reject
+ *     every legitimate sign-in while blaming the user's account.
+ *  2. An invite redemption *is* possible, because an invite names its
+ *     organization: scoping the transaction with app.current_org_id lets
+ *     the membership write through the WITH CHECK, and a re-invite that
+ *     names a different role actually applies it.
+ *
+ * Runs against a throwaway schema and a throwaway LOGIN role, both named
+ * with a random suffix so concurrent runs cannot collide, and both
+ * dropped in `finally`.
+ */
+export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `mlrls_probe_${suffix}`;
+  const role = `mlrls_app_${suffix}`;
+  const password = randomBytes(16).toString("hex");
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const memberEmail = `member_${suffix}@acme.test`;
+  const invitedEmail = `invited_${suffix}@acme.test`;
+
+  const probeUrl = new URL(databaseUrl);
+  probeUrl.username = role;
+  probeUrl.password = password;
+  const probeDatabaseUrl = probeUrl.toString();
+
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0003_magic_link_tokens.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A')`, [organizationId]);
+    await admin.query(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Member') RETURNING user_id`,
+      [memberEmail]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role)
+       SELECT $1, user_id, 'recruiter' FROM users WHERE email = $2`,
+      [organizationId, memberEmail]
+    );
+
+    // Control: as the superuser, RLS is bypassed, so the existing login
+    // path still works exactly as it does today. Without this, claim 1
+    // below could pass for the wrong reason (a lookup that is simply
+    // broken for everyone).
+    await createMagicLinkToken(databaseUrl, schema, {
+      tokenHash: `superuser-login-${suffix}`,
+      email: memberEmail,
+      expiresAt
+    });
+
+    // Claim 1: the same call under a role RLS applies to must name RLS
+    // as the cause, not report the member as having no membership.
+    let loginError: unknown;
+    try {
+      await createMagicLinkToken(probeDatabaseUrl, schema, {
+        tokenHash: `rls-login-${suffix}`,
+        email: memberEmail,
+        expiresAt
+      });
+    } catch (error) {
+      loginError = error;
+    }
+    const loginMessage = loginError instanceof Error ? loginError.message : String(loginError);
+    if (loginError === undefined) {
+      throw new Error("expected the login membership lookup to fail loudly under active row-level security");
+    }
+    if (!loginMessage.includes("row-level security is active")) {
+      throw new Error(
+        `login magic link under RLS must explain the real cause, got: ${loginMessage}`
+      );
+    }
+
+    // Claim 2: an invite names its organization, so redemption works
+    // under the same role -- and the named role is actually applied.
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-invite-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "recruiter" },
+      expiresAt
+    });
+    const firstRedemption = await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-invite-${suffix}`);
+    if (!firstRedemption.justRedeemed) {
+      throw new Error("invite redemption must succeed under active row-level security");
+    }
+    const afterInvite = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterInvite.rows[0]?.role !== "recruiter") {
+      throw new Error(
+        `invite redemption must provision the membership under RLS, got: ${JSON.stringify(afterInvite.rows)}`
+      );
+    }
+
+    // A promotion re-invite: DO NOTHING would report success here while
+    // silently leaving the old role in place.
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-reinvite-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "admin" },
+      expiresAt
+    });
+    await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);
+    const afterPromotion = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterPromotion.rows[0]?.role !== "admin") {
+      throw new Error(
+        `a re-invite naming a new role must apply it, got: ${JSON.stringify(afterPromotion.rows)}`
+      );
+    }
+
+    // A re-invite that would strand the organization with no owner is
+    // refused, loudly, and leaves the existing membership untouched.
+    await admin.query(`UPDATE memberships SET role = 'owner' WHERE organization_id = $1`, [organizationId]);
+    await admin.query(
+      `DELETE FROM memberships
+        WHERE organization_id = $1
+          AND user_id <> (SELECT user_id FROM users WHERE email = $2)`,
+      [organizationId, invitedEmail]
+    );
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-demote-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "recruiter" },
+      expiresAt
+    });
+    let demotionError: unknown;
+    try {
+      await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-demote-${suffix}`);
+    } catch (error) {
+      demotionError = error;
+    }
+    if (demotionError === undefined) {
+      throw new Error("demoting the last owner of an organization must be refused, not applied silently");
+    }
+    const afterRefusal = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterRefusal.rows[0]?.role !== "owner") {
+      throw new Error(
+        `a refused demotion must roll back and leave the membership intact, got: ${JSON.stringify(afterRefusal.rows)}`
+      );
+    }
+
+    // app.current_org_id must not survive the transaction that sets it.
+    //
+    // Scope of this check, stated exactly: it verifies the *mechanism*
+    // provisionInvitedMembership relies on -- that is_local => true is
+    // discarded at COMMIT and is_local => false is not -- on a connection
+    // this probe holds open across that COMMIT. It does not observe
+    // provisionInvitedMembership's own connection, because
+    // redeemMagicLinkToken opens and ends that one itself, so nothing
+    // outside can read its settings after the fact. Flipping is_local in
+    // provisionInvitedMembership therefore does NOT fail this assertion;
+    // that argument rests on reading the call, which is one line away.
+    //
+    // Worth being blunt about why that residual gap is acceptable today:
+    // every entry point in this module constructs its own Client and
+    // ends it in a finally, so there is no pool for a stale setting to
+    // leak into. is_local => true is the right thing to write anyway --
+    // it is correct the day a pool is introduced, and this check is what
+    // proves that keyword still means what the comment claims.
+    //
+    // An earlier version of this assertion ran on `admin`, which never
+    // called set_config at all. current_setting is per-connection, so it
+    // passed no matter what, and measured nothing. The is_local => false
+    // leg below is the control that keeps this one honest: if a
+    // session-scoped setting did not survive COMMIT either, the
+    // assertion above would again be measuring nothing.
+    const scoped = new Client({ connectionString: probeDatabaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await scoped.connect();
+      const readOrgSetting = async (): Promise<string> => {
+        const row = await scoped.query<{ value: string }>(
+          `SELECT coalesce(nullif(current_setting('app.current_org_id', true), ''), '') AS value`
+        );
+        return row.rows[0]?.value ?? "";
+      };
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error("set_config must take effect inside its own transaction");
+      }
+      await scoped.query("COMMIT");
+      const afterCommit = await readOrgSetting();
+      if (afterCommit !== "") {
+        throw new Error(
+          `app.current_org_id must be transaction-local; it survived COMMIT on the same connection as ${afterCommit}`
+        );
+      }
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, false)`, [organizationId]);
+      await scoped.query("COMMIT");
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error(
+          "control failed: a session-scoped set_config should survive COMMIT, so the transaction-local assertion above proves nothing"
+        );
+      }
+    } finally {
+      await scoped.end().catch(() => undefined);
+    }
+  } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
