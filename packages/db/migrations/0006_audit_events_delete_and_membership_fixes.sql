@@ -15,9 +15,32 @@
 --    without holding a permanent referential constraint against future
 --    membership deletion.
 
-ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_organization_id_fkey;
-ALTER TABLE audit_events ADD CONSTRAINT audit_events_organization_id_fkey
-  FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);
+-- Converted only while it is still the CASCADE version, then left alone.
+-- This file replays on every startup, and ADD CONSTRAINT ... FOREIGN KEY
+-- takes a strong lock and validates every existing row; on an append-only
+-- audit table an unconditional drop/add makes deployment cost grow with
+-- the audit history. confdeltype = 'c' is ON DELETE CASCADE, so the first
+-- replay converts and every later one is a no-op.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'audit_events'::regclass
+      AND conname = 'audit_events_organization_id_fkey'
+      AND confdeltype = 'c'
+  ) THEN
+    ALTER TABLE audit_events DROP CONSTRAINT audit_events_organization_id_fkey;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'audit_events'::regclass
+      AND conname = 'audit_events_organization_id_fkey'
+  ) THEN
+    ALTER TABLE audit_events ADD CONSTRAINT audit_events_organization_id_fkey
+      FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);
+  END IF;
+END $$;
 
 ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_actor_membership_fkey;
 

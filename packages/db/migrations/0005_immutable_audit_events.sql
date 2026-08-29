@@ -38,10 +38,28 @@ CREATE INDEX IF NOT EXISTS audit_events_organization_id_idx ON audit_events (org
 CREATE INDEX IF NOT EXISTS audit_events_entity_idx ON audit_events (entity_type, entity_id);
 
 -- Same format as contracts' requestIdSchema (req_ + version-4 UUID).
-ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_request_id_check;
-ALTER TABLE audit_events ADD CONSTRAINT audit_events_request_id_check CHECK (
-  request_id ~ '^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-);
+--
+-- Added only when absent, rather than dropped and re-added. The migrate
+-- service replays every .sql file on each startup, and ADD CONSTRAINT
+-- ... CHECK takes an ACCESS EXCLUSIVE lock and revalidates every existing
+-- row. On an append-only audit table that cost grows without bound, so an
+-- unconditional drop/add turns each routine deployment into a full scan
+-- that blocks writers for as long as it runs.
+--
+-- If this predicate ever needs to change, add a new migration; editing it
+-- here would leave existing databases on the old constraint silently.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'audit_events'::regclass
+      AND conname = 'audit_events_request_id_check'
+  ) THEN
+    ALTER TABLE audit_events ADD CONSTRAINT audit_events_request_id_check CHECK (
+      request_id ~ '^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    );
+  END IF;
+END $$;
 
 -- Actor must belong to the audited organization, not merely exist as a
 -- user. That rule is enforced by the BEFORE INSERT trigger created in
