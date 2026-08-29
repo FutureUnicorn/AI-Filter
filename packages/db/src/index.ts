@@ -1407,3 +1407,84 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.end().catch(() => undefined);
   }
 }
+
+/**
+ * A file intake carries both a tenant column and a reference to a
+ * tenant-owned row. Constraining those separately lets a row sit in
+ * organization B while pointing at organization A's role, and the
+ * misattributed document then counts toward the wrong tenant's per-role
+ * figures -- AF-58's failed-document rate reads exactly this pair.
+ *
+ * Third occurrence of this defect class (audit_events on AF-20,
+ * evidence_outcomes on AF-48, this), so the property is worth pinning
+ * rather than trusting the migration to stay correct.
+ */
+export async function assertFileIntakeTenantIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `fi_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'U')`, [
+      userId,
+      `fi_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'A role',$3)`,
+      [roleA, orgA, userId]
+    );
+
+    const insert = async (organizationId: string, key: string): Promise<void> => {
+      await admin.query(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,'cv.pdf','application/pdf','validated',$4)`,
+        [organizationId, roleA, key, userId]
+      );
+    };
+
+    // The legitimate pairing must still work -- a constraint that rejects
+    // everything would pass the negative case for the wrong reason.
+    await insert(orgA, `ok-${suffix}`);
+
+    let rejected = false;
+    let message = "";
+    try {
+      await insert(orgB, `bad-${suffix}`);
+    } catch (error) {
+      rejected = true;
+      message = error instanceof Error ? error.message : String(error);
+    }
+    if (!rejected) {
+      throw new Error(
+        "a file intake in organization B must not be able to reference organization A's role; " +
+          "the (role_id, organization_id) pair is unconstrained"
+      );
+    }
+    if (!/foreign key|violates/i.test(message)) {
+      throw new Error(`expected a foreign-key violation naming the real obstacle, got: ${message}`);
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
