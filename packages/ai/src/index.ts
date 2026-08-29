@@ -278,6 +278,11 @@ export const evidenceExtractionResponseSchema = z.strictObject({
 
 export type EvidenceExtractionItem = z.infer<typeof evidenceExtractionItemSchema>;
 
+export interface EvidenceSubject {
+  readonly organizationId: string;
+  readonly candidateId: string;
+}
+
 // ---- AF-36: rubric-to-evidence mapping ----
 //
 // Reconciles the model's raw (AF-35-validated) items against the
@@ -311,10 +316,12 @@ function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
   );
 }
 
-function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
+function invalidCitationOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "invalid_citation",
     message: "The model's citing item is missing a persistable source citation.",
@@ -322,31 +329,73 @@ function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
+function mapExtractedItem(subject: EvidenceSubject, item: EvidenceExtractionItem): EvidenceOutcome {
   const criterionId = item.criterion_id;
   switch (item.state) {
     case "not_found":
-      return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "not_found",
+        organizationId: subject.organizationId,
+        candidateId: subject.candidateId,
+        criterionId
+      };
     case "supported":
-    case "partially_supported":
-    case "contradicted":
-    case "unclear":
       if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(criterionId);
+        return invalidCitationOutcome(subject, criterionId);
       }
       return {
         schemaVersion: CONTRACT_SCHEMA_VERSION,
-        kind: item.state,
+        kind: "supported",
+        organizationId: subject.organizationId,
+        candidateId: subject.candidateId,
+        criterionId,
+        citation: citationFrom(item)
+      };
+    case "partially_supported":
+      if (!citingCitationIsPersistable(item)) {
+        return invalidCitationOutcome(subject, criterionId);
+      }
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "partially_supported",
+        organizationId: subject.organizationId,
+        candidateId: subject.candidateId,
+        criterionId,
+        citation: citationFrom(item)
+      };
+    case "contradicted":
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "extraction_error",
+        organizationId: subject.organizationId,
+        candidateId: subject.candidateId,
+        criterionId,
+        errorCode: "missing_conflicting_citation",
+        message: "The model's contradicted item has no conflicting citation.",
+        retryable: true
+      };
+    case "unclear":
+      if (!citingCitationIsPersistable(item)) {
+        return invalidCitationOutcome(subject, criterionId);
+      }
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "unclear",
+        organizationId: subject.organizationId,
+        candidateId: subject.candidateId,
         criterionId,
         citation: citationFrom(item)
       };
   }
 }
 
-function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
+function omittedCriterionOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "model_omitted_criterion",
     message: "The model's response did not include this criterion.",
@@ -354,10 +403,12 @@ function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function duplicateCriterionOutcome(criterionId: string, count: number): EvidenceOutcome {
+function duplicateCriterionOutcome(subject: EvidenceSubject, criterionId: string, count: number): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "duplicate_criterion_response",
     message: `The model returned ${count} responses for one criterion.`,
@@ -366,6 +417,7 @@ function duplicateCriterionOutcome(criterionId: string, count: number): Evidence
 }
 
 export function mapRubricToEvidence(
+  subject: EvidenceSubject,
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
@@ -411,11 +463,11 @@ export function mapRubricToEvidence(
     const matches = itemsByCriterion.get(criterionId) ?? [];
     const [firstMatch, ...rest] = matches;
     if (firstMatch === undefined) {
-      return omittedCriterionOutcome(criterionId);
+      return omittedCriterionOutcome(subject, criterionId);
     }
     if (rest.length > 0) {
-      return duplicateCriterionOutcome(criterionId, matches.length);
+      return duplicateCriterionOutcome(subject, criterionId, matches.length);
     }
-    return mapExtractedItem(firstMatch);
+    return mapExtractedItem(subject, firstMatch);
   });
 }
