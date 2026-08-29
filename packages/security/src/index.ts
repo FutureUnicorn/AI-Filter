@@ -217,9 +217,6 @@ export function resourceAuthorizationErrorResponse(
 
 const EMAIL_PATTERN = /[^\s@]+@[^\s@]+\.[^\s@]+/gu;
 const UUID_PATTERN = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
-const IPV4_PATTERN = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-const ISO_DATE_PATTERN =
-  /\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?\b/g;
 const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
 
