@@ -2317,6 +2317,144 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-57: evidence precision / correction rate ----
+//
+// "Share of evidence items a recruiter had to correct. Target >= 98%
+// precision on live pilots (99% on the locked offline eval)."
+//
+// **The denominator is items a human actually looked at, and that is the
+// whole ticket.** Measured over every item produced, precision rises by
+// generating more evidence nobody reads -- the metric would improve
+// fastest when the product was working least. An uncorrected item nobody
+// examined is not evidence of precision; it is evidence of nothing. So
+// unreviewed items stay in `population` and out of `sampleSize`, which
+// makes summarizeMetric emit population_incomplete on its own and keeps
+// the size of the unread pile visible next to the number it would
+// otherwise have inflated.
+//
+// **Live pilots and the locked offline eval are never pooled.** The
+// ticket sets two different targets, which only means anything if they
+// are two populations. Pooling them lets a large, clean offline eval
+// mask live-pilot errors -- and the offline set is exactly the one that
+// can be grown cheaply. There is deliberately no function here that
+// accepts both at once; the dataset is a required argument, and it
+// selects the metric name.
+
+export type EvidencePrecisionDataset = "live_pilot" | "locked_offline_eval";
+
+export interface EvidenceItemHistory {
+  /** Stable identity across corrections: the root of the revision chain. */
+  readonly itemId: string;
+  /** Every revision of this one item, in any order. */
+  readonly revisions: readonly EvidenceRevision[];
+  /**
+   * Whether a human examined this item -- a decision was recorded on the
+   * candidate, or the item itself was corrected. Not derivable from the
+   * revisions alone, because the common case is an item a reviewer read
+   * and left alone, which leaves no trace on the item.
+   */
+  readonly reviewed: boolean;
+}
+
+export interface EvidencePrecision {
+  /** 1 - (corrected / reviewed). null when nothing has been reviewed. */
+  readonly precision: number | null;
+  /** Items a human examined: the denominator. */
+  readonly reviewedItems: number;
+  /** Reviewed items that needed at least one correction. */
+  readonly correctedItems: number;
+  /** Items produced, reviewed or not: the population. */
+  readonly producedItems: number;
+  /**
+   * Corrections applied across reviewed items, counting repeats. Reported
+   * beside correctedItems rather than folded into it: an item corrected
+   * three times is one imprecise item for this metric, but three
+   * corrections is a different and worse story than one, and only the
+   * pair distinguishes them.
+   */
+  readonly correctionEvents: number;
+}
+
+/**
+ * An item corrected repeatedly counts once.
+ *
+ * Counting correction events instead would let a single stubborn item
+ * push the rate below any target on its own, and the number would stop
+ * meaning "share of items" while still being named that.
+ */
+export function summarizeEvidencePrecision(
+  items: readonly EvidenceItemHistory[]
+): EvidencePrecision {
+  const seen = new Set<string>();
+  let reviewedItems = 0;
+  let correctedItems = 0;
+  let correctionEvents = 0;
+
+  for (const item of items) {
+    if (seen.has(item.itemId)) {
+      // Two histories for one item would double-count it in both
+      // numerator and denominator -- not cancelling out, because only one
+      // of them may carry the correction.
+      throw new Error(`summarizeEvidencePrecision received two histories for item ${item.itemId}`);
+    }
+    seen.add(item.itemId);
+
+    const corrections = item.revisions.filter(
+      (revision) => revision.supersedesEvidenceOutcomeId !== undefined
+    ).length;
+
+    if (corrections > 0 && !item.reviewed) {
+      // Contradictory input rather than an edge case: a correction is a
+      // human act, so the item was examined by definition. Silently
+      // flipping the flag would hide a bug in whatever computed it, and
+      // that bug moves the denominator.
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s) but is marked unreviewed`
+      );
+    }
+    if (!item.reviewed) {
+      continue;
+    }
+    reviewedItems += 1;
+    correctionEvents += corrections;
+    if (corrections > 0) {
+      correctedItems += 1;
+    }
+  }
+
+  return {
+    // null, never 1. Perfect precision over an empty denominator is what
+    // a pilot that has not started yet would report, and it is the single
+    // most quotable wrong number this metric could produce.
+    precision: reviewedItems === 0 ? null : (reviewedItems - correctedItems) / reviewedItems,
+    reviewedItems,
+    correctedItems,
+    producedItems: items.length,
+    correctionEvents
+  };
+}
+
+/**
+ * Precision as a reportable metric, for one dataset at a time.
+ *
+ * `population` is every item produced and `sampleSize` is only those
+ * reviewed, so an unread backlog surfaces as population_incomplete
+ * without anyone having to remember to mention it.
+ */
+export function describeEvidencePrecision(
+  precision: EvidencePrecision,
+  dataset: EvidencePrecisionDataset,
+  minimumSampleSize: number
+): MetricSample {
+  return summarizeMetric({
+    metric: `evidence_precision_${dataset}`,
+    value: precision.precision,
+    sampleSize: precision.reviewedItems,
+    population: precision.producedItems,
+    minimumSampleSize
+  });
+}
+
 // ---- AF-56: qualified-candidate preservation ----
 //
 // "Percentage of independently-adjudicated strong candidates who were
