@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 
 import type {
   AuditAction,
+  CanonicalTextExtraction,
+  CanonicalTextPage,
+  CanonicalTextQuality,
   DomainPort,
   FileIntake,
   FileIntakeStatus,
@@ -1110,6 +1113,90 @@ export async function recordFileValidationResult(
     );
     const row = result.rows[0];
     return row === undefined ? { outcome: "not_uploaded" } : { outcome: "recorded", intake: rowToFileIntake(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-30: PDF/DOCX canonical text parser ----
+
+export interface CreateCanonicalTextExtractionInput {
+  readonly intakeId: string;
+  readonly pages: readonly CanonicalTextPage[];
+  readonly quality: CanonicalTextQuality;
+}
+
+interface CanonicalTextExtractionRow {
+  readonly extraction_id: string;
+  readonly intake_id: string;
+  readonly pages: readonly CanonicalTextPage[];
+  readonly total_pages: number;
+  readonly quality: CanonicalTextQuality;
+  readonly created_at: Date;
+}
+
+function rowToCanonicalTextExtraction(row: CanonicalTextExtractionRow): CanonicalTextExtraction {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    extractionId: row.extraction_id,
+    intakeId: row.intake_id,
+    pages: row.pages,
+    totalPages: row.total_pages,
+    quality: row.quality,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+const CANONICAL_TEXT_EXTRACTION_COLUMNS = "extraction_id, intake_id, pages, total_pages, quality, created_at";
+
+/** ON CONFLICT (intake_id) DO NOTHING + the follow-up SELECT is the same
+ * "idempotent, not a race" shape as AF-16's redemption: re-running
+ * extraction against an intake that already has one returns the
+ * existing row rather than erroring or producing a second one. */
+export async function createCanonicalTextExtraction(
+  databaseUrl: string,
+  schema: string,
+  input: CreateCanonicalTextExtractionInput
+): Promise<CanonicalTextExtraction> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const pagesJson = JSON.stringify(input.pages);
+    await client.query(
+      `INSERT INTO "${schema}".canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, $2::jsonb, $3, $4)
+       ON CONFLICT (intake_id) DO NOTHING`,
+      [input.intakeId, pagesJson, input.pages.length, input.quality]
+    );
+    const result = await client.query<CanonicalTextExtractionRow>(
+      `SELECT ${CANONICAL_TEXT_EXTRACTION_COLUMNS} FROM "${schema}".canonical_text_extractions WHERE intake_id = $1`,
+      [input.intakeId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("canonical text extraction upsert returned no row");
+    }
+    return rowToCanonicalTextExtraction(row);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export async function getCanonicalTextExtractionByIntakeId(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string
+): Promise<CanonicalTextExtraction | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<CanonicalTextExtractionRow>(
+      `SELECT ${CANONICAL_TEXT_EXTRACTION_COLUMNS} FROM "${schema}".canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToCanonicalTextExtraction(result.rows[0]);
   } finally {
     await client.end().catch(() => undefined);
   }
