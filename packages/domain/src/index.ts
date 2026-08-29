@@ -2317,6 +2317,202 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-65: retry / dead-letter administration ----
+//
+// "Admin view to retry or dead-letter stuck import/extraction jobs
+// without manually editing underlying candidate data."
+//
+// The clause after "without" is the requirement, not a caveat. An admin
+// tool that can reach candidate rows is the most dangerous surface in
+// the product: it is used rarely, by whoever is on call, under time
+// pressure, on the one tenant already having a bad day. So
+// JobAdministrationRequest carries a job id, an action and a reason and
+// has NO field into which candidate content could be placed. That is
+// what makes "without editing candidate data" a property of the type
+// rather than a rule someone has to keep.
+//
+// There is deliberately no new queue table. Stuckness is derived from
+// state that already exists -- a validated intake with no canonical
+// text, or an application whose current outcome is still processing or
+// retrying -- and dead-lettering records a terminal `failed` outcome
+// through the existing append-only evidence store. Inventing a job table
+// would create a second copy of "what happened to this document" that
+// could disagree with the first.
+//
+// **The property that matters most: dead-lettering must not improve any
+// metric.** The tempting implementation excludes dead-lettered
+// candidates from AF-56's denominator -- "we could not process them, so
+// they do not count" -- which would let the North Star safety number be
+// raised by dead-lettering everything difficult. A dead-lettered
+// candidate is precisely a candidate the workflow failed to surface, and
+// must keep counting as one.
+
+export type StuckJobKind = "import" | "extraction";
+export type JobAdministrationAction = "retry" | "dead_letter";
+
+export interface JobObservation {
+  readonly jobId: string;
+  readonly kind: StuckJobKind;
+  readonly organizationId: string;
+  /** Terminal jobs are never stuck, whatever their age. */
+  readonly terminal: boolean;
+  readonly attempts: number;
+  /** When the job entered its current non-terminal state. */
+  readonly waitingSince: string;
+}
+
+export interface StuckJobThresholds {
+  readonly importStuckAfterMs: number;
+  readonly extractionStuckAfterMs: number;
+  /** Attempts after which retrying is refused and dead-lettering is the only move. */
+  readonly maxAttempts: number;
+}
+
+export const DEFAULT_STUCK_JOB_THRESHOLDS: StuckJobThresholds = {
+  // Generous on purpose. A job flagged stuck while it is merely slow
+  // invites a retry that duplicates work still in flight, and the
+  // operator has no way to tell the two apart from the outside.
+  importStuckAfterMs: 30 * 60 * 1000,
+  extractionStuckAfterMs: 60 * 60 * 1000,
+  maxAttempts: 3
+};
+
+export interface StuckJob extends JobObservation {
+  readonly stuckForMs: number;
+  /** False once attempts have been exhausted: dead-letter is then the only action. */
+  readonly retryable: boolean;
+}
+
+export function identifyStuckJobs(
+  observations: readonly JobObservation[],
+  now: Date,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): readonly StuckJob[] {
+  const stuck: StuckJob[] = [];
+  for (const observation of observations) {
+    if (observation.terminal) {
+      continue;
+    }
+    const waitedMs = now.getTime() - Date.parse(observation.waitingSince);
+    const threshold =
+      observation.kind === "import" ? thresholds.importStuckAfterMs : thresholds.extractionStuckAfterMs;
+    if (waitedMs < threshold) {
+      continue;
+    }
+    stuck.push({
+      ...observation,
+      stuckForMs: waitedMs,
+      retryable: observation.attempts < thresholds.maxAttempts
+    });
+  }
+  // Longest-waiting first: the operator working down this list is
+  // triaging, and the oldest job is the one a customer has been staring
+  // at.
+  return stuck.sort((left, right) => right.stuckForMs - left.stuckForMs);
+}
+
+/**
+ * Everything an operator may say about a stuck job.
+ *
+ * Note what is absent: there is no field for a candidate name, a quote,
+ * a corrected value or arbitrary SQL. The admin path cannot edit
+ * candidate data because there is nowhere to put it, not because a
+ * reviewer remembered to check.
+ */
+export interface JobAdministrationRequest {
+  readonly jobId: string;
+  readonly action: JobAdministrationAction;
+  readonly reason: string;
+  readonly operatorUserId: string;
+}
+
+export type JobAdministrationRefusal =
+  | "job_not_stuck"
+  | "job_already_terminal"
+  | "retries_exhausted"
+  | "reason_required"
+  | "not_authorized";
+
+export type JobAdministrationDecision =
+  | { readonly allowed: true; readonly action: JobAdministrationAction; readonly attempt: number }
+  | { readonly allowed: false; readonly refusal: JobAdministrationRefusal };
+
+/**
+ * `supportAccessAllowed` is passed in rather than computed here, because
+ * the authority to touch a tenant's jobs is AF-66's decision and this
+ * module has no business re-deriving it. Passing `false` is refused
+ * outright: an admin action on a tenant's data is a look at that tenant's
+ * data plus a write.
+ */
+export function authorizeJobAdministration(
+  job: StuckJob | undefined,
+  request: JobAdministrationRequest,
+  supportAccessAllowed: boolean,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): JobAdministrationDecision {
+  if (!supportAccessAllowed) {
+    return { allowed: false, refusal: "not_authorized" };
+  }
+  if (!/[^\s]/u.test(request.reason)) {
+    // Same rule as AF-66's grant reason. An unexplained retry is
+    // indistinguishable from an accident, and dead-lettering without a
+    // reason discards a candidate silently.
+    return { allowed: false, refusal: "reason_required" };
+  }
+  if (job === undefined) {
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (job.terminal) {
+    return { allowed: false, refusal: "job_already_terminal" };
+  }
+  if (request.action === "dead_letter") {
+    // Always available. Refusing to dead-letter a job that has not yet
+    // exhausted its retries would leave an operator with no way to stop a
+    // document that is provably never going to parse.
+    return { allowed: true, action: "dead_letter", attempt: job.attempts };
+  }
+  if (!job.retryable || job.attempts >= thresholds.maxAttempts) {
+    // Bounded, because an unbounded retry on a permanently broken
+    // document burns the inference budget AF-41 exists to protect and
+    // never terminates.
+    return { allowed: false, refusal: "retries_exhausted" };
+  }
+  return { allowed: true, action: "retry", attempt: job.attempts + 1 };
+}
+
+/**
+ * The outcome recorded when a job is dead-lettered.
+ *
+ * `retryable: false` is the honest signal to every downstream reader
+ * that this will not resolve itself. It is still an EvidenceOutcome, so
+ * it still lands in the append-only store and still appears in the
+ * candidate's card set -- a dead-lettered candidate is visible as one the
+ * system gave up on, not absent.
+ *
+ * No organizationId/candidateId here, because ExtractionErrorEvidence on
+ * this stack does not carry them: AF-13's review added attribution to
+ * every outcome kind on the develop line, which this stack predates. The
+ * fields arrive when develop merges down, and this call site will stop
+ * compiling until they are supplied -- which is the correct way to find
+ * out, rather than a silently unattributed outcome.
+ */
+export function buildDeadLetterOutcome(criterionId: string, reason: string): EvidenceOutcome {
+  if (!/[^\s]/u.test(reason)) {
+    throw new Error("a dead-letter outcome requires a non-whitespace reason");
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    criterionId,
+    errorCode: "dead_lettered_by_operator",
+    message: reason,
+    // Not retryable: that is the whole meaning of dead-lettering, and a
+    // retryable dead-letter would be picked up again by the same job
+    // sweep that produced it.
+    retryable: false
+  };
+}
+
 // ---- AF-66: support-access logging ----
 //
 // "Any time a founder/operator looks at a specific tenant's data for
