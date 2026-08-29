@@ -60,7 +60,12 @@ const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
     // `.finite()` is explicit on purpose: TypeScript's `number` admits
     // Infinity and NaN, neither of which survives JSON -- both serialize
     // to `null`, silently changing the value at the transport boundary.
-    z.number().finite(),
+    // `-0` is rejected for the same reason and is easy to miss, because
+    // it IS finite: `JSON.stringify(-0)` emits `0`, so the value a caller
+    // handed in is not the value that comes back out the other side.
+    z.number().finite().refine((value) => !Object.is(value, -0), {
+      message: "must not be negative zero, which JSON serializes as 0"
+    }),
     z.boolean(),
     z.null(),
     z.array(jsonValueSchema),

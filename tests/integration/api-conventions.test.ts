@@ -92,6 +92,38 @@ test("buildApiError rejects a non-finite details value that would serialize to a
   }
 });
 
+test("buildApiError rejects negative zero, which is finite but does not round-trip through JSON", () => {
+  // -0 slips past a plain `.finite()` check because it genuinely is
+  // finite, yet `JSON.stringify(-0)` emits `0`: the value handed in is
+  // not the value that comes back out, which is the exact invariant this
+  // schema exists to enforce.
+  assert.equal(JSON.stringify(-0), "0");
+  assert.equal(Object.is(-0, 0), false);
+  assert.throws(
+    () =>
+      buildApiError({
+        requestId: generateRequestId(),
+        code: "internal_error",
+        message: "Something broke.",
+        details: { delta: -0 }
+      }),
+    /buildApiError produced a body that fails apiErrorBodySchema/
+  );
+});
+
+test("every accepted details value survives a JSON round trip unchanged", () => {
+  // The general property the individual rejections above are protecting:
+  // whatever buildApiError accepts must come back out of JSON identical.
+  const details = { count: 42, ratio: -0.5, zero: 0, nested: { list: [1, 2, 3], flag: true, empty: null } };
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), body);
+});
+
 test("buildApiError still accepts ordinary finite and nested JSON details", () => {
   const details = { count: 42, ratio: -0.5, nested: { list: [1, 2, 3], flag: true, empty: null } };
   const { body } = buildApiError({
