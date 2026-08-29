@@ -1308,3 +1308,168 @@ export function parseApplicationStateFilter(
   }
   return { ok: true, states: [...new Set(requested.filter(isApplicationEvidenceState))] };
 }
+
+// ---- AF-48: evidence card with source context ----
+//
+// "Criterion, state, exact quote, and source shown beside the original
+// application document for immediate verification."
+//
+// buildEvidenceCard is exhaustive over all thirteen EvidenceOutcome
+// kinds via assertUnreachableEvidenceOutcome, so a new kind fails to
+// compile here instead of silently rendering as a blank card.
+//
+// The honest part. Four kinds carry a quote a recruiter can check
+// (supported, partially_supported, contradicted, unclear) and one
+// carries a quote that was *rejected* (citation_invalid, whose whole
+// point is that the proposed citation did not survive AF-38's exact
+// match). The other eight cannot carry one -- not_found found nothing,
+// processing has not finished, quarantined never reached the model. For
+// those the card reports verifiable: false with the reason the kind
+// itself gives, so the UI can say why there is nothing to check rather
+// than rendering an empty quote box that looks like a bug.
+
+export interface EvidenceCardCitation {
+  /** What this quote is, so two quotes on a contradicted card are distinguishable. */
+  readonly role: "supporting" | "conflicting" | "rejected";
+  readonly citation: SourceCitation;
+}
+
+export interface EvidenceCard {
+  readonly criterionId: string;
+  readonly kind: EvidenceOutcomeKind;
+  readonly citations: readonly EvidenceCardCitation[];
+  /**
+   * Whether a recruiter can check this card against source material.
+   * False is a legitimate, explained state, not a missing value.
+   */
+  readonly verifiable: boolean;
+  /** Why this outcome is what it is, when the kind carries a reason. */
+  readonly explanation?: string | undefined;
+  readonly recordedAt: string;
+}
+
+export function buildEvidenceCard(outcome: EvidenceOutcome, recordedAt: string): EvidenceCard {
+  const base = { criterionId: outcome.criterionId, kind: outcome.kind, recordedAt } as const;
+  switch (outcome.kind) {
+    case "supported":
+    case "partially_supported":
+    case "unclear":
+      return {
+        ...base,
+        citations: [{ role: "supporting", citation: outcome.citation }],
+        verifiable: true
+      };
+    case "contradicted":
+      // Both sides of the conflict, labelled, because a contradiction a
+      // recruiter cannot see both halves of is not reviewable.
+      //
+      // The `in` check and cast are load-bearing and temporary.
+      // ContradictedEvidence on this branch carries one citation;
+      // AF-13's review added `conflictingCitation` and that fix is on
+      // develop, not yet propagated up this stack. Reading it
+      // defensively means the second quote appears the moment the fixed
+      // union arrives at merge, instead of a contradicted card silently
+      // showing one side. Delete the guard once the union has both.
+      return {
+        ...base,
+        citations: [
+          { role: "supporting", citation: outcome.citation },
+          ...("conflictingCitation" in outcome && outcome.conflictingCitation !== undefined
+            ? [{ role: "conflicting" as const, citation: outcome.conflictingCitation as SourceCitation }]
+            : [])
+        ],
+        verifiable: true
+      };
+    case "citation_invalid":
+      // Shown, but never as evidence: this is the quote the model
+      // proposed and validation rejected. Displaying it is what lets a
+      // recruiter see that the system caught a hallucination rather than
+      // silently dropping the criterion.
+      return {
+        ...base,
+        citations: [{ role: "rejected", citation: outcome.rejectedCitation as SourceCitation }],
+        verifiable: false,
+        explanation: outcome.reason
+      };
+    case "not_found":
+      return { ...base, citations: [], verifiable: false, explanation: "No relevant material was found." };
+    case "processing":
+      return { ...base, citations: [], verifiable: false, explanation: "Extraction has not finished." };
+    case "retrying":
+      return {
+        ...base,
+        citations: [],
+        verifiable: false,
+        explanation: `Retrying after a recoverable failure (attempt ${outcome.attempt} of ${outcome.maxAttempts}).`
+      };
+    case "extraction_error":
+      return { ...base, citations: [], verifiable: false, explanation: outcome.message };
+    case "invalid_source":
+    case "unsupported_file":
+      return { ...base, citations: [], verifiable: false, explanation: outcome.reason };
+    case "quarantined":
+      return {
+        ...base,
+        citations: [],
+        verifiable: false,
+        explanation: `Quarantined (${outcome.quarantineClass}): ${outcome.reason}`
+      };
+    case "failed":
+      return { ...base, citations: [], verifiable: false, explanation: outcome.message };
+    default:
+      return assertUnreachableEvidenceOutcome(outcome);
+  }
+}
+
+export interface EvidenceCardSet {
+  readonly applicationId: string;
+  readonly cards: readonly EvidenceCard[];
+  readonly verifiableCount: number;
+  readonly unverifiableCount: number;
+}
+
+/**
+ * Cards in rubric order, not in whatever order the database returned.
+ * A criterion the rubric names but nothing has been recorded for is
+ * reported as `processing` rather than omitted -- a review screen that
+ * silently drops a criterion tells a recruiter the rubric was smaller
+ * than it is, which is the one failure mode this whole card is meant to
+ * prevent.
+ */
+export function buildEvidenceCardSet(
+  applicationId: string,
+  rubricCriterionIds: readonly string[],
+  recorded: readonly { readonly outcome: EvidenceOutcome; readonly recordedAt: string }[]
+): EvidenceCardSet {
+  const byCriterion = new Map<string, { readonly outcome: EvidenceOutcome; readonly recordedAt: string }>();
+  for (const entry of recorded) {
+    const existing = byCriterion.get(entry.outcome.criterionId);
+    // Newest wins, which is how AF-49's append-only corrections will
+    // supersede an original without this needing to change.
+    if (existing === undefined || entry.recordedAt > existing.recordedAt) {
+      byCriterion.set(entry.outcome.criterionId, entry);
+    }
+  }
+
+  const cards = rubricCriterionIds.map((criterionId): EvidenceCard => {
+    const entry = byCriterion.get(criterionId);
+    if (entry === undefined) {
+      return {
+        criterionId,
+        kind: "processing",
+        citations: [],
+        verifiable: false,
+        explanation: "No evidence has been recorded for this criterion yet.",
+        recordedAt: ""
+      };
+    }
+    return buildEvidenceCard(entry.outcome, entry.recordedAt);
+  });
+
+  return {
+    applicationId,
+    cards,
+    verifiableCount: cards.filter((card) => card.verifiable).length,
+    unverifiableCount: cards.filter((card) => !card.verifiable).length
+  };
+}

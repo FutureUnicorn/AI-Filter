@@ -12,6 +12,7 @@ import type {
   CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRunRef,
+  EvidenceOutcome,
   FileIntake,
   FileIntakeStatus,
   ImportFinalizationSummary,
@@ -2164,6 +2165,294 @@ export async function assertApplicantOrderingPreserved(databaseUrl: string): Pro
     const again = await listApplicationsForRole(databaseUrl, schema, organizationId, roleId);
     if (again.map((a) => a.applicationId).join(",") !== listed.map((a) => a.applicationId).join(",")) {
       throw new Error("two identical reads returned different queue orders");
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-48 prerequisite: evidence outcome persistence ----
+
+export interface RecordEvidenceOutcomeInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly outcome: EvidenceOutcome;
+  /** The extraction run that produced this, when one did. */
+  readonly runId?: string;
+}
+
+/**
+ * Insert only. evidence_outcomes is append-only at the database level
+ * (0016's trigger), so there is deliberately no update or delete
+ * function here either -- same shape as appendAuditEvent and
+ * recordEvidenceExtractionRun.
+ *
+ * kind and criterionId are written as columns *and* live inside the
+ * jsonb; the table's CHECK constraints reject any row where the two
+ * disagree, so a caller cannot file an outcome under a state it does
+ * not actually hold.
+ */
+export async function recordEvidenceOutcome(
+  databaseUrl: string,
+  schema: string,
+  input: RecordEvidenceOutcomeInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".evidence_outcomes
+         (organization_id, application_id, criterion_id, kind, outcome, run_id)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+      [
+        input.organizationId,
+        input.applicationId,
+        input.outcome.criterionId,
+        input.outcome.kind,
+        JSON.stringify(input.outcome),
+        input.runId ?? null
+      ]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface RecordedEvidenceOutcome {
+  readonly outcome: EvidenceOutcome;
+  readonly recordedAt: string;
+}
+
+/**
+ * The current outcome per criterion: newest row wins.
+ *
+ * DISTINCT ON rather than fetching every revision and reducing in
+ * TypeScript, because a criterion corrected many times would otherwise
+ * ship its whole history to the caller to render one card. Scoped by
+ * organizationId as well as applicationId for the same reason
+ * listApplicationsForRole is (AF-45): an applicationId alone identifies
+ * the row, and relying on the route to have resolved tenancy first is
+ * exactly the shape of an IDOR.
+ */
+export async function listCurrentEvidenceOutcomesForApplication(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationId: string
+): Promise<readonly RecordedEvidenceOutcome[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ outcome: EvidenceOutcome; recorded_at: Date }>(
+      `SELECT DISTINCT ON (criterion_id) outcome, recorded_at
+         FROM "${schema}".evidence_outcomes
+        WHERE organization_id = $1 AND application_id = $2
+        ORDER BY criterion_id, recorded_at DESC, evidence_outcome_id DESC`,
+      [organizationId, applicationId]
+    );
+    return result.rows.map((row) => ({
+      outcome: row.outcome,
+      recordedAt: row.recorded_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * One application, scoped by organization as well as id. Routes need
+ * this to confirm an applicationId in the path actually belongs to the
+ * role in the path before reading anything else about it -- without it,
+ * a valid application id from a sibling tenant would resolve.
+ */
+export async function getApplicationById(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationId: string
+): Promise<Application | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<ApplicationRow>(
+      `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+              candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+         FROM "${schema}".applications
+        WHERE organization_id = $1 AND application_id = $2`,
+      [organizationId, applicationId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : rowToApplication(row);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-48 prerequisite: proves evidence_outcomes behaves as the review
+ * card depends on it to, against a real database.
+ *
+ * Four claims, each of which the card silently gets wrong if the table
+ * does not hold: the newest row per criterion is what a read returns,
+ * an outcome cannot be filed under a state or criterion it does not
+ * hold, an organization cannot read another's evidence, and nothing can
+ * edit or erase a recorded outcome.
+ */
+export async function assertEvidenceOutcomePersistence(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `evout_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const outcome = (kind: "supported" | "not_found", criterionId: string): EvidenceOutcome =>
+    kind === "supported"
+      ? {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          criterionId,
+          citation: {
+            document: "resume.pdf",
+            pageOrSection: "Experience",
+            offset: 10,
+            quote: "Built Python services in production."
+          }
+        }
+      : { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [orgA, orgB]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Probe') RETURNING user_id`,
+      [`evout_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+
+    const applicationIds: Record<string, string> = {};
+    for (const [label, organizationId] of [
+      ["a", orgA],
+      ["b", orgB]
+    ] as const) {
+      const role = await admin.query<{ role_id: string }>(
+        `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, $2, $3) RETURNING role_id`,
+        [organizationId, `Role ${label}`, userId]
+      );
+      const roleId = role.rows[0]?.role_id;
+      const intake = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+        [organizationId, roleId, `probe/${suffix}/${label}.csv`, userId]
+      );
+      const application = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, 1, 'Casey', $4) RETURNING application_id`,
+        [organizationId, roleId, intake.rows[0]?.intake_id, `${label}@acme.test`]
+      );
+      const applicationId = application.rows[0]?.application_id;
+      if (applicationId === undefined) {
+        throw new Error("probe could not create an application");
+      }
+      applicationIds[label] = applicationId;
+    }
+    const appA = applicationIds["a"];
+    const appB = applicationIds["b"];
+    if (appA === undefined || appB === undefined) {
+      throw new Error("probe did not create both applications");
+    }
+
+    // 1. Newest row per criterion wins -- the correction rule the card
+    //    and AF-49 both depend on.
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId: appA,
+      outcome: outcome("supported", "python")
+    });
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId: appA,
+      outcome: outcome("not_found", "python")
+    });
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId: appA,
+      outcome: outcome("supported", "postgres")
+    });
+
+    const current = await listCurrentEvidenceOutcomesForApplication(databaseUrl, schema, orgA, appA);
+    if (current.length !== 2) {
+      throw new Error(`expected one current outcome per criterion, got ${current.length}`);
+    }
+    const python = current.find((entry) => entry.outcome.criterionId === "python");
+    if (python?.outcome.kind !== "not_found") {
+      throw new Error(`the newest outcome must win, got ${python?.outcome.kind}`);
+    }
+
+    // 2. Another tenant's evidence is unreachable even with a real id.
+    const crossTenant = await listCurrentEvidenceOutcomesForApplication(databaseUrl, schema, orgB, appA);
+    if (crossTenant.length !== 0) {
+      throw new Error(`org B must not read org A's evidence, got ${crossTenant.length} rows`);
+    }
+
+    // 3. A row cannot be filed under a state or criterion it does not hold.
+    for (const [column, value] of [
+      ["kind", "'contradicted'"],
+      ["criterion_id", "'a_different_criterion'"]
+    ] as const) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+           VALUES ($1, $2, ${column === "criterion_id" ? value : "'python'"}, ${column === "kind" ? value : "'supported'"}, $3::jsonb)`,
+          [orgA, appA, JSON.stringify(outcome("supported", "python"))]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a row whose ${column} disagrees with its stored outcome must be rejected`);
+      }
+    }
+
+    // 4. Append-only: nothing edits or erases a recorded outcome.
+    for (const statement of [
+      `UPDATE evidence_outcomes SET kind = 'failed'`,
+      `DELETE FROM evidence_outcomes`,
+      `TRUNCATE evidence_outcomes`
+    ]) {
+      let rejected = false;
+      try {
+        await admin.query(statement);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`evidence_outcomes must reject: ${statement}`);
+      }
     }
   } finally {
     try {
