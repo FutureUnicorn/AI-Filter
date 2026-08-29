@@ -1273,6 +1273,32 @@ export function summarizeMetric(input: SummarizeMetricInput): MetricSample {
  * `population_incomplete` automatically rather than relying on whoever
  * writes the report to remember.
  */
+/**
+ * There is deliberately no function here that combines two MetricSamples,
+ * and adding one is the way this whole module gets quietly defeated.
+ *
+ * Pooling only looks like arithmetic. Two samples under different metric
+ * names are two different populations, and `metric` is a free-form string,
+ * so nothing in the types stops a caller summing a live-pilot sample with
+ * an offline-evaluation one and reporting the combined figure. AF-57
+ * relies on exactly that separation: it emits
+ * `evidence_precision_live_pilot` and
+ * `evidence_precision_locked_offline_eval` as distinct names, against two
+ * separate targets, so a dashboard cannot pool them by accident.
+ *
+ * The reason pooling is not merely imprecise but self-serving: the offline
+ * set is the one that can be grown cheaply, on demand, without a single
+ * recruiter reviewing anything. So a pooled denominator is always easiest
+ * to inflate on the side that flatters, and the combined number rises
+ * fastest exactly when the live pilot is going worst. That is the failure
+ * this module exists to prevent, arriving through the back door as a
+ * convenience helper.
+ *
+ * If a report genuinely needs one headline figure across populations, the
+ * honest form is to show both samples with their own sizes and
+ * limitations, not to average them. `population_incomplete` already
+ * carries the "you are not seeing everything" half.
+ */
 export function describeFailedDocumentRate(
   rate: FailedDocumentRate,
   minimumSampleSize: number
