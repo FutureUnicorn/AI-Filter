@@ -1334,10 +1334,27 @@ export interface EvidenceCardCitation {
   readonly citation: SourceCitation;
 }
 
+/**
+ * AF-49: what a recruiter needs to see to trust a corrected card --
+ * that it was corrected, by whom, why, and what it said before.
+ * Absent on an uncorrected card rather than present-and-empty, so
+ * "corrected" is a state you can check for rather than infer from a
+ * blank string.
+ */
+export interface EvidenceCorrectionProvenance {
+  readonly correctedByUserId: string;
+  readonly reason: string;
+  readonly correctedAt: string;
+  /** The state this correction replaced -- the "before" half. */
+  readonly previousKind: EvidenceOutcomeKind;
+  readonly previousCitations: readonly EvidenceCardCitation[];
+}
+
 export interface EvidenceCard {
   readonly criterionId: string;
   readonly kind: EvidenceOutcomeKind;
   readonly citations: readonly EvidenceCardCitation[];
+  readonly correction?: EvidenceCorrectionProvenance | undefined;
   /**
    * Whether a recruiter can check this card against source material.
    * False is a legitimate, explained state, not a missing value.
@@ -1466,6 +1483,136 @@ export function buildEvidenceCardSet(
     return buildEvidenceCard(entry.outcome, entry.recordedAt);
   });
 
+  return {
+    applicationId,
+    cards,
+    verifiableCount: cards.filter((card) => card.verifiable).length,
+    unverifiableCount: cards.filter((card) => !card.verifiable).length
+  };
+}
+
+// ---- AF-49: append-only evidence corrections ----
+//
+// "Recruiter corrections never overwrite the original AI output --
+// before/after state is preserved for every correction."
+//
+// The append-only half is the database's (0016 rejects UPDATE, DELETE
+// and TRUNCATE; 0017 makes every correction name what it replaced).
+// What belongs here is the reading: turning a chain of revisions into a
+// current card that carries its own before/after, so a recruiter looking
+// at a corrected criterion can see it was corrected without going to
+// look for a history somewhere else. A correction the reviewer has to go
+// hunting for is one they will not check.
+
+export interface EvidenceRevision {
+  readonly evidenceOutcomeId: string;
+  readonly outcome: EvidenceOutcome;
+  readonly recordedAt: string;
+  readonly correctedByUserId?: string | undefined;
+  readonly correctionReason?: string | undefined;
+  readonly supersedesEvidenceOutcomeId?: string | undefined;
+}
+
+/**
+ * The head of each criterion's revision chain, with the correction that
+ * produced it (if any) resolved against the revision it replaced.
+ *
+ * The head is found by following supersedes links, not by taking the
+ * newest timestamp: 0017 makes the chain a stored fact precisely so this
+ * does not have to be an inference. The head is the one revision no
+ * other revision supersedes. Timestamps break the tie only among
+ * criterion chains that are genuinely independent.
+ */
+export function resolveCurrentEvidenceRevisions(
+  revisions: readonly EvidenceRevision[]
+): readonly EvidenceRevision[] {
+  const superseded = new Set(
+    revisions
+      .map((revision) => revision.supersedesEvidenceOutcomeId)
+      .filter((id): id is string => id !== undefined)
+  );
+  const heads = new Map<string, EvidenceRevision>();
+  for (const revision of revisions) {
+    if (superseded.has(revision.evidenceOutcomeId)) {
+      continue;
+    }
+    const criterionId = revision.outcome.criterionId;
+    const existing = heads.get(criterionId);
+    // A criterion should have exactly one unsuperseded revision. If a
+    // history somehow forked despite 0017's unique index, take the newest
+    // rather than an arbitrary one, so the view is at least deterministic.
+    if (existing === undefined || revision.recordedAt > existing.recordedAt) {
+      heads.set(criterionId, revision);
+    }
+  }
+  return [...heads.values()];
+}
+
+export function buildCorrectedEvidenceCard(
+  revisions: readonly EvidenceRevision[],
+  head: EvidenceRevision
+): EvidenceCard {
+  const card = buildEvidenceCard(head.outcome, head.recordedAt);
+  if (head.correctedByUserId === undefined || head.supersedesEvidenceOutcomeId === undefined) {
+    return card;
+  }
+  const previous = revisions.find(
+    (revision) => revision.evidenceOutcomeId === head.supersedesEvidenceOutcomeId
+  );
+  if (previous === undefined) {
+    // The predecessor is missing from what we were given. Reporting the
+    // correction without its "before" would be worse than not claiming
+    // one: it would show a card as corrected while quietly failing the
+    // requirement the correction exists to satisfy. 0016 makes deletion
+    // impossible, so this means an incomplete read, not lost data.
+    return card;
+  }
+  const previousCard = buildEvidenceCard(previous.outcome, previous.recordedAt);
+  return {
+    ...card,
+    correction: {
+      correctedByUserId: head.correctedByUserId,
+      reason: head.correctionReason ?? "",
+      correctedAt: head.recordedAt,
+      previousKind: previousCard.kind,
+      previousCitations: previousCard.citations
+    }
+  };
+}
+
+/**
+ * AF-49's card set: the same rubric-ordered shape AF-48 produces, built
+ * from the full revision history so every corrected card carries its own
+ * before/after.
+ *
+ * Kept as a separate entry point rather than changing
+ * buildEvidenceCardSet's signature: that function takes "the current
+ * outcome per criterion" and is the right shape for a caller that has
+ * only that. This one takes the history, which is strictly more, and
+ * only a caller that has read the history can use it.
+ */
+export function buildCorrectedEvidenceCardSet(
+  applicationId: string,
+  rubricCriterionIds: readonly string[],
+  revisions: readonly EvidenceRevision[]
+): EvidenceCardSet {
+  const heads = new Map(
+    resolveCurrentEvidenceRevisions(revisions).map((head) => [head.outcome.criterionId, head])
+  );
+  const cards = rubricCriterionIds.map((criterionId): EvidenceCard => {
+    const head = heads.get(criterionId);
+    if (head === undefined) {
+      return {
+        criterionId,
+        kind: "processing",
+        citations: [],
+        verifiable: false,
+        explanation: "No evidence has been recorded for this criterion yet.",
+        recordedAt: ""
+      };
+    }
+    return buildCorrectedEvidenceCard(revisions, head);
+  });
   return {
     applicationId,
     cards,
