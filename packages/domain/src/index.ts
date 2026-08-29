@@ -409,3 +409,33 @@ export const ROLE_CAPABILITIES: Readonly<Record<MembershipRole, readonly Capabil
 export function roleHasCapability(role: MembershipRole, capability: Capability): boolean {
   return ROLE_CAPABILITIES[role].includes(capability);
 }
+
+// ---- AF-20: immutable audit events ----
+//
+// Every one of these four actions is required by docs/PRODUCT_BOUNDARY.md
+// POL-001 to be attributable to a named human, so actorUserId is never
+// optional and never a "system" placeholder. Append-only is enforced at
+// the database layer (a trigger, not a privilege grant -- see
+// packages/db/migrations/0005_immutable_audit_events.sql for why) and
+// reinforced here by only ever exposing an append function, never an
+// update or delete, from packages/db.
+
+export type AuditAction = "rubric_approved" | "evidence_corrected" | "decision_recorded" | "admin_action";
+
+export const AUDIT_ACTIONS: readonly AuditAction[] = [
+  "rubric_approved",
+  "evidence_corrected",
+  "decision_recorded",
+  "admin_action"
+] as const;
+
+export interface AuditEvent extends VersionedRecord {
+  readonly auditEventId: string;
+  readonly organizationId: string;
+  readonly actorUserId: string;
+  readonly action: AuditAction;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly requestId: string;
+  readonly occurredAt: string;
+}

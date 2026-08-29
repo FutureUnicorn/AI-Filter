@@ -10,4 +10,6 @@ AF-15 added `organizationSchema`/`userSchema`/`membershipSchema`, the runtime mi
 
 AF-16 added `requestMagicLinkInputSchema` (re-send a login link to an existing email) and `createInviteInputSchema` (an inviter names an email, organization, and role together). Neither is a signup schema; there is no public self-service path. The token mechanism itself (generation, hashing, atomic single-use redemption, and the pure verification decision) lives in `packages/security` and `packages/db`, not here — see `packages/db/migrations/0003_magic_link_tokens.sql`.
 
+AF-20 added `auditEventSchema`, the runtime mirror of `packages/db/migrations/0005_immutable_audit_events.sql`. `action` is closed to the four events POL-001 requires a named human for (`rubric_approved`/`evidence_corrected`/`decision_recorded`/`admin_action`), and `requestId` reuses AF-14's `requestIdSchema` rather than a second string check. `packages/db`'s `appendAuditEvent` is insert-only; the database itself rejects `UPDATE`/`DELETE` on this table via a trigger, not a privilege grant, because triggers hold even for the superuser role AF-11's infra currently connects as (unlike row-level security -- see `docs/architecture/tenant-isolation.md`).
+
 Transport, framework, and provider payloads must be mapped at the boundary and must not leak directly into domain APIs.
