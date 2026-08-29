@@ -3429,3 +3429,317 @@ export async function assertCandidateDecisionIntegrity(databaseUrl: string): Pro
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-52: low-evidence random audit sampling ----
+
+export interface RecordAuditSampleInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly seed: string;
+  readonly requestedSize: number;
+  readonly eligibleCount: number;
+  readonly drawnByUserId: string;
+  readonly sampledApplicationIds: readonly string[];
+}
+
+export interface RecordedAuditSample {
+  readonly auditSampleId: string;
+  readonly seed: string;
+  readonly requestedSize: number;
+  readonly eligibleCount: number;
+  readonly drawnByUserId: string;
+  readonly drawnAt: string;
+  readonly sampledApplicationIds: readonly string[];
+}
+
+/**
+ * The draw and its members are written in ONE transaction, because a
+ * draw recorded without its membership is indistinguishable from a draw
+ * whose membership was chosen afterwards -- which is precisely the thing
+ * recording the seed exists to rule out.
+ */
+export async function recordAuditSample(
+  databaseUrl: string,
+  schema: string,
+  input: RecordAuditSampleInput
+): Promise<string> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const drawn = await client.query<{ audit_sample_id: string }>(
+        `INSERT INTO "${schema}".audit_samples
+           (organization_id, role_id, seed, requested_size, eligible_count, drawn_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING audit_sample_id`,
+        [
+          input.organizationId,
+          input.roleId,
+          input.seed,
+          input.requestedSize,
+          input.eligibleCount,
+          input.drawnByUserId
+        ]
+      );
+      const auditSampleId = drawn.rows[0]?.audit_sample_id;
+      if (auditSampleId === undefined) {
+        throw new Error("recording an audit sample did not produce a draw row");
+      }
+      for (const applicationId of input.sampledApplicationIds) {
+        await client.query(
+          `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, application_id)
+           VALUES ($1, $2, $3)`,
+          [auditSampleId, input.organizationId, applicationId]
+        );
+      }
+      await client.query("COMMIT");
+      return auditSampleId;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Every draw for a role, newest first, with its membership. */
+export async function listAuditSamplesForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<readonly RecordedAuditSample[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      audit_sample_id: string;
+      seed: string;
+      requested_size: number;
+      eligible_count: number;
+      drawn_by_user_id: string;
+      drawn_at: Date;
+      application_ids: string[] | null;
+    }>(
+      `SELECT s.audit_sample_id, s.seed, s.requested_size, s.eligible_count,
+              s.drawn_by_user_id, s.drawn_at,
+              array_agg(m.application_id ORDER BY m.application_id)
+                FILTER (WHERE m.application_id IS NOT NULL) AS application_ids
+         FROM "${schema}".audit_samples s
+         LEFT JOIN "${schema}".audit_sample_members m ON m.audit_sample_id = s.audit_sample_id
+        WHERE s.organization_id = $1 AND s.role_id = $2
+        GROUP BY s.audit_sample_id
+        ORDER BY s.drawn_at DESC, s.audit_sample_id DESC`,
+      [organizationId, roleId]
+    );
+    return result.rows.map((row) => ({
+      auditSampleId: row.audit_sample_id,
+      seed: row.seed,
+      requestedSize: row.requested_size,
+      eligibleCount: row.eligible_count,
+      drawnByUserId: row.drawn_by_user_id,
+      drawnAt: row.drawn_at.toISOString(),
+      sampledApplicationIds: row.application_ids ?? []
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-52: proves a recorded draw cannot be re-rolled, re-attributed, or
+ * quietly extended after the fact.
+ *
+ * Every rejection attempt uses its own primary key. A shared one lets a
+ * duplicate-key error masquerade as the constraint under test -- which
+ * happened while checking this table by hand, and made a cross-tenant
+ * case look enforced when the unique index had fired instead.
+ */
+export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `sample_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [orgA, orgB]);
+    const member = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Auditor') RETURNING user_id`,
+      [`auditor_${suffix}@acme.test`]
+    );
+    const outsider = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Outsider') RETURNING user_id`,
+      [`outsider_${suffix}@acme.test`]
+    );
+    const memberId = member.rows[0]?.user_id;
+    const outsiderId = outsider.rows[0]?.user_id;
+    if (memberId === undefined || outsiderId === undefined) {
+      throw new Error("probe could not create users");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'auditor')`, [
+      orgA,
+      memberId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [orgA, memberId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgA, roleId, `probe/${suffix}.csv`, memberId]
+    );
+    const applicationIds: string[] = [];
+    for (let index = 1; index <= 3; index += 1) {
+      const application = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, $4, 'C', $5) RETURNING application_id`,
+        [orgA, roleId, intake.rows[0]?.intake_id, index, `c${index}_${suffix}@acme.test`]
+      );
+      const id = application.rows[0]?.application_id;
+      if (id === undefined) {
+        throw new Error("probe could not create an application");
+      }
+      applicationIds.push(id);
+    }
+    if (roleId === undefined) {
+      throw new Error("probe could not create a role");
+    }
+
+    // 1. A draw records with its membership, atomically.
+    const sampleId = await recordAuditSample(databaseUrl, schema, {
+      organizationId: orgA,
+      roleId,
+      seed: `audit-${suffix}`,
+      requestedSize: 2,
+      eligibleCount: 3,
+      drawnByUserId: memberId,
+      sampledApplicationIds: applicationIds.slice(0, 2)
+    });
+    const drawn = await listAuditSamplesForRole(databaseUrl, schema, orgA, roleId);
+    if (drawn.length !== 1 || drawn[0]?.sampledApplicationIds.length !== 2) {
+      throw new Error(`expected one draw of two applications, got ${JSON.stringify(drawn)}`);
+    }
+    if (drawn[0]?.seed !== `audit-${suffix}` || drawn[0]?.eligibleCount !== 3) {
+      throw new Error("a draw must record the seed and the eligible population it drew from");
+    }
+
+    // 2. A draw that cannot record its membership records nothing.
+    //    Otherwise a failed write leaves a seed with no members, which
+    //    reads as "we sampled and found nobody".
+    let partialRejected = false;
+    try {
+      await recordAuditSample(databaseUrl, schema, {
+        organizationId: orgA,
+        roleId,
+        seed: `atomic-${suffix}`,
+        requestedSize: 1,
+        eligibleCount: 3,
+        drawnByUserId: memberId,
+        sampledApplicationIds: ["99999999-9999-4999-8999-999999999999"]
+      });
+    } catch {
+      partialRejected = true;
+    }
+    if (!partialRejected) {
+      throw new Error("a draw naming an application that does not exist must fail");
+    }
+    const afterFailure = await listAuditSamplesForRole(databaseUrl, schema, orgA, roleId);
+    if (afterFailure.length !== 1) {
+      throw new Error(
+        `a failed draw must leave nothing behind; found ${afterFailure.length} draws, so the seed was recorded without its members`
+      );
+    }
+
+    // 3. Rejections. Each attempt gets its own primary key.
+    const rejections: Array<[string, string, string, string, number, number, string]> = [
+      ["a blank seed", "b0000001-4444-4444-8444-444444444444", orgA, "   ", 2, 3, memberId],
+      ["a zero sample size", "b0000002-4444-4444-8444-444444444444", orgA, "s", 0, 3, memberId],
+      ["a negative eligible count", "b0000003-4444-4444-8444-444444444444", orgA, "s", 2, -1, memberId],
+      ["a drawer with no membership here", "b0000004-4444-4444-8444-444444444444", orgA, "s", 2, 3, outsiderId],
+      ["org B drawing on org A's role", "b0000005-4444-4444-8444-444444444444", orgB, "s", 2, 3, memberId]
+    ];
+    for (const [label, id, organizationId, seed, size, eligible, drawer] of rejections) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO audit_samples
+             (audit_sample_id, organization_id, role_id, seed, requested_size, eligible_count, drawn_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [id, organizationId, roleId, seed, size, eligible, drawer]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`${label} must not be recordable as a draw`);
+      }
+    }
+
+    // 4. A member from another tenant, with a FRESH draw so the
+    //    (sample, application) unique key cannot fire first and be
+    //    mistaken for the tenant constraint doing the work.
+    let crossTenantRejected = false;
+    try {
+      await admin.query(
+        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
+        [sampleId, orgB, applicationIds[2]]
+      );
+    } catch {
+      crossTenantRejected = true;
+    }
+    if (!crossTenantRejected) {
+      throw new Error("a draw must not be able to claim another tenant's application");
+    }
+
+    // 5. Nothing edits, extends by rewriting, or erases a recorded draw.
+    for (const statement of [
+      `UPDATE audit_samples SET seed = 'rerolled'`,
+      `DELETE FROM audit_samples`,
+      `UPDATE audit_sample_members SET application_id = application_id`,
+      `DELETE FROM audit_sample_members`,
+      `TRUNCATE audit_sample_members`
+    ]) {
+      let rejected = false;
+      try {
+        await admin.query(statement);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a recorded draw must be immutable; permitted: ${statement}`);
+      }
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
