@@ -119,6 +119,83 @@ test("a typo'd expectedReviewCriterionIds entry throws instead of vanishing into
   assert.throws(() => scoreGoldSet([typoCase]), /psotgres_experience/);
 });
 
+test("over-escalation is caught: routing a clean case to review fails escalationPrecision", () => {
+  // The bug escalationPrecision exists to catch. Before it, the harness
+  // only ever asked "was every expected-review criterion flagged?", so a
+  // routing regression that sent EVERYTHING to human review scored a
+  // perfect 1.0 on escalationRecall and left every other metric
+  // untouched -- the gate passed while the product shipped a review
+  // queue containing all of its own clean results.
+  //
+  // This fixture stands in for that regression: the pipeline genuinely
+  // routes `unclear` to review (correctly, per routeOutcomeForReview),
+  // but the ground truth says this criterion should not have needed a
+  // human. That is precisely the shape of an over-escalation.
+  const overEscalatingCase: GoldSetCase = {
+    caseId: "over-escalation-fixture",
+    locked: false,
+    sourceText: "Familiar with backend systems including some Python tooling.",
+    rubricCriterionIds: ["python_production"],
+    simulatedExtraction: [
+      {
+        criterion_id: "python_production",
+        state: "unclear",
+        quote: "Familiar with backend systems including some Python tooling.",
+        source: { document: "resume.txt", page_or_section: "Skills", offset: 0 }
+      }
+    ],
+    expectedKinds: { python_production: "unclear" },
+    expectedReviewCriterionIds: []
+  };
+
+  const score = scoreGoldSet([overEscalatingCase]);
+
+  // Recall is blind here: nothing was expected to escalate, so its
+  // empty-denominator fallback reports a vacuous 1.0. That is the exact
+  // blind spot -- asserting it pins down that recall alone could not
+  // have failed this build.
+  assert.equal(score.escalationRecall, 1);
+  assert.equal(score.escalationPrecision, 0);
+
+  // And the gate has to actually act on it, naming the metric.
+  const gate = checkGoldSetThresholds(score, GOLD_SET_V1_THRESHOLDS);
+  assert.equal(gate.passed, false);
+  if (!gate.passed) {
+    assert.ok(
+      gate.failures.some((failure) => failure.includes("escalationPrecision")),
+      JSON.stringify({ score, gate })
+    );
+  }
+});
+
+test("escalationPrecision only counts genuine escalations, so a correctly-routed case still scores 1", () => {
+  // The negative control for the test above: same `unclear` outcome,
+  // but now the ground truth agrees it needs a human. Without this,
+  // "escalationPrecision drops to 0" could just as easily mean the
+  // metric is wired to a constant.
+  const correctlyEscalatingCase: GoldSetCase = {
+    caseId: "correct-escalation-fixture",
+    locked: false,
+    sourceText: "Familiar with backend systems including some Python tooling.",
+    rubricCriterionIds: ["python_production"],
+    simulatedExtraction: [
+      {
+        criterion_id: "python_production",
+        state: "unclear",
+        quote: "Familiar with backend systems including some Python tooling.",
+        source: { document: "resume.txt", page_or_section: "Skills", offset: 0 }
+      }
+    ],
+    expectedKinds: { python_production: "unclear" },
+    expectedReviewCriterionIds: ["python_production"]
+  };
+
+  const score = scoreGoldSet([correctlyEscalatingCase]);
+  assert.equal(score.escalationRecall, 1);
+  assert.equal(score.escalationPrecision, 1);
+  assert.deepEqual(checkGoldSetThresholds(score, GOLD_SET_V1_THRESHOLDS), { passed: true });
+});
+
 test("checkGoldSetThresholds reports which specific metric regressed, not just pass/fail", () => {
   const failingScore = {
     totalCases: 1,
@@ -126,7 +203,8 @@ test("checkGoldSetThresholds reports which specific metric regressed, not just p
     outcomeAccuracy: 0.5,
     citingPrecision: 1,
     citingRecall: 1,
-    escalationRecall: 1
+    escalationRecall: 1,
+    escalationPrecision: 1
   };
   const gate = checkGoldSetThresholds(failingScore, GOLD_SET_V1_THRESHOLDS);
   assert.equal(gate.passed, false);

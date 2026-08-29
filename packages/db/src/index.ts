@@ -445,6 +445,24 @@ export interface RecordInferenceUsageInput {
   readonly outputTokens: number;
 }
 
+/**
+ * Rejects a negative delta before it reaches the upsert. The table's
+ * CHECK only sees the RESULT of the addition, so once a row has a
+ * positive total, recording -50 against 100 silently lowers usage to 50:
+ * a faulty or untrusted caller could walk the meter backwards and
+ * postpone the cap indefinitely.
+ */
+function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
+  for (const [field, value] of [
+    ["inputTokens", input.inputTokens],
+    ["outputTokens", input.outputTokens]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`recordInferenceUsage requires a non-negative integer ${field}, got: ${value}`);
+    }
+  }
+}
+
 /** Increments the existing row for this (organization, model, period), or creates it. */
 export async function recordInferenceUsage(
   databaseUrl: string,
@@ -452,6 +470,7 @@ export async function recordInferenceUsage(
   input: RecordInferenceUsageInput
 ): Promise<void> {
   assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
@@ -538,6 +557,20 @@ export interface SetInferenceKillSwitchInput {
   readonly engaged: boolean;
   readonly reason?: string;
   readonly engagedByUserId?: string;
+  /**
+   * Required to audit the transition. Every engage/disengage overwrites
+   * the singleton row -- including its actor, reason and timestamp -- so
+   * without an audit row the previous incident-control action leaves no
+   * trace at all once the next transition happens. `audit_events`
+   * already covers consequential `admin_action`s explicitly, and the
+   * transition plus its audit row now commit in ONE transaction, so a
+   * flipped switch can never exist without the record of who flipped it.
+   */
+  readonly audit: {
+    readonly organizationId: string;
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
 }
 
 /**
@@ -560,14 +593,38 @@ export async function setInferenceKillSwitch(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    const result = await client.query(
-      `UPDATE "${schema}".inference_kill_switch
-          SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = CURRENT_TIMESTAMP
-        WHERE id = true`,
-      [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
-    );
-    if (result.rowCount === 0) {
-      throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+    await client.query("BEGIN");
+    try {
+      const result = await client.query(
+        `UPDATE "${schema}".inference_kill_switch
+            SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = clock_timestamp()
+          WHERE id = true`,
+        [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
+      );
+      if (result.rowCount === 0) {
+        throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+      }
+      // Same transaction, on the same client: the switch cannot end up
+      // flipped without the audit row recording who did it, and a
+      // failure here rolls the transition back rather than leaving an
+      // unattributed change behind.
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.audit.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "inference_kill_switch",
+          entityId: input.engaged ? "engaged" : "disengaged",
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
     }
   } finally {
     await client.end().catch(() => undefined);
@@ -750,6 +807,79 @@ export async function listRolesForOrganization(
   }
 }
 
+export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
+  /** Cap on (input + output) tokens for this organization/model/period. */
+  readonly maxTotalTokens: number;
+}
+
+export type ReserveInferenceBudgetOutcome =
+  | { readonly outcome: "reserved"; readonly totalTokensAfter: number }
+  | { readonly outcome: "cap_exceeded"; readonly totalTokensBefore: number; readonly maxTotalTokens: number };
+
+/**
+ * Atomic check-and-reserve. Reading the total with getInferenceUsage and
+ * then incrementing with recordInferenceUsage cannot be made safe by the
+ * caller: each opens its own connection, so they cannot share a
+ * transaction, and concurrent requests near the cap all read the same
+ * pre-increment total, all pass the check, and the burst spends
+ * arbitrarily far past the budget.
+ *
+ * Doing both in one statement closes that window. The INSERT ... ON
+ * CONFLICT DO UPDATE takes a row lock on conflict, so concurrent callers
+ * serialize on it, and the WHERE clause re-evaluates the cap against the
+ * row's committed value at that moment -- not against a total read
+ * earlier. When the guard fails the UPDATE affects no row, RETURNING is
+ * empty, and we report cap_exceeded instead of over-spending.
+ */
+export async function reserveInferenceBudget(
+  databaseUrl: string,
+  schema: string,
+  input: ReserveInferenceBudgetInput
+): Promise<ReserveInferenceBudgetOutcome> {
+  assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
+  const requested = input.inputTokens + input.outputTokens;
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const reserved = await client.query<{ total_tokens: string }>(
+      `INSERT INTO "${schema}".inference_usage_ledger
+         (organization_id, model, period_start, input_tokens, output_tokens)
+       SELECT $1, $2, $3, $4, $5
+        WHERE $6::bigint <= $7::bigint
+       ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+         input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+         output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+         updated_at = clock_timestamp()
+        WHERE "${schema}".inference_usage_ledger.input_tokens
+            + "${schema}".inference_usage_ledger.output_tokens
+            + $6::bigint <= $7::bigint
+       RETURNING (input_tokens + output_tokens)::bigint AS total_tokens`,
+      [
+        input.organizationId,
+        input.model,
+        input.periodStart,
+        input.inputTokens,
+        input.outputTokens,
+        requested,
+        input.maxTotalTokens
+      ]
+    );
+    const row = reserved.rows[0];
+    if (row !== undefined) {
+      return { outcome: "reserved", totalTokensAfter: Number(row.total_tokens) };
+    }
+    const current = await getInferenceUsage(databaseUrl, schema, input);
+    return {
+      outcome: "cap_exceeded",
+      totalTokensBefore: current.inputTokens + current.outputTokens,
+      maxTotalTokens: input.maxTotalTokens
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
@@ -840,8 +970,15 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
     }
   } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.

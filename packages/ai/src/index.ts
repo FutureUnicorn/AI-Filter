@@ -48,28 +48,53 @@ export interface OpenAiResponsesClient {
           strict: true;
         };
       };
+      /** Provider-side retention. Always sent explicitly; see the call site. */
+      store: boolean;
     }): Promise<{
       output_text: string;
-      usage: { input_tokens: number; output_tokens: number };
+      /** The model that actually served the request, which can differ
+       * from the requested one when that is a movable alias. */
+      model?: string | undefined;
+      /** Absent when the provider reported no usage. Never defaulted to
+       * zero: an unmetered billable call must not look free. */
+      usage?: { input_tokens: number; output_tokens: number } | undefined;
     }>;
   };
 }
+
+/**
+ * Explicit "this call site genuinely has no kill switch" marker, for
+ * tests and for adapters constructed outside the inference path. Named
+ * so that grepping for it finds every place the control is bypassed --
+ * which an optional field silently hid.
+ */
+export const alwaysDisengagedKillSwitch = async (): Promise<{ readonly engaged: boolean }> => ({
+  engaged: false
+});
 
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
   /**
    * Checked before every call; when it resolves `engaged: true`, the
-   * provider is never invoked. Optional only so the existing adapter
-   * tests (which don't care about kill-switch behavior) don't all need
-   * to supply one -- any real caller wiring this up for actual evidence
-   * extraction must pass one (e.g. `() => getInferenceKillSwitchStatus(
-   * databaseUrl, schema)` from packages/db, whose InferenceKillSwitchRow
-   * shape already matches this exactly). Before this, nothing in the
-   * codebase called this at all, so engaging the kill switch halted
-   * nothing.
+   * provider is never invoked.
+   *
+   * REQUIRED, not optional. While it was optional, every construction
+   * using the original `{ apiKey, model }` shape still compiled and
+   * called the provider without consulting the database, so engaging
+   * the switch could not reliably halt inference -- which is the entire
+   * point of the control. Making it mandatory means an adapter that
+   * skips the check cannot be built at all: it is a compile error.
+   *
+   * The caller injects it (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose row shape already
+   * matches). Injection rather than a direct import keeps packages/ai
+   * free of a dependency on packages/db, which the architecture rules
+   * forbid. Tests that genuinely do not exercise the switch pass
+   * `alwaysDisengagedKillSwitch` so the omission is explicit and
+   * greppable rather than silent.
    */
-  readonly checkKillSwitch?: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
 }
 
 /**
@@ -105,18 +130,65 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         const response = await openai.responses.create({
           model: params.model,
           input: params.input,
-          text: params.text
+          text: params.text,
+          store: params.store
         });
+        // response.model is the model that actually served the call.
+        // Discarding it made records produced by different revisions of
+        // a movable alias indistinguishable after the alias moved.
+        //
+        // Usage is passed through as-is, including absent. Defaulting it
+        // to 0/0 turned an unknown but potentially billable call into a
+        // legitimate free one: repeated responses in that state would
+        // never advance the ledger and could bypass the cap entirely.
+        // The adapter fails closed on it instead.
         return {
           output_text: response.output_text,
-          usage: {
-            input_tokens: response.usage?.input_tokens ?? 0,
-            output_tokens: response.usage?.output_tokens ?? 0
-          }
+          model: response.model,
+          ...(response.usage === undefined || response.usage === null
+            ? {}
+            : {
+                usage: {
+                  input_tokens: response.usage.input_tokens,
+                  output_tokens: response.usage.output_tokens
+                }
+              })
         };
       }
     }
   };
+}
+
+/**
+ * The provider returned no usage data. Thrown rather than defaulted to
+ * zero so an unmetered call can never be mistaken for a free one; the
+ * caller decides whether to retry or halt, but it cannot silently
+ * under-count against the budget.
+ */
+export class AiUsageUnavailableError extends Error {
+  readonly model: string;
+
+  constructor(model: string) {
+    super(`Provider returned no usage for model ${model}; refusing to record it as a zero-token call.`);
+    this.name = "AiUsageUnavailableError";
+    this.model = model;
+  }
+}
+
+/**
+ * The call succeeded and was billed, but `output_text` was not valid
+ * JSON (a refusal, a truncated response, an empty body). Carries the
+ * call's metadata -- including real token usage -- so the caller can
+ * still record what the attempt cost before deciding whether to retry.
+ */
+export class AiStructuredCallParseError extends Error {
+  readonly metadata: AiCallMetadata;
+
+  constructor(metadata: AiCallMetadata, cause: unknown) {
+    super(`Structured output for schema ${metadata.schemaName} was not valid JSON.`, { cause });
+    this.name = "AiStructuredCallParseError";
+    this.metadata = metadata;
+  }
 }
 
 export function createOpenAiAdapter(
@@ -127,11 +199,9 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
-      if (config.checkKillSwitch !== undefined) {
-        const status = await config.checkKillSwitch();
-        if (status.engaged) {
-          throw new InferenceKillSwitchEngagedError(status.reason);
-        }
+      const status = await config.checkKillSwitch();
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
       }
 
       const response = await openai.responses.create({
@@ -147,13 +217,36 @@ export function createOpenAiAdapter(
             schema: input.jsonSchema,
             strict: true
           }
-        }
+        },
+        // The structured output carries verbatim quotes from candidate
+        // documents. The Responses API retains response objects by
+        // default, so omitting this silently created a provider-side
+        // copy of candidate material on every successful call. Opt out
+        // explicitly; retention must be a deliberate decision, not the
+        // consequence of leaving a parameter off.
+        store: false
       });
 
-      const output: unknown = JSON.parse(response.output_text);
+      // Fail closed on unknown usage. The provider has already been
+      // called and may already have billed for it, so the one thing this
+      // must not do is report it as a zero-token call: that would let a
+      // provider degradation return usage-less responses indefinitely
+      // while the ledger never advances and the cap never trips.
+      if (response.usage === undefined || response.usage === null) {
+        throw new AiUsageUnavailableError(config.model);
+      }
+
+      // Metadata is built BEFORE parsing, deliberately. A refused,
+      // truncated, empty or otherwise non-JSON `output_text` still
+      // represents a call that was made and billed; building metadata
+      // afterwards meant JSON.parse threw first and the caller was left
+      // with no token counts to hand to recordInferenceUsage, so retries
+      // of failing responses stayed invisible to the budget and could
+      // accumulate unbounded cost.
       const metadata: AiCallMetadata = {
         provider: "openai",
         model: config.model,
+        ...(response.model === undefined ? {} : { resolvedModel: response.model }),
         promptVersion: input.promptVersion,
         schemaVersion: input.schemaVersion,
         schemaName: input.schemaName,
@@ -162,6 +255,13 @@ export function createOpenAiAdapter(
           outputTokens: response.usage.output_tokens
         }
       };
+
+      let output: unknown;
+      try {
+        output = JSON.parse(response.output_text);
+      } catch (cause) {
+        throw new AiStructuredCallParseError(metadata, cause);
+      }
       return { output, metadata };
     }
   };
@@ -363,6 +463,34 @@ export function mapRubricToEvidence(
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
+  // The rubric IDs arrive as an unconstrained string[] with no upstream
+  // schema or branded type guaranteeing anything about them, so they are
+  // validated here rather than assumed. Both checks protect the promise
+  // this function makes about its OUTPUT:
+  //
+  // - An empty ID would produce an outcome whose criterionId is "",
+  //   which fails evidenceOutcomeSchema (criterionId requires at least
+  //   one character). Returning it would mean handing back a value
+  //   advertised as a persistable EvidenceOutcome that cannot actually
+  //   be persisted.
+  // - A repeated ID would emit several outcomes for the same criterion,
+  //   contradicting the one-outcome-per-criterion invariant and letting
+  //   a downstream consumer persist or count it twice.
+  //
+  // Rejecting rather than silently de-duplicating: a rubric containing
+  // the same criterion twice is a malformed rubric, and quietly
+  // collapsing it would hide that from whoever authored it.
+  const seen = new Set<string>();
+  for (const criterionId of rubricCriterionIds) {
+    if (criterionId.length === 0) {
+      throw new Error("mapRubricToEvidence requires non-empty rubric criterion IDs");
+    }
+    if (seen.has(criterionId)) {
+      throw new Error(`mapRubricToEvidence requires unique rubric criterion IDs; "${criterionId}" appears more than once`);
+    }
+    seen.add(criterionId);
+  }
+
   const itemsByCriterion = new Map<string, EvidenceExtractionItem[]>();
   for (const item of extractedItems) {
     const existing = itemsByCriterion.get(item.criterion_id);
@@ -500,8 +628,34 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
       "quote not found verbatim in source text (likely hallucination)"
     );
   }
-  if (citation.offset >= 0 && citation.offset < sourceText.length) {
-    const window = sourceText.slice(citation.offset, citation.offset + citation.quote.length);
+  // Offsets are compared in Unicode CODE POINTS, matching the Python
+  // validator this ports (scripts/validate_citations.py indexes Python
+  // strings, which are code-point indexed). JavaScript's slice indexes
+  // UTF-16 code units, so any astral character before the quote -- an
+  // emoji, many CJK extension characters -- shifts every later offset
+  // and the two implementations disagree. In "😀Built" the correct
+  // offset of "Built" is 1 in Python but 2 in UTF-16 units, so slicing
+  // by the Python offset started inside the surrogate pair and reported
+  // a valid citation as invalid.
+  const sourceCodePoints = [...sourceText];
+
+  // An offset at or past the end of the source is not "unverifiable", it
+  // is impossible. Previously the range guard skipped the check
+  // entirely for such values, so a claimed offset of 9999 passed
+  // validation unexamined as long as the quote appeared somewhere in the
+  // text -- preserving an impossible citation location as valid evidence.
+  if (citation.offset >= sourceCodePoints.length) {
+    return toCitationInvalid(
+      criterionId,
+      citation,
+      "claimed offset is past the end of the source text"
+    );
+  }
+
+  if (citation.offset >= 0) {
+    const window = sourceCodePoints
+      .slice(citation.offset, citation.offset + [...citation.quote].length)
+      .join("");
     if (window !== citation.quote) {
       return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
     }
@@ -729,6 +883,13 @@ export interface GoldSetScore {
   readonly citingPrecision: number;
   readonly citingRecall: number;
   readonly escalationRecall: number;
+  /**
+   * Of everything routed to human review, how much genuinely warranted
+   * it. Recall alone cannot fail when routing over-escalates -- flagging
+   * every clean outcome scores a perfect recall -- so precision is what
+   * actually catches that regression.
+   */
+  readonly escalationPrecision: number;
 }
 
 const CITING_KINDS: ReadonlySet<EvidenceOutcomeKind> = new Set([
@@ -779,6 +940,7 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
   let falseNegative = 0;
   let reviewExpectedCount = 0;
   let reviewCorrectlyFlagged = 0;
+  let reviewIncorrectlyFlagged = 0;
 
   for (const goldCase of cases) {
     assertGoldSetCaseIntegrity(goldCase);
@@ -827,10 +989,21 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
     // denominator can never be silently short.
     const uniqueReviewCriterionIds = new Set(goldCase.expectedReviewCriterionIds);
     reviewExpectedCount += uniqueReviewCriterionIds.size;
-    for (const reviewCriterionId of uniqueReviewCriterionIds) {
-      const outcome = validated.find((candidate) => candidate.criterionId === reviewCriterionId);
-      if (outcome !== undefined && routeForReview(outcome).needsReview) {
+
+    // Every validated outcome is routed, not just the expected-review
+    // ones. Iterating only the expected IDs meant routeForReview was
+    // never called for negative examples, so a regression that flagged
+    // `supported` / `partially_supported` / `not_found` for review left
+    // escalationRecall at 1 and every other metric untouched -- the gate
+    // passed while the system sent ALL clean evidence to human review.
+    // Recording the false positives gives that failure a metric to trip.
+    for (const outcome of validated) {
+      const shouldEscalate = uniqueReviewCriterionIds.has(outcome.criterionId);
+      const didEscalate = routeForReview(outcome).needsReview;
+      if (shouldEscalate && didEscalate) {
         reviewCorrectlyFlagged += 1;
+      } else if (!shouldEscalate && didEscalate) {
+        reviewIncorrectlyFlagged += 1;
       }
     }
   }
@@ -841,7 +1014,11 @@ export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
     outcomeAccuracy: totalCriteria === 0 ? 1 : correctKinds / totalCriteria,
     citingPrecision: truePositive + falsePositive === 0 ? 1 : truePositive / (truePositive + falsePositive),
     citingRecall: truePositive + falseNegative === 0 ? 1 : truePositive / (truePositive + falseNegative),
-    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount
+    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount,
+    escalationPrecision:
+      reviewCorrectlyFlagged + reviewIncorrectlyFlagged === 0
+        ? 1
+        : reviewCorrectlyFlagged / (reviewCorrectlyFlagged + reviewIncorrectlyFlagged)
   };
 }
 
@@ -851,6 +1028,7 @@ export interface GoldSetThresholds {
   readonly minCitingPrecision: number;
   readonly minCitingRecall: number;
   readonly minEscalationRecall: number;
+  readonly minEscalationPrecision: number;
 }
 
 /**
@@ -865,7 +1043,8 @@ export const GOLD_SET_V1_THRESHOLDS: GoldSetThresholds = {
   minOutcomeAccuracy: 1,
   minCitingPrecision: 1,
   minCitingRecall: 1,
-  minEscalationRecall: 1
+  minEscalationRecall: 1,
+  minEscalationPrecision: 1
 };
 
 export type GoldSetGate =
@@ -888,6 +1067,9 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
   }
   if (score.escalationRecall < thresholds.minEscalationRecall) {
     failures.push(`escalationRecall ${score.escalationRecall} < ${thresholds.minEscalationRecall}`);
+  }
+  if (score.escalationPrecision < thresholds.minEscalationPrecision) {
+    failures.push(`escalationPrecision ${score.escalationPrecision} < ${thresholds.minEscalationPrecision}`);
   }
   return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }
