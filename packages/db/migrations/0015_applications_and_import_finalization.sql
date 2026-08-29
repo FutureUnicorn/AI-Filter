@@ -23,8 +23,11 @@ ALTER TABLE file_intakes
 CREATE TABLE IF NOT EXISTS applications (
   application_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
-  role_id uuid NOT NULL REFERENCES roles (role_id) ON DELETE CASCADE,
-  intake_id uuid NOT NULL REFERENCES file_intakes (intake_id) ON DELETE RESTRICT,
+  -- Tenant-paired, not single-column: see the guarded ALTERs at the end of
+  -- this file for why. Kept here too so a fresh database gets the correct
+  -- shape without waiting for the ALTER to fix it.
+  role_id uuid NOT NULL,
+  intake_id uuid NOT NULL,
   source_row_number integer NOT NULL CHECK (source_row_number >= 1),
   candidate_full_name text NOT NULL CHECK (candidate_full_name ~ '[^[:space:]]'),
   candidate_email text NOT NULL CHECK (candidate_email ~ '[^[:space:]]'),
@@ -86,5 +89,53 @@ BEGIN
   ) THEN
     ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_candidate_email_check;
     ALTER TABLE applications ADD CONSTRAINT applications_candidate_email_nonblank CHECK (candidate_email ~ '[^[:space:]]');
+  END IF;
+END $$;
+
+-- Cross-tenant misattribution on the application's own parents.
+--
+-- applications carries organization_id AND references roles and
+-- file_intakes. Constraining those separately let an application in
+-- organization B name organization A's role or intake -- verified by
+-- inserting both against a real database, and both were accepted. That is
+-- the row every downstream table hangs off: evidence_outcomes,
+-- candidate_decisions and the review queue all reach a tenant through this
+-- one, so a misattributed application carries the error into all of them.
+--
+-- Same class already closed on audit_events (composite FK to memberships)
+-- and file_intakes (composite FK to roles). The rule: a table holding both
+-- a tenant column and a reference to a tenant-owned row must constrain the
+-- pair, not each column separately.
+--
+-- Guarded rather than DROP/ADD because this file replays on every startup
+-- and re-adding a foreign key revalidates every row under a strong lock.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'file_intakes'::regclass AND conname = 'file_intakes_intake_id_organization_id_key'
+  ) THEN
+    ALTER TABLE file_intakes ADD CONSTRAINT file_intakes_intake_id_organization_id_key
+      UNIQUE (intake_id, organization_id);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'applications'::regclass AND conname = 'applications_role_organization_fkey'
+  ) THEN
+    ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_role_id_fkey;
+    ALTER TABLE applications ADD CONSTRAINT applications_role_organization_fkey
+      FOREIGN KEY (role_id, organization_id) REFERENCES roles (role_id, organization_id)
+      ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'applications'::regclass AND conname = 'applications_intake_organization_fkey'
+  ) THEN
+    ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_intake_id_fkey;
+    ALTER TABLE applications ADD CONSTRAINT applications_intake_organization_fkey
+      FOREIGN KEY (intake_id, organization_id) REFERENCES file_intakes (intake_id, organization_id)
+      ON DELETE RESTRICT;
   END IF;
 END $$;
