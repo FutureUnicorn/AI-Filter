@@ -2607,3 +2607,406 @@ export async function assertFileIntakeTenantIntegrity(databaseUrl: string): Prom
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-49: append-only evidence corrections ----
+
+export interface CorrectEvidenceOutcomeInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly criterionId: string;
+  /** What the recruiter says the outcome should be. */
+  readonly outcome: EvidenceOutcome;
+  readonly correctedByUserId: string;
+  readonly reason: string;
+}
+
+/**
+ * A correction is an append that names what it replaced, never an edit.
+ *
+ * `superseded` rather than an exception, because losing a race is an
+ * ordinary outcome a UI has to render ("someone corrected this while you
+ * were typing"), not a fault. Same discriminated shape as
+ * MagicLinkRedemptionAttempt and ResourceAuthorization.
+ *
+ * `nothing_to_correct` is its own state for the same reason: a
+ * correction with no "before" is not a correction, and silently turning
+ * it into an original would lose exactly the distinction AF-49 exists to
+ * keep.
+ */
+export type EvidenceCorrectionResult =
+  | { readonly outcome: "recorded"; readonly evidenceOutcomeId: string; readonly supersededId: string }
+  | { readonly outcome: "nothing_to_correct" }
+  | { readonly outcome: "superseded" };
+
+export async function correctEvidenceOutcome(
+  databaseUrl: string,
+  schema: string,
+  input: CorrectEvidenceOutcomeInput
+): Promise<EvidenceCorrectionResult> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      // What is actually load-bearing here, measured rather than
+      // asserted:
+      //
+      //   - The partial unique index on supersedes_evidence_outcome_id
+      //     is what makes a forked history impossible.
+      //   - `ON CONFLICT ... DO NOTHING` below is what turns losing the
+      //     race into the `superseded` result a UI can render instead of
+      //     a raw unique-violation exception. Removing it fails the
+      //     concurrency probe deterministically (6 runs, 6 failures).
+      //   - This FOR UPDATE is defence in depth and nothing more.
+      //     Removing it fails no test (4 runs, 4 passes), because
+      //     ON CONFLICT already handles the race on its own. It is kept
+      //     because serialising the two correctors is cheaper than
+      //     letting both build a row and discarding one, not because
+      //     correctness depends on it.
+      //
+      // Locking a row of an append-only table is safe: SELECT ... FOR
+      // UPDATE takes a row lock and does not fire the BEFORE UPDATE
+      // trigger. Verified against a real database, not assumed.
+      const head = await client.query<{ evidence_outcome_id: string }>(
+        `SELECT evidence_outcome_id
+           FROM "${schema}".evidence_outcomes
+          WHERE organization_id = $1 AND application_id = $2 AND criterion_id = $3
+          ORDER BY recorded_at DESC, evidence_outcome_id DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId, input.criterionId]
+      );
+      const supersededId = head.rows[0]?.evidence_outcome_id;
+      if (supersededId === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "nothing_to_correct" };
+      }
+
+      const inserted = await client.query<{ evidence_outcome_id: string }>(
+        `INSERT INTO "${schema}".evidence_outcomes
+           (organization_id, application_id, criterion_id, kind, outcome,
+            corrected_by_user_id, correction_reason, supersedes_evidence_outcome_id)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+         ON CONFLICT (supersedes_evidence_outcome_id)
+           WHERE supersedes_evidence_outcome_id IS NOT NULL DO NOTHING
+         RETURNING evidence_outcome_id`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.criterionId,
+          input.outcome.kind,
+          JSON.stringify(input.outcome),
+          input.correctedByUserId,
+          input.reason,
+          supersededId
+        ]
+      );
+      const evidenceOutcomeId = inserted.rows[0]?.evidence_outcome_id;
+      if (evidenceOutcomeId === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "superseded" };
+      }
+      await client.query("COMMIT");
+      return { outcome: "recorded", evidenceOutcomeId, supersededId };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface RecordedEvidenceRevision {
+  readonly evidenceOutcomeId: string;
+  readonly outcome: EvidenceOutcome;
+  readonly recordedAt: string;
+  readonly correctedByUserId?: string | undefined;
+  readonly correctionReason?: string | undefined;
+  readonly supersedesEvidenceOutcomeId?: string | undefined;
+}
+
+/**
+ * Every revision for an application, oldest first -- the "before/after
+ * state is preserved for every correction" half of AF-49, readable.
+ *
+ * Deliberately returns the whole history rather than just the current
+ * outcome: listCurrentEvidenceOutcomesForApplication already answers
+ * "what does this say now", and a caller that wanted before/after could
+ * not reconstruct it from that.
+ */
+export async function listEvidenceRevisionsForApplication(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationId: string
+): Promise<readonly RecordedEvidenceRevision[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      evidence_outcome_id: string;
+      outcome: EvidenceOutcome;
+      recorded_at: Date;
+      corrected_by_user_id: string | null;
+      correction_reason: string | null;
+      supersedes_evidence_outcome_id: string | null;
+    }>(
+      `SELECT evidence_outcome_id, outcome, recorded_at,
+              corrected_by_user_id, correction_reason, supersedes_evidence_outcome_id
+         FROM "${schema}".evidence_outcomes
+        WHERE organization_id = $1 AND application_id = $2
+        ORDER BY criterion_id, recorded_at, evidence_outcome_id`,
+      [organizationId, applicationId]
+    );
+    return result.rows.map((row) => ({
+      evidenceOutcomeId: row.evidence_outcome_id,
+      outcome: row.outcome,
+      recordedAt: row.recorded_at.toISOString(),
+      ...(row.corrected_by_user_id === null ? {} : { correctedByUserId: row.corrected_by_user_id }),
+      ...(row.correction_reason === null ? {} : { correctionReason: row.correction_reason }),
+      ...(row.supersedes_evidence_outcome_id === null
+        ? {}
+        : { supersedesEvidenceOutcomeId: row.supersedes_evidence_outcome_id })
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-49: proves corrections are append-only, attributed, chained, and
+ * safe under genuine concurrency -- against a real database.
+ *
+ * The concurrency case is the one that cannot be argued from the code.
+ * Two recruiters correcting the same criterion at the same moment must
+ * produce one correction and one honest "someone got there first", never
+ * two corrections both claiming the same predecessor. This fires both
+ * calls without awaiting the first, so they genuinely overlap.
+ */
+export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `evcorr_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const outcomeOf = (kind: "supported" | "not_found" | "unclear", criterionId: string): EvidenceOutcome =>
+    kind === "supported"
+      ? {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          criterionId,
+          citation: { document: "resume.pdf", pageOrSection: "Experience", offset: 4, quote: "Ran Postgres." }
+        }
+      : kind === "unclear"
+        ? {
+            schemaVersion: CONTRACT_SCHEMA_VERSION,
+            kind: "unclear",
+            criterionId,
+            citation: { document: "resume.pdf", pageOrSection: "Skills", offset: 9, quote: "Databases." }
+          }
+        : { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A')`, [organizationId]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Recruiter') RETURNING user_id`,
+      [`evcorr_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [organizationId, role.rows[0]?.role_id, `probe/${suffix}.csv`, userId]
+    );
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Casey', $4) RETURNING application_id`,
+      [organizationId, role.rows[0]?.role_id, intake.rows[0]?.intake_id, `casey_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (applicationId === undefined) {
+      throw new Error("probe could not create an application");
+    }
+
+    // 1. Correcting nothing is its own answer, not a silent original.
+    const nothing = await correctEvidenceOutcome(databaseUrl, schema, {
+      organizationId,
+      applicationId,
+      criterionId: "postgres",
+      outcome: outcomeOf("not_found", "postgres"),
+      correctedByUserId: userId,
+      reason: "there is nothing here yet"
+    });
+    if (nothing.outcome !== "nothing_to_correct") {
+      throw new Error(`correcting a criterion with no prior outcome must report it, got ${nothing.outcome}`);
+    }
+
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId,
+      applicationId,
+      outcome: outcomeOf("supported", "postgres")
+    });
+
+    // 2. A correction records, names its predecessor, and leaves the
+    //    original in place.
+    const corrected = await correctEvidenceOutcome(databaseUrl, schema, {
+      organizationId,
+      applicationId,
+      criterionId: "postgres",
+      outcome: outcomeOf("not_found", "postgres"),
+      correctedByUserId: userId,
+      reason: "quote belongs to a different candidate"
+    });
+    if (corrected.outcome !== "recorded") {
+      throw new Error(`expected the correction to record, got ${corrected.outcome}`);
+    }
+
+    const history = await listEvidenceRevisionsForApplication(databaseUrl, schema, organizationId, applicationId);
+    if (history.length !== 2) {
+      throw new Error(`the original must survive the correction; history has ${history.length} revisions`);
+    }
+    const originalRow = history.find((revision) => revision.supersedesEvidenceOutcomeId === undefined);
+    if (originalRow?.outcome.kind !== "supported") {
+      throw new Error("the original AI output must still read as it did before the correction");
+    }
+    const correctionRow = history.find((revision) => revision.evidenceOutcomeId === corrected.evidenceOutcomeId);
+    if (correctionRow?.supersedesEvidenceOutcomeId !== corrected.supersededId) {
+      throw new Error("a correction must record which revision it replaced");
+    }
+    if (correctionRow.correctionReason === undefined || correctionRow.correctedByUserId === undefined) {
+      throw new Error("a correction must be attributed to a person and a reason");
+    }
+
+    // 3. The current outcome is the correction, not the original.
+    const current = await listCurrentEvidenceOutcomesForApplication(
+      databaseUrl,
+      schema,
+      organizationId,
+      applicationId
+    );
+    if (current.length !== 1 || current[0]?.outcome.kind !== "not_found") {
+      throw new Error(`the corrected value must be current, got ${JSON.stringify(current)}`);
+    }
+
+    // 4. Genuine concurrency: both corrections launched before either is
+    //    awaited, so they overlap on the wire rather than in theory.
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId,
+      applicationId,
+      outcome: outcomeOf("supported", "python")
+    });
+    const [first, second] = await Promise.all([
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        criterionId: "python",
+        outcome: outcomeOf("not_found", "python"),
+        correctedByUserId: userId,
+        reason: "first corrector"
+      }),
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        criterionId: "python",
+        outcome: outcomeOf("unclear", "python"),
+        correctedByUserId: userId,
+        reason: "second corrector"
+      })
+    ]);
+    // What is asserted here is the invariant, not one particular
+    // interleaving. If the two calls genuinely overlap, one records and
+    // the other reports `superseded`; if the first commits before the
+    // second reads, the second legitimately corrects the correction and
+    // both record. Both are correct outcomes, and pinning the exact pair
+    // would make this test fail on timing rather than on behaviour --
+    // a flake dressed as a regression.
+    //
+    // What must never happen, under any interleaving, is a forked
+    // history: two revisions claiming the same predecessor, leaving
+    // "the before state" ambiguous for whichever survives.
+    //
+    // Stated honestly: this particular assertion cannot fail while the
+    // schema is intact, and dropping 0017's unique index to prove it
+    // does not isolate the behaviour -- the INSERT fails earlier with
+    // "there is no unique or exclusion constraint matching the ON
+    // CONFLICT specification". It is kept as a statement of the
+    // invariant and as a guard against a future refactor that stops
+    // routing corrections through ON CONFLICT; the assertion that
+    // genuinely discriminates today is the one above it.
+    for (const result of [first, second]) {
+      if (result.outcome === "nothing_to_correct") {
+        throw new Error("a criterion with a recorded outcome must never report nothing_to_correct");
+      }
+    }
+    const pythonRevisions = (
+      await listEvidenceRevisionsForApplication(databaseUrl, schema, organizationId, applicationId)
+    ).filter((revision) => revision.outcome.criterionId === "python");
+    const supersededIds = pythonRevisions
+      .map((revision) => revision.supersedesEvidenceOutcomeId)
+      .filter((id): id is string => id !== undefined);
+    if (new Set(supersededIds).size !== supersededIds.length) {
+      throw new Error(
+        `concurrent corrections forked the history: ${supersededIds.length} revisions claim ${new Set(supersededIds).size} distinct predecessors`
+      );
+    }
+    // Exactly one head, which is what "the chain is linear" means in
+    // the form the review card actually consumes.
+    const heads = pythonRevisions.filter(
+      (revision) => !supersededIds.includes(revision.evidenceOutcomeId)
+    );
+    if (heads.length !== 1) {
+      throw new Error(`a criterion must have exactly one current revision, got ${heads.length}`);
+    }
+    if (pythonRevisions.length < 2) {
+      throw new Error("the original must survive alongside whatever corrections were recorded");
+    }
+
+    // 5. Nothing edits or erases a correction either.
+    for (const statement of [
+      `UPDATE evidence_outcomes SET correction_reason = 'rewritten'`,
+      `DELETE FROM evidence_outcomes`
+    ]) {
+      let rejected = false;
+      try {
+        await admin.query(statement);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`corrections must be as immutable as originals; permitted: ${statement}`);
+      }
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}

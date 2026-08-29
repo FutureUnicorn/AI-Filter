@@ -15,10 +15,19 @@ interface CardCitation {
   readonly citation: SourceCitation;
 }
 
+interface CorrectionProvenance {
+  readonly correctedByUserId: string;
+  readonly reason: string;
+  readonly correctedAt: string;
+  readonly previousKind: string;
+  readonly previousCitations: readonly CardCitation[];
+}
+
 interface EvidenceCard {
   readonly criterionId: string;
   readonly kind: string;
   readonly citations: readonly CardCitation[];
+  readonly correction?: CorrectionProvenance;
   readonly verifiable: boolean;
   readonly explanation?: string;
   readonly recordedAt: string;
@@ -60,6 +69,11 @@ const CITATION_ROLE_LABELS: Readonly<Record<CardCitation["role"], string>> = {
  * A rejected citation is deliberately still shown, labelled as rejected.
  * That is how a recruiter sees the system caught a hallucination rather
  * than the criterion quietly disappearing.
+ *
+ * AF-49: a corrected card shows what it was corrected FROM, on the card
+ * itself, not behind a link to a history. The original AI output is
+ * never overwritten in the database, and a reviewer who has to go
+ * looking for the before state is a reviewer who will not check it.
  */
 export default function EvidenceCardPage() {
   const params = useParams<{ roleId: string; applicationId: string }>();
@@ -130,8 +144,37 @@ export default function EvidenceCardPage() {
               <h2>{card.criterionId}</h2>
               <p>
                 <strong>State:</strong> {card.kind}
+                {card.correction !== undefined && <> · corrected by a reviewer</>}
               </p>
               {card.explanation !== undefined && <p>{card.explanation}</p>}
+
+              {card.correction !== undefined && (
+                <aside aria-label={`Correction history for ${card.criterionId}`}>
+                  <p>
+                    <strong>Corrected from &ldquo;{card.correction.previousKind}&rdquo;</strong> on{" "}
+                    {card.correction.correctedAt} by {card.correction.correctedByUserId}.
+                  </p>
+                  <p>Reason: {card.correction.reason}</p>
+                  {card.correction.previousCitations.length > 0 && (
+                    <>
+                      <p>
+                        <small>What the original AI output quoted — kept, never overwritten:</small>
+                      </p>
+                      {card.correction.previousCitations.map((entry, index) => (
+                        <figure key={`${card.criterionId}-before-${index}`}>
+                          <blockquote cite={entry.citation.document}>{entry.citation.quote}</blockquote>
+                          <p>
+                            <small>
+                              {entry.citation.document} · {entry.citation.pageOrSection} · character offset{" "}
+                              {entry.citation.offset}
+                            </small>
+                          </p>
+                        </figure>
+                      ))}
+                    </>
+                  )}
+                </aside>
+              )}
 
               {card.citations.length === 0 ? (
                 <p>
