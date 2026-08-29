@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 
-import { buildApiError } from "@signal-audit/contracts";
+import { API_ERROR_CODES, buildApiError } from "@signal-audit/contracts";
 import type { ApiErrorResponse, BoundaryContract, RequestId } from "@signal-audit/contracts";
-import { roleHasCapability } from "@signal-audit/domain";
+import { AUDIT_ACTIONS, roleHasCapability } from "@signal-audit/domain";
 import type {
   Capability,
   DomainPort,
@@ -109,17 +109,34 @@ export function createConsoleMagicLinkEmailSender(appEnv: string = "development"
     async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
       // Structured log records that delivery happened, with no PII in it.
       logStructured("info", "magic_link.queued");
-      // Keep the local developer hint non-sensitive: even terminal output must
-      // avoid exposing the raw recipient or bearer token.
+
+      // The token is printed IN FULL, deliberately, and the previous
+      // version of this line was wrong to redact it.
       //
-      // The `g` flag is load-bearing, not tidiness. Without it only the
-      // FIRST token parameter is redacted, so a link carrying the
-      // parameter twice -- which nothing rejects, since a duplicated
-      // query parameter is well-formed -- printed the second one to the
-      // terminal in full. A redaction that stops at the first match is a
-      // leak for every input the author did not picture.
-      const safeLink = input.link.replace(/([?&])token=[^&]*/gi, "$1token=[REDACTED]");
-      process.stderr.write(`\n[dev magic link] to: [REDACTED_EMAIL]\n[dev magic link] open: ${safeLink}\n\n`);
+      // This adapter exists so a developer can complete local sign-in
+      // when no mail transport is configured. Redacting the token left a
+      // link that cannot be opened -- which is the same outcome as the
+      // silent no-op this function was written to replace, just with
+      // more ceremony. A credential printed where it cannot be used is
+      // not a safer credential, it is a broken feature.
+      //
+      // Two things make printing it acceptable here, and both are
+      // enforced rather than assumed:
+      //   - the constructor throws for staging and production, so this
+      //     can only ever run against a local environment whose tokens
+      //     grant access to a local database;
+      //   - it goes to stderr, never through logStructured, so it never
+      //     enters the shipped and retained log stream. That is the
+      //     boundary that actually matters: the threat is a credential
+      //     surviving in retained logs, not one appearing for a moment
+      //     in the terminal of the person who just requested it.
+      //
+      // The recipient stays redacted because nothing needs it: the
+      // developer already knows which address they typed, so printing it
+      // buys nothing and puts an email address on a terminal.
+      process.stderr.write(
+        `\n[dev magic link] to: [REDACTED_EMAIL]\n[dev magic link] open: ${input.link}\n\n`
+      );
     }
   };
 }
@@ -358,10 +375,40 @@ function findIsoDateSpans(value: string): readonly Span[] {
       continue;
     }
     cursor += 2;
+
+    // Only a real calendar date is protected. `dddd-dd-dd` alone is not
+    // enough: an eight-digit phone written as `1234-56-78` matched the
+    // shape, every one of its digits was then treated as covered by a
+    // "date" span, and redactPii returned the phone unchanged --
+    // verified before this check existed. A span that is not a date must
+    // be allowed to participate in phone redaction, which is the safe
+    // direction to be wrong in.
+    if (!isCalendarDate(value.slice(index, cursor))) {
+      continue;
+    }
+
     const end = cursor;
     spans.push({ start: index, end });
   }
   return mergeSpans(spans);
+}
+
+/**
+ * True only for a date that exists. Month and day ranges are checked
+ * against the actual length of that month, leap years included, because
+ * `2026-02-30` and `2026-13-01` are digit runs a phone can hide behind
+ * just as easily as `1234-56-78` can.
+ */
+function isCalendarDate(candidate: string): boolean {
+  const year = Number(candidate.slice(0, 4));
+  const month = Number(candidate.slice(5, 7));
+  const day = Number(candidate.slice(8, 10));
+  if (month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= (daysInMonth[month - 1] ?? 0);
 }
 
 /**
@@ -540,8 +587,39 @@ const LOG_CONTEXT_KEYS = [
 
 const UUID_ONLY = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
 const REQUEST_ID_ONLY = /^req_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
-/** Lowercase machine token: an action, entity type, or error code. */
-const SAFE_TOKEN = /^[a-z][a-z0-9._-]{0,63}$/u;
+
+/**
+ * The entity kinds this system has. A closed, developer-authored set,
+ * for the same reason LOG_EVENT_NAMES is one.
+ *
+ * There was previously a `SAFE_TOKEN` pattern here -- lowercase letters,
+ * digits, dot, underscore, hyphen -- used for action, entityType,
+ * entityId and errorCode. A shape is not a boundary: `alice`,
+ * `alice.smith` and `interview_alice` all satisfy it, redactPii does not
+ * recognise a name as email or phone, and so human-derived values were
+ * emitted verbatim into retained structured logs. Verified before this
+ * change. That is precisely the character-pattern gap the message
+ * allowlist was written to close, left open one field over.
+ */
+const LOG_ENTITY_TYPES: ReadonlySet<string> = new Set([
+  "organization",
+  "user",
+  "membership",
+  "magic_link_token",
+  "audit_event",
+  "evidence_extraction_run",
+  "inference_usage",
+  "inference_kill_switch",
+  "role",
+  "rubric",
+  "file_intake",
+  "canonical_text_extraction",
+  "application",
+  "import_finalization",
+  "import_row",
+  "evidence_outcome",
+  "candidate_decision"
+]);
 
 /**
  * Per-field validators, because an allowlist of *keys* is not a PII
@@ -560,10 +638,17 @@ const LOG_CONTEXT_VALIDATORS: Readonly<Record<(typeof LOG_CONTEXT_KEYS)[number],
   requestId: (value) => typeof value === "string" && REQUEST_ID_ONLY.test(value),
   organizationId: (value) => typeof value === "string" && UUID_ONLY.test(value),
   actorUserId: (value) => typeof value === "string" && UUID_ONLY.test(value),
-  action: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
-  entityType: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
-  entityId: (value) => typeof value === "string" && (UUID_ONLY.test(value) || SAFE_TOKEN.test(value)),
-  errorCode: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
+  // Closed sets, not shapes. action and errorCode reuse vocabularies the
+  // system already owns, so a log line and an audit row cannot describe
+  // the same act with different words -- and adding a value means adding
+  // it where it belongs rather than happening to match a regex.
+  action: (value) => typeof value === "string" && (AUDIT_ACTIONS as readonly string[]).includes(value),
+  entityType: (value) => typeof value === "string" && LOG_ENTITY_TYPES.has(value),
+  // Opaque identifiers only. An entity id is a handle, never a name: if
+  // a call site has something to say that is not a uuid or a request id,
+  // the honest answer is that it does not belong in a retained log.
+  entityId: (value) => typeof value === "string" && (UUID_ONLY.test(value) || REQUEST_ID_ONLY.test(value)),
+  errorCode: (value) => typeof value === "string" && (API_ERROR_CODES as readonly string[]).includes(value),
   statusCode: (value) => typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599,
   durationMs: (value) => typeof value === "number" && Number.isFinite(value) && value >= 0
 };

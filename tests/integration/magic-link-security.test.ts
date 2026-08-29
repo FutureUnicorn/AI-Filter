@@ -86,33 +86,39 @@ test("an unconsumed but expired token is expired, not already_consumed", () => {
   assert.deepEqual(result, { outcome: "expired" });
 });
 
-test("createConsoleMagicLinkEmailSender does not leak the recipient or raw token", async (t) => {
+test("createConsoleMagicLinkEmailSender keeps the credential out of the LOG, not out of the terminal", async (t) => {
+  // Rewritten. This asserted that the token never reached stderr either,
+  // which made the printed link unopenable -- the same outcome as the
+  // silent no-op this adapter was written to replace. The boundary that
+  // matters is the retained log stream: a credential that survives in
+  // shipped logs is the threat, one that appears for a moment in the
+  // terminal of the developer who just requested it is the feature.
   const logMock = t.mock.method(console, "log", () => undefined);
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const sender = createConsoleMagicLinkEmailSender("development");
   await sender.sendMagicLink({ email: "user@acme.test", link: "https://example.test/verify?token=abc" });
-  const dumped = [
-    ...logMock.mock.calls.map((call) => String(call.arguments[0])),
-    ...stderrMock.mock.calls.map((call) => String(call.arguments[0]))
-  ].join("\n");
-  assert.equal(dumped.includes("user@acme.test"), false);
-  assert.equal(dumped.includes("token=abc"), false);
-  assert.equal(dumped.includes("token=[REDACTED]"), true);
+
+  const logged = logMock.mock.calls.map((call) => String(call.arguments[0])).join("\n");
+  assert.equal(logged.includes("token=abc"), false, "the structured log must never carry the credential");
+  assert.equal(logged.includes("user@acme.test"), false, "nor the recipient");
+
+  const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("\n");
+  assert.equal(written.includes("token=abc"), true, "the developer must be able to open the link");
+  assert.equal(written.includes("user@acme.test"), false, "the recipient is still redacted; nothing needs it");
 });
 
-test("every token parameter is redacted, not just the first", async (t) => {
-  // A duplicated query parameter is well-formed and nothing rejects it.
-  // Before the `g` flag, the second token printed to the terminal in full
-  // -- a redaction that stops at the first match leaks on every input its
-  // author did not picture.
+test("a link with duplicated token parameters is printed intact, not partially mangled", async (t) => {
+  // Rewritten alongside the test above. It previously asserted BOTH
+  // tokens were redacted -- a fix I made for a real bug in a redaction
+  // that should not have been there at all. With the redaction gone the
+  // bug is gone with it, and what matters now is that an unusual but
+  // well-formed link is not silently altered on its way to the terminal:
+  // a developer debugging a duplicated parameter needs to see it.
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const sender = createConsoleMagicLinkEmailSender("development");
-  await sender.sendMagicLink({
-    email: "user@acme.test",
-    link: "https://example.test/verify?a=1&token=FIRST_SECRET&b=2&token=SECOND_SECRET&c=3"
-  });
+  const link = "https://example.test/verify?a=1&token=FIRST_SECRET&b=2&token=SECOND_SECRET&c=3";
+  await sender.sendMagicLink({ email: "user@acme.test", link });
   const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("");
-  assert.doesNotMatch(written, /FIRST_SECRET/, "the first token must not reach the terminal");
-  assert.doesNotMatch(written, /SECOND_SECRET/, "the second token must not reach the terminal either");
-  assert.equal(written.match(/token=\[REDACTED\]/g)?.length, 2, "both parameters must be redacted");
+  assert.ok(written.includes(link), "the link reaches the terminal exactly as issued");
+  assert.doesNotMatch(written, /\[REDACTED\]/u, "nothing in the link is rewritten any more");
 });
