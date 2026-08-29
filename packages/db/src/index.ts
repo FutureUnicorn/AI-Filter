@@ -808,8 +808,15 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
     }
   } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
