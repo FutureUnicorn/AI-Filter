@@ -1725,3 +1725,119 @@ export function deriveCandidateWorkflowStatus(
     revisionCount: decisions.length - 1
   };
 }
+
+// ---- AF-52: low-evidence random audit sampling ----
+//
+// "Randomly sample low-ranked/low-evidence candidates for independent
+// review -- this is how false negatives get caught, not by trusting the
+// model's confidence."
+//
+// Two things about that sentence had to be resolved before any of it
+// could be built.
+//
+// There is no "low-ranked". Nothing in this system ranks candidates:
+// POL-003 forbids a scoring field, AF-46 fixes the queue to the
+// employer's own file order, and AF-47's filters are a subsequence of
+// that order rather than a re-sort. So the selectable population is
+// defined by evidence, not position, and this module offers no way to
+// order candidates by anything a reviewer could mistake for a rank. The
+// half of the ticket that cannot be honoured is the half that asks for
+// something the product deliberately does not have.
+//
+// "Not by trusting the model's confidence" is likewise structural
+// rather than a promise: there is no confidence value to consult. What
+// IS available is the KIND of each evidence outcome, which is a
+// statement about what was found rather than how sure anything was.
+
+/**
+ * How much citable evidence an application actually carries.
+ *
+ * Deliberately three coarse buckets rather than a number. A number would
+ * be a rank in everything but name -- someone would sort by it within a
+ * week -- and it would imply a precision the underlying data does not
+ * have.
+ */
+export type EvidenceStrength = "none" | "weak" | "cited";
+
+export interface EvidenceStrengthSummary {
+  readonly strength: EvidenceStrength;
+  /** Criteria whose current outcome carries a quote a human can check. */
+  readonly citedCount: number;
+  /** Criteria answered, but with nothing to verify (not_found, unclear-without-citation, errors). */
+  readonly uncitedCount: number;
+  readonly totalCriteria: number;
+}
+
+/**
+ * Uses the same card set the reviewer sees, so "low evidence" means the
+ * same thing to the sampler and to the human it hands work to.
+ */
+export function summarizeEvidenceStrength(cards: readonly EvidenceCard[]): EvidenceStrengthSummary {
+  const citedCount = cards.filter((card) => card.verifiable).length;
+  const totalCriteria = cards.length;
+  const uncitedCount = totalCriteria - citedCount;
+  const strength: EvidenceStrength =
+    citedCount === 0 ? "none" : citedCount * 2 <= totalCriteria ? "weak" : "cited";
+  return { strength, citedCount, uncitedCount, totalCriteria };
+}
+
+export interface AuditSampleCandidate {
+  readonly applicationId: string;
+  readonly strength: EvidenceStrength;
+}
+
+export interface AuditSampleSelection {
+  readonly seed: string;
+  readonly eligibleCount: number;
+  readonly sampledApplicationIds: readonly string[];
+}
+
+/**
+ * A 32-bit FNV-1a hash. Not cryptographic and not trying to be: this
+ * needs to be stable across processes, machines and language runtimes so
+ * that an auditor re-running the selection six months later gets the
+ * same answer, and FNV-1a is small enough to reimplement from the spec
+ * if they are checking it in a different language.
+ */
+function stableHash(value: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Selects `size` applications for independent review from those whose
+ * evidence is weak or absent.
+ *
+ * Deterministic from the seed, not Math.random(), and that is the point
+ * rather than an implementation detail. A sample nobody can reproduce
+ * cannot be audited -- and one that can be silently re-rolled until it
+ * looks acceptable is worse than none, because it carries the authority
+ * of a random check while being a chosen one. Recording the seed
+ * alongside the result (AF-52's migration) makes the selection
+ * reproducible by anyone and re-rollable by no one.
+ *
+ * Ties break on applicationId so the order is total: two applications
+ * hashing to the same bucket must not depend on input order, or the
+ * "reproducible" claim quietly fails on collision.
+ */
+export function selectAuditSample(
+  candidates: readonly AuditSampleCandidate[],
+  seed: string,
+  size: number
+): AuditSampleSelection {
+  const eligible = candidates.filter((candidate) => candidate.strength !== "cited");
+  const ordered = [...eligible].sort((a, b) => {
+    const left = stableHash(`${seed}:${a.applicationId}`);
+    const right = stableHash(`${seed}:${b.applicationId}`);
+    return left - right || a.applicationId.localeCompare(b.applicationId);
+  });
+  return {
+    seed,
+    eligibleCount: eligible.length,
+    sampledApplicationIds: ordered.slice(0, Math.max(0, size)).map((candidate) => candidate.applicationId)
+  };
+}
