@@ -552,3 +552,56 @@ export interface Rubric extends VersionedRecord {
   readonly createdAt: string;
   readonly updatedAt: string;
 }
+
+// ---- AF-26: protected-characteristic proxy flagging ----
+//
+// A heuristic phrase scanner, same spirit as AF-44's INJECTION_PATTERNS:
+// this is a regression suite of known problematic phrasings, not a claim
+// of legal completeness or a substitute for an employer's own legal
+// review. It flags for a human to look at (AF-26 asks the UI to "flag,"
+// not to block saving) -- a criterion that trips this can still be
+// saved; the point is making the recruiter look at it once, not gating
+// the editor on an incomplete pattern list. Placed in packages/domain
+// (zero deps) rather than packages/ai so a browser bundle can run this
+// live, as-you-type, without pulling in an AI provider SDK for a feature
+// that has nothing to do with model calls.
+
+export type ProtectedCharacteristicCategory =
+  | "age"
+  | "national_origin_or_language"
+  | "gender"
+  | "disability"
+  | "family_status";
+
+interface ProtectedCharacteristicPattern {
+  readonly category: ProtectedCharacteristicCategory;
+  readonly pattern: RegExp;
+}
+
+const PROTECTED_CHARACTERISTIC_PATTERNS: readonly ProtectedCharacteristicPattern[] = [
+  { category: "age", pattern: /\b(digital native|young and energetic|recent grad(uate)?s? only|years young)\b/iu },
+  { category: "age", pattern: /\bunder \d{2}\b/iu },
+  { category: "national_origin_or_language", pattern: /\bnative (english|[a-z]+) speaker\b/iu },
+  { category: "national_origin_or_language", pattern: /\bno accents?\b/iu },
+  { category: "gender", pattern: /\b(he|she) must\b/iu },
+  { category: "gender", pattern: /\bmanpower\b/iu },
+  { category: "disability", pattern: /\bable[- ]bodied\b/iu },
+  { category: "disability", pattern: /\bno (physical|medical) limitations\b/iu },
+  { category: "family_status", pattern: /\b(no children|childless|unmarried) (preferred|required)\b/iu },
+  { category: "family_status", pattern: /\bavailable (nights|weekends) with no family (obligations|commitments)\b/iu }
+];
+
+export interface ProtectedCharacteristicFlag {
+  readonly category: ProtectedCharacteristicCategory;
+  readonly matchedPhrase: string;
+}
+
+/** Flags every match, not just the first -- the same criterion text can
+ * read as more than one kind of proxy at once. */
+export function scanCriterionForProtectedCharacteristicProxy(
+  text: string
+): readonly ProtectedCharacteristicFlag[] {
+  return PROTECTED_CHARACTERISTIC_PATTERNS.filter(({ pattern }) => pattern.test(text)).map(
+    ({ category, pattern }) => ({ category, matchedPhrase: pattern.source })
+  );
+}
