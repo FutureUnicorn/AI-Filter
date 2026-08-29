@@ -2317,6 +2317,242 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-61: retention policy ----
+//
+// "Default retention window for raw candidate data (e.g. 30-90 days),
+// configurable per contract, applied consistently across object storage,
+// canonical text, and derived indexes."
+//
+// "Consistently" is the whole ticket, and the honest finding is that it
+// is not currently achievable. Measured against the real migrations, on
+// a candidate with one document and one evidence outcome, EVERY deletion
+// path fails:
+//
+//   DELETE evidence_outcomes  -> append-only trigger rejects DELETE
+//   UPDATE evidence_outcomes  -> append-only trigger rejects UPDATE too,
+//                                so the quote cannot even be redacted
+//   DELETE applications       -> FK violation from evidence_outcomes
+//   DELETE file_intakes       -> FK violation from applications
+//
+// The candidate's name, email, full canonical CV text and quoted CV text
+// all survive. That is not a bug in any one migration: 0016 is
+// append-only because an evidence record that can be edited after the
+// fact cannot serve as an audit trail, and it deliberately has no
+// ON DELETE CASCADE because a cascade issues a DELETE that the very same
+// trigger rejects (the AF-20 defect). Both decisions are right on their
+// own terms and together they make retention unimplementable.
+//
+// So this module does NOT pretend to purge. It produces a plan in which
+// every surface carries an explicit disposition, blocked ones say why,
+// and summarizeSurvivingCandidateData reports what is still there
+// afterwards -- because a privacy notice written from an optimistic
+// retention policy is a false statement to a candidate, which is a
+// materially worse outcome than an honest "we keep quotes indefinitely".
+//
+// The unblocking design is named, not built: encrypt candidate-derived
+// text under a per-candidate key and delete the key at expiry. The
+// append-only row survives intact, so the audit trail holds, while its
+// readable content does not. That is a schema and key-management change
+// well beyond this ticket and needs a human decision, so AF-61 stops at
+// telling the truth about the current state.
+
+export const RETENTION_SURFACES = [
+  "object_storage_documents",
+  "file_intakes",
+  "canonical_text_extractions",
+  "import_rows",
+  "applications",
+  "evidence_outcomes",
+  "candidate_decisions",
+  "audit_events"
+] as const;
+
+export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
+
+export type RetentionDisposition =
+  /** Can be deleted at expiry today. */
+  | "purge"
+  /** Holds candidate data that an append-only guarantee forbids removing. */
+  | "blocked_append_only"
+  /** Deletable in principle, but a foreign key from a blocked surface pins it. */
+  | "blocked_by_reference"
+  /** In scope for completeness; holds no candidate-derived content. */
+  | "no_candidate_data";
+
+export interface RetentionSurfacePlan {
+  readonly surface: RetentionSurface;
+  readonly disposition: RetentionDisposition;
+  /** What candidate-derived content this surface holds, in plain words. */
+  readonly holds: string;
+  /** Why the disposition is what it is. Never empty for a blocked surface. */
+  readonly detail: string;
+}
+
+export interface RetentionPolicy {
+  readonly organizationId: string;
+  readonly windowDays: number;
+  /**
+   * Required once the window exceeds the standard range, so an unusually
+   * long retention is traceable to something someone signed rather than
+   * to a config value nobody remembers setting.
+   */
+  readonly contractReference?: string | undefined;
+}
+
+/** The ticket's stated norm. Anything longer needs a contract reference. */
+export const RETENTION_STANDARD_MAX_DAYS = 90;
+/** Shortest of the stated range: a default that errs long keeps candidate data by accident. */
+export const RETENTION_DEFAULT_DAYS = 30;
+/** A hard ceiling, so a typo cannot become a decade. */
+export const RETENTION_ABSOLUTE_MAX_DAYS = 3650;
+
+export function validateRetentionPolicy(policy: RetentionPolicy): void {
+  if (!Number.isInteger(policy.windowDays) || policy.windowDays < 1) {
+    throw new Error(
+      `retention windowDays must be a positive whole number of days, got: ${policy.windowDays}`
+    );
+  }
+  if (policy.windowDays > RETENTION_ABSOLUTE_MAX_DAYS) {
+    throw new Error(
+      `retention windowDays ${policy.windowDays} exceeds the absolute maximum of ${RETENTION_ABSOLUTE_MAX_DAYS}`
+    );
+  }
+  if (policy.windowDays > RETENTION_STANDARD_MAX_DAYS) {
+    const reference = policy.contractReference?.trim() ?? "";
+    if (reference.length === 0) {
+      throw new Error(
+        `a retention window of ${policy.windowDays} days exceeds the standard ` +
+          `${RETENTION_STANDARD_MAX_DAYS} days and requires a contractReference`
+      );
+    }
+  }
+}
+
+/**
+ * Records created at or before this instant are past their window.
+ *
+ * Computed from an explicit `now` rather than reading the clock, so the
+ * same policy evaluated twice in one purge run cannot straddle midnight
+ * and delete a different set the second time.
+ */
+export function computeRetentionCutoff(policy: RetentionPolicy, now: Date): string {
+  validateRetentionPolicy(policy);
+  const cutoff = new Date(now.getTime() - policy.windowDays * 24 * 60 * 60 * 1000);
+  return cutoff.toISOString();
+}
+
+const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePlan, "surface">>> = {
+  object_storage_documents: {
+    disposition: "purge",
+    holds: "the uploaded document itself",
+    detail: "Deletable by storage key; nothing in the database references the object's bytes."
+  },
+  file_intakes: {
+    disposition: "blocked_by_reference",
+    holds: "declared_filename, which routinely contains the candidate's name",
+    detail:
+      "DELETE fails with a foreign key violation from applications. The filename is easy to " +
+      "overlook as PII and is often exactly 'Firstname_Lastname_CV.pdf'."
+  },
+  canonical_text_extractions: {
+    disposition: "blocked_by_reference",
+    holds: "the full extracted text of the candidate's document",
+    detail:
+      "ON DELETE CASCADE from file_intakes would remove it, but file_intakes itself cannot be " +
+      "deleted while an application references it. The largest single store of raw candidate text."
+  },
+  import_rows: {
+    disposition: "blocked_by_reference",
+    holds: "failure_reason, which can quote the offending row",
+    detail: "Cascades from file_intakes, and inherits its blocker."
+  },
+  applications: {
+    disposition: "blocked_by_reference",
+    holds: "candidate_full_name, candidate_email, external_reference_id",
+    detail:
+      "DELETE fails with a foreign key violation from evidence_outcomes, which has no " +
+      "ON DELETE CASCADE -- deliberately, since a cascade issues a DELETE the append-only " +
+      "trigger would reject anyway."
+  },
+  evidence_outcomes: {
+    disposition: "blocked_append_only",
+    holds: "citation quotes, which are verbatim candidate text",
+    detail:
+      "Both DELETE and UPDATE are rejected by the append-only trigger, so the quote cannot be " +
+      "removed and cannot be redacted in place either. This is the root blocker."
+  },
+  candidate_decisions: {
+    disposition: "blocked_append_only",
+    holds: "rationale, free text a human wrote about the candidate",
+    detail:
+      "Append-only for the same reason: a decision record that can be edited afterwards cannot " +
+      "evidence who decided what."
+  },
+  audit_events: {
+    disposition: "no_candidate_data",
+    holds: "nothing candidate-derived, by construction",
+    detail:
+      "Append-only, and AF-21's redaction plus the closed context allowlist are what keep " +
+      "candidate text out of it. Listed so its exclusion is a stated finding rather than an omission."
+  }
+};
+
+export interface RetentionPlan {
+  readonly organizationId: string;
+  readonly windowDays: number;
+  readonly cutoff: string;
+  readonly surfaces: readonly RetentionSurfacePlan[];
+}
+
+/**
+ * Every surface appears, always. A surface missing from a retention plan
+ * reads as "nothing to do there", which is the same failure mode as a
+ * missing section in AF-59's report and has the same fix: make omission
+ * unrepresentable rather than discouraged.
+ */
+export function planRetention(policy: RetentionPolicy, now: Date): RetentionPlan {
+  return {
+    organizationId: policy.organizationId,
+    windowDays: policy.windowDays,
+    cutoff: computeRetentionCutoff(policy, now),
+    surfaces: RETENTION_SURFACES.map((surface) => ({ surface, ...RETENTION_PLAN[surface] }))
+  };
+}
+
+export interface SurvivingCandidateData {
+  /** True when at least one surface still holds candidate data after expiry. */
+  readonly anySurvives: boolean;
+  readonly surfaces: readonly RetentionSurfacePlan[];
+  /**
+   * A sentence a privacy notice can be written from without it becoming a
+   * false statement to a candidate.
+   */
+  readonly statement: string;
+}
+
+export function summarizeSurvivingCandidateData(plan: RetentionPlan): SurvivingCandidateData {
+  const surviving = plan.surfaces.filter(
+    (surface) =>
+      surface.disposition === "blocked_append_only" || surface.disposition === "blocked_by_reference"
+  );
+  if (surviving.length === 0) {
+    return {
+      anySurvives: false,
+      surfaces: [],
+      statement: `Raw candidate data is deleted ${plan.windowDays} days after intake.`
+    };
+  }
+  return {
+    anySurvives: true,
+    surfaces: surviving,
+    statement:
+      `After the ${plan.windowDays}-day retention window, the following candidate data is still ` +
+      `retained and cannot currently be deleted: ` +
+      surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ") +
+      `.`
+  };
+}
+
 // ---- AF-59: role-level audit report ----
 //
 // "The actual pilot deliverable: time saved, preservation, precision,
