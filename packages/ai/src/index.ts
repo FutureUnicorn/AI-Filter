@@ -227,7 +227,11 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
             additionalProperties: false,
             required: ["document", "page_or_section", "offset"],
             properties: {
-              document: { type: "string" },
+              // minLength here for the same reason as criterion_id: the
+              // Zod validator requires this unconditionally, so leaving
+              // the model-facing schema silent asks the provider for
+              // something it will then be rejected for producing.
+              document: { type: "string", minLength: 1 },
               page_or_section: { type: "string" },
               offset: { type: "integer" }
             }

@@ -122,3 +122,89 @@ test("EVIDENCE_EXTRACTION_JSON_SCHEMA's state enum matches EVIDENCE_EXTRACTION_S
   const stateEnum = root.properties.items.items.properties.state.enum;
   assert.deepEqual(new Set(stateEnum), new Set(EVIDENCE_EXTRACTION_STATES));
 });
+
+// ---- AF-35 review: the schema the model sees must not permit what the
+// validator will reject ----
+//
+// A divergence here is not a type error, it is a wasted call: the
+// provider is asked for a shape that then fails post-parse validation,
+// and the model is never told what it did wrong.
+//
+// The list below is written out rather than derived from the Zod schema
+// because Zod's introspection does not distinguish "min(1) always" from
+// "min(1) only when state is citing", and that distinction is the whole
+// point: OpenAI's strict mode cannot express a conditional, so a field
+// that is only sometimes required must stay unconstrained in the
+// model-facing schema and be enforced at parse time instead.
+
+const SCHEMA_ITEM_PROPERTIES = (
+  (EVIDENCE_EXTRACTION_JSON_SCHEMA as Record<string, never>).properties as unknown as {
+    items: { items: { properties: Record<string, { type?: string; minLength?: number; properties?: Record<string, { type?: string; minLength?: number }> }> } };
+  }
+).items.items.properties;
+
+/** Non-empty in the validator no matter what state the item carries. */
+const UNCONDITIONALLY_NON_EMPTY = ["criterion_id", "source.document"] as const;
+
+/** Constrained only for citing states, so the flat schema cannot say it. */
+const CONDITIONALLY_CONSTRAINED = ["quote", "source.page_or_section", "source.offset"] as const;
+
+function schemaFor(path: string): { type?: string; minLength?: number } | undefined {
+  const [head, tail] = path.split(".");
+  const top = SCHEMA_ITEM_PROPERTIES[head ?? ""];
+  return tail === undefined ? top : top?.properties?.[tail];
+}
+
+test("every unconditionally non-empty field is also non-empty in the schema the model sees", () => {
+  // source.document was missing this after criterion_id was fixed --
+  // the same divergence, one field over, in the same object.
+  for (const path of UNCONDITIONALLY_NON_EMPTY) {
+    assert.equal(
+      schemaFor(path)?.minLength,
+      1,
+      `${path} is required non-empty by the validator, so the model-facing schema must say minLength: 1`
+    );
+  }
+});
+
+test("every string field in the schema is accounted for, so a new one cannot slip through unclassified", () => {
+  // The half that catches the NEXT field rather than the last one. A
+  // property added to the schema and to neither list fails here, which
+  // forces the author to decide which kind it is.
+  const classified = new Set<string>([...UNCONDITIONALLY_NON_EMPTY, ...CONDITIONALLY_CONSTRAINED, "state"]);
+  const paths: string[] = [];
+  for (const [key, value] of Object.entries(SCHEMA_ITEM_PROPERTIES)) {
+    if (value.properties === undefined) {
+      paths.push(key);
+      continue;
+    }
+    for (const nested of Object.keys(value.properties)) {
+      paths.push(`${key}.${nested}`);
+    }
+  }
+  const unclassified = paths.filter((path) => !classified.has(path));
+  assert.deepEqual(
+    unclassified,
+    [],
+    `these schema fields are neither unconditionally non-empty nor conditionally constrained: ${unclassified.join(", ")}`
+  );
+});
+
+test("a conditionally-constrained field stays unconstrained in the schema, and is caught at parse time", () => {
+  // The negative half. Adding minLength to quote would make the model
+  // unable to return a valid not_found item at all.
+  for (const path of CONDITIONALLY_CONSTRAINED) {
+    assert.equal(
+      schemaFor(path)?.minLength,
+      undefined,
+      `${path} is only required for citing states; strict mode cannot express that, so the schema must stay silent`
+    );
+  }
+  const notFound = evidenceExtractionItemSchema.safeParse({
+    criterion_id: "c",
+    state: "not_found",
+    quote: "",
+    source: { document: "cv.pdf", page_or_section: "", offset: -1 }
+  });
+  assert.equal(notFound.success, true, "a not_found item with no citation coordinates is legitimate");
+});
