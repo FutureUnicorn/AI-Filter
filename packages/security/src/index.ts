@@ -1,12 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
 
-import type { BoundaryContract } from "@signal-audit/contracts";
+import { buildApiError } from "@signal-audit/contracts";
+import type { ApiErrorResponse, BoundaryContract, RequestId } from "@signal-audit/contracts";
+import { roleHasCapability } from "@signal-audit/domain";
 import type {
+  Capability,
   DomainPort,
   MagicLinkEmailSender,
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
-  MagicLinkVerification
+  MagicLinkVerification,
+  Membership,
+  MembershipRole
 } from "@signal-audit/domain";
 
 /** Auth and authorization vendors will remain outside the domain here. */
@@ -87,4 +92,85 @@ export function createConsoleMagicLinkEmailSender(): MagicLinkEmailSender {
       console.log(`[magic-link] ${email}: ${link}`);
     }
   };
+}
+
+// ---- AF-19: server-side resource authorization ----
+//
+// "Never trust a client-supplied organization/job ID alone" means: the
+// role used for the capability check comes only from a membership row
+// this function was handed (fetched server-side for the authenticated
+// user), never from anything the request itself claims. A request that
+// asks for an organizationId the caller has no membership row for is
+// treated exactly like a request for an organization that doesn't
+// exist, not "found but forbidden" -- see resourceAuthorizationErrorResponse.
+
+/**
+ * Explicit, non-collapsing outcomes: "no membership" (this
+ * organizationId isn't one of the caller's, whether or not it even
+ * exists) and "insufficient capability" (it is the caller's
+ * organization, but their role there doesn't cover this action) are
+ * structurally distinct, not one generic "forbidden".
+ */
+export type ResourceAuthorization =
+  | { readonly outcome: "authorized"; readonly role: MembershipRole }
+  | { readonly outcome: "no_membership" }
+  | { readonly outcome: "insufficient_capability"; readonly role: MembershipRole };
+
+function canonicalizeUuid(value: string): string {
+  return value.toLowerCase();
+}
+
+/**
+ * `memberships` must be fetched server-side. The check is bound to
+ * `authenticatedUserId`: a row for a different user is ignored even if
+ * it is in the array, and UUID letter-case is not treated as a
+ * different identity.
+ */
+export function authorizeResourceAccess(
+  memberships: readonly Membership[],
+  organizationId: string,
+  capability: Capability,
+  authenticatedUserId: string
+): ResourceAuthorization {
+  const callerId = canonicalizeUuid(authenticatedUserId);
+  const requestedOrgId = canonicalizeUuid(organizationId);
+  const membership = memberships.find(
+    (candidate) =>
+      canonicalizeUuid(candidate.userId) === callerId &&
+      canonicalizeUuid(candidate.organizationId) === requestedOrgId
+  );
+  if (membership === undefined) {
+    return { outcome: "no_membership" };
+  }
+  if (!roleHasCapability(membership.role, capability)) {
+    return { outcome: "insufficient_capability", role: membership.role };
+  }
+  return { outcome: "authorized", role: membership.role };
+}
+
+/**
+ * `no_membership` maps to `not_found`, not `forbidden`: telling a caller
+ * with no relationship to an organization that it exists but they can't
+ * touch it would confirm the organizationId is real. A membership that
+ * exists but lacks the capability gets the honest `forbidden`.
+ */
+export function resourceAuthorizationErrorResponse(
+  authorization: ResourceAuthorization,
+  requestId: RequestId
+): ApiErrorResponse | undefined {
+  if (authorization.outcome === "authorized") {
+    return undefined;
+  }
+  if (authorization.outcome === "no_membership") {
+    return buildApiError({
+      requestId,
+      code: "not_found",
+      message: "Organization not found."
+    });
+  }
+  return buildApiError({
+    requestId,
+    code: "forbidden",
+    message: `Role ${authorization.role} does not have this capability.`
+  });
 }
