@@ -10,6 +10,8 @@ import type {
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
+  CandidateDecision,
+  CandidateDecisionKind,
   DomainPort,
   EvidenceExtractionRunRef,
   EvidenceOutcome,
@@ -3066,6 +3068,356 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
       }
       if (!rejected) {
         throw new Error(`corrections must be as immutable as originals; permitted: ${statement}`);
+      }
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-51: named human advance/hold/decline recording ----
+
+export interface RecordCandidateDecisionInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly decision: CandidateDecisionKind;
+  readonly rationale: string;
+  /**
+   * Always required, never defaulted. There is no signature of this
+   * function that records a decision without a named person, which is
+   * the code-level half of what 0019's NOT NULL enforces.
+   */
+  readonly decidedByUserId: string;
+}
+
+export type CandidateDecisionResult =
+  | { readonly outcome: "recorded"; readonly decisionId: string; readonly supersededId?: string }
+  | { readonly outcome: "superseded" };
+
+/**
+ * Appends a decision, superseding the current one if there is one.
+ *
+ * Unlike a correction, there is no `nothing_to_decide` state: the first
+ * decision about a candidate is a legitimate decision, it simply
+ * supersedes nothing.
+ *
+ * `superseded` is returned rather than thrown when another reviewer
+ * decided first -- the caller was looking at a status that has since
+ * changed, so re-reading and re-deciding is the right next step, and a
+ * UI has to be able to say so.
+ */
+export async function recordCandidateDecision(
+  databaseUrl: string,
+  schema: string,
+  input: RecordCandidateDecisionInput
+): Promise<CandidateDecisionResult> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const head = await client.query<{ decision_id: string }>(
+        `SELECT d.decision_id
+           FROM "${schema}".candidate_decisions d
+          WHERE d.organization_id = $1
+            AND d.application_id = $2
+            AND NOT EXISTS (
+              SELECT 1 FROM "${schema}".candidate_decisions s
+               WHERE s.supersedes_decision_id = d.decision_id
+            )
+          ORDER BY d.decided_at DESC, d.decision_id DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId]
+      );
+      const supersededId = head.rows[0]?.decision_id;
+
+      const inserted = await client.query<{ decision_id: string }>(
+        `INSERT INTO "${schema}".candidate_decisions
+           (organization_id, application_id, decision, rationale, decided_by_user_id, supersedes_decision_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (supersedes_decision_id)
+           WHERE supersedes_decision_id IS NOT NULL DO NOTHING
+         RETURNING decision_id`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.decision,
+          input.rationale,
+          input.decidedByUserId,
+          supersededId ?? null
+        ]
+      );
+      const decisionId = inserted.rows[0]?.decision_id;
+      if (decisionId === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "superseded" };
+      }
+      await client.query("COMMIT");
+      return supersededId === undefined
+        ? { outcome: "recorded", decisionId }
+        : { outcome: "recorded", decisionId, supersededId };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Every decision about one candidate, oldest first. */
+export async function listCandidateDecisionsForApplication(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationId: string
+): Promise<readonly CandidateDecision[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      decision_id: string;
+      organization_id: string;
+      application_id: string;
+      decision: CandidateDecisionKind;
+      rationale: string;
+      decided_by_user_id: string;
+      supersedes_decision_id: string | null;
+      decided_at: Date;
+    }>(
+      `SELECT decision_id, organization_id, application_id, decision, rationale,
+              decided_by_user_id, supersedes_decision_id, decided_at
+         FROM "${schema}".candidate_decisions
+        WHERE organization_id = $1 AND application_id = $2
+        ORDER BY decided_at, decision_id`,
+      [organizationId, applicationId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      decisionId: row.decision_id,
+      organizationId: row.organization_id,
+      applicationId: row.application_id,
+      decision: row.decision,
+      rationale: row.rationale,
+      decidedByUserId: row.decided_by_user_id,
+      ...(row.supersedes_decision_id === null ? {} : { supersedesDecisionId: row.supersedes_decision_id }),
+      decidedAt: row.decided_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-51: proves the decision log is the only place a candidate's status
+ * can change, and that every row in it names a person and a reason.
+ */
+export async function assertCandidateDecisionIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `decision_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [orgA, orgB]);
+    const member = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Member') RETURNING user_id`,
+      [`decider_${suffix}@acme.test`]
+    );
+    const outsider = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Outsider') RETURNING user_id`,
+      [`outsider_${suffix}@acme.test`]
+    );
+    const memberId = member.rows[0]?.user_id;
+    const outsiderId = outsider.rows[0]?.user_id;
+    if (memberId === undefined || outsiderId === undefined) {
+      throw new Error("probe could not create users");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      orgA,
+      memberId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [orgA, memberId]
+    );
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgA, role.rows[0]?.role_id, `probe/${suffix}.csv`, memberId]
+    );
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Casey', $4) RETURNING application_id`,
+      [orgA, role.rows[0]?.role_id, intake.rows[0]?.intake_id, `casey_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (applicationId === undefined) {
+      throw new Error("probe could not create an application");
+    }
+
+    // 1. "The only place": applications carries no status column, so
+    //    there is nothing else that could hold a workflow status.
+    const columns = await admin.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = 'applications'`,
+      [schema]
+    );
+    const statusLike = columns.rows
+      .map((row) => row.column_name)
+      .filter((name) => /status|stage|disposition|outcome|decision/u.test(name));
+    if (statusLike.length > 0) {
+      throw new Error(
+        `applications must hold no workflow status of its own; found ${statusLike.join(", ")} -- a second copy the decision log cannot keep in sync`
+      );
+    }
+
+    // 2. A decision records, and reads back as the current status.
+    const first = await recordCandidateDecision(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      decision: "advance",
+      rationale: "meets every criterion with cited evidence",
+      decidedByUserId: memberId
+    });
+    if (first.outcome !== "recorded" || first.supersededId !== undefined) {
+      throw new Error(`the first decision supersedes nothing; got ${JSON.stringify(first)}`);
+    }
+
+    // 3. A revision supersedes it, and the original survives.
+    const second = await recordCandidateDecision(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      decision: "decline",
+      rationale: "reference check contradicted the cited claim",
+      decidedByUserId: memberId
+    });
+    if (second.outcome !== "recorded" || second.supersededId !== first.decisionId) {
+      throw new Error(`a revision must name the decision it replaced; got ${JSON.stringify(second)}`);
+    }
+    const history = await listCandidateDecisionsForApplication(databaseUrl, schema, orgA, applicationId);
+    if (history.length !== 2) {
+      throw new Error(`the earlier decision must survive; history has ${history.length}`);
+    }
+    if (history[0]?.decision !== "advance") {
+      throw new Error("the original decision must still read as it did");
+    }
+
+    // 4. Never a nameless or unexplained decision, and never someone
+    //    without standing in this tenant. Each attempt gets its own key
+    //    so a duplicate-key error cannot masquerade as the constraint.
+    const rejections: Array<[string, string, string | null, string | null, string | null]> = [
+      ["a decision by someone with no membership here", orgA, "decline", "no", outsiderId],
+      // The ticket's core claim is "always a named human action". Without
+      // this case, removing decided_by_user_id's NOT NULL failed nothing
+      // -- the membership foreign key is MATCH SIMPLE, so a NULL decider
+      // satisfies it, and only the NOT NULL catches a nameless decision.
+      ["a decision with no decider at all", orgA, "hold", "someone decided this", null],
+      ["a whitespace-only rationale", orgA, "hold", "\t\n ", memberId],
+      ["an empty rationale", orgA, "hold", "", memberId],
+      ["a null rationale", orgA, "hold", null, memberId],
+      ["a decision about another tenant's candidate", orgB, "decline", "no", memberId]
+    ];
+    for (const [label, organizationId, kind, rationale, decider] of rejections) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO candidate_decisions (organization_id, application_id, decision, rationale, decided_by_user_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [organizationId, applicationId, kind, rationale, decider]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`${label} must not be recordable`);
+      }
+    }
+
+    // 5. Nothing edits or erases a decision.
+    for (const statement of [
+      `UPDATE candidate_decisions SET decision = 'advance'`,
+      `DELETE FROM candidate_decisions`,
+      `TRUNCATE candidate_decisions`
+    ]) {
+      let rejected = false;
+      try {
+        await admin.query(statement);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a recorded decision must be immutable; permitted: ${statement}`);
+      }
+    }
+
+    // 6. Concurrency: two reviewers deciding at once must not fork the
+    //    chain. Both launched before either is awaited.
+    const [a, b] = await Promise.all([
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId: orgA,
+        applicationId,
+        decision: "hold",
+        rationale: "first reviewer",
+        decidedByUserId: memberId
+      }),
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId: orgA,
+        applicationId,
+        decision: "advance",
+        rationale: "second reviewer",
+        decidedByUserId: memberId
+      })
+    ]);
+    const after = await listCandidateDecisionsForApplication(databaseUrl, schema, orgA, applicationId);
+    const supersededIds = after
+      .map((decision) => decision.supersedesDecisionId)
+      .filter((id): id is string => id !== undefined);
+    // Stated honestly, because it was measured: this assertion cannot
+    // fail while the schema is intact, and dropping 0019's unique index
+    // to prove otherwise does not isolate it -- the INSERT fails earlier
+    // with "there is no unique or exclusion constraint matching the ON
+    // CONFLICT specification". The same is true of AF-49's equivalent.
+    // Kept as a statement of the invariant and as a guard against a
+    // future refactor that stops routing decisions through ON CONFLICT;
+    // the assertions that genuinely discriminate here are the exactly-
+    // one-head check below and the rejection cases above.
+    if (new Set(supersededIds).size !== supersededIds.length) {
+      throw new Error("concurrent decisions forked the chain: two rows claim the same predecessor");
+    }
+    const heads = after.filter((decision) => !supersededIds.includes(decision.decisionId));
+    if (heads.length !== 1) {
+      throw new Error(`a candidate must have exactly one current decision, got ${heads.length}`);
+    }
+    for (const result of [a, b]) {
+      if (result.outcome === "recorded" && result.decisionId === undefined) {
+        throw new Error("a recorded decision must report its id");
       }
     }
   } finally {

@@ -1632,3 +1632,96 @@ export function buildCorrectedEvidenceCardSet(
     unverifiableCount: cards.filter((card) => !card.verifiable).length
   };
 }
+
+// ---- AF-51: named human advance/hold/decline recording ----
+//
+// "The only place a candidate's workflow status changes. Always a named
+// human action with a rationale field; the model has no path to this
+// endpoint."
+//
+// Status is DERIVED, never stored. There is no status column on
+// applications and this module offers no way to set one -- a candidate's
+// workflow status is a function of the decision log and nothing else, so
+// there is no second copy to drift and no other writer to audit. That is
+// what makes "the only place" a property of the schema rather than a
+// convention.
+
+export type CandidateDecisionKind = "advance" | "hold" | "decline";
+
+export const CANDIDATE_DECISION_KINDS: readonly CandidateDecisionKind[] = [
+  "advance",
+  "hold",
+  "decline"
+] as const;
+
+export interface CandidateDecision extends VersionedRecord {
+  readonly decisionId: string;
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly decision: CandidateDecisionKind;
+  /** Why. Never optional: an unexplained decision is not reviewable. */
+  readonly rationale: string;
+  /** Who. Never optional and never a service account -- see 0019. */
+  readonly decidedByUserId: string;
+  readonly supersedesDecisionId?: string | undefined;
+  readonly decidedAt: string;
+}
+
+/**
+ * `undecided` is a real state, not a missing value: a candidate nobody
+ * has ruled on yet is different from one held, and collapsing the two
+ * would let an untouched application read as a deliberate outcome.
+ */
+export type CandidateWorkflowStatus =
+  | { readonly status: "undecided" }
+  | {
+      readonly status: CandidateDecisionKind;
+      readonly decidedByUserId: string;
+      readonly rationale: string;
+      readonly decidedAt: string;
+      readonly decisionId: string;
+      /** How many times this candidate's status has been revised. */
+      readonly revisionCount: number;
+    };
+
+/**
+ * The current decision is the one nothing supersedes, found by following
+ * the supersedes links rather than by taking the newest timestamp. 0019
+ * stores that link precisely so this is a lookup and not an inference:
+ * two decisions recorded in the same microsecond, or any clock skew,
+ * must not be able to invert which one stands.
+ */
+export function deriveCandidateWorkflowStatus(
+  decisions: readonly CandidateDecision[]
+): CandidateWorkflowStatus {
+  if (decisions.length === 0) {
+    return { status: "undecided" };
+  }
+  const superseded = new Set(
+    decisions.map((decision) => decision.supersedesDecisionId).filter((id): id is string => id !== undefined)
+  );
+  const heads = decisions.filter((decision) => !superseded.has(decision.decisionId));
+  // 0019's partial unique index makes more than one head impossible.
+  // If one somehow appears, take the newest so the view is at least
+  // deterministic rather than dependent on row order.
+  const current = heads.reduce<CandidateDecision | undefined>(
+    (latest, decision) =>
+      latest === undefined || decision.decidedAt > latest.decidedAt ? decision : latest,
+    undefined
+  );
+  if (current === undefined) {
+    // Every decision is superseded by another, which means the chain is
+    // a cycle. Unrepresentable through recordCandidateDecision, but
+    // reporting `undecided` beats returning an arbitrary row from a
+    // structure that is already wrong.
+    return { status: "undecided" };
+  }
+  return {
+    status: current.decision,
+    decidedByUserId: current.decidedByUserId,
+    rationale: current.rationale,
+    decidedAt: current.decidedAt,
+    decisionId: current.decisionId,
+    revisionCount: decisions.length - 1
+  };
+}

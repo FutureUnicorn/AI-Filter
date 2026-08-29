@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   ALLOWED_FILE_TYPES,
   APPLICATION_EVIDENCE_STATES,
+  CANDIDATE_DECISION_KINDS,
   APPLICATION_IMPORT_FIELDS,
   AUDIT_ACTIONS,
   CONTRACT_SCHEMA_VERSION,
@@ -20,6 +21,7 @@ import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   Application,
   ApplicationQueueEntry,
+  CandidateDecision,
   AuditEvent,
   CitationInvalidEvidence,
   ContradictedEvidence,
@@ -706,4 +708,29 @@ export const correctionReasonSchema = z
 export const recordEvidenceCorrectionInputSchema = z.strictObject({
   outcome: evidenceOutcomeSchema,
   reason: correctionReasonSchema
+});
+
+// ---- AF-51: named human advance/hold/decline recording ----
+
+export const candidateDecisionSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  decisionId: z.uuid(),
+  organizationId: z.uuid(),
+  applicationId: z.uuid(),
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema,
+  decidedByUserId: z.uuid(),
+  supersedesDecisionId: z.uuid().optional(),
+  decidedAt: z.iso.datetime()
+}) satisfies z.ZodType<CandidateDecision>;
+
+/**
+ * What a caller may send. Note what is absent: no decidedByUserId. The
+ * actor is the session's own user, never a value in the request, so a
+ * caller cannot record a decision in someone else's name -- and there is
+ * nothing here a non-human caller could fill in to become one.
+ */
+export const recordCandidateDecisionInputSchema = z.strictObject({
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema
 });
