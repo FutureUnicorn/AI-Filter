@@ -27,7 +27,7 @@
     "test:unit": "corepack pnpm run test:unit:ts && corepack pnpm run test:python",
     "test:unit:ts": "node --test tests/unit/environment-config.test.ts tests/unit/environment-model.test.ts tests/unit/evidence-outcome-domain.test.ts tests/unit/organization-user-membership-domain.test.ts tests/unit/role-capabilities.test.ts",
     "test:integration": "corepack pnpm run build:packages && node --test tests/integration/worker.test.ts tests/integration/environment-policy.test.ts tests/integration/evidence-outcome-contracts.test.ts tests/integration/api-conventions.test.ts tests/integration/organization-user-membership-contracts.test.ts tests/integration/magic-link-contracts.test.ts tests/integration/magic-link-security.test.ts tests/integration/resource-authorization.test.ts tests/integration/audit-event-contracts.test.ts tests/integration/pii-safe-logging.test.ts tests/integration/cross-tenant-access.test.ts tests/integration/openai-adapter.test.ts tests/integration/evidence-extraction-schema.test.ts",
-    "test:architecture": "node --test tests/architecture/workspace-structure.test.ts tests/architecture/ci-policy.test.ts",
+    "test:architecture": "node --test tests/architecture/workspace-structure.test.ts tests/architecture/ci-policy.test.ts tests/architecture/test-registration.test.ts",
     "test:ts": "corepack pnpm run test:architecture && corepack pnpm run test:integration",
     "test:python": "uv run --locked --cache-dir .cache/uv pytest -q tests/test_validate_citations.py",
     "check:architecture": "depcruise --config dependency-cruiser.config.cjs apps packages && node tests/architecture/check-workspace-boundaries.mjs && corepack pnpm run test:architecture",
