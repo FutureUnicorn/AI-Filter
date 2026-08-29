@@ -273,6 +273,21 @@ test("citation_invalid still rejects a rejectedCitation that isn't JSON-serializ
   assert.equal(result.success, false);
 });
 
+test("citation_invalid rejects a circular rejectedCitation instead of overflowing the stack", () => {
+  const circular: Record<string, unknown> = {
+    document: "resume.txt",
+    pageOrSection: "Experience",
+    offset: 0,
+    quote: "Built and maintained Python microservices processing 2M+ events/day."
+  };
+  circular.self = circular;
+  let result: ReturnType<typeof safeParseEvidenceOutcome>;
+  assert.doesNotThrow(() => {
+    result = safeParseEvidenceOutcome({ ...samples.citation_invalid, rejectedCitation: circular });
+  });
+  assert.equal(result.success, false);
+});
+
 test("buildApiError rejects a malformed requestId instead of producing a contract-invalid body", () => {
   assert.throws(() => buildApiError({ requestId: "not-a-real-request-id", code: "not_found", message: "x" }));
 });

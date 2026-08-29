@@ -53,8 +53,26 @@ const sourceCitationSchema = z.strictObject({
  * any particular shape. Used both for `rejectedCitation` below (which
  * must preserve a structurally malformed proposal, just not one
  * containing something like a bigint that would throw at the transport
- * boundary) and for `BuildApiErrorInput.details` further down. */
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+ * boundary) and for `BuildApiErrorInput.details` further down.
+ *
+ * A cycle check runs before the recursive Zod parse itself: a self-referential
+ * object is still a `Record` at the type level, but it can never survive JSON
+ * and would otherwise overflow the stack while walking the graph. */
+function hasCircularJsonReference(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  if (seen.has(value)) {
+    return true;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasCircularJsonReference(entry, seen));
+  }
+  return Object.values(value).some((entry) => hasCircularJsonReference(entry, seen));
+}
+
+const recursiveJsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string(),
     // `.finite()` is explicit on purpose: TypeScript's `number` admits
@@ -68,10 +86,14 @@ const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
     }),
     z.boolean(),
     z.null(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema)
+    z.array(recursiveJsonValueSchema),
+    z.record(z.string(), recursiveJsonValueSchema)
   ])
 );
+
+const jsonValueSchema: z.ZodType<JsonValue> = z.custom<JsonValue>((value) => {
+  return !hasCircularJsonReference(value) && recursiveJsonValueSchema.safeParse(value).success;
+}, { message: "must be a cycle-free JSON value" }) as z.ZodType<JsonValue>;
 
 const supportedEvidenceSchema = z.strictObject({
   schemaVersion: schemaVersionSchema,
