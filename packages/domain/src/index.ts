@@ -1145,3 +1145,169 @@ export function summarizeFailedDocuments(
     failedRate: resolved === 0 ? null : failed / resolved
   };
 }
+
+// ---- AF-60: sample sizes and limitations ----
+//
+// "Do not let a report imply more confidence than the sample supports."
+// A bare number does that by omission: 0.6 reads the same whether it came
+// from 5 resolved documents or 5,000, and a reader has no way to tell.
+//
+// So a reported metric is never a bare number here. It carries the
+// denominator it was computed over, the population that denominator was
+// drawn from, and an explicit list of the reasons it should not be read
+// at face value. When the sample cannot support a value at all, `value`
+// is null and a limitation says why -- the same choice AF-58 made for
+// failedRate, generalised, because "we cannot tell you" and "the answer
+// is zero" are different claims and only one of them is ever true of an
+// empty sample.
+//
+// The limitation codes are a closed set rather than free text: a report
+// consumer has to be able to branch on them, and prose that varies by
+// call site cannot be aggregated or translated.
+
+export const METRIC_LIMITATION_CODES = [
+  /** Nothing has resolved yet; there is no denominator to divide by. */
+  "no_sample",
+  /** A denominator exists but is too small for the stated threshold. */
+  "below_minimum_sample",
+  /** Some of the population is excluded from the denominator (e.g. still in flight). */
+  "population_incomplete"
+] as const;
+
+export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
+
+export interface MetricLimitation {
+  readonly code: MetricLimitationCode;
+  /** Human-readable specifics, always including the numbers involved. */
+  readonly detail: string;
+}
+
+export interface MetricSample extends VersionedRecord {
+  readonly metric: string;
+  /** null when the sample cannot support a value; never a placeholder number. */
+  readonly value: number | null;
+  /** The denominator the value was actually computed over. */
+  readonly sampleSize: number;
+  /** How many entities were in scope, whether or not they reached the denominator. */
+  readonly population: number;
+  /** The smallest sampleSize this metric is willing to report a value for. */
+  readonly minimumSampleSize: number;
+  readonly limitations: readonly MetricLimitation[];
+}
+
+export interface SummarizeMetricInput {
+  readonly metric: string;
+  /** The computed value, or null if the caller already knows it is unavailable. */
+  readonly value: number | null;
+  readonly sampleSize: number;
+  readonly population: number;
+  readonly minimumSampleSize: number;
+}
+
+/**
+ * Suppression is deliberate, not advisory. A metric below its minimum
+ * sample returns `value: null` rather than the number plus a warning,
+ * because a warning beside a number is routinely dropped by whatever
+ * renders it, and the number is what gets quoted. If the sample cannot
+ * support the claim, the report must not be able to make it.
+ */
+export function summarizeMetric(input: SummarizeMetricInput): MetricSample {
+  const { metric, value, sampleSize, population, minimumSampleSize } = input;
+  if (metric.trim().length === 0) {
+    throw new Error("summarizeMetric requires a metric name");
+  }
+  for (const [name, n] of [
+    ["sampleSize", sampleSize],
+    ["population", population],
+    ["minimumSampleSize", minimumSampleSize]
+  ] as const) {
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`summarizeMetric requires a non-negative integer ${name}, got: ${n}`);
+    }
+  }
+  if (sampleSize > population) {
+    throw new Error(
+      `summarizeMetric: sampleSize (${sampleSize}) exceeds population (${population}) for ${metric}; ` +
+        "the denominator cannot be larger than the set it was drawn from"
+    );
+  }
+  if (value !== null && !Number.isFinite(value)) {
+    throw new Error(`summarizeMetric: ${metric} value must be finite or null, got: ${value}`);
+  }
+
+  const limitations: MetricLimitation[] = [];
+  if (sampleSize === 0) {
+    limitations.push({
+      code: "no_sample",
+      detail: `no ${metric} observations have resolved yet (population ${population})`
+    });
+  } else if (sampleSize < minimumSampleSize) {
+    limitations.push({
+      code: "below_minimum_sample",
+      detail: `${sampleSize} observations is below the minimum of ${minimumSampleSize} required to report ${metric}`
+    });
+  }
+  if (sampleSize < population) {
+    limitations.push({
+      code: "population_incomplete",
+      detail: `${population - sampleSize} of ${population} in scope are not yet counted toward ${metric}`
+    });
+  }
+
+  const supported = sampleSize > 0 && sampleSize >= minimumSampleSize;
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    metric,
+    value: supported ? value : null,
+    sampleSize,
+    population,
+    minimumSampleSize,
+    limitations
+  };
+}
+
+/**
+ * AF-58's failed-document rate expressed as a reportable metric. Its
+ * denominator is documents with a terminal outcome, and its population is
+ * every document that arrived -- so a role still draining reports
+ * `population_incomplete` automatically rather than relying on whoever
+ * writes the report to remember.
+ */
+/**
+ * There is deliberately no function here that combines two MetricSamples,
+ * and adding one is the way this whole module gets quietly defeated.
+ *
+ * Pooling only looks like arithmetic. Two samples under different metric
+ * names are two different populations, and `metric` is a free-form string,
+ * so nothing in the types stops a caller summing a live-pilot sample with
+ * an offline-evaluation one and reporting the combined figure. AF-57
+ * relies on exactly that separation: it emits
+ * `evidence_precision_live_pilot` and
+ * `evidence_precision_locked_offline_eval` as distinct names, against two
+ * separate targets, so a dashboard cannot pool them by accident.
+ *
+ * The reason pooling is not merely imprecise but self-serving: the offline
+ * set is the one that can be grown cheaply, on demand, without a single
+ * recruiter reviewing anything. So a pooled denominator is always easiest
+ * to inflate on the side that flatters, and the combined number rises
+ * fastest exactly when the live pilot is going worst. That is the failure
+ * this module exists to prevent, arriving through the back door as a
+ * convenience helper.
+ *
+ * If a report genuinely needs one headline figure across populations, the
+ * honest form is to show both samples with their own sizes and
+ * limitations, not to average them. `population_incomplete` already
+ * carries the "you are not seeing everything" half.
+ */
+export function describeFailedDocumentRate(
+  rate: FailedDocumentRate,
+  minimumSampleSize: number
+): MetricSample {
+  return summarizeMetric({
+    metric: "failed_document_rate",
+    value: rate.failedRate,
+    sampleSize: rate.resolved,
+    population: rate.uploaded,
+    minimumSampleSize
+  });
+}
