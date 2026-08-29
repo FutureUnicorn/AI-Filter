@@ -6,12 +6,12 @@ import { fileURLToPath } from "node:url";
 import type {
   Application,
   AuditAction,
+  CandidateDecision,
+  CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
-  CandidateDecision,
-  CandidateDecisionKind,
   DomainPort,
   EvidenceExtractionRunRef,
   EvidenceOutcome,
@@ -25,6 +25,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  ReviewTimingSpan,
   Role,
   RoleStatus,
   Rubric,
@@ -3732,6 +3733,297 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       }
       if (!rejected) {
         throw new Error(`a recorded draw must be immutable; permitted: ${statement}`);
+      }
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-54: capture recruiter review timing ----
+
+export interface RecordReviewTimingSpanInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly reviewerUserId: string;
+  readonly startedAt: Date;
+  readonly endedAt: Date;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+export async function recordReviewTimingSpan(
+  databaseUrl: string,
+  schema: string,
+  input: RecordReviewTimingSpanInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".review_timing_spans
+         (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        input.applicationId,
+        input.reviewerUserId,
+        input.startedAt,
+        input.endedAt,
+        input.activeMs,
+        input.truncatedByIdle
+      ]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Spans for a role, grouped by application.
+ *
+ * There is deliberately NO listReviewTimingSpansForReviewer, and no
+ * index that would make one cheap. Time-per-application is a product
+ * baseline; the same rows sorted by person are a performance-management
+ * dataset, and which of those exists is decided by which query is easy
+ * to write. reviewer_user_id is stored because a span with no actor
+ * cannot be deduplicated or excluded when someone leaves -- not so it
+ * can be reported on.
+ */
+export async function listReviewTimingSpansForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<readonly ReviewTimingSpan[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      application_id: string;
+      active_ms: number;
+      truncated_by_idle: boolean;
+    }>(
+      `SELECT s.application_id, s.active_ms, s.truncated_by_idle
+         FROM "${schema}".review_timing_spans s
+         JOIN "${schema}".applications a
+           ON a.application_id = s.application_id AND a.organization_id = s.organization_id
+        WHERE s.organization_id = $1 AND a.role_id = $2
+        ORDER BY s.application_id, s.started_at`,
+      [organizationId, roleId]
+    );
+    return result.rows.map((row) => ({
+      applicationId: row.application_id,
+      activeMs: row.active_ms,
+      truncatedByIdle: row.truncated_by_idle
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-54: proves a review-timing span cannot record a duration it did
+ * not measure, cannot cross tenants, and cannot be edited afterwards.
+ *
+ * Every rejection attempt uses its own primary key, and the ids are
+ * hex-safe. A first pass at this used ids beginning with `t`, which is
+ * not a hex digit -- every case failed with "invalid input syntax for
+ * type uuid" and would have read as "all rejected" from the exit status
+ * alone.
+ */
+export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `timing_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [orgA, orgB]);
+    const reviewer = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Reviewer') RETURNING user_id`,
+      [`reviewer_${suffix}@acme.test`]
+    );
+    const outsider = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Outsider') RETURNING user_id`,
+      [`outsider_${suffix}@acme.test`]
+    );
+    const reviewerId = reviewer.rows[0]?.user_id;
+    const outsiderId = outsider.rows[0]?.user_id;
+    if (reviewerId === undefined || outsiderId === undefined) {
+      throw new Error("probe could not create users");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      orgA,
+      reviewerId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [orgA, reviewerId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgA, roleId, `probe/${suffix}.csv`, reviewerId]
+    );
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'C', $4) RETURNING application_id`,
+      [orgA, roleId, intake.rows[0]?.intake_id, `c_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (applicationId === undefined || roleId === undefined) {
+      throw new Error("probe could not create an application");
+    }
+
+    // 1. Two honest spans record and read back at the right grain.
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date("2026-08-29T10:00:00Z"),
+      endedAt: new Date("2026-08-29T10:01:30Z"),
+      activeMs: 90_000,
+      truncatedByIdle: false
+    });
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date("2026-08-29T11:00:00Z"),
+      endedAt: new Date("2026-08-29T11:05:00Z"),
+      activeMs: 120_000,
+      truncatedByIdle: true
+    });
+    const spans = await listReviewTimingSpansForRole(databaseUrl, schema, orgA, roleId);
+    if (spans.length !== 2) {
+      throw new Error(`expected both spans for this role, got ${spans.length}`);
+    }
+    if (!spans.some((span) => span.truncatedByIdle)) {
+      throw new Error("the idle flag must survive the round trip; a summary cannot exclude what it cannot see");
+    }
+
+    // 2. A span cannot claim more active time than the wall clock it
+    //    sits inside. This is the check that catches a client sending a
+    //    fabricated duration, which would quietly corrupt the baseline.
+    const rejections: Array<[string, string, string, string, string, number]> = [
+      [
+        "eight hours of activity inside ninety seconds",
+        "ea000001-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T14:00:00Z",
+        "2026-08-29T14:01:30Z",
+        28_800_000
+      ],
+      [
+        "negative active time",
+        "ea000002-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T15:00:00Z",
+        "2026-08-29T15:01:00Z",
+        -5
+      ],
+      [
+        "a span that ended before it started",
+        "ea000003-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T16:00:00.500Z",
+        "2026-08-29T16:00:00.000Z",
+        0
+      ],
+      [
+        "another tenant timing this application",
+        "ea000004-4444-4444-8444-444444444444",
+        orgB,
+        "2026-08-29T17:00:00Z",
+        "2026-08-29T17:01:00Z",
+        60_000
+      ]
+    ];
+    for (const [label, id, organizationId, startedAt, endedAt, activeMs] of rejections) {
+      let rejected = false;
+      try {
+        await admin.query(
+          `INSERT INTO review_timing_spans
+             (review_timing_span_id, organization_id, application_id, reviewer_user_id,
+              started_at, ended_at, active_ms, truncated_by_idle)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+          [id, organizationId, applicationId, reviewerId, startedAt, endedAt, activeMs]
+        );
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`${label} must not be recordable as review timing`);
+      }
+    }
+
+    // 3. A reviewer with no standing in this tenant cannot be recorded
+    //    as having reviewed.
+    let outsiderRejected = false;
+    try {
+      await admin.query(
+        `INSERT INTO review_timing_spans
+           (review_timing_span_id, organization_id, application_id, reviewer_user_id,
+            started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ('ea000005-4444-4444-8444-444444444444', $1, $2, $3, $4, $5, 60000, false)`,
+        [orgA, applicationId, outsiderId, "2026-08-29T18:00:00Z", "2026-08-29T18:01:00Z"]
+      );
+    } catch {
+      outsiderRejected = true;
+    }
+    if (!outsiderRejected) {
+      throw new Error("a reviewer with no membership in this organization must not be recordable");
+    }
+
+    // 4. Nothing edits or erases a recorded span. Checked with rows
+    //    present -- an UPDATE or DELETE affecting zero rows never fires
+    //    a row-level trigger and would pass for the wrong reason.
+    const before = await admin.query<{ count: string }>(`SELECT count(*)::text AS count FROM review_timing_spans`);
+    if (Number(before.rows[0]?.count ?? 0) === 0) {
+      throw new Error("the immutability check needs rows present to be meaningful");
+    }
+    for (const statement of [
+      `UPDATE review_timing_spans SET active_ms = 1`,
+      `DELETE FROM review_timing_spans`,
+      `TRUNCATE review_timing_spans`
+    ]) {
+      let rejected = false;
+      try {
+        await admin.query(statement);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a recorded timing span must be immutable; permitted: ${statement}`);
       }
     }
   } finally {
