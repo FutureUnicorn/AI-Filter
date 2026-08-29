@@ -294,6 +294,11 @@ export type EvidenceExtractionItem = z.infer<typeof evidenceExtractionItemSchema
 // requirement (docs/PRODUCT_BOUNDARY.md: "AI MUST NOT invent
 // requirements"), so there is nothing in the rubric for it to become.
 
+export interface RubricEvidenceMappingContext {
+  readonly organizationId: string;
+  readonly candidateId: string;
+}
+
 function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   return {
     document: item.source.document,
@@ -311,10 +316,15 @@ function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
   );
 }
 
-function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
+function invalidCitationOutcome(
+  context: RubricEvidenceMappingContext,
+  criterionId: string
+): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: context.organizationId,
+    candidateId: context.candidateId,
     criterionId,
     errorCode: "invalid_citation",
     message: "The model's citing item is missing a persistable source citation.",
@@ -322,31 +332,64 @@ function invalidCitationOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function mapExtractedItem(item: EvidenceExtractionItem): EvidenceOutcome {
+function missingConflictingCitationOutcome(
+  context: RubricEvidenceMappingContext,
+  criterionId: string
+): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    organizationId: context.organizationId,
+    candidateId: context.candidateId,
+    criterionId,
+    errorCode: "missing_conflicting_citation",
+    message: "A contradicted outcome requires citations for both conflicting facts.",
+    retryable: true
+  };
+}
+
+function mapExtractedItem(
+  context: RubricEvidenceMappingContext,
+  item: EvidenceExtractionItem
+): EvidenceOutcome {
   const criterionId = item.criterion_id;
   switch (item.state) {
     case "not_found":
-      return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId };
+      return {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        kind: "not_found",
+        organizationId: context.organizationId,
+        candidateId: context.candidateId,
+        criterionId
+      };
     case "supported":
     case "partially_supported":
-    case "contradicted":
     case "unclear":
       if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(criterionId);
+        return invalidCitationOutcome(context, criterionId);
       }
       return {
         schemaVersion: CONTRACT_SCHEMA_VERSION,
         kind: item.state,
+        organizationId: context.organizationId,
+        candidateId: context.candidateId,
         criterionId,
         citation: citationFrom(item)
       };
+    case "contradicted":
+      return missingConflictingCitationOutcome(context, criterionId);
   }
 }
 
-function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
+function omittedCriterionOutcome(
+  context: RubricEvidenceMappingContext,
+  criterionId: string
+): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: context.organizationId,
+    candidateId: context.candidateId,
     criterionId,
     errorCode: "model_omitted_criterion",
     message: "The model's response did not include this criterion.",
@@ -354,10 +397,16 @@ function omittedCriterionOutcome(criterionId: string): EvidenceOutcome {
   };
 }
 
-function duplicateCriterionOutcome(criterionId: string, count: number): EvidenceOutcome {
+function duplicateCriterionOutcome(
+  context: RubricEvidenceMappingContext,
+  criterionId: string,
+  count: number
+): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: context.organizationId,
+    candidateId: context.candidateId,
     criterionId,
     errorCode: "duplicate_criterion_response",
     message: `The model returned ${count} responses for one criterion.`,
@@ -366,6 +415,7 @@ function duplicateCriterionOutcome(criterionId: string, count: number): Evidence
 }
 
 export function mapRubricToEvidence(
+  context: RubricEvidenceMappingContext,
   rubricCriterionIds: readonly string[],
   extractedItems: readonly EvidenceExtractionItem[]
 ): EvidenceOutcome[] {
@@ -411,11 +461,11 @@ export function mapRubricToEvidence(
     const matches = itemsByCriterion.get(criterionId) ?? [];
     const [firstMatch, ...rest] = matches;
     if (firstMatch === undefined) {
-      return omittedCriterionOutcome(criterionId);
+      return omittedCriterionOutcome(context, criterionId);
     }
     if (rest.length > 0) {
-      return duplicateCriterionOutcome(criterionId, matches.length);
+      return duplicateCriterionOutcome(context, criterionId, matches.length);
     }
-    return mapExtractedItem(firstMatch);
+    return mapExtractedItem(context, firstMatch);
   });
 }
