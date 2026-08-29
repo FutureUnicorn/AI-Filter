@@ -13,6 +13,7 @@ import {
   IMPORT_ROW_OUTCOMES,
   MAX_RUBRIC_CRITERIA,
   MEMBERSHIP_ROLES,
+  METRIC_LIMITATION_CODES,
   MIN_RUBRIC_CRITERIA,
   ROLE_STATUSES,
   RUBRIC_STATUSES
@@ -23,6 +24,8 @@ import type {
   ApplicationQueueEntry,
   CandidateDecision,
   AuditEvent,
+  CanonicalTextExtraction,
+  CanonicalTextPage,
   CitationInvalidEvidence,
   ContradictedEvidence,
   CsvColumnMapping,
@@ -30,16 +33,17 @@ import type {
   EvidenceExtractionRun,
   EvidenceOutcome,
   ExtractionErrorEvidence,
+  FailedDocumentRate,
   FailedEvidence,
+  FileIntake,
   ImportRow,
   InvalidSourceEvidence,
   Membership,
+  MetricLimitation,
+  MetricSample,
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
-  CanonicalTextExtraction,
-  CanonicalTextPage,
-  FileIntake,
   ProcessingEvidence,
   QuarantinedEvidence,
   RetryingEvidence,
@@ -734,3 +738,68 @@ export const recordCandidateDecisionInputSchema = z.strictObject({
   decision: z.enum(CANDIDATE_DECISION_KINDS),
   rationale: correctionReasonSchema
 });
+/**
+ * AF-58. `failedRate` is nullable on purpose -- see summarizeFailedDocuments:
+ * a role where nothing has resolved yet has no rate, and 0 would read as
+ * "nothing failed". `.nullable()` forces every consumer to handle that.
+ */
+export const failedDocumentRateSchema = z.strictObject({
+  schemaVersion: schemaVersionSchema,
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  uploaded: z.number().int().min(0),
+  failed: z.number().int().min(0),
+  quarantined: z.number().int().min(0),
+  rejected: z.number().int().min(0),
+  extractionEmpty: z.number().int().min(0),
+  extractionSucceeded: z.number().int().min(0),
+  resolved: z.number().int().min(0),
+  inFlight: z.number().int().min(0),
+  failedRate: z.number().min(0).max(1).nullable()
+}) satisfies z.ZodType<FailedDocumentRate>;
+
+/**
+ * AF-60. `value` is nullable at the contract boundary on purpose: a metric
+ * whose sample cannot support it must be structurally incapable of
+ * carrying a number, not merely accompanied by a warning that a renderer
+ * can drop. `limitations` is required and may be empty -- an absent field
+ * would be indistinguishable from "no limitations known", which is the
+ * claim this ticket exists to prevent making by accident.
+ */
+export const metricLimitationSchema = z.strictObject({
+  code: z.enum(METRIC_LIMITATION_CODES),
+  detail: z.string().min(1)
+}) satisfies z.ZodType<MetricLimitation>;
+
+// The refinements below return a ZodEffects, which cannot carry the
+// `satisfies z.ZodType<MetricSample>` binding the rest of this file uses
+// to keep contracts and domain in step. Declaring the object shape first
+// keeps that binding: if MetricSample gains a field, this stops compiling
+// here rather than silently accepting a payload that omits it.
+const metricSampleObjectSchema = z.strictObject({
+  schemaVersion: schemaVersionSchema,
+  metric: z.string().min(1),
+  value: z.number().finite().nullable(),
+  sampleSize: z.number().int().min(0),
+  population: z.number().int().min(0),
+  minimumSampleSize: z.number().int().min(0),
+  limitations: z.array(metricLimitationSchema)
+}) satisfies z.ZodType<MetricSample>;
+
+export const metricSampleSchema = metricSampleObjectSchema
+  .refine((sample) => sample.sampleSize <= sample.population, {
+    message: "sampleSize cannot exceed population",
+    path: ["sampleSize"]
+  })
+  .refine(
+    (sample) =>
+      sample.value === null || (sample.sampleSize > 0 && sample.sampleSize >= sample.minimumSampleSize),
+    {
+      // The invariant the whole ticket rests on: a value may not cross the
+      // boundary unless its own sample supports it. Without this the schema
+      // would happily transport the exact thing summarizeMetric refuses to
+      // produce.
+      message: "a value must not be reported when sampleSize is 0 or below minimumSampleSize",
+      path: ["value"]
+    }
+  );
