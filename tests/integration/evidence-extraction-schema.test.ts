@@ -102,6 +102,19 @@ test("EVIDENCE_EXTRACTION_JSON_SCHEMA sets additionalProperties:false at every o
   assert.deepEqual(new Set(item.properties.source.required), new Set(["document", "page_or_section", "offset"]));
 });
 
+test("EVIDENCE_EXTRACTION_JSON_SCHEMA enforces the non-empty criterion_id constraint used by the Zod validator", () => {
+  const root = EVIDENCE_EXTRACTION_JSON_SCHEMA as {
+    properties: {
+      items: {
+        items: {
+          properties: { criterion_id: { minLength: number } };
+        };
+      };
+    };
+  };
+  assert.equal(root.properties.items.items.properties.criterion_id.minLength, 1);
+});
+
 test("EVIDENCE_EXTRACTION_JSON_SCHEMA's state enum matches EVIDENCE_EXTRACTION_STATES exactly", () => {
   const root = EVIDENCE_EXTRACTION_JSON_SCHEMA as {
     properties: { items: { items: { properties: { state: { enum: readonly string[] } } } } };

@@ -109,10 +109,17 @@ export function createConsoleMagicLinkEmailSender(appEnv: string = "development"
     async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
       // Structured log records that delivery happened, with no PII in it.
       logStructured("info", "magic_link.queued");
-      // The link itself, to the terminal only, never to the log stream.
-      process.stderr.write(
-        `\n[dev magic link] to: ${input.email}\n[dev magic link] open: ${input.link}\n\n`
-      );
+      // Keep the local developer hint non-sensitive: even terminal output must
+      // avoid exposing the raw recipient or bearer token.
+      //
+      // The `g` flag is load-bearing, not tidiness. Without it only the
+      // FIRST token parameter is redacted, so a link carrying the
+      // parameter twice -- which nothing rejects, since a duplicated
+      // query parameter is well-formed -- printed the second one to the
+      // terminal in full. A redaction that stops at the first match is a
+      // leak for every input the author did not picture.
+      const safeLink = input.link.replace(/([?&])token=[^&]*/gi, "$1token=[REDACTED]");
+      process.stderr.write(`\n[dev magic link] to: [REDACTED_EMAIL]\n[dev magic link] open: ${safeLink}\n\n`);
     }
   };
 }
@@ -209,22 +216,7 @@ export function resourceAuthorizationErrorResponse(
 // fields, after protecting UUID / IPv4 / ISO-date correlation IDs.
 
 const EMAIL_PATTERN = /[^\s@]+@[^\s@]+\.[^\s@]+/gu;
-/**
- * Bounded on purpose. An earlier `/\+?\d[\d\s().-]{7,}\d/` had no upper
- * limit and treated whitespace as an interior character, so it matched
- * any run of digits/spaces/dots/dashes -- including straight across
- * several space-separated correlation IDs (`<uuid> <iso-date> <ipv4>`
- * matched as one 70-character "phone number", which then defeated every
- * protected span it covered). Capping total digits at 15 (E.164's
- * maximum) and allowing at most two separator characters between digits
- * keeps a match inside a single real token, so it can no longer swallow
- * neighbouring identifiers.
- */
-const PHONE_PATTERN = /\+?\d(?:[ ().-]{0,2}\d){6,14}/gu;
 const UUID_PATTERN = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
-const IPV4_PATTERN = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-const ISO_DATE_PATTERN =
-  /\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?\b/g;
 const REJECTED_LOG_MESSAGE = "log.rejected_message";
 const REDACTED = "[REDACTED]";
 
@@ -270,16 +262,166 @@ function mergeSpans(spans: readonly Span[]): readonly Span[] {
   return merged;
 }
 
-function collectSpans(value: string, patterns: readonly RegExp[]): readonly Span[] {
+function findEmailSpans(value: string): readonly Span[] {
   const spans: Span[] = [];
-  for (const pattern of patterns) {
-    for (const match of value.matchAll(pattern)) {
-      if (match.index === undefined || match[0].length === 0) {
-        continue;
+  let index = 0;
+  while (index < value.length) {
+    if (/\s/u.test(value[index] ?? "")) {
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < value.length && !/\s/u.test(value[end] ?? "")) {
+      end += 1;
+    }
+    const token = value.slice(index, end);
+    EMAIL_PATTERN.lastIndex = 0;
+    if (EMAIL_PATTERN.test(token)) {
+      spans.push({ start: index, end });
+    }
+    index = end;
+  }
+  return mergeSpans(spans);
+}
+
+function findUuidSpans(value: string): readonly Span[] {
+  const spans: Span[] = [];
+  for (const match of value.matchAll(UUID_PATTERN)) {
+    if (match.index === undefined || match[0].length === 0) {
+      continue;
+    }
+    spans.push({ start: match.index, end: match.index + match[0].length });
+  }
+  return mergeSpans(spans);
+}
+
+function findIpv4Spans(value: string): readonly Span[] {
+  const spans: Span[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    if (!/[0-9]/u.test(value[index] ?? "")) {
+      continue;
+    }
+    let cursor = index;
+    const groups: number[] = [];
+    while (groups.length < 4 && cursor < value.length) {
+      const groupStart = cursor;
+      while (cursor < value.length && /[0-9]/u.test(value[cursor] ?? "")) {
+        cursor += 1;
       }
-      spans.push({ start: match.index, end: match.index + match[0].length });
+      const digits = value.slice(groupStart, cursor);
+      if (digits.length === 0 || Number(digits) > 255) {
+        break;
+      }
+      groups.push(Number(digits));
+      if (groups.length === 4) {
+        break;
+      }
+      if (cursor >= value.length || value[cursor] !== ".") {
+        break;
+      }
+      cursor += 1;
+    }
+    if (groups.length === 4) {
+      spans.push({ start: index, end: cursor });
+      index = cursor - 1;
     }
   }
+  return mergeSpans(spans);
+}
+
+function findIsoDateSpans(value: string): readonly Span[] {
+  const spans: Span[] = [];
+  for (let index = 0; index <= value.length - 4; index += 1) {
+    if (!/[0-9]/u.test(value[index] ?? "")) {
+      continue;
+    }
+    const year = value.slice(index, index + 4);
+    if (!/^\d{4}$/u.test(year)) {
+      continue;
+    }
+    let cursor = index + 4;
+    if (value[cursor] !== "-") {
+      continue;
+    }
+    cursor += 1;
+    const month = value.slice(cursor, cursor + 2);
+    if (!/^\d{2}$/u.test(month)) {
+      continue;
+    }
+    cursor += 2;
+    if (value[cursor] !== "-") {
+      continue;
+    }
+    cursor += 1;
+    const day = value.slice(cursor, cursor + 2);
+    if (!/^\d{2}$/u.test(day)) {
+      continue;
+    }
+    cursor += 2;
+    const end = cursor;
+    spans.push({ start: index, end });
+  }
+  return mergeSpans(spans);
+}
+
+/**
+ * Scan for phone-shaped digit runs without letting a loose separator pattern
+ * swallow neighbouring identifier spans. This is intentionally narrower than
+ * the earlier regex and only used as a redaction aid; any digits already
+ * covered by UUID / IPv4 / ISO-date spans are filtered out before the value is
+ * redacted.
+ */
+function findPhoneSpans(value: string): readonly Span[] {
+  const spans: Span[] = [];
+  let index = 0;
+
+  while (index < value.length) {
+    const start = index;
+    if (value[index] === "+") {
+      const next = value[index + 1];
+      if (next === undefined || !/[0-9]/u.test(next)) {
+        index += 1;
+        continue;
+      }
+      index += 1;
+    }
+
+    if (!/[0-9]/u.test(value[index] ?? "")) {
+      index += 1;
+      continue;
+    }
+
+    const phoneStart = start;
+    let digits = 0;
+    let cursor = index;
+
+    while (cursor < value.length) {
+      const character = value[cursor];
+      if (/[0-9]/u.test(character ?? "")) {
+        digits += 1;
+        cursor += 1;
+        continue;
+      }
+      if (/[ .()-]/u.test(character ?? "")) {
+        let next = cursor + 1;
+        while (next < value.length && /[ .()-]/u.test(value[next] ?? "")) {
+          next += 1;
+        }
+        if (next < value.length && /[0-9]/u.test(value[next] ?? "")) {
+          cursor = next;
+          continue;
+        }
+        break;
+      }
+      break;
+    }
+
+    if (digits >= 7) {
+      spans.push({ start: phoneStart, end: cursor });
+    }
+    index = cursor + 1;
+  }
+
   return mergeSpans(spans);
 }
 
@@ -325,10 +467,12 @@ export function redactPii(value: string): string {
   // this is what stops `user@192.0.2.1` or `user@2026-08-21.com` from
   // leaking because an identifier-shaped substring got carved out of the
   // middle and left the email pattern unable to match the whole token.
-  const emailSpans = collectSpans(value, [EMAIL_PATTERN]);
-  const protectedSpans = collectSpans(value, [UUID_PATTERN, IPV4_PATTERN, ISO_DATE_PATTERN]).filter(
-    (candidate) => !emailSpans.some((email) => overlaps(candidate, email))
-  );
+  const emailSpans = findEmailSpans(value);
+  const protectedSpans = mergeSpans([
+    ...findUuidSpans(value),
+    ...findIpv4Spans(value),
+    ...findIsoDateSpans(value)
+  ]).filter((candidate) => !emailSpans.some((email) => overlaps(candidate, email)));
 
   // A phone match only counts when at least one of its digits is not
   // already part of a recognized identifier. Without that test the loose
@@ -339,7 +483,7 @@ export function redactPii(value: string): string {
   // left alone, while `Call +1 2026-08-21 now` is still redacted -- the
   // leading `1` sits outside the date, which is what makes it a phone
   // number rather than a date sitting on its own.
-  const phoneSpans = collectSpans(value, [PHONE_PATTERN]).filter((phone) =>
+  const phoneSpans = findPhoneSpans(value).filter((phone) =>
     hasDigitOutside(value, phone, protectedSpans)
   );
 
@@ -458,8 +602,10 @@ export interface LogContext {
   readonly action?: string;
   readonly entityType?: string;
   readonly entityId?: string;
+  /** HTTP status code when available; values outside 100..599 are dropped. */
   readonly statusCode?: number;
   readonly errorCode?: string;
+  /** Milliseconds since start, non-negative only. */
   readonly durationMs?: number;
 }
 
@@ -508,7 +654,7 @@ const LOG_CONTEXT_VALIDATORS: Readonly<Record<(typeof LOG_CONTEXT_KEYS)[number],
   entityType: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
   entityId: (value) => typeof value === "string" && (UUID_ONLY.test(value) || SAFE_TOKEN.test(value)),
   errorCode: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
-  statusCode: (value) => typeof value === "number" && Number.isInteger(value),
+  statusCode: (value) => typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599,
   durationMs: (value) => typeof value === "number" && Number.isFinite(value) && value >= 0
 };
 
@@ -516,7 +662,7 @@ function pickLogContext(context: LogContext | undefined): LogContext | undefined
   if (context === undefined) {
     return undefined;
   }
-  const picked: Record<string, unknown> = {};
+  const picked: Partial<Record<keyof LogContext, LogContext[keyof LogContext]>> = {};
   for (const key of LOG_CONTEXT_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(context, key)) {
       continue;
@@ -527,12 +673,17 @@ function pickLogContext(context: LogContext | undefined): LogContext | undefined
     }
     // redactPii stays as a second layer for the string fields it applies
     // to, but the validator above is what actually decides whether a
-    // value is loggable at all.
-    picked[key] = LOG_CONTEXT_VALIDATORS[key](value)
-      ? typeof value === "string"
-        ? redactPii(value)
-        : value
-      : REDACTED;
+    // value is loggable at all. Invalid numeric fields are dropped rather
+    // than coerced to a string, because the stored shape must remain
+    // LogContext-compatible.
+    if (!LOG_CONTEXT_VALIDATORS[key](value)) {
+      if (key === "statusCode" || key === "durationMs") {
+        continue;
+      }
+      picked[key] = REDACTED as LogContext[keyof LogContext];
+      continue;
+    }
+    picked[key] = typeof value === "string" ? (redactPii(value) as LogContext[keyof LogContext]) : value;
   }
   return Object.keys(picked).length === 0 ? undefined : (picked as LogContext);
 }
