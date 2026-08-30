@@ -386,11 +386,34 @@ function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   };
 }
 
+function conflictingCitationFrom(item: EvidenceExtractionItem): SourceCitation | undefined {
+  const side = item.conflicting;
+  if (side == null) {
+    return undefined;
+  }
+  return {
+    document: side.source.document,
+    pageOrSection: side.source.page_or_section,
+    offset: side.source.offset,
+    quote: side.quote
+  };
+}
+
 function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
   return (
     item.source.page_or_section.trim().length > 0 &&
     item.source.offset >= 0 &&
     item.quote.trim().length > 0
+  );
+}
+
+function conflictingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
+  const side = item.conflicting;
+  return (
+    side != null &&
+    side.source.page_or_section.trim().length > 0 &&
+    side.source.offset >= 0 &&
+    side.quote.trim().length > 0
   );
 }
 
@@ -439,39 +462,42 @@ function mapExtractedItem(subject: EvidenceSubject, item: EvidenceExtractionItem
     case "not_found":
       return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId, candidateId, criterionId };
     case "contradicted":
-      // A second defect CI surfaced alongside the missing attribution,
-      // and it is not a typing nuisance.
-      //
-      // AF-13's review made ContradictedEvidence carry BOTH sides of the
-      // conflict -- citation AND conflictingCitation -- because a
-      // contradiction a reviewer can only see one half of is not
-      // reviewable. An extraction item carries one quote. So a single
-      // item can no longer produce a persistable contradicted outcome,
-      // and constructing one with the second side missing would hand
-      // back a value that fails evidenceOutcomeSchema.
-      //
-      // Reported as a retryable extraction_error naming the real reason,
-      // rather than downgraded to `unclear`: a model that found
-      // conflicting evidence and a model that found ambiguous evidence
-      // are saying different things, and collapsing them would lose the
-      // signal this criterion most needs a human for. AF-35's
-      // model-facing schema has to grow a second quote for the
-      // contradicted state before this can map properly.
-      if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(subject, criterionId);
+      // AF-13 requires both sides of the conflict. AF-35's follow-up
+      // (#64) added `conflicting` so a validated contradicted item can
+      // carry them. The item type still types that field as nullish
+      // (direct-construction fixtures omit it), so the mapper narrows
+      // at runtime: both persistable citations become `contradicted`;
+      // a missing or unpersistable second side stays a named
+      // extraction_error rather than being collapsed to `unclear`.
+      {
+        const conflictingCitation = conflictingCitationFrom(item);
+        if (!citingCitationIsPersistable(item)) {
+          return invalidCitationOutcome(subject, criterionId);
+        }
+        if (conflictingCitation === undefined || !conflictingCitationIsPersistable(item)) {
+          return {
+            schemaVersion: CONTRACT_SCHEMA_VERSION,
+            kind: "extraction_error",
+            organizationId,
+            candidateId,
+            criterionId,
+            errorCode: "contradiction_missing_conflicting_citation",
+            message:
+              "The model reported a contradiction but did not supply a persistable conflicting citation; " +
+              "a persistable contradicted outcome requires both sides of the conflict.",
+            retryable: true
+          };
+        }
+        return {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          organizationId,
+          candidateId,
+          criterionId,
+          citation: citationFrom(item),
+          conflictingCitation
+        };
       }
-      return {
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        kind: "extraction_error",
-        organizationId,
-        candidateId,
-        criterionId,
-        errorCode: "contradiction_missing_conflicting_citation",
-        message:
-          "The model reported a contradiction but the extraction schema supplies only one quote; " +
-          "a persistable contradicted outcome requires both sides of the conflict.",
-        retryable: true
-      };
     case "supported":
     case "partially_supported":
     case "unclear":
