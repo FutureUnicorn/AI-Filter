@@ -102,16 +102,33 @@ test("every outcome carries the attribution it was given, on every kind", () => 
 });
 
 test("an empty attribution is rejected rather than producing unpersistable outcomes", () => {
-  for (const subject of [
-    { organizationId: "", candidateId: "c" },
-    { organizationId: "o", candidateId: "" },
-    { organizationId: "   ", candidateId: "c" }
-  ]) {
-    assert.throws(
-      () => mapRubricToEvidence(subject, ["a"], [notFound("a")]),
-      /non-empty organizationId and candidateId/
-    );
-  }
+  assert.throws(
+    () => mapRubricToEvidence({ organizationId: "", candidateId: "c" }, ["a"], [notFound("a")]),
+    /UUID organizationId/
+  );
+  assert.throws(
+    () => mapRubricToEvidence({ organizationId: "   ", candidateId: "c" }, ["a"], [notFound("a")]),
+    /UUID organizationId/
+  );
+  assert.throws(
+    () =>
+      mapRubricToEvidence(
+        { organizationId: SUBJECT.organizationId, candidateId: "" },
+        ["a"],
+        [notFound("a")]
+      ),
+    /non-empty candidateId/
+  );
+});
+
+test("a nonempty non-UUID organizationId is rejected rather than producing unpersistable outcomes", () => {
+  // evidenceOutcomeSchema requires organizationId: z.uuid() on every
+  // kind. "org-1" is nonempty, so a whitespace-only check used to let it
+  // through and every generated outcome then failed the contract.
+  assert.throws(
+    () => mapRubricToEvidence({ organizationId: "org-1", candidateId: "c" }, ["a"], [notFound("a")]),
+    /UUID organizationId/
+  );
 });
 
 test("a criterion the model omitted becomes extraction_error, never a silently invented not_found", () => {

@@ -440,12 +440,16 @@ export function mapRubricToEvidence(
   // Validated for the same reason the criterion IDs below are, and the
   // comment there states it: this function advertises its output as
   // persistable EvidenceOutcomes, and evidenceOutcomeSchema requires a
-  // uuid organizationId and a non-empty candidateId. Constructing
-  // outcomes carrying an empty attribution would hand back values that
-  // cannot actually be persisted, and the failure would surface far from
-  // here.
-  if (subject.organizationId.trim().length === 0 || subject.candidateId.trim().length === 0) {
-    throw new Error("mapRubricToEvidence requires a non-empty organizationId and candidateId");
+  // UUID organizationId and a non-empty candidateId. A nonempty but
+  // non-UUID organizationId (for example "org-1") used to pass a
+  // whitespace-only check and then fail every contract branch at persist
+  // time. Constructing outcomes carrying an unpersistable attribution
+  // would surface that failure far from here.
+  if (subject.candidateId.trim().length === 0) {
+    throw new Error("mapRubricToEvidence requires a non-empty candidateId");
+  }
+  if (!z.uuid().safeParse(subject.organizationId).success) {
+    throw new Error("mapRubricToEvidence requires a UUID organizationId");
   }
   // The rubric IDs arrive as an unconstrained string[] with no upstream
   // schema or branded type guaranteeing anything about them, so they are
