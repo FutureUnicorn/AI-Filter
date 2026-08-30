@@ -101,9 +101,12 @@ and administrator-audit requirements are documented in
 `tests/integration/cross-tenant-access.test.ts` exercises the real memberships
 RLS policy (`packages/db/migrations/0004_tenant_scoped_rls.sql`) against a
 real, disposable Postgres schema -- it needs `SIGNAL_AUDIT_RLS_DATABASE_URL`
-set to any reachable Postgres connection string. The same local Postgres
-`pnpm dev:infra` already starts works: it creates its own throwaway schema
-inside whatever database you point it at, so pointing it at your local dev
+set to a Postgres connection string whose role can `CREATE SCHEMA` and
+`CREATE ROLE` -- not merely any reachable database. The probe builds a
+throwaway schema and a throwaway login role, exercises the policy as that
+role, and drops both afterwards, so it needs the privileges to create them.
+The local Postgres `pnpm dev:infra` starts already qualifies. Everything it
+creates is namespaced and removed, so pointing it at your local development
 database is safe.
 
 ```bash
