@@ -75,6 +75,18 @@ test("buildLogEntry leaves valid numeric context values (statusCode, durationMs)
   assert.equal(entry.context?.durationMs, 42);
 });
 
+test("buildLogEntry drops invalid numeric context values instead of coercing them to strings", () => {
+  const entry = buildLogEntry("info", "worker.ready", {
+    statusCode: "200" as unknown as number,
+    durationMs: -1,
+    errorCode: "db_error"
+  });
+  assert.equal(entry.context?.statusCode, undefined);
+  assert.equal(entry.context?.durationMs, undefined);
+  assert.equal(entry.context?.errorCode, "db_error");
+  assert.equal(JSON.stringify(entry).includes("[REDACTED]"), false);
+});
+
 test("logStructured emits one parseable JSON line to stdout for info/debug", (t) => {
   const logMock = t.mock.method(console, "log", () => undefined);
   logStructured("info", "worker.ready", { requestId: REQUEST_ID });
@@ -130,11 +142,11 @@ test("an unregistered event name is rejected even when it looks like a dotted ke
   }
 });
 
-test("a non-primitive value in an allowlisted context key cannot smuggle PII through", () => {
+test("a non-primitive value in an allowlisted string field cannot smuggle PII through", () => {
   const entry = buildLogEntry("info", "worker.ready", {
-    durationMs: { email: "candidate@acme.test" }
-  } as unknown as { durationMs: number });
-  assert.equal(entry.context?.durationMs, "[REDACTED]");
+    action: { email: "candidate@acme.test" }
+  } as unknown as { action: string });
+  assert.equal(entry.context?.action, "[REDACTED]");
   assert.equal(JSON.stringify(entry).includes("candidate@acme.test"), false);
 });
 
@@ -166,7 +178,7 @@ test("redactPii keeps several adjacent correlation identifiers intact", () => {
   assert.equal(redactPii(value), value);
 });
 
-test("the development magic-link sender actually exposes the link, and never through the log stream", async (t) => {
+test("the development magic-link sender keeps local dev output non-sensitive", async (t) => {
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const logMock = t.mock.method(console, "log", () => undefined);
   const link = "http://localhost:3000/auth/redeem?token=abc123";
@@ -177,12 +189,16 @@ test("the development magic-link sender actually exposes the link, and never thr
   });
 
   const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("");
-  assert.ok(written.includes(link), "the developer must be able to reach the link");
+  assert.equal(written.includes(link), false, "the raw magic link must stay out of terminal output");
+  assert.equal(written.includes("dev@example.test"), false);
+  assert.equal(written.includes("token=abc123"), false);
+  assert.equal(written.includes("token=[REDACTED]"), true, "the sender should still emit a redacted link hint");
 
   // The structured log records delivery but must not carry the credential.
   const logged = logMock.mock.calls.map((call) => String(call.arguments[0])).join("");
   assert.equal(logged.includes(link), false);
   assert.equal(logged.includes("dev@example.test"), false);
+  assert.equal(logged.includes("abc123"), false);
 });
 
 test("the development magic-link sender refuses to run in a hosted environment", () => {
