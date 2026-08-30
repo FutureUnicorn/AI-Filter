@@ -220,7 +220,7 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["criterion_id", "state", "quote", "source"],
+        required: ["criterion_id", "state", "quote", "source", "conflicting"],
         properties: {
           criterion_id: { type: "string", minLength: 1 },
           state: { type: "string", enum: EVIDENCE_EXTRACTION_STATES },
@@ -234,9 +234,48 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
             additionalProperties: false,
             required: ["document", "page_or_section", "offset"],
             properties: {
-              document: { type: "string" },
+              // minLength here for the same reason as criterion_id: the
+              // Zod validator requires this unconditionally, so leaving
+              // the model-facing schema silent asks the provider for
+              // something it will then be rejected for producing.
+              document: { type: "string", minLength: 1 },
               page_or_section: { type: "string" },
               offset: { type: "integer" }
+            }
+          },
+          // A contradiction has two sides. AF-13's ContradictedEvidence
+          // requires BOTH `citation` and `conflictingCitation`, so an item
+          // carrying one quote could never map to a persistable
+          // contradicted outcome -- it is the only state in the union that
+          // needs a second citation, and without this the kind is
+          // unreachable no matter what the model returns.
+          //
+          // Expressed as a null union rather than an omitted key because
+          // this schema is sent with `strict: true`, where optionality is
+          // spelled `type: [..., "null"]` rather than by leaving the
+          // property out of `required`. Non-null exactly when state is
+          // "contradicted"; the Zod validator enforces that both ways.
+          conflicting: {
+            type: ["object", "null"],
+            additionalProperties: false,
+            required: ["quote", "source"],
+            description:
+              "The opposing evidence, when state is contradicted. Must be null for every other state.",
+            properties: {
+              quote: {
+                type: "string",
+                description: "Exact verbatim substring that conflicts with the primary quote."
+              },
+              source: {
+                type: "object",
+                additionalProperties: false,
+                required: ["document", "page_or_section", "offset"],
+                properties: {
+                  document: { type: "string", minLength: 1 },
+                  page_or_section: { type: "string" },
+                  offset: { type: "integer" }
+                }
+              }
             }
           }
         }
@@ -261,7 +300,22 @@ export const evidenceExtractionItemSchema = z
       document: z.string().min(1),
       page_or_section: z.string(),
       offset: z.number().int()
-    })
+    }),
+    // Nullish rather than required-nullable: the model-facing JSON schema
+    // above always asks for the key (strict mode), but this validator is
+    // also the entry point for callers constructing items directly, and
+    // requiring the key there would break every non-contradicted fixture
+    // for no safety gain. The refinements below carry the real rule.
+    conflicting: z
+      .strictObject({
+        quote: z.string(),
+        source: z.strictObject({
+          document: z.string().min(1),
+          page_or_section: z.string(),
+          offset: z.number().int()
+        })
+      })
+      .nullish()
   })
   .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.trim().length > 0), {
     message: "quote must be empty only when state is not_found, and citing quotes must contain non-whitespace",
@@ -274,7 +328,36 @@ export const evidenceExtractionItemSchema = z
   .refine((item) => item.state === "not_found" || item.source.offset >= 0, {
     message: "citing states require a nonnegative offset",
     path: ["source", "offset"]
-  });
+  })
+  // A contradiction needs both sides or it cannot be persisted at all:
+  // AF-13's ContradictedEvidence requires citation AND conflictingCitation.
+  .refine((item) => item.state !== "contradicted" || (item.conflicting ?? null) !== null, {
+    message: "state contradicted requires a conflicting quote and source; a contradiction has two sides",
+    path: ["conflicting"]
+  })
+  // ...and only a contradiction may carry one. Without this, a supported
+  // item could smuggle a second citation that nothing downstream reads,
+  // which is a quiet way to lose evidence a reviewer was meant to see.
+  .refine((item) => item.state === "contradicted" || (item.conflicting ?? null) === null, {
+    message: "only state contradicted may carry a conflicting quote",
+    path: ["conflicting"]
+  })
+  .refine(
+    (item) =>
+      item.state !== "contradicted" ||
+      (item.conflicting != null &&
+        item.conflicting.quote.trim().length > 0 &&
+        item.conflicting.source.page_or_section.trim().length > 0 &&
+        item.conflicting.source.offset >= 0),
+    {
+      // The same coordinate rules the primary citation already gets. A
+      // conflicting side that fails sourceCitationSchema would make the
+      // contradicted outcome unpersistable for a second, subtler reason.
+      message:
+        "a conflicting side requires a nonempty quote, a nonempty page_or_section and a nonnegative offset",
+      path: ["conflicting"]
+    }
+  );
 
 export const evidenceExtractionResponseSchema = z.strictObject({
   items: z.array(evidenceExtractionItemSchema)
@@ -307,11 +390,34 @@ function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   };
 }
 
+function conflictingCitationFrom(item: EvidenceExtractionItem): SourceCitation | undefined {
+  const side = item.conflicting;
+  if (side == null) {
+    return undefined;
+  }
+  return {
+    document: side.source.document,
+    pageOrSection: side.source.page_or_section,
+    offset: side.source.offset,
+    quote: side.quote
+  };
+}
+
 function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
   return (
     item.source.page_or_section.trim().length > 0 &&
     item.source.offset >= 0 &&
     item.quote.trim().length > 0
+  );
+}
+
+function conflictingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
+  const side = item.conflicting;
+  return (
+    side != null &&
+    side.source.page_or_section.trim().length > 0 &&
+    side.source.offset >= 0 &&
+    side.quote.trim().length > 0
   );
 }
 
@@ -360,39 +466,42 @@ function mapExtractedItem(subject: EvidenceSubject, item: EvidenceExtractionItem
     case "not_found":
       return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId, candidateId, criterionId };
     case "contradicted":
-      // A second defect CI surfaced alongside the missing attribution,
-      // and it is not a typing nuisance.
-      //
-      // AF-13's review made ContradictedEvidence carry BOTH sides of the
-      // conflict -- citation AND conflictingCitation -- because a
-      // contradiction a reviewer can only see one half of is not
-      // reviewable. An extraction item carries one quote. So a single
-      // item can no longer produce a persistable contradicted outcome,
-      // and constructing one with the second side missing would hand
-      // back a value that fails evidenceOutcomeSchema.
-      //
-      // Reported as a retryable extraction_error naming the real reason,
-      // rather than downgraded to `unclear`: a model that found
-      // conflicting evidence and a model that found ambiguous evidence
-      // are saying different things, and collapsing them would lose the
-      // signal this criterion most needs a human for. AF-35's
-      // model-facing schema has to grow a second quote for the
-      // contradicted state before this can map properly.
-      if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(subject, criterionId);
+      // AF-13 requires both sides of the conflict. AF-35's follow-up
+      // (#64) added `conflicting` so a validated contradicted item can
+      // carry them. The item type still types that field as nullish
+      // (direct-construction fixtures omit it), so the mapper narrows
+      // at runtime: both persistable citations become `contradicted`;
+      // a missing or unpersistable second side stays a named
+      // extraction_error rather than being collapsed to `unclear`.
+      {
+        const conflictingCitation = conflictingCitationFrom(item);
+        if (!citingCitationIsPersistable(item)) {
+          return invalidCitationOutcome(subject, criterionId);
+        }
+        if (conflictingCitation === undefined || !conflictingCitationIsPersistable(item)) {
+          return {
+            schemaVersion: CONTRACT_SCHEMA_VERSION,
+            kind: "extraction_error",
+            organizationId,
+            candidateId,
+            criterionId,
+            errorCode: "contradiction_missing_conflicting_citation",
+            message:
+              "The model reported a contradiction but did not supply a persistable conflicting citation; " +
+              "a persistable contradicted outcome requires both sides of the conflict.",
+            retryable: true
+          };
+        }
+        return {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          organizationId,
+          candidateId,
+          criterionId,
+          citation: citationFrom(item),
+          conflictingCitation
+        };
       }
-      return {
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        kind: "extraction_error",
-        organizationId,
-        candidateId,
-        criterionId,
-        errorCode: "contradiction_missing_conflicting_citation",
-        message:
-          "The model reported a contradiction but the extraction schema supplies only one quote; " +
-          "a persistable contradicted outcome requires both sides of the conflict.",
-        retryable: true
-      };
     case "supported":
     case "partially_supported":
     case "unclear":
