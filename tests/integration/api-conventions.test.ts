@@ -33,6 +33,19 @@ test("withRequestId sets the header without disturbing existing headers", () => 
   assert.equal(headers.get("content-type"), "application/json");
 });
 
+test("withRequestId refuses a malformed request id instead of emitting a contract-invalid header", () => {
+  // `RequestId` is a plain alias, so the compiler cannot stop this; a
+  // caller propagating an untrusted inbound X-Request-Id must fail here
+  // rather than emit a header that fails requestIdSchema.
+  for (const malformed of ["bad", "", "req_not-a-uuid", crypto.randomUUID()]) {
+    assert.throws(
+      () => withRequestId({}, malformed),
+      /withRequestId requires a well-formed RequestId/,
+      `expected withRequestId to reject ${JSON.stringify(malformed)}`
+    );
+  }
+});
+
 test("every API_ERROR_CODES entry has exactly one status in API_ERROR_STATUS", () => {
   assert.deepEqual(new Set(Object.keys(API_ERROR_STATUS)), new Set(API_ERROR_CODES));
 });
@@ -57,6 +70,85 @@ test("buildApiError carries optional details through when provided", () => {
     details: { field: "criterionId" }
   });
   assert.deepEqual(body.error.details, { field: "criterionId" });
+});
+
+test("buildApiError rejects a non-finite details value that would serialize to a different value", () => {
+  // TypeScript's `number` admits Infinity/NaN, so these calls type-check
+  // fully. Left unchecked they produced a body that failed the very
+  // apiErrorBodySchema this function advertises, and JSON.stringify
+  // turned them into `null` -- a silently changed value, not a rejection.
+  for (const nonFinite of [Infinity, -Infinity, NaN]) {
+    assert.throws(
+      () =>
+        buildApiError({
+          requestId: generateRequestId(),
+          code: "internal_error",
+          message: "Something broke.",
+          details: { count: nonFinite }
+        }),
+      /buildApiError produced a body that fails apiErrorBodySchema/,
+      `expected buildApiError to reject details: { count: ${String(nonFinite)} }`
+    );
+  }
+});
+
+test("buildApiError rejects negative zero, which is finite but does not round-trip through JSON", () => {
+  // -0 slips past a plain `.finite()` check because it genuinely is
+  // finite, yet `JSON.stringify(-0)` emits `0`: the value handed in is
+  // not the value that comes back out, which is the exact invariant this
+  // schema exists to enforce.
+  assert.equal(JSON.stringify(-0), "0");
+  assert.equal(Object.is(-0, 0), false);
+  assert.throws(
+    () =>
+      buildApiError({
+        requestId: generateRequestId(),
+        code: "internal_error",
+        message: "Something broke.",
+        details: { delta: -0 }
+      }),
+    /buildApiError produced a body that fails apiErrorBodySchema/
+  );
+});
+
+test("every accepted details value survives a JSON round trip unchanged", () => {
+  // The general property the individual rejections above are protecting:
+  // whatever buildApiError accepts must come back out of JSON identical.
+  const details = { count: 42, ratio: -0.5, zero: 0, nested: { list: [1, 2, 3], flag: true, empty: null } };
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), body);
+});
+
+test("buildApiError returns parsed.data so non-enumerable toJSON cannot hijack serialization", () => {
+  const details = { count: 42 };
+  Object.defineProperty(details, "toJSON", {
+    value: () => ({ hijacked: true }),
+    enumerable: false
+  });
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(body)).error.details, { count: 42 });
+});
+
+test("buildApiError still accepts ordinary finite and nested JSON details", () => {
+  const details = { count: 42, ratio: -0.5, nested: { list: [1, 2, 3], flag: true, empty: null } };
+  const { body } = buildApiError({
+    requestId: generateRequestId(),
+    code: "invalid_request",
+    message: "Bad payload.",
+    details
+  });
+  assert.deepEqual(body.error.details, details);
+  assert.equal(apiErrorBodySchema.safeParse(body).success, true);
 });
 
 test("apiErrorBodySchema rejects an unrecognized top-level property", () => {
@@ -103,6 +195,15 @@ test("an invalid Idempotency-Key is distinguished from a missing one", () => {
   assert.equal(result.required, true);
   assert.equal(result.required && result.outcome, "invalid");
   assert.equal(idempotencyKeySchema.safeParse("has a space").success, false);
+});
+
+test("an explicitly empty Idempotency-Key header is invalid, not missing", () => {
+  // Headers.get() returns "" for a header the caller actually sent
+  // empty, distinct from null for a header never sent at all -- these
+  // are different mistakes and must not collapse into the same outcome.
+  const result = checkIdempotencyRequirement("PUT", "");
+  assert.equal(result.required, true);
+  assert.equal(result.required && result.outcome, "invalid");
 });
 
 test("a well-formed Idempotency-Key is echoed back exactly", () => {

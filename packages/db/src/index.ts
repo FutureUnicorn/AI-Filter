@@ -906,6 +906,20 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
     await admin.query(`CREATE ROLE ${role} NOSUPERUSER NOBYPASSRLS`);
+    // Being a member of the role is NOT enough to SET ROLE to it. Since
+    // PostgreSQL 16 a membership grant carries separate INHERIT, SET and
+    // ADMIN options, and the grant a CREATEROLE user receives implicitly
+    // on a role it creates is ADMIN only: verified on 17.10, the
+    // pg_auth_members row reads admin_option=true, inherit_option=false,
+    // set_option=false, and `SET ROLE` fails with "permission denied to
+    // set role". This probe therefore only ever worked because it was run
+    // as a superuser, which bypasses the check -- the same "works because
+    // the control is currently inert" shape AF-43 found in the RLS lookup.
+    //
+    // An explicit GRANT defaults to SET TRUE, so this makes the probe work
+    // for any role with CREATEROLE and CREATE ON SCHEMA rather than
+    // requiring superuser. Dropped with the role in the finally block.
+    await admin.query(`GRANT ${role} TO CURRENT_USER`);
     await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A'), ($2, 'Org B')`, [
@@ -916,10 +930,31 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       `INSERT INTO users (user_id, email, display_name) VALUES ($1, 'a@acme.test', 'A'), ($2, 'b@acme.test', 'B')`,
       [userA, userB]
     );
-    await admin.query(
-      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($3, $4, 'owner')`,
-      [orgA, userA, orgB, userB]
-    );
+    // Seeding memberships needs the same tenant scope the policy demands.
+    // 0004 uses FORCE ROW LEVEL SECURITY, so the table OWNER is subject to
+    // the policy too -- only a superuser bypasses it. Inserting both rows
+    // unscoped therefore fails with "new row violates row-level security
+    // policy" for any non-superuser, which is the second reason this probe
+    // silently required superuser. Each row is seeded inside its own
+    // organization's scope, in a transaction so the setting is local and
+    // cannot leak into the assertions below.
+    for (const [organizationId, userId] of [
+      [orgA, userA],
+      [orgB, userB]
+    ] as const) {
+      await admin.query("BEGIN");
+      try {
+        await admin.query("SELECT set_config('app.current_org_id', $1, true)", [organizationId]);
+        await admin.query(
+          `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`,
+          [organizationId, userId]
+        );
+        await admin.query("COMMIT");
+      } catch (error) {
+        await admin.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    }
 
     const asProbe = async (orgId: string | undefined, sql: string, params: unknown[] = []) => {
       await admin.query("BEGIN");
