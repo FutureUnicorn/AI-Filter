@@ -184,7 +184,20 @@ export function createOpenAiAdapter(
 // a model cannot self-report "the citation validator will reject me."
 
 export const EVIDENCE_EXTRACTION_SCHEMA_NAME = "evidence_response";
-export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "1.0.0";
+// Bumped to 2.0.0 by the same change that made `conflicting` required.
+//
+// Adding a required property is breaking in both directions: a response
+// that was valid under 1.0.0 (no `conflicting` key) is now rejected, and a
+// 2.0.0 response carries a key a 1.0.0 consumer does not expect. AF-40
+// persists this string on every extraction run, so leaving it at 1.0.0
+// would label two incompatible response shapes with the same version and
+// leave a consumer replaying that history unable to pick the right
+// validator -- the audit record would say the runs were comparable when
+// they are not.
+//
+// Major rather than minor because the break is to previously-valid input,
+// not an additive option.
+export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "2.0.0";
 
 export const EVIDENCE_EXTRACTION_STATES = [
   "supported",
