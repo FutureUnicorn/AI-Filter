@@ -758,7 +758,7 @@ export async function assertExtractionRunOrganizationDelete(
     await admin.query(`SET search_path TO "${schema}"`);
     for (const file of [
       "0002_organizations_users_memberships.sql",
-      "0007_evidence_extraction_runs.sql"
+      "0006_evidence_extraction_runs.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
@@ -778,6 +778,85 @@ export async function assertExtractionRunOrganizationDelete(
     throw new Error(
       "assertExtractionRunOrganizationDelete: deleting the organization SUCCEEDED, but an extraction run still references it"
     );
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-41 review (#24): budget totals must not lose precision ----
+
+export interface InferenceBudgetPrecisionObservations {
+  /** Reading a bigint past MAX_SAFE_INTEGER must throw, not round. */
+  readonly oversizedReadRejection: string;
+  /** The value Number() would have silently returned instead. */
+  readonly silentlyRoundedValue: number;
+  readonly storedValue: string;
+  /** cap_exceeded reports the real committed total. */
+  readonly capExceededTotalBefore: number;
+}
+
+export async function assertInferenceBudgetPrecision(
+  databaseUrl: string
+): Promise<InferenceBudgetPrecisionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const oversized = "9007199254740993"; // MAX_SAFE_INTEGER + 2
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO inference_usage_ledger (organization_id, model, period_start, input_tokens, output_tokens)
+       VALUES ($1,'gpt-5.6','2026-09-01',$2::bigint,0)`,
+      [org, oversized]
+    );
+
+    let oversizedReadRejection = "";
+    try {
+      await getInferenceUsage(databaseUrl, schema, {
+        organizationId: org,
+        model: "gpt-5.6",
+        periodStart: "2026-09-01"
+      });
+      throw new Error("assertInferenceBudgetPrecision: an oversized bigint was read without complaint");
+    } catch (error) {
+      oversizedReadRejection = error instanceof Error ? error.message : String(error);
+    }
+
+    // A second tenant with an ordinary total, to read back the cap_exceeded path.
+    await admin.query(
+      `UPDATE inference_usage_ledger SET input_tokens = 900, output_tokens = 100 WHERE organization_id = $1`,
+      [org]
+    );
+    const capped = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org,
+      model: "gpt-5.6",
+      periodStart: "2026-09-01",
+      inputTokens: 500,
+      outputTokens: 0,
+      maxTotalTokens: 1_200
+    });
+
+    return {
+      oversizedReadRejection,
+      silentlyRoundedValue: Number(oversized),
+      storedValue: oversized,
+      capExceededTotalBefore: capped.outcome === "cap_exceeded" ? capped.totalTokensBefore : -1
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
