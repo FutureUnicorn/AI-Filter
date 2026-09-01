@@ -53,7 +53,14 @@ const schemaVersionSchema = z.literal(CONTRACT_SCHEMA_VERSION);
  * at the persist/transport boundary. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-const sourceCitationSchema = z.strictObject({
+/**
+ * Exported so packages/ai can ask "will this citation actually persist?"
+ * by parsing it, rather than restating the rules. AF-36 restated them and
+ * omitted two -- a nonempty document, and an offset that is an integer
+ * rather than merely non-negative -- which let 0.5 and Infinity through.
+ * A predicate that duplicates a schema drifts from it; parsing cannot.
+ */
+export const sourceCitationSchema = z.strictObject({
   document: z.string().min(1),
   pageOrSection: z.string().min(1),
   offset: z.number().int().min(0),
