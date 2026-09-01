@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,8 @@ import type {
   CandidateDataErasureTrigger,
   CandidateDecisionKind,
   PrivacyRequestKind,
+  RoleAuditReport,
+  ShareLinkResolution,
   PrivacyRequestStatus,
   PrivacyRequestSubjectKind,
   CanonicalTextExtraction,
@@ -45,12 +47,14 @@ import {
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   computePrivacyRequestDueDate,
+  computeShareLinkExpiry,
   erasedStorageKey,
   isPrivacyRequestOverdue,
   mapCsvRowToApplication,
   planCandidateDataErasure,
   summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
+  renderShareLinkResolution,
   summarizeImportRows,
   validatePrivacyRequestTransition
 } from "@signal-audit/domain";
@@ -5730,6 +5734,382 @@ export async function assertPrivacyRequestLifecycle(
       candidateWithoutApplicationRejection,
       employerWithApplicationRejection,
       unattributedResolutionRejection,
+      crossTenantRejection
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-90: unauthenticated share link for the role-level audit report ----
+
+export interface CreateAuditReportShareLinkInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  /** SHA-256 hex of the raw token. The raw token never reaches this layer. */
+  readonly tokenHash: string;
+  readonly report: RoleAuditReport;
+  readonly createdByUserId: string;
+  readonly createdAt: Date;
+  readonly days?: number | undefined;
+}
+
+export async function createAuditReportShareLink(
+  databaseUrl: string,
+  schema: string,
+  input: CreateAuditReportShareLinkInput
+): Promise<{ readonly shareLinkId: string; readonly expiresAt: string }> {
+  assertSafeSchema(schema);
+  const expiresAt = computeShareLinkExpiry(input.createdAt, input.days ?? undefined);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const inserted = await client.query<{ share_link_id: string; expires_at: Date }>(
+      `INSERT INTO "${schema}".audit_report_share_links
+         (organization_id, role_id, token_hash, report, report_generated_at, expires_at,
+          created_by_user_id, created_at)
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8)
+       RETURNING share_link_id, expires_at`,
+      [
+        input.organizationId,
+        input.roleId,
+        input.tokenHash,
+        JSON.stringify(input.report),
+        input.report.generatedAt,
+        expiresAt,
+        input.createdByUserId,
+        input.createdAt.toISOString()
+      ]
+    );
+    const row = inserted.rows[0];
+    if (row === undefined) {
+      throw new Error("createAuditReportShareLink: insert returned no row");
+    }
+    return { shareLinkId: row.share_link_id, expiresAt: row.expires_at.toISOString() };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Resolves a token to a report, and records the disclosure when it serves one.
+ *
+ * The lookup is by token hash alone -- there is no organization to scope
+ * it to, because the caller is unauthenticated and naming one would just
+ * be a parameter an attacker also controls. Tenant integrity comes from
+ * the row itself: the link was minted against a (role_id, organization_id)
+ * pair that the schema forced to be real.
+ *
+ * A view is logged only when the report is actually served. A refused
+ * attempt disclosed nothing, and recording it here would make
+ * audit_report_share_link_views mean two different things -- "this report
+ * was seen" and "someone knocked" -- which is exactly the ambiguity that
+ * makes an access log unusable as evidence later. The refusal reason is
+ * still returned for the server log, so a revoked link being retried is
+ * observable; it is just not conflated with a disclosure.
+ */
+export async function resolveAuditReportShareLink(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string,
+  now: Date
+): Promise<ShareLinkResolution> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    const found = await client.query<{
+      share_link_id: string;
+      report: RoleAuditReport;
+      expires_at: Date;
+      revoked_at: Date | null;
+    }>(
+      `SELECT share_link_id, report, expires_at, revoked_at
+         FROM "${schema}".audit_report_share_links
+        WHERE token_hash = $1`,
+      [tokenHash]
+    );
+    const link = found.rows[0];
+    if (link === undefined) {
+      await client.query("COMMIT");
+      return { status: "unavailable", internalReason: "not_found" };
+    }
+    // Revocation is checked before expiry: a link that was revoked and has
+    // since also expired was still revoked, and an operator reading the log
+    // needs the reason someone acted, not the one the clock supplied later.
+    if (link.revoked_at !== null) {
+      await client.query("COMMIT");
+      return { status: "unavailable", internalReason: "revoked" };
+    }
+    if (link.expires_at.getTime() <= now.getTime()) {
+      await client.query("COMMIT");
+      return { status: "unavailable", internalReason: "expired" };
+    }
+    await client.query(
+      `INSERT INTO "${schema}".audit_report_share_link_views (share_link_id) VALUES ($1)`,
+      [link.share_link_id]
+    );
+    await client.query("COMMIT");
+    return { status: "available", report: link.report };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Kills one link, or every link on a role.
+ *
+ * Per-link answers "I sent it to the wrong person"; the role-wide form
+ * answers "the pilot is over". The second is the same statement without a
+ * link id rather than a separate mechanism, so there is one revocation
+ * path to reason about. Already-revoked links keep their original
+ * revoked_at: re-revoking must not rewrite when the first revocation
+ * happened, which is the fact anyone would later be asking about.
+ */
+export async function revokeAuditReportShareLinks(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly roleId: string;
+    readonly shareLinkId?: string | undefined;
+    readonly revokedByUserId: string;
+  }
+): Promise<{ readonly revoked: number }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query(
+      `UPDATE "${schema}".audit_report_share_links
+          SET revoked_at = CURRENT_TIMESTAMP, revoked_by_user_id = $1
+        WHERE organization_id = $2
+          AND role_id = $3
+          AND revoked_at IS NULL
+          AND ($4::uuid IS NULL OR share_link_id = $4::uuid)`,
+      [input.revokedByUserId, input.organizationId, input.roleId, input.shareLinkId ?? null]
+    );
+    return { revoked: result.rowCount ?? 0 };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface AuditReportShareLinkObservations {
+  readonly liveResolution: string;
+  readonly liveViewCount: number;
+  readonly expiredResolution: string;
+  readonly revokedResolution: string;
+  readonly unknownResolution: string;
+  /** Views logged against links that were refused. Must stay zero. */
+  readonly refusedViewCount: number;
+  /** Every failure must render identically, or the endpoint is an oracle. */
+  readonly distinctFailureBodies: readonly string[];
+  readonly distinctFailureStatuses: readonly number[];
+  /** Re-revoking must not rewrite when the first revocation happened. */
+  readonly revokedAtUnchangedOnSecondRevoke: boolean;
+  readonly roleWideRevokedCount: number;
+  readonly otherRoleLinkStillLive: boolean;
+  readonly viewsUpdateRejection: string;
+  readonly expiryCeilingRejection: string;
+  readonly crossTenantRejection: string;
+}
+
+/**
+ * Proves the share link refuses what it must, against the real schema.
+ *
+ * The property worth proving is a negative one: that an unauthenticated
+ * caller cannot tell a revoked link from an expired one from a token that
+ * never existed. That is invisible in the happy path and easy to break
+ * later with a well-meant "helpful" error message, so it is asserted as a
+ * set comparison rather than three separate cases.
+ */
+export async function assertAuditReportShareLinkSecurity(
+  databaseUrl: string
+): Promise<AuditReportShareLinkObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `share_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const otherOrg = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const otherRoleId = "99999999-9999-4999-8999-999999999999";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const hash = (seed: string): string => createHash("sha256").update(seed).digest("hex");
+  const now = new Date("2026-09-01T00:00:00.000Z");
+
+  const report = {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId: org,
+    roleId,
+    generatedAt: "2026-08-01T00:00:00.000Z",
+    metrics: {},
+    corrections: null,
+    auditSample: null
+  } as unknown as RoleAuditReport;
+
+  const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`assertAuditReportShareLinkSecurity: "${label}" SUCCEEDED but must be refused`);
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0025_audit_report_share_links.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [
+      org,
+      otherOrg
+    ]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `share_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
+       VALUES ($1,$2,'Eng',$4), ($3,$2,'Design',$4)`,
+      [roleId, org, otherRoleId, userId]
+    );
+
+    const link = async (seed: string, days: number, createdAt: Date): Promise<string> =>
+      (
+        await createAuditReportShareLink(databaseUrl, schema, {
+          organizationId: org,
+          roleId,
+          tokenHash: hash(seed),
+          report,
+          createdByUserId: userId,
+          createdAt,
+          days
+        })
+      ).shareLinkId;
+
+    const liveId = await link("live", 30, now);
+    await link("expired", 1, new Date("2026-01-01T00:00:00.000Z"));
+    const revokedId = await link("revoked", 30, now);
+    const roleWideA = await link("rolewide-a", 30, now);
+    await createAuditReportShareLink(databaseUrl, schema, {
+      organizationId: org,
+      roleId: otherRoleId,
+      tokenHash: hash("other-role"),
+      report,
+      createdByUserId: userId,
+      createdAt: now,
+      days: 30
+    });
+
+    await revokeAuditReportShareLinks(databaseUrl, schema, {
+      organizationId: org,
+      roleId,
+      shareLinkId: revokedId,
+      revokedByUserId: userId
+    });
+    const firstRevokedAt = await admin.query<{ revoked_at: Date }>(
+      `SELECT revoked_at FROM audit_report_share_links WHERE share_link_id = $1`,
+      [revokedId]
+    );
+    // Re-revoking must leave the original timestamp alone: when the first
+    // revocation happened is the fact anyone would later be asking about.
+    await revokeAuditReportShareLinks(databaseUrl, schema, {
+      organizationId: org,
+      roleId,
+      shareLinkId: revokedId,
+      revokedByUserId: userId
+    });
+    const secondRevokedAt = await admin.query<{ revoked_at: Date }>(
+      `SELECT revoked_at FROM audit_report_share_links WHERE share_link_id = $1`,
+      [revokedId]
+    );
+
+    const resolve = async (seed: string): Promise<ShareLinkResolution> =>
+      resolveAuditReportShareLink(databaseUrl, schema, hash(seed), now);
+
+    const live = await resolve("live");
+    const expired = await resolve("expired");
+    const revoked = await resolve("revoked");
+    const unknown = await resolve("never-existed");
+
+    const describe = (r: ShareLinkResolution): string =>
+      r.status === "available" ? "available" : r.internalReason;
+
+    const liveViews = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_report_share_link_views WHERE share_link_id = $1`,
+      [liveId]
+    );
+    const refusedViews = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_report_share_link_views WHERE share_link_id <> $1`,
+      [liveId]
+    );
+
+    const rendered = [expired, revoked, unknown].map((r) => renderShareLinkResolution(r));
+
+    // Role-wide revocation: everything still live on this role, and nothing
+    // on any other role.
+    const roleWide = await revokeAuditReportShareLinks(databaseUrl, schema, {
+      organizationId: org,
+      roleId,
+      revokedByUserId: userId
+    });
+    const otherRoleLink = await resolve("other-role");
+    void roleWideA;
+
+    const viewsUpdateRejection = await expectRejected("views:update", () =>
+      admin.query(`UPDATE audit_report_share_link_views SET viewed_at = CURRENT_TIMESTAMP`)
+    );
+    const expiryCeilingRejection = await expectRejected("expiry:beyond_ceiling", () =>
+      admin.query(
+        `INSERT INTO audit_report_share_links
+           (organization_id, role_id, token_hash, report, report_generated_at, expires_at, created_by_user_id)
+         VALUES ($1,$2,$3,'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '200 days', $4)`,
+        [org, roleId, hash("too-long"), userId]
+      )
+    );
+    const crossTenantRejection = await expectRejected("mint:cross_tenant", () =>
+      admin.query(
+        `INSERT INTO audit_report_share_links
+           (organization_id, role_id, token_hash, report, report_generated_at, expires_at, created_by_user_id)
+         VALUES ($1,$2,$3,'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '30 days', $4)`,
+        [otherOrg, roleId, hash("cross-tenant"), userId]
+      )
+    );
+
+    return {
+      liveResolution: describe(live),
+      liveViewCount: Number.parseInt(liveViews.rows[0]?.count ?? "", 10),
+      expiredResolution: describe(expired),
+      revokedResolution: describe(revoked),
+      unknownResolution: describe(unknown),
+      refusedViewCount: Number.parseInt(refusedViews.rows[0]?.count ?? "", 10),
+      distinctFailureBodies: [...new Set(rendered.map((r) => r.body))],
+      distinctFailureStatuses: [...new Set(rendered.map((r) => r.httpStatus))],
+      revokedAtUnchangedOnSecondRevoke:
+        firstRevokedAt.rows[0]?.revoked_at.getTime() === secondRevokedAt.rows[0]?.revoked_at.getTime(),
+      roleWideRevokedCount: roleWide.revoked,
+      otherRoleLinkStillLive: otherRoleLink.status === "available",
+      viewsUpdateRejection,
+      expiryCeilingRejection,
       crossTenantRejection
     };
   } finally {
