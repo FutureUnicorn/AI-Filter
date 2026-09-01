@@ -2720,7 +2720,17 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // stronger sense too: it is the audit metadata the deletion workflow is
   // specified to preserve, so a retention job that purged it would destroy
   // the only evidence that the deletion it is auditing ever happened.
-  "candidate_data_erasures"
+  "candidate_data_erasures",
+  // AF-64. The record of a privacy obligation: who asked, for what, by
+  // when, and what they were told. Exempt for the same reason the erasure
+  // receipt is -- purging it would destroy the only evidence that a
+  // request was answered in time, which is the thing a regulator asks for.
+  // The free-text fields (refusal_reason, extension_reason, and an event's
+  // note) are operator-written and must stay operator-facing: this
+  // exemption is false the moment someone pastes a candidate's details
+  // into one, the same caveat that applies to support_access_grants.
+  "privacy_requests",
+  "privacy_request_events"
 ]);
 
 export type RetentionClassification = "planned" | "exempt" | "unclassified";
@@ -3331,6 +3341,206 @@ export function summarizeCandidateDataErasureResidue(
       "AF-91: " +
       blocked.map((step) => step.surface).join("; ") +
       "."
+  };
+}
+
+
+// ---- AF-64: privacy export/delete requests ----
+//
+// "A tracked request/response lifecycle for candidate or employer data
+// export and deletion requests, with a due date and status."
+//
+// AF-62 built the machinery that erases a candidate's data. This is the
+// obligation around it. The due date is the reason it is a lifecycle
+// rather than a function call: a deletion that happened and a deletion
+// that happened in time are different claims, and only the second is what
+// a data subject is owed.
+//
+// The deadline is a calendar month, not thirty days. GDPR Article 12(3)
+// says "within one month of receipt of the request", and calendar months
+// vary in length -- a request received on 31 January is due 28 February,
+// which a 30-day rule would put on 2 March, two days into a breach that
+// nobody would notice because the arithmetic looks reasonable. The same
+// rule allows two further months for complex or numerous requests, but
+// only if the data subject is told within the original month, so an
+// extension recorded later is a late response being backdated rather than
+// an extension.
+
+export const PRIVACY_REQUEST_SUBJECT_KINDS = ["candidate", "employer"] as const;
+export type PrivacyRequestSubjectKind = (typeof PRIVACY_REQUEST_SUBJECT_KINDS)[number];
+
+export const PRIVACY_REQUEST_KINDS = ["export", "delete"] as const;
+export type PrivacyRequestKind = (typeof PRIVACY_REQUEST_KINDS)[number];
+
+export const PRIVACY_REQUEST_STATUSES = [
+  "received",
+  "in_progress",
+  "completed",
+  "refused"
+] as const;
+export type PrivacyRequestStatus = (typeof PRIVACY_REQUEST_STATUSES)[number];
+
+/** Article 12(3)'s base period. */
+export const PRIVACY_REQUEST_RESPONSE_MONTHS = 1;
+/** The most it can be extended by, and only with a timely notification. */
+export const PRIVACY_REQUEST_MAX_EXTENSION_MONTHS = 2;
+
+/**
+ * Adds calendar months the way Postgres INTERVAL does, clamping to the end
+ * of the target month.
+ *
+ * JavaScript's own Date arithmetic is wrong for this and wrong in the
+ * dangerous direction: `setMonth` overflows rather than clamping, so
+ * 31 January plus one month becomes 3 March -- a deadline three days
+ * later than the law allows, produced by code that looks correct. The
+ * database computes the same boundary with INTERVAL '1 month', so the two
+ * have to agree or a row will fail a CHECK that the domain thought it
+ * satisfied.
+ */
+export function addCalendarMonths(from: Date, months: number): Date {
+  if (!Number.isInteger(months)) {
+    throw new Error(`addCalendarMonths requires a whole number of months, got: ${months}`);
+  }
+  const year = from.getUTCFullYear();
+  const month = from.getUTCMonth() + months;
+  const targetYear = year + Math.floor(month / 12);
+  const targetMonth = ((month % 12) + 12) % 12;
+  // Day 0 of the following month is the last day of the target month.
+  const lastDayOfTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const day = Math.min(from.getUTCDate(), lastDayOfTargetMonth);
+  return new Date(
+    Date.UTC(
+      targetYear,
+      targetMonth,
+      day,
+      from.getUTCHours(),
+      from.getUTCMinutes(),
+      from.getUTCSeconds(),
+      from.getUTCMilliseconds()
+    )
+  );
+}
+
+export function computePrivacyRequestDueDate(receivedAt: Date, extensionMonths = 0): string {
+  if (!Number.isInteger(extensionMonths) || extensionMonths < 0) {
+    throw new Error(
+      `privacy request extensionMonths must be a whole number of months and not negative, got: ${extensionMonths}`
+    );
+  }
+  if (extensionMonths > PRIVACY_REQUEST_MAX_EXTENSION_MONTHS) {
+    throw new Error(
+      `a privacy request may be extended by at most ${PRIVACY_REQUEST_MAX_EXTENSION_MONTHS} months, got: ${extensionMonths}`
+    );
+  }
+  return addCalendarMonths(receivedAt, PRIVACY_REQUEST_RESPONSE_MONTHS + extensionMonths).toISOString();
+}
+
+/**
+ * Whether an extension is still available.
+ *
+ * Article 12(3) requires the data subject to be informed of the extension
+ * within the original month. Past that point the request is simply late,
+ * and recording an extension would relabel a breach as compliance.
+ */
+export function canExtendPrivacyRequest(receivedAt: Date, now: Date): boolean {
+  return now.getTime() <= addCalendarMonths(receivedAt, PRIVACY_REQUEST_RESPONSE_MONTHS).getTime();
+}
+
+/**
+ * The legal transitions. Written as a map rather than checked inline so
+ * that adding a status forces a decision about what may reach it.
+ *
+ * completed and refused are terminal. A request that has been answered
+ * cannot quietly reopen and acquire a fresh deadline; a second request is
+ * a second row, with its own clock.
+ */
+const PRIVACY_REQUEST_TRANSITIONS: Readonly<Record<PrivacyRequestStatus, readonly PrivacyRequestStatus[]>> =
+  {
+    received: ["in_progress", "completed", "refused"],
+    in_progress: ["completed", "refused"],
+    completed: [],
+    refused: []
+  };
+
+export function validatePrivacyRequestTransition(
+  from: PrivacyRequestStatus,
+  to: PrivacyRequestStatus
+): void {
+  if (from === to) {
+    throw new Error(`a privacy request transition must change the status, got ${from} twice`);
+  }
+  const allowed = PRIVACY_REQUEST_TRANSITIONS[from];
+  if (!allowed.includes(to)) {
+    throw new Error(
+      `a privacy request cannot move from ${from} to ${to}` +
+        (allowed.length === 0
+          ? `; ${from} is terminal, and a new request is a new row with its own deadline`
+          : `; ${from} may only move to ${allowed.join(" or ")}`)
+    );
+  }
+}
+
+export interface PrivacyRequestClock {
+  readonly status: PrivacyRequestStatus;
+  readonly receivedAt: string;
+  readonly dueAt: string;
+}
+
+/**
+ * Overdue means unanswered past the deadline, not merely past it.
+ *
+ * A request completed on time stays not-overdue forever, which is the
+ * whole point of recording completed_at: otherwise every historical
+ * request becomes a breach the moment its due date passes.
+ */
+export function isPrivacyRequestOverdue(request: PrivacyRequestClock, now: Date): boolean {
+  if (request.status === "completed" || request.status === "refused") {
+    return false;
+  }
+  return now.getTime() > new Date(request.dueAt).getTime();
+}
+
+export interface PrivacyRequestOutcome {
+  readonly kind: PrivacyRequestKind;
+  /** True when the answer given to the requester is the whole answer. */
+  readonly complete: boolean;
+  readonly statement: string;
+}
+
+/**
+ * What the requester is told, for a deletion request.
+ *
+ * This is where AF-62's residue has to surface. Reporting a deletion
+ * request as satisfied while the verbatim quote and the decision rationale
+ * are still stored would be exactly the false statement to a candidate
+ * that AF-61 and AF-62 were both built to avoid, and it would be made in
+ * response to someone explicitly asking.
+ */
+export function describeDeletionRequestOutcome(
+  residue: CandidateDataErasureResidue
+): PrivacyRequestOutcome {
+  return {
+    kind: "delete",
+    complete: !residue.anyResidue,
+    statement: residue.statement
+  };
+}
+
+/**
+ * What the requester is told, for an export request.
+ *
+ * An export is answerable in full, and the residue is the reason: content
+ * that cannot be erased is still content that can be read, so the two
+ * request kinds fail and succeed in opposite places.
+ */
+export function describeExportRequestOutcome(surfaces: readonly string[]): PrivacyRequestOutcome {
+  if (surfaces.length === 0) {
+    throw new Error("an export request outcome must name the surfaces it drew from");
+  }
+  return {
+    kind: "export",
+    complete: true,
+    statement: `Exported the candidate's data from: ${surfaces.join("; ")}.`
   };
 }
 
