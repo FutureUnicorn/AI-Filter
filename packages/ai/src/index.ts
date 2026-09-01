@@ -711,11 +711,17 @@ function isCitingEvidence(
   );
 }
 
-function toCitationInvalid(criterionId: string, rejectedCitation: SourceCitation, reason: string): EvidenceOutcome {
+function toCitationInvalid(
+  outcome: SupportedEvidence | PartiallySupportedEvidence | ContradictedEvidence | UnclearEvidence,
+  rejectedCitation: SourceCitation,
+  reason: string
+): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "citation_invalid",
-    criterionId,
+    organizationId: outcome.organizationId,
+    candidateId: outcome.candidateId,
+    criterionId: outcome.criterionId,
     reason,
     rejectedCitation
   };
@@ -733,14 +739,14 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
     return outcome;
   }
 
-  const { citation, criterionId } = outcome;
+  const { citation } = outcome;
 
   if (citation.quote.length === 0) {
-    return toCitationInvalid(criterionId, citation, "missing quote for a citing state");
+    return toCitationInvalid(outcome, citation, "missing quote for a citing state");
   }
   if (!sourceText.includes(citation.quote)) {
     return toCitationInvalid(
-      criterionId,
+      outcome,
       citation,
       "quote not found verbatim in source text (likely hallucination)"
     );
@@ -763,7 +769,7 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
   // text -- preserving an impossible citation location as valid evidence.
   if (citation.offset >= sourceCodePoints.length) {
     return toCitationInvalid(
-      criterionId,
+      outcome,
       citation,
       "claimed offset is past the end of the source text"
     );
@@ -774,7 +780,7 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
       .slice(citation.offset, citation.offset + [...citation.quote].length)
       .join("");
     if (window !== citation.quote) {
-      return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
+      return toCitationInvalid(outcome, citation, "quote exists in source but not at the claimed offset");
     }
   }
 

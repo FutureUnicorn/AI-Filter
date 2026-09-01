@@ -12,14 +12,18 @@ function citing(kind: "supported" | "partially_supported" | "contradicted" | "un
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind,
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    candidateId: "22222222-2222-4222-8222-222222222222",
     criterionId: "python_production",
     citation: { document: "resume.txt", pageOrSection: "Experience", offset, quote }
-  };
+  } as EvidenceOutcome;
 }
 
 const notFound: EvidenceOutcome = {
   schemaVersion: CONTRACT_SCHEMA_VERSION,
   kind: "not_found",
+  organizationId: "11111111-1111-4111-8111-111111111111",
+  candidateId: "22222222-2222-4222-8222-222222222222",
   criterionId: "aws_certification"
 };
 
@@ -36,7 +40,7 @@ test("a hallucinated quote that never appears in the source is rejected as citat
   assert.equal(result.kind, "citation_invalid");
   if (result.kind === "citation_invalid") {
     assert.match(result.reason, /not found verbatim/);
-    assert.equal(result.rejectedCitation.quote, "Designed PostgreSQL schemas for the core transactional workload");
+    assert.equal((result.rejectedCitation as { quote: string }).quote, "Designed PostgreSQL schemas for the core transactional workload");
   }
 });
 
@@ -84,6 +88,7 @@ function af38Citing(quote: string, offset: number): EvidenceOutcome {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "supported",
     organizationId: "11111111-1111-4111-8111-111111111111",
+    candidateId: "22222222-2222-4222-8222-222222222222",
     criterionId: "python_production",
     citation: { document: "resume.txt", pageOrSection: "Experience", offset, quote }
   } as EvidenceOutcome;
