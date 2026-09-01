@@ -7,6 +7,7 @@ import type {
   Application,
   AuditAction,
   CandidateDecision,
+  CandidateDataErasureTrigger,
   CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -35,11 +36,15 @@ import type {
   User
 } from "@signal-audit/domain";
 import {
+  CANDIDATE_DATA_ERASURE_PLACEHOLDER,
   CONTRACT_SCHEMA_VERSION,
   canonicalizeCsvColumnMapping,
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
+  erasedStorageKey,
   mapCsvRowToApplication,
+  planCandidateDataErasure,
+  summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
@@ -4730,6 +4735,484 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
     );
 
     return rejections;
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-62: candidate-data deletion workflow ----
+
+export interface EraseCandidateDataInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly trigger: CandidateDataErasureTrigger;
+  readonly requestedByUserId?: string | undefined;
+}
+
+export interface CandidateDataErasureReceipt {
+  readonly erasureId: string;
+  /** True when the application had already been erased and nothing was rewritten. */
+  readonly alreadyErased: boolean;
+  /** Rows overwritten per surface. A surface deferred to the last candidate reports 0. */
+  readonly rowsBySurface: Readonly<Record<string, number>>;
+  /**
+   * True when the intake-scoped surfaces were erased too, i.e. this was the
+   * last candidate still holding the shared document open.
+   */
+  readonly intakeErased: boolean;
+  /** How many applications on the same intake are still unerased. */
+  readonly applicationsStillReferencingIntake: number;
+  readonly residueStatement: string;
+}
+
+/**
+ * Erases one candidate's data, and records what it could not erase.
+ *
+ * Everything happens in one transaction, including the object-storage
+ * delete, which is deliberate even though it means holding a row lock
+ * across a network call. The alternative orderings are both worse: delete
+ * the object first and a later failure leaves the database describing a
+ * document that is no longer there, while redacting first and failing
+ * leaves bytes in the bucket that nothing can name any more, because
+ * storage_key was the only handle to them. Rolling the whole thing back
+ * and retrying is the only sequence that leaves no unrecoverable state.
+ *
+ * The intake-scoped half is conditional. applications.intake_id is not
+ * unique -- a CSV import produces one intake and many applications -- so
+ * the extracted text, the filename and the stored object are shared by
+ * every candidate in that file. Erasing them on the first candidate's
+ * request would destroy data belonging to candidates who never asked for
+ * anything, so they are erased only once no unerased application is left
+ * on the intake, and reported as deferred until then.
+ */
+export async function eraseCandidateData(
+  databaseUrl: string,
+  schema: string,
+  input: EraseCandidateDataInput,
+  deleteObject?: (storageKey: string) => Promise<void>
+): Promise<CandidateDataErasureReceipt> {
+  assertSafeSchema(schema);
+  const plan = planCandidateDataErasure(input.trigger, input.requestedByUserId);
+  const residue = summarizeCandidateDataErasureResidue(plan);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const rowsBySurface: Record<string, number> = {};
+
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+
+    // Scoped by the pair, not by application_id alone. Reading on the id
+    // by itself would let one organization erase another's application.
+    const application = await client.query<{ intake_id: string; redacted_at: Date | null }>(
+      `SELECT intake_id, redacted_at
+         FROM "${schema}".applications
+        WHERE application_id = $1 AND organization_id = $2
+        FOR UPDATE`,
+      [input.applicationId, input.organizationId]
+    );
+    const found = application.rows[0];
+    if (found === undefined) {
+      throw new Error(
+        `eraseCandidateData: no application ${input.applicationId} in organization ${input.organizationId}`
+      );
+    }
+
+    if (found.redacted_at !== null) {
+      // Idempotent by design. A retention job that crashes halfway and is
+      // re-run must not append a second receipt claiming a second erasure.
+      const existing = await client.query<{ erasure_id: string }>(
+        `SELECT erasure_id FROM "${schema}".candidate_data_erasures
+          WHERE application_id = $1 AND organization_id = $2
+          ORDER BY executed_at ASC
+          LIMIT 1`,
+        [input.applicationId, input.organizationId]
+      );
+      await client.query("COMMIT");
+      return {
+        erasureId: existing.rows[0]?.erasure_id ?? "",
+        alreadyErased: true,
+        rowsBySurface: {},
+        intakeErased: false,
+        applicationsStillReferencingIntake: 0,
+        residueStatement: residue.statement
+      };
+    }
+
+    const intakeId = found.intake_id;
+
+    const applications = await client.query(
+      `UPDATE "${schema}".applications
+          SET candidate_full_name = $1,
+              candidate_email = $1,
+              external_reference_id = NULL,
+              redacted_at = CURRENT_TIMESTAMP
+        WHERE application_id = $2 AND organization_id = $3 AND redacted_at IS NULL`,
+      [CANDIDATE_DATA_ERASURE_PLACEHOLDER, input.applicationId, input.organizationId]
+    );
+    rowsBySurface["applications"] = applications.rowCount ?? 0;
+
+    // Anyone else still holding the shared intake open?
+    const remaining = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM "${schema}".applications
+        WHERE intake_id = $1 AND redacted_at IS NULL`,
+      [intakeId]
+    );
+    const stillReferencing = Number.parseInt(remaining.rows[0]?.count ?? "", 10);
+    if (!Number.isSafeInteger(stillReferencing)) {
+      throw new Error("eraseCandidateData: remaining-application count is not a safe integer");
+    }
+    const intakeErased = stillReferencing === 0;
+
+    if (intakeErased) {
+      const intake = await client.query<{ storage_key: string }>(
+        `SELECT storage_key FROM "${schema}".file_intakes WHERE intake_id = $1 FOR UPDATE`,
+        [intakeId]
+      );
+      const storageKey = intake.rows[0]?.storage_key;
+      if (storageKey === undefined) {
+        throw new Error(
+          `eraseCandidateData: application ${input.applicationId} references a missing intake`
+        );
+      }
+
+      // Before the key is overwritten, never after.
+      if (deleteObject !== undefined) {
+        await deleteObject(storageKey);
+        rowsBySurface["object_storage_documents"] = 1;
+      }
+
+      const extractions = await client.query(
+        `UPDATE "${schema}".canonical_text_extractions
+            SET pages = '[]'::jsonb, redacted_at = CURRENT_TIMESTAMP
+          WHERE intake_id = $1 AND redacted_at IS NULL`,
+        [intakeId]
+      );
+      rowsBySurface["canonical_text_extractions"] = extractions.rowCount ?? 0;
+
+      // failure_reason cannot simply be nulled: CHECK ((outcome = 'failed')
+      // = (failure_reason IS NOT NULL)) makes a null reason on a failed row
+      // a constraint violation. Rows that have a reason get the
+      // placeholder, rows that never had one keep their NULL, so the
+      // invariant holds either way.
+      const importRows = await client.query(
+        `UPDATE "${schema}".import_rows
+            SET failure_reason = CASE WHEN failure_reason IS NULL THEN NULL ELSE $1 END,
+                redacted_at = CURRENT_TIMESTAMP
+          WHERE intake_id = $2 AND redacted_at IS NULL`,
+        [CANDIDATE_DATA_ERASURE_PLACEHOLDER, intakeId]
+      );
+      rowsBySurface["import_rows"] = importRows.rowCount ?? 0;
+
+      // storage_key is NOT NULL UNIQUE and embeds the declared filename, so
+      // it needs a replacement that is both non-colliding and free of
+      // anything about the candidate.
+      const intakes = await client.query(
+        `UPDATE "${schema}".file_intakes
+            SET declared_filename = $1, storage_key = $2, redacted_at = CURRENT_TIMESTAMP
+          WHERE intake_id = $3 AND redacted_at IS NULL`,
+        [CANDIDATE_DATA_ERASURE_PLACEHOLDER, erasedStorageKey(intakeId), intakeId]
+      );
+      rowsBySurface["file_intakes"] = intakes.rowCount ?? 0;
+    }
+
+    const receipt = await client.query<{ erasure_id: string }>(
+      `INSERT INTO "${schema}".candidate_data_erasures
+         (organization_id, application_id, erasure_trigger, requested_by_user_id, surfaces_erased, residue)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+       RETURNING erasure_id`,
+      [
+        input.organizationId,
+        input.applicationId,
+        input.trigger,
+        input.requestedByUserId ?? null,
+        JSON.stringify(rowsBySurface),
+        JSON.stringify({
+          statement: residue.statement,
+          surfaces: residue.surfaces.map((step) => step.surface),
+          intakeDeferred: !intakeErased,
+          applicationsStillReferencingIntake: stillReferencing
+        })
+      ]
+    );
+
+    await client.query("COMMIT");
+    return {
+      erasureId: receipt.rows[0]?.erasure_id ?? "",
+      alreadyErased: false,
+      rowsBySurface,
+      intakeErased,
+      applicationsStillReferencingIntake: stillReferencing,
+      residueStatement: residue.statement
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface CandidateDataErasureObservations {
+  /** Candidate text still readable after only the first of two candidates is erased. */
+  readonly textAfterFirstErasure: string;
+  readonly otherCandidateNameAfterFirstErasure: string;
+  readonly firstErasureIntakeErased: boolean;
+  readonly firstErasureDeferredCount: number;
+  /** Objects deleted at the point only the first candidate had been erased. */
+  readonly deletedObjectCountAfterFirstErasure: number;
+  /** After the last candidate on the intake is erased. */
+  readonly textAfterLastErasure: string;
+  readonly filenameAfterLastErasure: string;
+  readonly storageKeyAfterLastErasure: string;
+  readonly erasedNameAfterLastErasure: string;
+  readonly externalReferenceAfterLastErasure: string | null;
+  readonly lastErasureIntakeErased: boolean;
+  /** Keys handed to the object-storage delete, in call order. */
+  readonly deletedObjectKeys: readonly string[];
+  /** The residue: still there, and the reason this ticket is not finished. */
+  readonly evidenceQuoteAfterErasure: string;
+  readonly decisionRationaleAfterErasure: string;
+  /** import_rows keeps its CHECK invariant rather than violating it. */
+  readonly failedRowReasonAfterErasure: string;
+  readonly processedRowReasonAfterErasure: string | null;
+  /** Re-running does not append a second receipt. */
+  readonly secondRunAlreadyErased: boolean;
+  readonly receiptCount: number;
+  /** Negative controls: these must fail, by message. */
+  readonly ledgerUpdateRejection: string;
+  readonly crossTenantRejection: string;
+}
+
+/**
+ * Proves the erasure actually erases, against the real migrations.
+ *
+ * Every claim this workflow makes is a claim made to a candidate, so none
+ * of it is asserted by reading the SQL. The probe builds two candidates
+ * sharing one CSV intake precisely because that is the case where a naive
+ * implementation is wrong in a way nobody notices: it erases the shared
+ * document on the first request and silently destroys the second
+ * candidate's data too.
+ */
+export async function assertCandidateDataErasure(
+  databaseUrl: string
+): Promise<CandidateDataErasureObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `erase_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const otherOrg = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const filename = "Jane_Doe_CV.pdf";
+  const storageKey = `quarantine/${org}/${roleId}/pending/${suffix}-${filename}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const deletedObjectKeys: string[] = [];
+
+  const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`assertCandidateDataErasure: "${label}" SUCCEEDED but must be refused`);
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [
+      org,
+      otherOrg
+    ]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `erase_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,'text/csv','imported',$6)`,
+      [intakeId, org, roleId, storageKey, filename, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    for (const [applicationId, row, name, email] of [
+      [applicationA, 1, "Jane Doe", "jane@example.test"],
+      [applicationB, 2, "Sam Roe", "sam@example.test"]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email, external_reference_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [applicationId, org, roleId, intakeId, row, name, email, `ATS-${row}`]
+      );
+    }
+    // One processed row and one failed row: the failed row is the one whose
+    // failure_reason a naive "SET failure_reason = NULL" would break.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason)
+       VALUES ($1, 1, 'processed', $2, NULL), ($1, 3, 'failed', NULL, 'row 3: bad email for Jane Doe')`,
+      [intakeId, applicationA]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1,$2,$3,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [outcomeId, org, applicationA]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (organization_id, application_id, decided_by_user_id, decision, rationale)
+       VALUES ($1,$2,$3,'advance','Jane Doe interviews well')`,
+      [org, applicationA, userId]
+    );
+
+    const readText = async (): Promise<string> => {
+      const result = await admin.query<{ pages: unknown }>(
+        `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
+        [intakeId]
+      );
+      return JSON.stringify(result.rows[0]?.pages ?? null);
+    };
+
+    // --- first candidate: the intake is shared, so it must survive ---
+    const first = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      {
+        organizationId: org,
+        applicationId: applicationA,
+        trigger: "candidate_request",
+        requestedByUserId: userId
+      },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const deletedObjectCountAfterFirstErasure = deletedObjectKeys.length;
+    const textAfterFirstErasure = await readText();
+    const otherName = await admin.query<{ candidate_full_name: string }>(
+      `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
+      [applicationB]
+    );
+
+    // --- last candidate: now the intake goes too ---
+    const last = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const textAfterLastErasure = await readText();
+    const intakeAfter = await admin.query<{ declared_filename: string; storage_key: string }>(
+      `SELECT declared_filename, storage_key FROM file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+    const erasedApplication = await admin.query<{
+      candidate_full_name: string;
+      external_reference_id: string | null;
+    }>(
+      `SELECT candidate_full_name, external_reference_id FROM applications WHERE application_id = $1`,
+      [applicationA]
+    );
+    const quote = await admin.query<{ outcome: { citation?: { quote?: string } } }>(
+      `SELECT outcome FROM evidence_outcomes WHERE evidence_outcome_id = $1`,
+      [outcomeId]
+    );
+    const rationale = await admin.query<{ rationale: string }>(
+      `SELECT rationale FROM candidate_decisions WHERE application_id = $1`,
+      [applicationA]
+    );
+    const failedRow = await admin.query<{ failure_reason: string }>(
+      `SELECT failure_reason FROM import_rows WHERE intake_id = $1 AND outcome = 'failed'`,
+      [intakeId]
+    );
+    const processedRow = await admin.query<{ failure_reason: string | null }>(
+      `SELECT failure_reason FROM import_rows WHERE intake_id = $1 AND outcome = 'processed'`,
+      [intakeId]
+    );
+
+    // --- idempotency and the negative controls ---
+    const second = await eraseCandidateData(databaseUrl, schema, {
+      organizationId: org,
+      applicationId: applicationA,
+      trigger: "candidate_request",
+      requestedByUserId: userId
+    });
+    const receipts = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_data_erasures`
+    );
+
+    const ledgerUpdateRejection = await expectRejected("candidate_data_erasures:update", () =>
+      admin.query(`UPDATE candidate_data_erasures SET residue = '{}'::jsonb`)
+    );
+    const crossTenantRejection = await expectRejected("erase:cross_tenant", () =>
+      eraseCandidateData(databaseUrl, schema, {
+        organizationId: otherOrg,
+        applicationId: applicationB,
+        trigger: "retention_expiry"
+      })
+    );
+
+    return {
+      textAfterFirstErasure,
+      otherCandidateNameAfterFirstErasure: otherName.rows[0]?.candidate_full_name ?? "",
+      firstErasureIntakeErased: first.intakeErased,
+      firstErasureDeferredCount: first.applicationsStillReferencingIntake,
+      deletedObjectCountAfterFirstErasure,
+      textAfterLastErasure,
+      filenameAfterLastErasure: intakeAfter.rows[0]?.declared_filename ?? "",
+      storageKeyAfterLastErasure: intakeAfter.rows[0]?.storage_key ?? "",
+      erasedNameAfterLastErasure: erasedApplication.rows[0]?.candidate_full_name ?? "",
+      externalReferenceAfterLastErasure: erasedApplication.rows[0]?.external_reference_id ?? null,
+      lastErasureIntakeErased: last.intakeErased,
+      deletedObjectKeys,
+      evidenceQuoteAfterErasure: quote.rows[0]?.outcome?.citation?.quote ?? "",
+      decisionRationaleAfterErasure: rationale.rows[0]?.rationale ?? "",
+      failedRowReasonAfterErasure: failedRow.rows[0]?.failure_reason ?? "",
+      processedRowReasonAfterErasure: processedRow.rows[0]?.failure_reason ?? null,
+      secondRunAlreadyErased: second.alreadyErased,
+      receiptCount: Number.parseInt(receipts.rows[0]?.count ?? "", 10),
+      ledgerUpdateRejection,
+      crossTenantRejection
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
