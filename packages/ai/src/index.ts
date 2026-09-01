@@ -742,28 +742,43 @@ function toCitationInvalid(
 }
 
 /**
- * Non-citing outcomes pass through unexamined -- there is nothing to
- * validate and no citation field to inspect. A citing outcome whose
- * quote fails this check is discarded and replaced with
- * `citation_invalid`, carrying the rejected citation and why, ready for
- * AF-39 to route to human review.
+ * The text a citation must be checked against, or undefined when none was
+ * supplied for the document it names.
+ *
+ * The string form means "one document is in play", which is how every
+ * caller uses this today. A citation naming some OTHER document cannot be
+ * checked against it, and saying so is the point: silently checking a
+ * cover-letter quote against the resume would report a real citation as a
+ * hallucination, and silently skipping it would let an unchecked one
+ * through. The map form is how a caller expresses a genuine
+ * cross-document contradiction.
  */
-export function validateCitation(outcome: EvidenceOutcome, sourceText: string): EvidenceOutcome {
-  if (!isCitingEvidence(outcome)) {
-    return outcome;
+export type CitationSources = string | ReadonlyMap<string, string>;
+
+function sourceTextFor(
+  citation: SourceCitation,
+  sources: CitationSources,
+  singleDocument: string
+): string | undefined {
+  if (typeof sources === "string") {
+    return citation.document === singleDocument ? sources : undefined;
   }
+  return sources.get(citation.document);
+}
 
-  const { citation } = outcome;
-
+/**
+ * Why one citation fails, or undefined if it holds up.
+ *
+ * Extracted so both sides of a contradiction are checked by the same
+ * rules. Two copies of these four checks would drift, and the side that
+ * drifted would be the one nobody was looking at.
+ */
+function citationFailureReason(citation: SourceCitation, sourceText: string): string | undefined {
   if (citation.quote.length === 0) {
-    return toCitationInvalid(outcome, citation, "missing quote for a citing state");
+    return "missing quote for a citing state";
   }
   if (!sourceText.includes(citation.quote)) {
-    return toCitationInvalid(
-      outcome,
-      citation,
-      "quote not found verbatim in source text (likely hallucination)"
-    );
+    return "quote not found verbatim in source text (likely hallucination)";
   }
   // Offsets are compared in Unicode CODE POINTS, matching the Python
   // validator this ports (scripts/validate_citations.py indexes Python
@@ -782,11 +797,7 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
   // validation unexamined as long as the quote appeared somewhere in the
   // text -- preserving an impossible citation location as valid evidence.
   if (citation.offset >= sourceCodePoints.length) {
-    return toCitationInvalid(
-      outcome,
-      citation,
-      "claimed offset is past the end of the source text"
-    );
+    return "claimed offset is past the end of the source text";
   }
 
   if (citation.offset >= 0) {
@@ -794,7 +805,80 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
       .slice(citation.offset, citation.offset + [...citation.quote].length)
       .join("");
     if (window !== citation.quote) {
-      return toCitationInvalid(outcome, citation, "quote exists in source but not at the claimed offset");
+      return "quote exists in source but not at the claimed offset";
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Non-citing outcomes pass through unexamined -- there is nothing to
+ * validate and no citation field to inspect. A citing outcome whose
+ * quote fails this check is discarded and replaced with
+ * `citation_invalid`, carrying the rejected citation and why, ready for
+ * AF-39 to route to human review.
+ *
+ * A `contradicted` outcome is the case that needs saying explicitly,
+ * because it carries TWO citations and only one of them used to be
+ * checked. A contradiction is a claim about both cited facts at once, so
+ * a hallucinated opposing side is not half-valid evidence -- it is a
+ * fabricated conflict, and the more damaging half to get wrong, since it
+ * is the side that argues against the candidate. Validating only the
+ * primary let such an outcome reach a reviewer as valid `contradicted`
+ * evidence, with the fabricated quote displayed beside a real one that
+ * lent it credibility.
+ */
+export function validateCitation(outcome: EvidenceOutcome, sources: CitationSources): EvidenceOutcome {
+  if (!isCitingEvidence(outcome)) {
+    return outcome;
+  }
+
+  const { citation } = outcome;
+
+  const primaryText = typeof sources === "string" ? sources : sources.get(citation.document);
+  if (primaryText === undefined) {
+    return toCitationInvalid(
+      outcome,
+      citation,
+      `no source text was supplied for document "${citation.document}", so this citation cannot be verified`
+    );
+  }
+
+  const primaryFailure = citationFailureReason(citation, primaryText);
+  if (primaryFailure !== undefined) {
+    return toCitationInvalid(outcome, citation, primaryFailure);
+  }
+
+  if (outcome.kind === "contradicted") {
+    // Typed as required, checked anyway. This function's entire job is
+    // validating model output that has crossed a trust boundary, and a
+    // static type is not a runtime guarantee about such data -- a
+    // contradicted outcome that arrives with one side missing must fail
+    // closed here rather than throw a TypeError out of a validator.
+    const conflicting = outcome.conflictingCitation as SourceCitation | undefined;
+    if (conflicting === undefined) {
+      return toCitationInvalid(
+        outcome,
+        citation,
+        "contradicted outcome carries no conflicting citation, so the contradiction has only one side"
+      );
+    }
+    const conflictingText = sourceTextFor(conflicting, sources, citation.document);
+    if (conflictingText === undefined) {
+      // Fails closed. An unverifiable citation is not a valid one, and a
+      // contradiction resting on an unchecked quote is exactly the thing
+      // this validator exists to keep away from reviewers.
+      return toCitationInvalid(
+        outcome,
+        conflicting,
+        `conflicting citation names document "${conflicting.document}", for which no source text was ` +
+          `supplied; pass a document-to-text map to validate a cross-document contradiction`
+      );
+    }
+    const conflictingFailure = citationFailureReason(conflicting, conflictingText);
+    if (conflictingFailure !== undefined) {
+      return toCitationInvalid(outcome, conflicting, `conflicting citation: ${conflictingFailure}`);
     }
   }
 
