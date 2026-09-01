@@ -409,6 +409,27 @@ export interface RecordInferenceUsageInput {
  * a faulty or untrusted caller could walk the meter backwards and
  * postpone the cap indefinitely.
  */
+/**
+ * Reads a Postgres bigint column, refusing to lose precision quietly.
+ *
+ * bigint arrives as a string precisely because it does not fit a JS
+ * number. Number("9007199254740993") is 9007199254740992 -- off by one,
+ * with no error -- and these values feed a budget comparison, so a
+ * silently wrong total is a silently wrong spending decision. Failing here
+ * is loud and fixable; the alternative is a cap that stops working
+ * correctly at a threshold nobody is watching for.
+ */
+function bigintColumnToNumber(raw: string, column: string): number {
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || String(value) !== raw.trim()) {
+    throw new Error(
+      `${column} is ${raw}, which exceeds the range a JavaScript number can hold exactly ` +
+        `(max ${Number.MAX_SAFE_INTEGER}); refusing to return a value that has silently lost precision`
+    );
+  }
+  return value;
+}
+
 function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
   for (const [field, value] of [
     ["inputTokens", input.inputTokens],
@@ -469,8 +490,8 @@ export async function getInferenceUsage(
     );
     const row = result.rows[0];
     return {
-      inputTokens: row === undefined ? 0 : Number(row.input_tokens),
-      outputTokens: row === undefined ? 0 : Number(row.output_tokens)
+      inputTokens: row === undefined ? 0 : bigintColumnToNumber(row.input_tokens, "input_tokens"),
+      outputTokens: row === undefined ? 0 : bigintColumnToNumber(row.output_tokens, "output_tokens")
     };
   } finally {
     await client.end().catch(() => undefined);
@@ -619,6 +640,16 @@ export async function reserveInferenceBudget(
 ): Promise<ReserveInferenceBudgetOutcome> {
   assertSafeSchema(schema);
   assertNonNegativeUsage(input);
+  // Validated here rather than left to the `$7::bigint` cast. An unchecked
+  // NaN or fractional value fails inside Postgres with a cast error that
+  // names neither the field nor the caller, and a negative cap would make
+  // every reservation fail as cap_exceeded rather than being rejected as
+  // the nonsense it is.
+  if (!Number.isSafeInteger(input.maxTotalTokens) || input.maxTotalTokens < 0) {
+    throw new Error(
+      `reserveInferenceBudget requires a non-negative safe integer maxTotalTokens, got: ${input.maxTotalTokens}`
+    );
+  }
   const requested = input.inputTokens + input.outputTokens;
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
@@ -648,12 +679,25 @@ export async function reserveInferenceBudget(
     );
     const row = reserved.rows[0];
     if (row !== undefined) {
-      return { outcome: "reserved", totalTokensAfter: Number(row.total_tokens) };
+      return { outcome: "reserved", totalTokensAfter: bigintColumnToNumber(row.total_tokens, "total_tokens") };
     }
-    const current = await getInferenceUsage(databaseUrl, schema, input);
+    // Read back on the connection already open, rather than calling
+    // getInferenceUsage and opening a second one. This is the capped path,
+    // which is the hot one exactly when a tenant is hammering the cap.
+    const current = await client.query<{ input_tokens: string; output_tokens: string }>(
+      `SELECT input_tokens, output_tokens FROM "${schema}".inference_usage_ledger
+        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+      [input.organizationId, input.model, input.periodStart]
+    );
+    const currentRow = current.rows[0];
+    const totalTokensBefore =
+      currentRow === undefined
+        ? 0
+        : bigintColumnToNumber(currentRow.input_tokens, "input_tokens") +
+          bigintColumnToNumber(currentRow.output_tokens, "output_tokens");
     return {
       outcome: "cap_exceeded",
-      totalTokensBefore: current.inputTokens + current.outputTokens,
+      totalTokensBefore,
       maxTotalTokens: input.maxTotalTokens
     };
   } finally {
@@ -789,6 +833,144 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-40 review (#23): the organization reference must not cascade ----
+
+/**
+ * Proves that deleting an organization fails for the RIGHT reason.
+ *
+ * evidence_extraction_runs is append-only, so ON DELETE CASCADE on
+ * organization_id could never work: the cascaded DELETE hits the
+ * reject-mutation trigger and the error reads "evidence_extraction_runs is
+ * append-only", naming the trigger instead of the organization reference
+ * that actually blocks the delete. Operators debugging a failed offboarding
+ * are then looking at the wrong constraint.
+ *
+ * 0006_audit_events_delete_and_membership_fixes.sql already fixed exactly
+ * this on audit_events. Asserted here so the next append-only table that
+ * copies this pattern is caught by a test rather than by a reviewer.
+ */
+export async function assertExtractionRunOrganizationDelete(
+  databaseUrl: string
+): Promise<{ readonly message: string }> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `run_fk_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs
+         (organization_id, entity_type, entity_id, provider, model, prompt_version,
+          extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,'application','app-1','openai','gpt-5.6','v1','1.0.0','evidence','v1')`,
+      [org]
+    );
+    try {
+      await admin.query(`DELETE FROM organizations WHERE organization_id = $1`, [org]);
+    } catch (error) {
+      return { message: error instanceof Error ? error.message : String(error) };
+    }
+    throw new Error(
+      "assertExtractionRunOrganizationDelete: deleting the organization SUCCEEDED, but an extraction run still references it"
+    );
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-41 review (#24): budget totals must not lose precision ----
+
+export interface InferenceBudgetPrecisionObservations {
+  /** Reading a bigint past MAX_SAFE_INTEGER must throw, not round. */
+  readonly oversizedReadRejection: string;
+  /** The value Number() would have silently returned instead. */
+  readonly silentlyRoundedValue: number;
+  readonly storedValue: string;
+  /** cap_exceeded reports the real committed total. */
+  readonly capExceededTotalBefore: number;
+}
+
+export async function assertInferenceBudgetPrecision(
+  databaseUrl: string
+): Promise<InferenceBudgetPrecisionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const oversized = "9007199254740993"; // MAX_SAFE_INTEGER + 2
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO inference_usage_ledger (organization_id, model, period_start, input_tokens, output_tokens)
+       VALUES ($1,'gpt-5.6','2026-09-01',$2::bigint,0)`,
+      [org, oversized]
+    );
+
+    let oversizedReadRejection = "";
+    try {
+      await getInferenceUsage(databaseUrl, schema, {
+        organizationId: org,
+        model: "gpt-5.6",
+        periodStart: "2026-09-01"
+      });
+      throw new Error("assertInferenceBudgetPrecision: an oversized bigint was read without complaint");
+    } catch (error) {
+      oversizedReadRejection = error instanceof Error ? error.message : String(error);
+    }
+
+    // A second tenant with an ordinary total, to read back the cap_exceeded path.
+    await admin.query(
+      `UPDATE inference_usage_ledger SET input_tokens = 900, output_tokens = 100 WHERE organization_id = $1`,
+      [org]
+    );
+    const capped = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org,
+      model: "gpt-5.6",
+      periodStart: "2026-09-01",
+      inputTokens: 500,
+      outputTokens: 0,
+      maxTotalTokens: 1_200
+    });
+
+    return {
+      oversizedReadRejection,
+      silentlyRoundedValue: Number(oversized),
+      storedValue: oversized,
+      capExceededTotalBefore: capped.outcome === "cap_exceeded" ? capped.totalTokensBefore : -1
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }

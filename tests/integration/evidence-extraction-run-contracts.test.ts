@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import { evidenceExtractionRunSchema } from "../../packages/contracts/src/index.ts";
+import { assertExtractionRunOrganizationDelete } from "../../packages/db/src/index.ts";
 
 const base = {
   schemaVersion: CONTRACT_SCHEMA_VERSION,
@@ -56,4 +57,21 @@ test("an unrecognized property is rejected", () => {
 test("a stale schemaVersion is rejected", () => {
   const result = evidenceExtractionRunSchema.safeParse({ ...base, schemaVersion: "0.9.0" });
   assert.equal(result.success, false);
+});
+
+// AF-40 review (#23). ON DELETE CASCADE on organization_id fought the
+// append-only trigger, so offboarding an organization failed while naming
+// the trigger rather than the reference that actually blocks it.
+
+test("deleting an organization is refused by the foreign key, not by the append-only trigger", async () => {
+  const databaseUrl = process.env["SIGNAL_AUDIT_RLS_DATABASE_URL"];
+  if (databaseUrl === undefined || databaseUrl.length === 0) {
+    assert.fail("SIGNAL_AUDIT_RLS_DATABASE_URL must be set. See README.md.");
+  }
+  const { message } = await assertExtractionRunOrganizationDelete(databaseUrl);
+  assert.match(message, /violates foreign key constraint/);
+  assert.match(message, /evidence_extraction_runs_organization_id_fkey/);
+  // The failure it used to give. An operator debugging a blocked
+  // offboarding would have been sent to the wrong constraint entirely.
+  assert.doesNotMatch(message, /append-only/);
 });
