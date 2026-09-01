@@ -2730,7 +2730,17 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // exemption is false the moment someone pastes a candidate's details
   // into one, the same caveat that applies to support_access_grants.
   "privacy_requests",
-  "privacy_request_events"
+  "privacy_request_events",
+  // AF-90. The share link holds a frozen role-level audit report and a log
+  // of when it was viewed. The report is aggregate metrics -- AF-59's
+  // describeAuditSampleProvenance drops sampledApplicationIds before it is
+  // ever built -- so no candidate is named and no application text is
+  // carried. The caveat that keeps this honest: the sample SEED survives,
+  // and it is a reconstruction key for anyone who separately holds the
+  // eligible application set. That does not make the report candidate
+  // content, but it is why shareLinkDisclosureNotice says so out loud.
+  "audit_report_share_links",
+  "audit_report_share_link_views"
 ]);
 
 export type RetentionClassification = "planned" | "exempt" | "unclassified";
@@ -3755,6 +3765,119 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 
   return lines.join("\n") + "\n";
 }
+
+// ---- AF-90: unauthenticated share link for the role-level audit report ----
+//
+// AF-59 built the report and said it should be readable "without a
+// login"; this is the policy around that URL. The endpoint is
+// unauthenticated by definition, so the interesting decisions are all
+// about what the link does NOT do.
+//
+// A leaked link exposes an employer's role-level pilot metrics, not named
+// candidates: describeAuditSampleProvenance already reduces the sample to
+// seed / eligibleCount / sampledCount and drops sampledApplicationIds
+// entirely. That is the difference between an embarrassment and a
+// notifiable incident, and it is why a share link is a normal feature
+// rather than a blocker.
+//
+// One caveat that survives that reduction and belongs in the design: the
+// seed is a reconstruction key. Anyone who ALSO holds the eligible
+// application set can recompute exactly which applications were sampled.
+// Harmless to a stranger who holds neither, fine for the employer whose
+// data it is -- but it means a report should not be treated as safe to
+// hand to a third party who might hold an overlapping candidate set.
+// shareLinkDisclosureNotice states that, so the decision to forward is
+// made with it rather than around it.
+
+/** Always bounded. A pilot ends; a link outliving it is the failure mode. */
+export const SHARE_LINK_DEFAULT_DAYS = 30;
+/** Enforced here and again by a CHECK constraint, so neither can drift alone. */
+export const SHARE_LINK_MAX_DAYS = 180;
+
+export function computeShareLinkExpiry(createdAt: Date, days: number = SHARE_LINK_DEFAULT_DAYS): string {
+  if (!Number.isInteger(days) || days < 1) {
+    throw new Error(`a share link must last a whole number of days, at least one, got: ${days}`);
+  }
+  if (days > SHARE_LINK_MAX_DAYS) {
+    throw new Error(
+      `a share link may last at most ${SHARE_LINK_MAX_DAYS} days, got: ${days}; a link that outlives ` +
+        "the pilot it was made for is the failure this ceiling exists to prevent"
+    );
+  }
+  return new Date(createdAt.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/**
+ * Why a link did not serve a report. Server-side only.
+ *
+ * Never returned to the caller, and that is the whole point. Telling an
+ * unauthenticated requester that a token was "expired" or "revoked"
+ * rather than "not found" confirms the token existed, which turns a
+ * guessing attack into a two-step one: enumerate to find real tokens,
+ * then look for a leaked-but-live one. The distinction is worth keeping
+ * for operators, who need to know whether a link is being retried after
+ * revocation, so it is recorded rather than discarded -- just not sent.
+ */
+export type ShareLinkUnavailableReason = "not_found" | "expired" | "revoked";
+
+export interface ShareLinkAvailable {
+  readonly status: "available";
+  readonly report: RoleAuditReport;
+}
+
+export interface ShareLinkUnavailable {
+  readonly status: "unavailable";
+  /** For the server log and operator tooling. Must not reach the response. */
+  readonly internalReason: ShareLinkUnavailableReason;
+}
+
+export type ShareLinkResolution = ShareLinkAvailable | ShareLinkUnavailable;
+
+/**
+ * The one message every failure produces.
+ *
+ * A single constant rather than a function over the reason, because a
+ * function invites a caller to pass the reason through "just for
+ * debugging" and that is exactly how an oracle gets reintroduced.
+ */
+export const SHARE_LINK_UNAVAILABLE_MESSAGE =
+  "This report link is not available. Ask the person who shared it for a current link.";
+
+/**
+ * What a viewer is told, whatever went wrong.
+ *
+ * Takes the resolution and returns only what is safe to render, so the
+ * narrowing happens in one place that can be tested rather than at each
+ * call site.
+ */
+export function renderShareLinkResolution(
+  resolution: ShareLinkResolution
+): { readonly httpStatus: 200 | 404; readonly body: string } {
+  if (resolution.status === "available") {
+    return { httpStatus: 200, body: renderRoleAuditReport(resolution.report) };
+  }
+  // 404 for every failure, including revoked and expired. A 410 Gone would
+  // be more descriptive and would leak precisely the fact being withheld.
+  return { httpStatus: 404, body: SHARE_LINK_UNAVAILABLE_MESSAGE };
+}
+
+/**
+ * The sentence that goes at the top of a shared report.
+ *
+ * Says what the link does and does not contain, so an employer deciding
+ * whether to forward it is deciding with the reconstruction-key caveat in
+ * front of them rather than discovering it later.
+ */
+export function shareLinkDisclosureNotice(): string {
+  return (
+    "This report contains role-level audit metrics for a single hiring role. It does not name " +
+    "candidates or contain their application text. It does contain the random seed used to draw " +
+    "the audit sample: anyone who already holds the full list of applications for this role can " +
+    "use that seed to work out which ones were sampled, so treat this link as you would the " +
+    "underlying data."
+  );
+}
+
 
 // ---- AF-57: evidence precision / correction rate ----
 //
