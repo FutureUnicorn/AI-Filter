@@ -1,18 +1,23 @@
--- Numbered 0007, not 0006: 0006_audit_events_delete_and_membership_fixes.sql
--- already holds that number. Two files sharing one number makes the
--- sequence ambiguous to read and leaves any reference to "0006" pointing
--- at either of them.
+-- On the shared 0006 prefix with
+-- 0006_audit_events_delete_and_membership_fixes.sql: it stays, deliberately.
 --
--- organization_id deliberately has NO ON DELETE clause, so it takes the
--- implicit RESTRICT. ON DELETE CASCADE fights the append-only trigger
--- below: deleting an organization with any extraction history attempts a
--- cascaded DELETE on this table, the trigger rejects it, and the failure
--- reads "evidence_extraction_runs is append-only: DELETE is not allowed"
--- rather than naming the organization reference that actually blocks it.
--- Verified by executing exactly that, and it is the same bug
--- 0006_audit_events_delete_and_membership_fixes.sql already fixed on
--- audit_events for the same reason -- reintroduced here on a new
--- append-only table.
+-- Renumbering this file to 0007 was tried and reverted, for two reasons
+-- found by checking rather than by reasoning about it:
+--
+--   1. 0007 is free on this branch but TAKEN one branch later, by
+--      0007_inference_usage_ledger.sql on AF-41. Resolving that pushes a
+--      renumber through every branch above, each of which adds its own next
+--      number, so the cascade does not terminate cheaply.
+--   2. This file defines reject_append_only_mutation(), which later
+--      migrations call. Its sort position is load-bearing -- it cannot move
+--      after its consumers, which also rules out "use the next free number".
+--
+-- The ordering is not actually ambiguous. infra/compose/runtime.yml applies
+-- migrations with `for migration in /migrations/*.sql`, a shell glob, which
+-- sorts lexicographically: 0006_audit_events... runs before
+-- 0006_evidence_extraction_runs..., the order they need. What was ambiguous
+-- is prose that says "0006" without a filename, so references name the full
+-- file instead.
 
 -- AF-40: persist which model, prompt, schema, and rubric version
 -- produced each evidence-extraction run, for reproducibility and

@@ -555,7 +555,7 @@ export async function assertExtractionRunOrganizationDelete(
     await admin.query(`SET search_path TO "${schema}"`);
     for (const file of [
       "0002_organizations_users_memberships.sql",
-      "0007_evidence_extraction_runs.sql"
+      "0006_evidence_extraction_runs.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
