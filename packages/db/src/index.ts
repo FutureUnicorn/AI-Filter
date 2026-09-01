@@ -525,3 +525,62 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-40 review (#23): the organization reference must not cascade ----
+
+/**
+ * Proves that deleting an organization fails for the RIGHT reason.
+ *
+ * evidence_extraction_runs is append-only, so ON DELETE CASCADE on
+ * organization_id could never work: the cascaded DELETE hits the
+ * reject-mutation trigger and the error reads "evidence_extraction_runs is
+ * append-only", naming the trigger instead of the organization reference
+ * that actually blocks the delete. Operators debugging a failed offboarding
+ * are then looking at the wrong constraint.
+ *
+ * 0006_audit_events_delete_and_membership_fixes.sql already fixed exactly
+ * this on audit_events. Asserted here so the next append-only table that
+ * copies this pattern is caught by a test rather than by a reviewer.
+ */
+export async function assertExtractionRunOrganizationDelete(
+  databaseUrl: string
+): Promise<{ readonly message: string }> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `run_fk_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_evidence_extraction_runs.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs
+         (organization_id, entity_type, entity_id, provider, model, prompt_version,
+          extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,'application','app-1','openai','gpt-5.6','v1','1.0.0','evidence','v1')`,
+      [org]
+    );
+    try {
+      await admin.query(`DELETE FROM organizations WHERE organization_id = $1`, [org]);
+    } catch (error) {
+      return { message: error instanceof Error ? error.message : String(error) };
+    }
+    throw new Error(
+      "assertExtractionRunOrganizationDelete: deleting the organization SUCCEEDED, but an extraction run still references it"
+    );
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}

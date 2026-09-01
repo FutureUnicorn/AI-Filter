@@ -1,3 +1,19 @@
+-- Numbered 0007, not 0006: 0006_audit_events_delete_and_membership_fixes.sql
+-- already holds that number. Two files sharing one number makes the
+-- sequence ambiguous to read and leaves any reference to "0006" pointing
+-- at either of them.
+--
+-- organization_id deliberately has NO ON DELETE clause, so it takes the
+-- implicit RESTRICT. ON DELETE CASCADE fights the append-only trigger
+-- below: deleting an organization with any extraction history attempts a
+-- cascaded DELETE on this table, the trigger rejects it, and the failure
+-- reads "evidence_extraction_runs is append-only: DELETE is not allowed"
+-- rather than naming the organization reference that actually blocks it.
+-- Verified by executing exactly that, and it is the same bug
+-- 0006_audit_events_delete_and_membership_fixes.sql already fixed on
+-- audit_events for the same reason -- reintroduced here on a new
+-- append-only table.
+
 -- AF-40: persist which model, prompt, schema, and rubric version
 -- produced each evidence-extraction run, for reproducibility and
 -- audit. Append-only for the same reason as audit_events (0005): a
@@ -19,7 +35,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE TABLE IF NOT EXISTS evidence_extraction_runs (
   run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+  organization_id uuid NOT NULL REFERENCES organizations (organization_id),
   entity_type text NOT NULL CHECK (length(entity_type) > 0),
   entity_id text NOT NULL CHECK (length(entity_id) > 0),
   provider text NOT NULL CHECK (length(provider) > 0),
@@ -45,3 +61,12 @@ DROP TRIGGER IF EXISTS evidence_extraction_runs_reject_truncate ON evidence_extr
 CREATE TRIGGER evidence_extraction_runs_reject_truncate
   BEFORE TRUNCATE ON evidence_extraction_runs
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- Idempotent repair for any database where this table was created before
+-- the cascade was removed. Dropping and re-adding is the only way to
+-- change a foreign key's delete action.
+ALTER TABLE evidence_extraction_runs
+  DROP CONSTRAINT IF EXISTS evidence_extraction_runs_organization_id_fkey;
+ALTER TABLE evidence_extraction_runs
+  ADD CONSTRAINT evidence_extraction_runs_organization_id_fkey
+  FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);
