@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { z } from "zod";
 
+import { sourceCitationSchema } from "@signal-audit/contracts";
 import type { BoundaryContract } from "@signal-audit/contracts";
 import { CONTRACT_SCHEMA_VERSION, assertUnreachableEvidenceOutcome } from "@signal-audit/domain";
 import type {
@@ -240,7 +241,20 @@ export function createOpenAiAdapter(
 // a model cannot self-report "the citation validator will reject me."
 
 export const EVIDENCE_EXTRACTION_SCHEMA_NAME = "evidence_response";
-export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "1.0.0";
+// Bumped to 2.0.0 by the same change that made `conflicting` required.
+//
+// Adding a required property is breaking in both directions: a response
+// that was valid under 1.0.0 (no `conflicting` key) is now rejected, and a
+// 2.0.0 response carries a key a 1.0.0 consumer does not expect. AF-40
+// persists this string on every extraction run, so leaving it at 1.0.0
+// would label two incompatible response shapes with the same version and
+// leave a consumer replaying that history unable to pick the right
+// validator -- the audit record would say the runs were comparable when
+// they are not.
+//
+// Major rather than minor because the break is to previously-valid input,
+// not an additive option.
+export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "2.0.0";
 
 export const EVIDENCE_EXTRACTION_STATES = [
   "supported",
@@ -269,7 +283,7 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["criterion_id", "state", "quote", "source"],
+        required: ["criterion_id", "state", "quote", "source", "conflicting"],
         properties: {
           criterion_id: { type: "string", minLength: 1 },
           state: { type: "string", enum: EVIDENCE_EXTRACTION_STATES },
@@ -283,9 +297,48 @@ export const EVIDENCE_EXTRACTION_JSON_SCHEMA: Record<string, unknown> = {
             additionalProperties: false,
             required: ["document", "page_or_section", "offset"],
             properties: {
-              document: { type: "string" },
+              // minLength here for the same reason as criterion_id: the
+              // Zod validator requires this unconditionally, so leaving
+              // the model-facing schema silent asks the provider for
+              // something it will then be rejected for producing.
+              document: { type: "string", minLength: 1 },
               page_or_section: { type: "string" },
               offset: { type: "integer" }
+            }
+          },
+          // A contradiction has two sides. AF-13's ContradictedEvidence
+          // requires BOTH `citation` and `conflictingCitation`, so an item
+          // carrying one quote could never map to a persistable
+          // contradicted outcome -- it is the only state in the union that
+          // needs a second citation, and without this the kind is
+          // unreachable no matter what the model returns.
+          //
+          // Expressed as a null union rather than an omitted key because
+          // this schema is sent with `strict: true`, where optionality is
+          // spelled `type: [..., "null"]` rather than by leaving the
+          // property out of `required`. Non-null exactly when state is
+          // "contradicted"; the Zod validator enforces that both ways.
+          conflicting: {
+            type: ["object", "null"],
+            additionalProperties: false,
+            required: ["quote", "source"],
+            description:
+              "The opposing evidence, when state is contradicted. Must be null for every other state.",
+            properties: {
+              quote: {
+                type: "string",
+                description: "Exact verbatim substring that conflicts with the primary quote."
+              },
+              source: {
+                type: "object",
+                additionalProperties: false,
+                required: ["document", "page_or_section", "offset"],
+                properties: {
+                  document: { type: "string", minLength: 1 },
+                  page_or_section: { type: "string" },
+                  offset: { type: "integer" }
+                }
+              }
             }
           }
         }
@@ -310,7 +363,22 @@ export const evidenceExtractionItemSchema = z
       document: z.string().min(1),
       page_or_section: z.string(),
       offset: z.number().int()
-    })
+    }),
+    // Nullish rather than required-nullable: the model-facing JSON schema
+    // above always asks for the key (strict mode), but this validator is
+    // also the entry point for callers constructing items directly, and
+    // requiring the key there would break every non-contradicted fixture
+    // for no safety gain. The refinements below carry the real rule.
+    conflicting: z
+      .strictObject({
+        quote: z.string(),
+        source: z.strictObject({
+          document: z.string().min(1),
+          page_or_section: z.string(),
+          offset: z.number().int()
+        })
+      })
+      .nullish()
   })
   .refine((item) => (item.state === "not_found" ? item.quote === "" : item.quote.trim().length > 0), {
     message: "quote must be empty only when state is not_found, and citing quotes must contain non-whitespace",
@@ -323,7 +391,36 @@ export const evidenceExtractionItemSchema = z
   .refine((item) => item.state === "not_found" || item.source.offset >= 0, {
     message: "citing states require a nonnegative offset",
     path: ["source", "offset"]
-  });
+  })
+  // A contradiction needs both sides or it cannot be persisted at all:
+  // AF-13's ContradictedEvidence requires citation AND conflictingCitation.
+  .refine((item) => item.state !== "contradicted" || (item.conflicting ?? null) !== null, {
+    message: "state contradicted requires a conflicting quote and source; a contradiction has two sides",
+    path: ["conflicting"]
+  })
+  // ...and only a contradiction may carry one. Without this, a supported
+  // item could smuggle a second citation that nothing downstream reads,
+  // which is a quiet way to lose evidence a reviewer was meant to see.
+  .refine((item) => item.state === "contradicted" || (item.conflicting ?? null) === null, {
+    message: "only state contradicted may carry a conflicting quote",
+    path: ["conflicting"]
+  })
+  .refine(
+    (item) =>
+      item.state !== "contradicted" ||
+      (item.conflicting != null &&
+        item.conflicting.quote.trim().length > 0 &&
+        item.conflicting.source.page_or_section.trim().length > 0 &&
+        item.conflicting.source.offset >= 0),
+    {
+      // The same coordinate rules the primary citation already gets. A
+      // conflicting side that fails sourceCitationSchema would make the
+      // contradicted outcome unpersistable for a second, subtler reason.
+      message:
+        "a conflicting side requires a nonempty quote, a nonempty page_or_section and a nonnegative offset",
+      path: ["conflicting"]
+    }
+  );
 
 export const evidenceExtractionResponseSchema = z.strictObject({
   items: z.array(evidenceExtractionItemSchema)
@@ -356,12 +453,37 @@ function citationFrom(item: EvidenceExtractionItem): SourceCitation {
   };
 }
 
+function conflictingCitationFrom(item: EvidenceExtractionItem): SourceCitation | undefined {
+  const side = item.conflicting;
+  if (side == null) {
+    return undefined;
+  }
+  return {
+    document: side.source.document,
+    pageOrSection: side.source.page_or_section,
+    offset: side.source.offset,
+    quote: side.quote
+  };
+}
+
+// Both helpers answer one question -- "will the citation this builds
+// survive sourceCitationSchema?" -- so they ask the schema instead of
+// restating it. The restated version omitted two of its four rules: a
+// nonempty `document`, and an `offset` that is an INTEGER rather than
+// merely non-negative. So `document: ""`, `offset: 0.5` and
+// `offset: Infinity` all passed here and produced a citing outcome that
+// then failed the persisted contract downstream, which is the failure the
+// predicate exists to prevent.
+//
+// Parsing cannot drift from the schema. A restatement always can, and did.
+
 function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
-  return (
-    item.source.page_or_section.trim().length > 0 &&
-    item.source.offset >= 0 &&
-    item.quote.trim().length > 0
-  );
+  return sourceCitationSchema.safeParse(citationFrom(item)).success;
+}
+
+function conflictingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
+  const side = conflictingCitationFrom(item);
+  return side !== undefined && sourceCitationSchema.safeParse(side).success;
 }
 
 /**
@@ -382,6 +504,24 @@ function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
 export interface EvidenceSubject {
   readonly organizationId: string;
   readonly candidateId: string;
+}
+
+/**
+ * Every function that advertises persistable EvidenceOutcomes has to agree
+ * on what a valid attribution is, or one constructs outcomes the other's
+ * rules reject and the failure surfaces at persist time, far from the
+ * cause. evidenceOutcomeSchema requires a UUID organizationId and a
+ * non-empty candidateId; a nonempty but non-UUID organizationId such as
+ * "org-1" used to pass a whitespace-only check and then fail every
+ * contract branch later.
+ */
+function assertPersistableSubject(subject: EvidenceSubject, fn: string): void {
+  if (subject.candidateId.trim().length === 0) {
+    throw new Error(`${fn} requires a non-empty candidateId`);
+  }
+  if (!z.uuid().safeParse(subject.organizationId).success) {
+    throw new Error(`${fn} requires a UUID organizationId`);
+  }
 }
 
 function invalidCitationOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
@@ -409,39 +549,42 @@ function mapExtractedItem(subject: EvidenceSubject, item: EvidenceExtractionItem
     case "not_found":
       return { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId, candidateId, criterionId };
     case "contradicted":
-      // A second defect CI surfaced alongside the missing attribution,
-      // and it is not a typing nuisance.
-      //
-      // AF-13's review made ContradictedEvidence carry BOTH sides of the
-      // conflict -- citation AND conflictingCitation -- because a
-      // contradiction a reviewer can only see one half of is not
-      // reviewable. An extraction item carries one quote. So a single
-      // item can no longer produce a persistable contradicted outcome,
-      // and constructing one with the second side missing would hand
-      // back a value that fails evidenceOutcomeSchema.
-      //
-      // Reported as a retryable extraction_error naming the real reason,
-      // rather than downgraded to `unclear`: a model that found
-      // conflicting evidence and a model that found ambiguous evidence
-      // are saying different things, and collapsing them would lose the
-      // signal this criterion most needs a human for. AF-35's
-      // model-facing schema has to grow a second quote for the
-      // contradicted state before this can map properly.
-      if (!citingCitationIsPersistable(item)) {
-        return invalidCitationOutcome(subject, criterionId);
+      // AF-13 requires both sides of the conflict. AF-35's follow-up
+      // (#64) added `conflicting` so a validated contradicted item can
+      // carry them. The item type still types that field as nullish
+      // (direct-construction fixtures omit it), so the mapper narrows
+      // at runtime: both persistable citations become `contradicted`;
+      // a missing or unpersistable second side stays a named
+      // extraction_error rather than being collapsed to `unclear`.
+      {
+        const conflictingCitation = conflictingCitationFrom(item);
+        if (!citingCitationIsPersistable(item)) {
+          return invalidCitationOutcome(subject, criterionId);
+        }
+        if (conflictingCitation === undefined || !conflictingCitationIsPersistable(item)) {
+          return {
+            schemaVersion: CONTRACT_SCHEMA_VERSION,
+            kind: "extraction_error",
+            organizationId,
+            candidateId,
+            criterionId,
+            errorCode: "contradiction_missing_conflicting_citation",
+            message:
+              "The model reported a contradiction but did not supply a persistable conflicting citation; " +
+              "a persistable contradicted outcome requires both sides of the conflict.",
+            retryable: true
+          };
+        }
+        return {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          organizationId,
+          candidateId,
+          criterionId,
+          citation: citationFrom(item),
+          conflictingCitation
+        };
       }
-      return {
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        kind: "extraction_error",
-        organizationId,
-        candidateId,
-        criterionId,
-        errorCode: "contradiction_missing_conflicting_citation",
-        message:
-          "The model reported a contradiction but the extraction schema supplies only one quote; " +
-          "a persistable contradicted outcome requires both sides of the conflict.",
-        retryable: true
-      };
     case "supported":
     case "partially_supported":
     case "unclear":
@@ -498,12 +641,7 @@ export function mapRubricToEvidence(
   // whitespace-only check and then fail every contract branch at persist
   // time. Constructing outcomes carrying an unpersistable attribution
   // would surface that failure far from here.
-  if (subject.candidateId.trim().length === 0) {
-    throw new Error("mapRubricToEvidence requires a non-empty candidateId");
-  }
-  if (!z.uuid().safeParse(subject.organizationId).success) {
-    throw new Error("mapRubricToEvidence requires a UUID organizationId");
-  }
+  assertPersistableSubject(subject, "mapRubricToEvidence");
   // The rubric IDs arrive as an unconstrained string[] with no upstream
   // schema or branded type guaranteeing anything about them, so they are
   // validated here rather than assumed. Both checks protect the promise
@@ -567,7 +705,7 @@ export type EscalationReason =
   | "unreadable_input"
   | "citation_failed"
   | "contradiction_detected"
-  | "injection_indicator";
+  | "injection_indicator_detected";
 
 export interface RoutingSignals {
   readonly unreadableInput: boolean;
@@ -575,6 +713,30 @@ export interface RoutingSignals {
   readonly contradictionDetected: boolean;
   readonly injectionIndicatorDetected: boolean;
 }
+
+/**
+ * Signal to reason, as one ordered table rather than four if-blocks.
+ *
+ * Every reason is the snake_case of the signal that raises it. That was
+ * true of three of the four and not the fourth --
+ * `injectionIndicatorDetected` reported `injection_indicator`, dropping
+ * the `_detected` the other pair keeps -- which is the kind of drift that
+ * survives review precisely because each line reads fine on its own. A
+ * reason is a value that ends up in audit logs and analytics, so a name
+ * that does not match its signal makes the two impossible to join without
+ * a lookup nobody writes down.
+ *
+ * Holding the pairs in one table means the correspondence is a single
+ * fact that can be asserted, rather than four independent facts that can
+ * each rot separately. The order is the order reasons are reported in,
+ * and is load-bearing for callers that render them.
+ */
+export const ESCALATION_SIGNAL_REASONS: readonly (readonly [keyof RoutingSignals, EscalationReason])[] = [
+  ["unreadableInput", "unreadable_input"],
+  ["citationFailed", "citation_failed"],
+  ["contradictionDetected", "contradiction_detected"],
+  ["injectionIndicatorDetected", "injection_indicator_detected"]
+];
 
 export interface ModelRoutingConfig {
   readonly defaultModel: string;
@@ -588,19 +750,9 @@ export interface ModelRoutingResult {
 }
 
 export function routeModel(config: ModelRoutingConfig, signals: RoutingSignals): ModelRoutingResult {
-  const reasons: EscalationReason[] = [];
-  if (signals.unreadableInput) {
-    reasons.push("unreadable_input");
-  }
-  if (signals.citationFailed) {
-    reasons.push("citation_failed");
-  }
-  if (signals.contradictionDetected) {
-    reasons.push("contradiction_detected");
-  }
-  if (signals.injectionIndicatorDetected) {
-    reasons.push("injection_indicator");
-  }
+  const reasons = ESCALATION_SIGNAL_REASONS.filter(([signal]) => signals[signal]).map(
+    ([, reason]) => reason
+  );
 
   return reasons.length === 0
     ? { model: config.defaultModel, tier: "default", reasons: [] }
@@ -635,39 +787,87 @@ function isCitingEvidence(
   );
 }
 
-function toCitationInvalid(criterionId: string, rejectedCitation: SourceCitation, reason: string): EvidenceOutcome {
+function toCitationInvalid(
+  outcome: SupportedEvidence | PartiallySupportedEvidence | ContradictedEvidence | UnclearEvidence,
+  rejectedCitation: unknown,
+  reason: string
+): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "citation_invalid",
-    criterionId,
+    organizationId: outcome.organizationId,
+    candidateId: outcome.candidateId,
+    criterionId: outcome.criterionId,
     reason,
     rejectedCitation
   };
 }
 
 /**
- * Non-citing outcomes pass through unexamined -- there is nothing to
- * validate and no citation field to inspect. A citing outcome whose
- * quote fails this check is discarded and replaced with
- * `citation_invalid`, carrying the rejected citation and why, ready for
- * AF-39 to route to human review.
+ * The text a citation must be checked against, or undefined when none was
+ * supplied for the document it names.
+ *
+ * The string form carries no document identifier, so it cannot and does
+ * not check which document the PRIMARY citation names: passing a string
+ * asserts "this is the text of whatever document this outcome cites", and
+ * that assertion is the caller's, not something this function verifies.
+ * What it does enforce is internal consistency -- a CONFLICTING citation
+ * naming a different document than the primary is refused, because there
+ * is no text here to check it against. Silently checking a cover-letter
+ * quote against the resume would report a real citation as a
+ * hallucination, and silently skipping it would let an unchecked one
+ * through.
+ *
+ * The map form is what actually verifies documents: each citation is
+ * looked up by the document it names, so a citation naming a document the
+ * caller did not supply is refused rather than checked against the wrong
+ * text.
  */
-export function validateCitation(outcome: EvidenceOutcome, sourceText: string): EvidenceOutcome {
-  if (!isCitingEvidence(outcome)) {
-    return outcome;
+export type CitationSources = string | ReadonlyMap<string, string>;
+
+function sourceTextFor(
+  citation: SourceCitation,
+  sources: CitationSources,
+  singleDocument: string
+): string | undefined {
+  if (typeof sources === "string") {
+    return citation.document === singleDocument ? sources : undefined;
   }
+  return sources.get(citation.document);
+}
 
-  const { citation, criterionId } = outcome;
-
+/**
+ * Why one citation fails, or undefined if it holds up.
+ *
+ * Extracted so both sides of a contradiction are checked by the same
+ * rules. Two copies of these four checks would drift, and the side that
+ * drifted would be the one nobody was looking at.
+ */
+function citationFailureReason(citation: SourceCitation, sourceText: string): string | undefined {
   if (citation.quote.length === 0) {
-    return toCitationInvalid(criterionId, citation, "missing quote for a citing state");
+    return "missing quote for a citing state";
   }
   if (!sourceText.includes(citation.quote)) {
-    return toCitationInvalid(
-      criterionId,
-      citation,
-      "quote not found verbatim in source text (likely hallucination)"
-    );
+    return "quote not found verbatim in source text (likely hallucination)";
+  }
+  // Placed AFTER the substring check, deliberately: if the quote is not in
+  // the source at all, "hallucination" is the accurate diagnosis and a
+  // complaint about the offset would send a reviewer to the wrong problem.
+  // An offset only means anything for a quote that exists.
+  //
+  // NaN and any negative offset make both `>= sourceCodePoints.length` and
+  // `>= 0` false, so the check below was SKIPPED ENTIRELY and the outcome
+  // passed on the substring match alone -- the same shape as the
+  // out-of-range bug fixed earlier in this file, reached by a different
+  // input. A fractional offset is worse than skipped: slice() truncates, so
+  // 0.5 silently verified position 0 and reported the citation as valid at
+  // a location it never claimed.
+  //
+  // sourceCitationSchema already says offset is z.number().int().min(0);
+  // this function inspects model output that has not necessarily been
+  // through it, so the same rule is enforced rather than assumed.
+  if (!Number.isSafeInteger(citation.offset) || citation.offset < 0) {
+    return "claimed offset is not a non-negative whole number";
   }
   // Offsets are compared in Unicode CODE POINTS, matching the Python
   // validator this ports (scripts/validate_citations.py indexes Python
@@ -686,19 +886,88 @@ export function validateCitation(outcome: EvidenceOutcome, sourceText: string): 
   // validation unexamined as long as the quote appeared somewhere in the
   // text -- preserving an impossible citation location as valid evidence.
   if (citation.offset >= sourceCodePoints.length) {
-    return toCitationInvalid(
-      criterionId,
-      citation,
-      "claimed offset is past the end of the source text"
-    );
+    return "claimed offset is past the end of the source text";
   }
 
-  if (citation.offset >= 0) {
+  {
     const window = sourceCodePoints
       .slice(citation.offset, citation.offset + [...citation.quote].length)
       .join("");
     if (window !== citation.quote) {
-      return toCitationInvalid(criterionId, citation, "quote exists in source but not at the claimed offset");
+      return "quote exists in source but not at the claimed offset";
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Non-citing outcomes pass through unexamined -- there is nothing to
+ * validate and no citation field to inspect. A citing outcome whose
+ * quote fails this check is discarded and replaced with
+ * `citation_invalid`, carrying the rejected citation and why, ready for
+ * AF-39 to route to human review.
+ *
+ * A `contradicted` outcome is the case that needs saying explicitly,
+ * because it carries TWO citations and only one of them used to be
+ * checked. A contradiction is a claim about both cited facts at once, so
+ * a hallucinated opposing side is not half-valid evidence -- it is a
+ * fabricated conflict, and the more damaging half to get wrong, since it
+ * is the side that argues against the candidate. Validating only the
+ * primary let such an outcome reach a reviewer as valid `contradicted`
+ * evidence, with the fabricated quote displayed beside a real one that
+ * lent it credibility.
+ */
+export function validateCitation(outcome: EvidenceOutcome, sources: CitationSources): EvidenceOutcome {
+  if (!isCitingEvidence(outcome)) {
+    return outcome;
+  }
+
+  const { citation } = outcome;
+
+  const primaryText = typeof sources === "string" ? sources : sources.get(citation.document);
+  if (primaryText === undefined) {
+    return toCitationInvalid(
+      outcome,
+      citation,
+      `no source text was supplied for document "${citation.document}", so this citation cannot be verified`
+    );
+  }
+
+  const primaryFailure = citationFailureReason(citation, primaryText);
+  if (primaryFailure !== undefined) {
+    return toCitationInvalid(outcome, citation, primaryFailure);
+  }
+
+  if (outcome.kind === "contradicted") {
+    // Typed as required, checked anyway. This function's entire job is
+    // validating model output that has crossed a trust boundary, and a
+    // static type is not a runtime guarantee about such data -- a
+    // contradicted outcome that arrives with one side missing must fail
+    // closed here rather than throw a TypeError out of a validator.
+    const conflicting = outcome.conflictingCitation as SourceCitation | undefined;
+    if (conflicting === undefined) {
+      return toCitationInvalid(
+        outcome,
+        citation,
+        "contradicted outcome carries no conflicting citation, so the contradiction has only one side"
+      );
+    }
+    const conflictingText = sourceTextFor(conflicting, sources, citation.document);
+    if (conflictingText === undefined) {
+      // Fails closed. An unverifiable citation is not a valid one, and a
+      // contradiction resting on an unchecked quote is exactly the thing
+      // this validator exists to keep away from reviewers.
+      return toCitationInvalid(
+        outcome,
+        conflicting,
+        `conflicting citation names document "${conflicting.document}", for which no source text was ` +
+          `supplied; pass a document-to-text map to validate a cross-document contradiction`
+      );
+    }
+    const conflictingFailure = citationFailureReason(conflicting, conflictingText);
+    if (conflictingFailure !== undefined) {
+      return toCitationInvalid(outcome, conflicting, `conflicting citation: ${conflictingFailure}`);
     }
   }
 
@@ -799,13 +1068,23 @@ export function parseEvidenceExtractionResponse(value: unknown): ExtractionParse
  * payload cannot disappear before human review.
  */
 export function outcomesForSchemaValidationFailure(
+  subject: EvidenceSubject,
   rubricCriterionIds: readonly string[],
   failure: SchemaValidationFailure
 ): EvidenceOutcome[] {
+  // Takes the subject for the same reason mapRubricToEvidence does: every
+  // EvidenceOutcome kind carries organizationId and candidateId, and an
+  // outcome without them is neither persistable nor attributable to a
+  // tenant. Missing them here did not merely fail to compile -- it meant
+  // the one path that exists to keep a rejected payload visible to a human
+  // produced outcomes that could never be stored.
+  assertPersistableSubject(subject, "outcomesForSchemaValidationFailure");
   const summary = summarizeSchemaValidationFailure(failure);
   return rubricCriterionIds.map((criterionId) => ({
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     errorCode: "schema_validation_failed",
     message: `Model response failed schema validation: ${summary}`,
