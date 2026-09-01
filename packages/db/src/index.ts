@@ -409,6 +409,27 @@ export interface RecordInferenceUsageInput {
  * a faulty or untrusted caller could walk the meter backwards and
  * postpone the cap indefinitely.
  */
+/**
+ * Reads a Postgres bigint column, refusing to lose precision quietly.
+ *
+ * bigint arrives as a string precisely because it does not fit a JS
+ * number. Number("9007199254740993") is 9007199254740992 -- off by one,
+ * with no error -- and these values feed a budget comparison, so a
+ * silently wrong total is a silently wrong spending decision. Failing here
+ * is loud and fixable; the alternative is a cap that stops working
+ * correctly at a threshold nobody is watching for.
+ */
+function bigintColumnToNumber(raw: string, column: string): number {
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || String(value) !== raw.trim()) {
+    throw new Error(
+      `${column} is ${raw}, which exceeds the range a JavaScript number can hold exactly ` +
+        `(max ${Number.MAX_SAFE_INTEGER}); refusing to return a value that has silently lost precision`
+    );
+  }
+  return value;
+}
+
 function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
   for (const [field, value] of [
     ["inputTokens", input.inputTokens],
@@ -469,8 +490,8 @@ export async function getInferenceUsage(
     );
     const row = result.rows[0];
     return {
-      inputTokens: row === undefined ? 0 : Number(row.input_tokens),
-      outputTokens: row === undefined ? 0 : Number(row.output_tokens)
+      inputTokens: row === undefined ? 0 : bigintColumnToNumber(row.input_tokens, "input_tokens"),
+      outputTokens: row === undefined ? 0 : bigintColumnToNumber(row.output_tokens, "output_tokens")
     };
   } finally {
     await client.end().catch(() => undefined);
@@ -508,6 +529,16 @@ export async function reserveInferenceBudget(
 ): Promise<ReserveInferenceBudgetOutcome> {
   assertSafeSchema(schema);
   assertNonNegativeUsage(input);
+  // Validated here rather than left to the `$7::bigint` cast. An unchecked
+  // NaN or fractional value fails inside Postgres with a cast error that
+  // names neither the field nor the caller, and a negative cap would make
+  // every reservation fail as cap_exceeded rather than being rejected as
+  // the nonsense it is.
+  if (!Number.isSafeInteger(input.maxTotalTokens) || input.maxTotalTokens < 0) {
+    throw new Error(
+      `reserveInferenceBudget requires a non-negative safe integer maxTotalTokens, got: ${input.maxTotalTokens}`
+    );
+  }
   const requested = input.inputTokens + input.outputTokens;
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
@@ -537,12 +568,25 @@ export async function reserveInferenceBudget(
     );
     const row = reserved.rows[0];
     if (row !== undefined) {
-      return { outcome: "reserved", totalTokensAfter: Number(row.total_tokens) };
+      return { outcome: "reserved", totalTokensAfter: bigintColumnToNumber(row.total_tokens, "total_tokens") };
     }
-    const current = await getInferenceUsage(databaseUrl, schema, input);
+    // Read back on the connection already open, rather than calling
+    // getInferenceUsage and opening a second one. This is the capped path,
+    // which is the hot one exactly when a tenant is hammering the cap.
+    const current = await client.query<{ input_tokens: string; output_tokens: string }>(
+      `SELECT input_tokens, output_tokens FROM "${schema}".inference_usage_ledger
+        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+      [input.organizationId, input.model, input.periodStart]
+    );
+    const currentRow = current.rows[0];
+    const totalTokensBefore =
+      currentRow === undefined
+        ? 0
+        : bigintColumnToNumber(currentRow.input_tokens, "input_tokens") +
+          bigintColumnToNumber(currentRow.output_tokens, "output_tokens");
     return {
       outcome: "cap_exceeded",
-      totalTokensBefore: current.inputTokens + current.outputTokens,
+      totalTokensBefore,
       maxTotalTokens: input.maxTotalTokens
     };
   } finally {
