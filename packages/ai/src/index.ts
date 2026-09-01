@@ -838,6 +838,37 @@ function isCitingEvidence(
   );
 }
 
+/**
+ * Renders a rejected proposal in a form that survives JSON.
+ *
+ * citation_invalid exists to preserve what was rejected, and the offset
+ * guard above deliberately rejects NaN and the infinities -- which are
+ * exactly the values JSON cannot carry. jsonValueSchema enforces
+ * `.finite()`, so copying the citation through verbatim produced a
+ * citation_invalid that itself failed evidenceOutcomeSchema: unpersistable,
+ * unroutable, and therefore invisible to the human review this kind is for.
+ * That is the same failure that made rejectedCitation `unknown` in the
+ * first place, reached one layer further down.
+ *
+ * Non-finite numbers become their string form ("NaN", "Infinity") rather
+ * than being dropped or zeroed. A reviewer still sees exactly what was
+ * claimed, and the outcome persists.
+ */
+function jsonSafeRejection(value: unknown): unknown {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(jsonSafeRejection);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, jsonSafeRejection(v)])
+    );
+  }
+  return value;
+}
+
 function toCitationInvalid(
   outcome: SupportedEvidence | PartiallySupportedEvidence | ContradictedEvidence | UnclearEvidence,
   rejectedCitation: unknown,
@@ -850,7 +881,7 @@ function toCitationInvalid(
     candidateId: outcome.candidateId,
     criterionId: outcome.criterionId,
     reason,
-    rejectedCitation
+    rejectedCitation: jsonSafeRejection(rejectedCitation)
   };
 }
 
@@ -974,7 +1005,22 @@ export function validateCitation(outcome: EvidenceOutcome, sources: CitationSour
     return outcome;
   }
 
-  const { citation } = outcome;
+  // isCitingEvidence narrows on `kind` alone, which is all it can do for a
+  // payload that has not been through the schema. A model response
+  // claiming kind "supported" with no citation field would then throw a
+  // TypeError out of a validator whose entire job is inspecting untrusted
+  // output. Fails closed instead.
+  const citation = (outcome as { citation?: SourceCitation }).citation;
+  if (citation === null || typeof citation !== "object") {
+    // `null`, not the absent value: undefined is not a JSON value, so
+    // passing it through would produce yet another citation_invalid that
+    // cannot be persisted -- the same trap this branch exists to close.
+    return toCitationInvalid(
+      outcome,
+      citation ?? null,
+      "citing outcome carries no citation, so there is nothing to verify"
+    );
+  }
 
   const primaryText = typeof sources === "string" ? sources : sources.get(citation.document);
   if (primaryText === undefined) {
