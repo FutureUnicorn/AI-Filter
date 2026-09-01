@@ -639,7 +639,7 @@ export type EscalationReason =
   | "unreadable_input"
   | "citation_failed"
   | "contradiction_detected"
-  | "injection_indicator";
+  | "injection_indicator_detected";
 
 export interface RoutingSignals {
   readonly unreadableInput: boolean;
@@ -647,6 +647,30 @@ export interface RoutingSignals {
   readonly contradictionDetected: boolean;
   readonly injectionIndicatorDetected: boolean;
 }
+
+/**
+ * Signal to reason, as one ordered table rather than four if-blocks.
+ *
+ * Every reason is the snake_case of the signal that raises it. That was
+ * true of three of the four and not the fourth --
+ * `injectionIndicatorDetected` reported `injection_indicator`, dropping
+ * the `_detected` the other pair keeps -- which is the kind of drift that
+ * survives review precisely because each line reads fine on its own. A
+ * reason is a value that ends up in audit logs and analytics, so a name
+ * that does not match its signal makes the two impossible to join without
+ * a lookup nobody writes down.
+ *
+ * Holding the pairs in one table means the correspondence is a single
+ * fact that can be asserted, rather than four independent facts that can
+ * each rot separately. The order is the order reasons are reported in,
+ * and is load-bearing for callers that render them.
+ */
+export const ESCALATION_SIGNAL_REASONS: readonly (readonly [keyof RoutingSignals, EscalationReason])[] = [
+  ["unreadableInput", "unreadable_input"],
+  ["citationFailed", "citation_failed"],
+  ["contradictionDetected", "contradiction_detected"],
+  ["injectionIndicatorDetected", "injection_indicator_detected"]
+];
 
 export interface ModelRoutingConfig {
   readonly defaultModel: string;
@@ -660,19 +684,9 @@ export interface ModelRoutingResult {
 }
 
 export function routeModel(config: ModelRoutingConfig, signals: RoutingSignals): ModelRoutingResult {
-  const reasons: EscalationReason[] = [];
-  if (signals.unreadableInput) {
-    reasons.push("unreadable_input");
-  }
-  if (signals.citationFailed) {
-    reasons.push("citation_failed");
-  }
-  if (signals.contradictionDetected) {
-    reasons.push("contradiction_detected");
-  }
-  if (signals.injectionIndicatorDetected) {
-    reasons.push("injection_indicator");
-  }
+  const reasons = ESCALATION_SIGNAL_REASONS.filter(([signal]) => signals[signal]).map(
+    ([, reason]) => reason
+  );
 
   return reasons.length === 0
     ? { model: config.defaultModel, tier: "default", reasons: [] }
