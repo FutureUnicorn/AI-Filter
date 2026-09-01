@@ -254,3 +254,38 @@ test("a cross-document contradiction validates when each document's text is supp
   const result = validateCitation(fabricated, sources);
   assert.equal(result.kind, "citation_invalid");
 });
+
+// AF-38 review round 2 (#21). The offset guard was reachable by inputs the
+// earlier out-of-range fix did not cover.
+
+test("an offset that is not a non-negative whole number is rejected, not skipped", () => {
+  // NaN and any negative value make BOTH `>= length` and `>= 0` false, so
+  // the offset check was skipped entirely and the outcome passed on the
+  // substring match alone -- the same shape as the out-of-range bug above,
+  // reached by a different input. A fractional offset is worse than
+  // skipped: slice() truncates, so 0.5 silently verified position 0.
+  for (const offset of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, 0.5]) {
+    const result = validateCitation(af38Citing("Built", offset), "Built Python services.");
+    assert.equal(result.kind, "citation_invalid", `offset ${offset} was accepted`);
+  }
+});
+
+test("a legitimate offset still passes, so the guard is not rejecting everything", () => {
+  // The control for the case above.
+  const result = validateCitation(af38Citing("Built", 0), "Built Python services.");
+  assert.equal(result.kind, "supported");
+});
+
+test("the rejected citation is preserved verbatim, malformed values included", () => {
+  // The reason CitationInvalidEvidence types rejectedCitation as `unknown`:
+  // this kind exists to carry what was actually rejected, including a
+  // proposal that could never satisfy SourceCitation. A helper that narrows
+  // the parameter back to SourceCitation quietly undoes that.
+  const malformed = { document: "resume.txt", pageOrSection: "Experience", offset: Number.NaN, quote: "Built" };
+  const outcome = { ...af38Citing("Built", 0), citation: malformed } as unknown as EvidenceOutcome;
+  const result = validateCitation(outcome, "Built Python services.");
+  assert.equal(result.kind, "citation_invalid");
+  if (result.kind === "citation_invalid") {
+    assert.deepEqual(result.rejectedCitation, malformed, "the rejected proposal must survive intact");
+  }
+});

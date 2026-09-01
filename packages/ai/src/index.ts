@@ -727,7 +727,7 @@ function isCitingEvidence(
 
 function toCitationInvalid(
   outcome: SupportedEvidence | PartiallySupportedEvidence | ContradictedEvidence | UnclearEvidence,
-  rejectedCitation: SourceCitation,
+  rejectedCitation: unknown,
   reason: string
 ): EvidenceOutcome {
   return {
@@ -745,13 +745,21 @@ function toCitationInvalid(
  * The text a citation must be checked against, or undefined when none was
  * supplied for the document it names.
  *
- * The string form means "one document is in play", which is how every
- * caller uses this today. A citation naming some OTHER document cannot be
- * checked against it, and saying so is the point: silently checking a
- * cover-letter quote against the resume would report a real citation as a
+ * The string form carries no document identifier, so it cannot and does
+ * not check which document the PRIMARY citation names: passing a string
+ * asserts "this is the text of whatever document this outcome cites", and
+ * that assertion is the caller's, not something this function verifies.
+ * What it does enforce is internal consistency -- a CONFLICTING citation
+ * naming a different document than the primary is refused, because there
+ * is no text here to check it against. Silently checking a cover-letter
+ * quote against the resume would report a real citation as a
  * hallucination, and silently skipping it would let an unchecked one
- * through. The map form is how a caller expresses a genuine
- * cross-document contradiction.
+ * through.
+ *
+ * The map form is what actually verifies documents: each citation is
+ * looked up by the document it names, so a citation naming a document the
+ * caller did not supply is refused rather than checked against the wrong
+ * text.
  */
 export type CitationSources = string | ReadonlyMap<string, string>;
 
@@ -780,6 +788,25 @@ function citationFailureReason(citation: SourceCitation, sourceText: string): st
   if (!sourceText.includes(citation.quote)) {
     return "quote not found verbatim in source text (likely hallucination)";
   }
+  // Placed AFTER the substring check, deliberately: if the quote is not in
+  // the source at all, "hallucination" is the accurate diagnosis and a
+  // complaint about the offset would send a reviewer to the wrong problem.
+  // An offset only means anything for a quote that exists.
+  //
+  // NaN and any negative offset make both `>= sourceCodePoints.length` and
+  // `>= 0` false, so the check below was SKIPPED ENTIRELY and the outcome
+  // passed on the substring match alone -- the same shape as the
+  // out-of-range bug fixed earlier in this file, reached by a different
+  // input. A fractional offset is worse than skipped: slice() truncates, so
+  // 0.5 silently verified position 0 and reported the citation as valid at
+  // a location it never claimed.
+  //
+  // sourceCitationSchema already says offset is z.number().int().min(0);
+  // this function inspects model output that has not necessarily been
+  // through it, so the same rule is enforced rather than assumed.
+  if (!Number.isSafeInteger(citation.offset) || citation.offset < 0) {
+    return "claimed offset is not a non-negative whole number";
+  }
   // Offsets are compared in Unicode CODE POINTS, matching the Python
   // validator this ports (scripts/validate_citations.py indexes Python
   // strings, which are code-point indexed). JavaScript's slice indexes
@@ -800,7 +827,7 @@ function citationFailureReason(citation: SourceCitation, sourceText: string): st
     return "claimed offset is past the end of the source text";
   }
 
-  if (citation.offset >= 0) {
+  {
     const window = sourceCodePoints
       .slice(citation.offset, citation.offset + [...citation.quote].length)
       .join("");
