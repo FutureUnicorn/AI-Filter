@@ -1210,10 +1210,23 @@ export function routeForReview(
 // AF-39's review queue as if something went wrong with the extraction
 // itself.
 
-export function killSwitchRetryOutcome(criterionId: string, attempt: number, maxAttempts: number): EvidenceOutcome {
+export function killSwitchRetryOutcome(
+  subject: EvidenceSubject,
+  criterionId: string,
+  attempt: number,
+  maxAttempts: number
+): EvidenceOutcome {
+  // Same reason mapRubricToEvidence and outcomesForSchemaValidationFailure
+  // take a subject: every EvidenceOutcome kind carries organizationId and
+  // candidateId. A `retrying` outcome without them is not persistable, and
+  // this is the outcome that represents work deferred by the kill switch --
+  // exactly the state that has to survive until someone picks it back up.
+  assertPersistableSubject(subject, "killSwitchRetryOutcome");
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "retrying",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     attempt,
     maxAttempts

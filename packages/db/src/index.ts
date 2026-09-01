@@ -534,7 +534,11 @@ export async function getInferenceKillSwitchStatus(
 export interface SetInferenceKillSwitchInput {
   readonly engaged: boolean;
   readonly reason?: string;
-  readonly engagedByUserId?: string;
+  // No separate engagedByUserId: the audited actor below is the single
+  // source of truth. Carrying both let the singleton row name one person
+  // while the audit event named another, and the two are supposed to be
+  // the same fact recorded twice -- so the row is written from the actor.
+
   /**
    * Required to audit the transition. Every engage/disengage overwrites
    * the singleton row -- including its actor, reason and timestamp -- so
@@ -553,7 +557,8 @@ export interface SetInferenceKillSwitchInput {
 
 /**
  * The database CHECK constraint (migration 0008) is the real enforcement:
- * engaging without a reason and an engagedByUserId is rejected there
+ * engaging without a reason is rejected there, and the actor comes from
+ * the audited actorUserId rather than a second field
  * regardless of what this function is called with, matching this
  * codebase's habit of enforcing an invariant at more than one layer.
  *
@@ -575,9 +580,15 @@ export async function setInferenceKillSwitch(
     try {
       const result = await client.query(
         `UPDATE "${schema}".inference_kill_switch
-            SET engaged = $1, reason = $2, engaged_by_user_id = $3, updated_at = clock_timestamp()
+            SET engaged = $1,
+                reason = $2,
+                -- Cleared on disengage: "who engaged it" is meaningless
+                -- once it is off, and leaving the last engager's name on a
+                -- disengaged switch reads like they are still holding it.
+                engaged_by_user_id = CASE WHEN $1 THEN $3::uuid ELSE NULL END,
+                updated_at = clock_timestamp()
           WHERE id = true`,
-        [input.engaged, input.reason ?? null, input.engagedByUserId ?? null]
+        [input.engaged, input.reason ?? null, input.audit.actorUserId]
       );
       if (result.rowCount === 0) {
         throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
