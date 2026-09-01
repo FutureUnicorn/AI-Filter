@@ -55,6 +55,7 @@ import {
   validatePrivacyRequestTransition
 } from "@signal-audit/domain";
 import { Client } from "pg";
+import type { QueryResult, QueryResultRow } from "pg";
 
 /** Persistence adapters will implement domain-owned ports in this package. */
 export interface DatabaseAdapterBoundary {
@@ -1438,6 +1439,19 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
     await admin.query(`CREATE ROLE ${role} NOSUPERUSER NOBYPASSRLS`);
+    // Postgres 16 split role membership into INHERIT / SET / ADMIN, and the
+    // implicit membership a CREATEROLE user gets on a role it creates is
+    // ADMIN only: on 17.10 the pg_auth_members row reads admin_option=true,
+    // inherit_option=false, set_option=false, and `SET ROLE` fails with
+    // "permission denied to set role". This probe therefore only ever
+    // worked because it was run as a superuser, which bypasses the check --
+    // the same "works because the control is currently inert" shape AF-43
+    // found in the RLS lookup.
+    //
+    // An explicit GRANT defaults to SET TRUE, so this makes the probe work
+    // for any role with CREATEROLE and CREATE ON SCHEMA rather than
+    // requiring superuser. Dropped with the role in the finally block.
+    await admin.query(`GRANT ${role} TO CURRENT_USER`);
     await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A'), ($2, 'Org B')`, [
@@ -1448,10 +1462,31 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       `INSERT INTO users (user_id, email, display_name) VALUES ($1, 'a@acme.test', 'A'), ($2, 'b@acme.test', 'B')`,
       [userA, userB]
     );
-    await admin.query(
-      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($3, $4, 'owner')`,
-      [orgA, userA, orgB, userB]
-    );
+    // Seeding memberships needs the same tenant scope the policy demands.
+    // 0004 uses FORCE ROW LEVEL SECURITY, so the table OWNER is subject to
+    // the policy too -- only a superuser bypasses it. Inserting both rows
+    // unscoped therefore fails with "new row violates row-level security
+    // policy" for any non-superuser, which is the second reason this probe
+    // silently required superuser. Each row is seeded inside its own
+    // organization's scope, in a transaction so the setting is local and
+    // cannot leak into the assertions below.
+    for (const [organizationId, userId] of [
+      [orgA, userA],
+      [orgB, userB]
+    ] as const) {
+      await admin.query("BEGIN");
+      try {
+        await admin.query("SELECT set_config('app.current_org_id', $1, true)", [organizationId]);
+        await admin.query(
+          `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`,
+          [organizationId, userId]
+        );
+        await admin.query("COMMIT");
+      } catch (error) {
+        await admin.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    }
 
     const asProbe = async (orgId: string | undefined, sql: string, params: unknown[] = []) => {
       await admin.query("BEGIN");
@@ -1565,21 +1600,65 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
       `INSERT INTO users (email, display_name) VALUES ($1, 'Member') RETURNING user_id`,
       [memberEmail]
     );
-    await admin.query(
+    // Same FORCE ROW LEVEL SECURITY constraint as
+    // assertMembershipsTenantIsolation: the owner is subject to the policy,
+    // so this seed has to run inside the tenant scope it is writing into or
+    // it fails for every non-superuser.
+    // FORCE ROW LEVEL SECURITY subjects the table OWNER to the policy, so
+    // every statement this probe issues against memberships -- reads
+    // included, not just the seed -- has to name the tenant it is working
+    // in. An unscoped SELECT does not error, it returns zero rows, which is
+    // the failure worth guarding against: a verification read that silently
+    // sees nothing reports "the write did not happen" when the write
+    // happened correctly and the reader simply could not see it.
+    const asScopedOwner = async <T extends QueryResultRow>(
+      sql: string,
+      params: unknown[] = []
+    ): Promise<QueryResult<T>> => {
+      await admin.query("BEGIN");
+      try {
+        await admin.query("SELECT set_config('app.current_org_id', $1, true)", [organizationId]);
+        const result = await admin.query<T>(sql, params);
+        await admin.query("COMMIT");
+        return result;
+      } catch (error) {
+        await admin.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    };
+
+    await asScopedOwner(
       `INSERT INTO memberships (organization_id, user_id, role)
        SELECT $1, user_id, 'recruiter' FROM users WHERE email = $2`,
       [organizationId, memberEmail]
     );
 
-    // Control: as the superuser, RLS is bypassed, so the existing login
-    // path still works exactly as it does today. Without this, claim 1
-    // below could pass for the wrong reason (a lookup that is simply
-    // broken for everyone).
-    await createMagicLinkToken(databaseUrl, schema, {
-      tokenHash: `superuser-login-${suffix}`,
-      email: memberEmail,
-      expiresAt
-    });
+    // Control: for a role RLS does not apply to, the existing login path
+    // still works exactly as it does today. Without this, claim 1 below
+    // could pass for the wrong reason -- a lookup that is simply broken
+    // for everyone.
+    //
+    // "A role RLS does not apply to" used to mean "a superuser", and this
+    // probe silently required one. That is the same defect the memberships
+    // probe carried until it was fixed to run for any role with CREATEROLE:
+    // a control that only holds under superuser is inert everywhere else,
+    // and an inert control proves nothing. FORCE ROW LEVEL SECURITY is
+    // precisely what subjects the table OWNER to the policy, so lifting it
+    // for the duration of the control is the same condition expressed in a
+    // way the owner can actually reach. Restored in the finally, before
+    // claim 1 runs, so the claim is still measured under the real policy --
+    // and restored on the failure path too, since leaving FORCE off would
+    // make claim 1 pass for the wrong reason.
+    await admin.query(`ALTER TABLE memberships NO FORCE ROW LEVEL SECURITY`);
+    try {
+      await createMagicLinkToken(databaseUrl, schema, {
+        tokenHash: `unforced-login-${suffix}`,
+        email: memberEmail,
+        expiresAt
+      });
+    } finally {
+      await admin.query(`ALTER TABLE memberships FORCE ROW LEVEL SECURITY`);
+    }
 
     // Claim 1: the same call under a role RLS applies to must name RLS
     // as the cause, not report the member as having no membership.
@@ -1615,7 +1694,7 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     if (!firstRedemption.justRedeemed) {
       throw new Error("invite redemption must succeed under active row-level security");
     }
-    const afterInvite = await admin.query<{ role: string }>(
+    const afterInvite = await asScopedOwner<{ role: string }>(
       `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
       [invitedEmail]
     );
@@ -1634,7 +1713,7 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
       expiresAt
     });
     await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);
-    const afterPromotion = await admin.query<{ role: string }>(
+    const afterPromotion = await asScopedOwner<{ role: string }>(
       `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
       [invitedEmail]
     );
@@ -1646,8 +1725,10 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
 
     // A re-invite that would strand the organization with no owner is
     // refused, loudly, and leaves the existing membership untouched.
-    await admin.query(`UPDATE memberships SET role = 'owner' WHERE organization_id = $1`, [organizationId]);
-    await admin.query(
+    await asScopedOwner(`UPDATE memberships SET role = 'owner' WHERE organization_id = $1`, [
+      organizationId
+    ]);
+    await asScopedOwner(
       `DELETE FROM memberships
         WHERE organization_id = $1
           AND user_id <> (SELECT user_id FROM users WHERE email = $2)`,
@@ -1668,7 +1749,7 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     if (demotionError === undefined) {
       throw new Error("demoting the last owner of an organization must be refused, not applied silently");
     }
-    const afterRefusal = await admin.query<{ role: string }>(
+    const afterRefusal = await asScopedOwner<{ role: string }>(
       `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
       [invitedEmail]
     );
