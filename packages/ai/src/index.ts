@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { z } from "zod";
 
+import { sourceCitationSchema } from "@signal-audit/contracts";
 import type { BoundaryContract } from "@signal-audit/contracts";
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 import type {
@@ -191,7 +192,20 @@ export function createOpenAiAdapter(
 // a model cannot self-report "the citation validator will reject me."
 
 export const EVIDENCE_EXTRACTION_SCHEMA_NAME = "evidence_response";
-export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "1.0.0";
+// Bumped to 2.0.0 by the same change that made `conflicting` required.
+//
+// Adding a required property is breaking in both directions: a response
+// that was valid under 1.0.0 (no `conflicting` key) is now rejected, and a
+// 2.0.0 response carries a key a 1.0.0 consumer does not expect. AF-40
+// persists this string on every extraction run, so leaving it at 1.0.0
+// would label two incompatible response shapes with the same version and
+// leave a consumer replaying that history unable to pick the right
+// validator -- the audit record would say the runs were comparable when
+// they are not.
+//
+// Major rather than minor because the break is to previously-valid input,
+// not an additive option.
+export const EVIDENCE_EXTRACTION_SCHEMA_VERSION = "2.0.0";
 
 export const EVIDENCE_EXTRACTION_STATES = [
   "supported",
@@ -403,22 +417,24 @@ function conflictingCitationFrom(item: EvidenceExtractionItem): SourceCitation |
   };
 }
 
+// Both helpers answer one question -- "will the citation this builds
+// survive sourceCitationSchema?" -- so they ask the schema instead of
+// restating it. The restated version omitted two of its four rules: a
+// nonempty `document`, and an `offset` that is an INTEGER rather than
+// merely non-negative. So `document: ""`, `offset: 0.5` and
+// `offset: Infinity` all passed here and produced a citing outcome that
+// then failed the persisted contract downstream, which is the failure the
+// predicate exists to prevent.
+//
+// Parsing cannot drift from the schema. A restatement always can, and did.
+
 function citingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
-  return (
-    item.source.page_or_section.trim().length > 0 &&
-    item.source.offset >= 0 &&
-    item.quote.trim().length > 0
-  );
+  return sourceCitationSchema.safeParse(citationFrom(item)).success;
 }
 
 function conflictingCitationIsPersistable(item: EvidenceExtractionItem): boolean {
-  const side = item.conflicting;
-  return (
-    side != null &&
-    side.source.page_or_section.trim().length > 0 &&
-    side.source.offset >= 0 &&
-    side.quote.trim().length > 0
-  );
+  const side = conflictingCitationFrom(item);
+  return side !== undefined && sourceCitationSchema.safeParse(side).success;
 }
 
 /**
