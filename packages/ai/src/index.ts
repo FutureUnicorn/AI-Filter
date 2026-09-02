@@ -1268,6 +1268,26 @@ export function killSwitchRetryOutcome(
   // this is the outcome that represents work deferred by the kill switch --
   // exactly the state that has to survive until someone picks it back up.
   assertPersistableSubject(subject, "killSwitchRetryOutcome");
+  // Checked here, where the caller is, rather than left to the schema. This
+  // function's whole promise is a persistable outcome, and
+  // `retryingEvidenceSchema` requires both counters to be positive integers
+  // with attempt <= maxAttempts. A zero, a fraction, or an attempt past the
+  // maximum is accepted here and then rejected at the write, so paused work
+  // fails only at the moment someone tries to save it: the point at which the
+  // kill switch was supposed to have safely deferred it.
+  for (const [field, value] of [
+    ["attempt", attempt],
+    ["maxAttempts", maxAttempts]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`killSwitchRetryOutcome requires a positive integer ${field}, got: ${value}`);
+    }
+  }
+  if (attempt > maxAttempts) {
+    throw new Error(
+      `killSwitchRetryOutcome cannot describe attempt ${attempt} of ${maxAttempts}; an exhausted retry is not a retrying outcome`
+    );
+  }
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "retrying",

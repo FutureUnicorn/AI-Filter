@@ -593,6 +593,17 @@ export async function setInferenceKillSwitch(
       if (result.rowCount === 0) {
         throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
       }
+      // The reason, kept where the next transition cannot overwrite it.
+      // The singleton above is the CURRENT state, so disengaging replaces or
+      // clears the reason the engage recorded; this row is the history. Same
+      // transaction as both the flip and the audit event, so a switch cannot
+      // end up flipped with no record of why.
+      await client.query(
+        `INSERT INTO "${schema}".inference_kill_switch_transitions
+           (engaged, reason, actor_user_id, request_id)
+         VALUES ($1, $2, $3, $4)`,
+        [input.engaged, input.reason ?? null, input.audit.actorUserId, input.audit.requestId]
+      );
       // Same transaction, on the same client: the switch cannot end up
       // flipped without the audit row recording who did it, and a
       // failure here rolls the transition back rather than leaving an
@@ -920,6 +931,111 @@ export interface InferenceBudgetPrecisionObservations {
   readonly storedValue: string;
   /** cap_exceeded reports the real committed total. */
   readonly capExceededTotalBefore: number;
+}
+
+export interface KillSwitchTransitionObservations {
+  /** Whether engaging with no reason at all is refused by the table itself. */
+  readonly nullReasonRejected: boolean;
+  /** What the pre-review constraint did with the same row. */
+  readonly nullReasonAcceptedByOldConstraint: boolean;
+  /** Reasons in the append-only log, oldest first. */
+  readonly loggedReasons: readonly (string | null)[];
+  /** The reason left on the singleton after a later transition overwrote it. */
+  readonly singletonReasonAfterDisengage: string | null;
+}
+
+/**
+ * Exercise the kill-switch constraint and its transition log on a real
+ * Postgres, in a disposable schema.
+ *
+ * Both halves of this need a live server to mean anything. `reason ~ '...'`
+ * against a NULL reason evaluates to NULL rather than false, and Postgres
+ * accepts a CHECK that is true OR NULL, so the hole only exists in the
+ * database's three-valued logic and cannot be reproduced in TypeScript. The
+ * old constraint is rebuilt here and shown accepting the row it should have
+ * refused, so the test can prove the fix rather than assert it.
+ */
+export async function assertKillSwitchTransitionLog(
+  databaseUrl: string
+): Promise<KillSwitchTransitionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `kill_switch_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const actor = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0005_immutable_audit_events.sql",
+      "0008_inference_kill_switch.sql",
+      "0009_inference_kill_switch_nonblank_reason.sql",
+      "0010_kill_switch_reason_non_whitespace.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,'a@example.com','Probe Actor')`, [actor]);
+
+    const engageWithNullReason = async (): Promise<boolean> => {
+      try {
+        await admin.query(
+          `UPDATE inference_kill_switch
+              SET engaged = true, reason = NULL, engaged_by_user_id = $1 WHERE id = true`,
+          [actor]
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const acceptedNow = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // Rebuild the pre-review constraint and show it accepting the same row.
+    await admin.query(`ALTER TABLE inference_kill_switch DROP CONSTRAINT inference_kill_switch_check`);
+    await admin.query(
+      `ALTER TABLE inference_kill_switch ADD CONSTRAINT inference_kill_switch_check
+       CHECK ((engaged AND reason ~ '[^[:space:]]' AND engaged_by_user_id IS NOT NULL) OR NOT engaged)`
+    );
+    const acceptedBefore = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // The log keeps each transition's reason where the next cannot reach it.
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (true, 'runaway extraction loop', $1, 'req_00000000-0000-4000-8000-000000000001')`,
+      [actor]
+    );
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (false, NULL, $1, 'req_00000000-0000-4000-8000-000000000002')`,
+      [actor]
+    );
+    await admin.query(
+      `UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`
+    );
+
+    const logged = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch_transitions ORDER BY occurred_at`
+    );
+    const singleton = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch WHERE id = true`
+    );
+
+    return {
+      nullReasonRejected: !acceptedNow,
+      nullReasonAcceptedByOldConstraint: acceptedBefore,
+      loggedReasons: logged.rows.map((r) => r.reason),
+      singletonReasonAfterDisengage: singleton.rows[0]?.reason ?? null
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export async function assertInferenceBudgetPrecision(
