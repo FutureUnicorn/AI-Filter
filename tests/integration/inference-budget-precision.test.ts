@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertInferenceBudgetAtomicity,
   assertInferenceBudgetPrecision,
-  reserveInferenceBudget
+  assertInferenceReservationSettlement,
+  recordInferenceUsage,
+  reserveInferenceBudget,
+  settleInferenceReservation
 } from "../../packages/db/src/index.ts";
 
 // AF-41 review (#24). The ledger columns are bigint, which Postgres returns
@@ -56,6 +60,131 @@ test("a nonsensical cap is rejected at the boundary, not by a SQL cast", async (
       () => reserveInferenceBudget(databaseUrl, "public", { ...base, maxTotalTokens }),
       /non-negative safe integer maxTotalTokens/,
       `maxTotalTokens ${maxTotalTokens} was accepted`
+    );
+  }
+});
+
+test("concurrent reservations near the cap cannot overspend it", async () => {
+  // The P1 this ticket's review raised. A sequential loop cannot show it:
+  // the broken read-then-write version passes that just as happily. Thirty
+  // reservations of 100 fire in parallel against a cap of 1000, so only ten
+  // can legitimately win, and the observation records what the pattern this
+  // replaced does under the identical burst.
+  const observed = await assertInferenceBudgetAtomicity(requireDatabase());
+  assert.equal(observed.cap, 1000);
+  assert.equal(observed.reserved, 10, "exactly ten reservations of 100 fit under a 1000 cap");
+  assert.equal(observed.totalAfter, 1000);
+  assert.ok(
+    observed.totalAfter <= observed.cap,
+    `committed ${observed.totalAfter} against a cap of ${observed.cap}`
+  );
+  // The failure mode being prevented, shown rather than described.
+  assert.ok(
+    observed.naiveTotalAfter > observed.cap,
+    "read-then-write should overspend here; if it no longer does, this test has stopped proving anything"
+  );
+});
+
+test("a negative usage delta cannot walk the meter backwards", async () => {
+  // The table CHECK only sees the result of the addition, so -50 against a
+  // committed 100 lands as 50 and postpones the cap. Rejected at the
+  // boundary instead, on both write paths.
+  const databaseUrl = requireDatabase();
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    model: "gpt-5.6",
+    periodStart: "2026-09-01"
+  };
+  for (const [inputTokens, outputTokens] of [
+    [-50, 0],
+    [0, -1],
+    [1.5, 0]
+  ] as const) {
+    await assert.rejects(
+      () => recordInferenceUsage(databaseUrl, "public", { ...base, inputTokens, outputTokens }),
+      /non-negative integer/,
+      `recordInferenceUsage accepted ${inputTokens}/${outputTokens}`
+    );
+    await assert.rejects(
+      () =>
+        reserveInferenceBudget(databaseUrl, "public", {
+          ...base,
+          inputTokens,
+          outputTokens,
+          maxTotalTokens: 1_000
+        }),
+      /non-negative integer/,
+      `reserveInferenceBudget accepted ${inputTokens}/${outputTokens}`
+    );
+  }
+});
+
+// AF-41 review round two (#24), the two P1s and the safe-sum P2.
+
+test("a zero-token reservation is refused, so a cap cannot be walked past", async () => {
+  // Both guards are `<=`, so a caller sitting exactly at its cap satisfied
+  // `total + 0 <= cap` and was told `reserved`, forever. A caller with no
+  // pre-call estimate could reserve nothing repeatedly and keep calling the
+  // provider after the budget should have blocked everything. It also
+  // contradicted the domain, where zero usage against a zero cap is capped.
+  const databaseUrl = requireDatabase();
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    model: "gpt-5.6",
+    periodStart: "2026-09-01",
+    maxTotalTokens: 1000
+  };
+  await assert.rejects(
+    () => reserveInferenceBudget(databaseUrl, "public", { ...base, inputTokens: 0, outputTokens: 0 }),
+    /requires a positive token estimate/
+  );
+});
+
+test("settling a reservation replaces the estimate instead of adding to it", async () => {
+  // The other P1. A reservation is written before the call, when only an
+  // estimate exists, into the same columns that afterwards hold real usage.
+  // Recording usage on top of it counted the call twice.
+  const observed = await assertInferenceReservationSettlement(requireDatabase());
+
+  assert.deepEqual(observed.overEstimate, { inputTokens: 45, outputTokens: 25 }, "the over-estimate refunded");
+  assert.deepEqual(observed.underEstimate, { inputTokens: 30, outputTokens: 15 }, "the under-estimate topped up");
+
+  // The failure mode being prevented, shown rather than described: reserving
+  // 100 and consuming 70 used to leave 170 in the ledger the cap reads.
+  assert.equal(observed.doubleCountedTotal, 170);
+  assert.equal(observed.overEstimate.inputTokens + observed.overEstimate.outputTokens, 70);
+});
+
+test("a refund larger than the stored total floors at zero instead of aborting", async () => {
+  // Reachable whenever a period rolls over or a row is reset between the
+  // reservation and the response. The columns carry CHECK (>= 0), so without
+  // the floor the statement aborts exactly when a failed settlement is least
+  // welcome.
+  const observed = await assertInferenceReservationSettlement(requireDatabase());
+  assert.deepEqual(observed.oversizedRefund, { inputTokens: 0, outputTokens: 0 });
+});
+
+test("settlement rejects nonsensical token counts at the boundary", async () => {
+  const databaseUrl = requireDatabase();
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    model: "gpt-5.6",
+    periodStart: "2026-09-01",
+    reservedInputTokens: 1,
+    reservedOutputTokens: 1,
+    actualInputTokens: 1,
+    actualOutputTokens: 1
+  };
+  for (const field of [
+    "reservedInputTokens",
+    "reservedOutputTokens",
+    "actualInputTokens",
+    "actualOutputTokens"
+  ] as const) {
+    await assert.rejects(
+      () => settleInferenceReservation(databaseUrl, "public", { ...base, [field]: Number.NaN }),
+      new RegExp(`non-negative safe integer ${field}`),
+      `${field} accepted NaN`
     );
   }
 });

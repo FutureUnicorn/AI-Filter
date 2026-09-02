@@ -39,3 +39,61 @@ test("zero usage against a zero cap is capped, not a division error", () => {
   const result = checkInferenceBudget({ tokensUsedThisPeriod: 0 }, { maxTokensPerPeriod: 0, alertThresholdRatio: 0.8 });
   assert.equal(result.outcome, "capped");
 });
+
+// AF-41 review (#24), codex P2. Every comparison in checkInferenceBudget is
+// false against NaN, so a malformed numeric environment value fell through to
+// "ok" and silently disabled the cap: the one outcome a budget check must
+// never reach by accident.
+
+test("a NaN cap is refused, not treated as no cap at all", () => {
+  assert.throws(
+    () => checkInferenceBudget({ tokensUsedThisPeriod: 5000 }, { maxTokensPerPeriod: NaN, alertThresholdRatio: 0.8 }),
+    /non-negative safe integer maxTokensPerPeriod/
+  );
+});
+
+test("an infinite cap is refused", () => {
+  assert.throws(
+    () =>
+      checkInferenceBudget(
+        { tokensUsedThisPeriod: 5000 },
+        { maxTokensPerPeriod: Number.POSITIVE_INFINITY, alertThresholdRatio: 0.8 }
+      ),
+    /non-negative safe integer maxTokensPerPeriod/
+  );
+});
+
+test("a negative cap is refused rather than capping everything", () => {
+  assert.throws(
+    () => checkInferenceBudget({ tokensUsedThisPeriod: 0 }, { maxTokensPerPeriod: -1, alertThresholdRatio: 0.8 }),
+    /non-negative safe integer maxTokensPerPeriod/
+  );
+});
+
+test("a NaN alert ratio is refused, so warning cannot silently never fire", () => {
+  assert.throws(
+    () => checkInferenceBudget({ tokensUsedThisPeriod: 900 }, { maxTokensPerPeriod: 1000, alertThresholdRatio: NaN }),
+    /alertThresholdRatio between 0 and 1/
+  );
+});
+
+test("an alert ratio above one is refused", () => {
+  assert.throws(
+    () => checkInferenceBudget({ tokensUsedThisPeriod: 900 }, { maxTokensPerPeriod: 1000, alertThresholdRatio: 1.5 }),
+    /alertThresholdRatio between 0 and 1/
+  );
+});
+
+test("NaN usage is refused rather than reading as under the cap", () => {
+  assert.throws(
+    () => checkInferenceBudget({ tokensUsedThisPeriod: NaN }, config),
+    /non-negative tokensUsedThisPeriod/
+  );
+});
+
+test("zero usage against a zero cap is still capped, and a zero ratio is legal", () => {
+  // Pins the boundary the database path was contradicting: at the cap is
+  // capped, even when the cap is zero and nothing has been spent.
+  const result = checkInferenceBudget({ tokensUsedThisPeriod: 0 }, { maxTokensPerPeriod: 0, alertThresholdRatio: 0 });
+  assert.deepEqual(result, { outcome: "capped", tokensUsedThisPeriod: 0, maxTokensPerPeriod: 0 });
+});
