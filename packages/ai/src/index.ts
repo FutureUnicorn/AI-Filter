@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { sourceCitationSchema } from "@signal-audit/contracts";
 import type { BoundaryContract } from "@signal-audit/contracts";
-import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION, assertUnreachableEvidenceOutcome } from "@signal-audit/domain";
 import type {
   AiAdapter,
   AiCallMetadata,
@@ -457,6 +457,24 @@ export interface EvidenceSubject {
   readonly candidateId: string;
 }
 
+/**
+ * Every function that advertises persistable EvidenceOutcomes has to agree
+ * on what a valid attribution is, or one constructs outcomes the other's
+ * rules reject and the failure surfaces at persist time, far from the
+ * cause. evidenceOutcomeSchema requires a UUID organizationId and a
+ * non-empty candidateId; a nonempty but non-UUID organizationId such as
+ * "org-1" used to pass a whitespace-only check and then fail every
+ * contract branch later.
+ */
+function assertPersistableSubject(subject: EvidenceSubject, fn: string): void {
+  if (subject.candidateId.trim().length === 0) {
+    throw new Error(`${fn} requires a non-empty candidateId`);
+  }
+  if (!z.uuid().safeParse(subject.organizationId).success) {
+    throw new Error(`${fn} requires a UUID organizationId`);
+  }
+}
+
 function invalidCitationOutcome(subject: EvidenceSubject, criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
@@ -574,12 +592,7 @@ export function mapRubricToEvidence(
   // whitespace-only check and then fail every contract branch at persist
   // time. Constructing outcomes carrying an unpersistable attribution
   // would surface that failure far from here.
-  if (subject.candidateId.trim().length === 0) {
-    throw new Error("mapRubricToEvidence requires a non-empty candidateId");
-  }
-  if (!z.uuid().safeParse(subject.organizationId).success) {
-    throw new Error("mapRubricToEvidence requires a UUID organizationId");
-  }
+  assertPersistableSubject(subject, "mapRubricToEvidence");
   // The rubric IDs arrive as an unconstrained string[] with no upstream
   // schema or branded type guaranteeing anything about them, so they are
   // validated here rather than assumed. Both checks protect the promise
@@ -956,4 +969,180 @@ export function validateCitation(outcome: EvidenceOutcome, sources: CitationSour
   }
 
   return outcome;
+}
+
+// ---- AF-39: route ambiguous/invalid/suspicious evidence to human review ----
+//
+// A closed, exhaustive switch, not an allow/deny list: the default
+// branch calls assertUnreachableEvidenceOutcome, so a future
+// EvidenceOutcome kind forces a real decision here (a compile error)
+// instead of silently defaulting to "no review needed" -- fail closed,
+// never silently resolved.
+//
+// The ticket names four categories. Failed citation checks and
+// contradictions are EvidenceOutcome kinds (citation_invalid,
+// contradicted) and route from the switch. The other two are not
+// outcomes at all until this layer says so:
+//
+// * Failed schema validation never produces an EvidenceExtractionItem
+//   (evidenceExtractionResponseSchema rejects the payload first, and
+//   mapRubricToEvidence only sees already-valid items). Callers pass
+//   the parse failure itself into routeForReview, or convert it into
+//   per-criterion extraction_error records via
+//   outcomesForSchemaValidationFailure so the failure is persistable.
+// * Injection indicators are a routing signal (AF-37), not a
+//   quarantined outcome. A later supported/not_found result does not
+//   clear the signal -- pass injectionIndicatorDetected on the
+//   context so the original detection still fail-closes to review.
+//
+// invalid_source/unsupported_file/failed are included too: they are
+// broken or incomplete evidence a human needs to know about.
+// supported/partially_supported/not_found are confident, validated
+// results -- they still go through the ordinary review flow (AF-5),
+// just without this special flag, unless an injection signal is
+// attached. processing/retrying have not resolved into anything yet.
+
+export type ReviewRouting =
+  | { readonly needsReview: false }
+  | { readonly needsReview: true; readonly reason: string };
+
+export interface SchemaValidationIssue {
+  readonly path: string;
+  readonly message: string;
+}
+
+export interface SchemaValidationFailure {
+  readonly type: "schema_validation_failure";
+  readonly issues: readonly SchemaValidationIssue[];
+}
+
+export type ReviewRoutingInput = EvidenceOutcome | SchemaValidationFailure;
+
+export interface ReviewRoutingContext {
+  readonly injectionIndicatorDetected?: boolean;
+}
+
+export type ExtractionParseResult =
+  | { readonly ok: true; readonly items: readonly EvidenceExtractionItem[] }
+  | { readonly ok: false; readonly failure: SchemaValidationFailure };
+
+function schemaValidationFailureFromZod(error: z.ZodError): SchemaValidationFailure {
+  return {
+    type: "schema_validation_failure",
+    issues: error.issues.map((issue) => ({
+      path: issue.path.length === 0 ? "" : issue.path.map(String).join("."),
+      message: issue.message
+    }))
+  };
+}
+
+function summarizeSchemaValidationFailure(failure: SchemaValidationFailure): string {
+  if (failure.issues.length === 0) {
+    return "unknown schema error";
+  }
+  return failure.issues
+    .map((issue) => (issue.path.length === 0 ? issue.message : `${issue.path}: ${issue.message}`))
+    .join("; ");
+}
+
+export function isSchemaValidationFailure(input: ReviewRoutingInput): input is SchemaValidationFailure {
+  return "type" in input && input.type === "schema_validation_failure";
+}
+
+/** Accept the raw model payload and keep schema rejection as a first-class failure. */
+export function parseEvidenceExtractionResponse(value: unknown): ExtractionParseResult {
+  const parsed = evidenceExtractionResponseSchema.safeParse(value);
+  if (parsed.success) {
+    return { ok: true, items: parsed.data.items };
+  }
+  return { ok: false, failure: schemaValidationFailureFromZod(parsed.error) };
+}
+
+/**
+ * One persistable extraction_error per rubric criterion when the whole
+ * model response failed schema validation -- the same "exactly one
+ * outcome per criterion" rule as mapRubricToEvidence, so a rejected
+ * payload cannot disappear before human review.
+ */
+export function outcomesForSchemaValidationFailure(
+  subject: EvidenceSubject,
+  rubricCriterionIds: readonly string[],
+  failure: SchemaValidationFailure
+): EvidenceOutcome[] {
+  // Takes the subject for the same reason mapRubricToEvidence does: every
+  // EvidenceOutcome kind carries organizationId and candidateId, and an
+  // outcome without them is neither persistable nor attributable to a
+  // tenant. Missing them here did not merely fail to compile -- it meant
+  // the one path that exists to keep a rejected payload visible to a human
+  // produced outcomes that could never be stored.
+  assertPersistableSubject(subject, "outcomesForSchemaValidationFailure");
+  const summary = summarizeSchemaValidationFailure(failure);
+  return rubricCriterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "extraction_error",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
+    criterionId,
+    errorCode: "schema_validation_failed",
+    message: `Model response failed schema validation: ${summary}`,
+    retryable: true
+  }));
+}
+
+function routeOutcomeForReview(outcome: EvidenceOutcome): ReviewRouting {
+  switch (outcome.kind) {
+    case "supported":
+    case "partially_supported":
+    case "not_found":
+    case "processing":
+    case "retrying":
+      return { needsReview: false };
+    case "unclear":
+      return { needsReview: true, reason: "Evidence is ambiguous and requires human judgment." };
+    case "contradicted":
+      return { needsReview: true, reason: "Supplied facts conflict about this criterion." };
+    case "citation_invalid":
+      return { needsReview: true, reason: `Citation failed validation: ${outcome.reason}` };
+    case "extraction_error":
+      return { needsReview: true, reason: `Extraction failed: ${outcome.message}` };
+    case "invalid_source":
+      return { needsReview: true, reason: `Source material could not be used: ${outcome.reason}` };
+    case "unsupported_file":
+      return { needsReview: true, reason: `Unsupported file format: ${outcome.reason}` };
+    case "quarantined":
+      return { needsReview: true, reason: `Quarantined (${outcome.quarantineClass}): ${outcome.reason}` };
+    case "failed":
+      return { needsReview: true, reason: `Processing failed: ${outcome.message}` };
+    default:
+      return assertUnreachableEvidenceOutcome(outcome);
+  }
+}
+
+function withInjectionSignal(routing: ReviewRouting): ReviewRouting {
+  if (routing.needsReview) {
+    return {
+      needsReview: true,
+      reason: `${routing.reason} Injection indicator was also detected.`
+    };
+  }
+  return {
+    needsReview: true,
+    reason: "Injection indicator detected; this result cannot be trusted without human review."
+  };
+}
+
+export function routeForReview(
+  input: ReviewRoutingInput,
+  context: ReviewRoutingContext = {}
+): ReviewRouting {
+  if (isSchemaValidationFailure(input)) {
+    const routing: ReviewRouting = {
+      needsReview: true,
+      reason: `Model response failed schema validation: ${summarizeSchemaValidationFailure(input)}`
+    };
+    return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
+  }
+
+  const routing = routeOutcomeForReview(input);
+  return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
 }

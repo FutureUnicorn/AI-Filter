@@ -45,6 +45,14 @@ export interface BoundaryContract {
 
 const schemaVersionSchema = z.literal(CONTRACT_SCHEMA_VERSION);
 
+/** Recursive JSON-value type: restricts a field to values that can
+ * actually survive JSON.stringify / Response.json, without requiring any
+ * particular shape. Used for `rejectedCitation`, which must preserve a
+ * structurally malformed citation proposal (empty quote, impossible
+ * offset) while still refusing something like a bigint that would throw
+ * at the persist/transport boundary. */
+export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+
 /**
  * Exported so packages/ai can ask "will this citation actually persist?"
  * by parsing it, rather than restating the rules. AF-36 restated them and
@@ -368,7 +376,11 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
  * and `buildApiError` parses its constructed body through
  * `apiErrorBodySchema` so a non-finite `details` value cannot escape as
  * a body that serializes to a different value than it type-checked as. */
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+// (JsonValue is declared once, above, next to the JSON machinery that
+// enforces it. The paragraph above explains what it buys HERE, on the
+// error-body surface; the declaration site explains what it buys for
+// rejectedCitation. Two duplicate declarations of it -- byte-identical,
+// from a merge -- used to sit here and made this file fail to compile.)
 
 /** The one shape every error response on the API surface takes. */
 export interface ApiErrorBody {
