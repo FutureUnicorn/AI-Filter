@@ -403,13 +403,6 @@ export interface RecordInferenceUsageInput {
 }
 
 /**
- * Rejects a negative delta before it reaches the upsert. The table's
- * CHECK only sees the RESULT of the addition, so once a row has a
- * positive total, recording -50 against 100 silently lowers usage to 50:
- * a faulty or untrusted caller could walk the meter backwards and
- * postpone the cap indefinitely.
- */
-/**
  * Reads a Postgres bigint column, refusing to lose precision quietly.
  *
  * bigint arrives as a string precisely because it does not fit a JS
@@ -430,6 +423,13 @@ function bigintColumnToNumber(raw: string, column: string): number {
   return value;
 }
 
+/**
+ * Rejects a negative delta before it reaches the upsert. The table's
+ * CHECK only sees the RESULT of the addition, so once a row has a
+ * positive total, recording -50 against 100 silently lowers usage to 50:
+ * a faulty or untrusted caller could walk the meter backwards and
+ * postpone the cap indefinitely.
+ */
 function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
   for (const [field, value] of [
     ["inputTokens", input.inputTokens],
@@ -798,6 +798,97 @@ export interface InferenceBudgetPrecisionObservations {
   readonly storedValue: string;
   /** cap_exceeded reports the real committed total. */
   readonly capExceededTotalBefore: number;
+}
+
+export interface InferenceBudgetAtomicityObservations {
+  /** How many of the concurrent reservations were granted. */
+  readonly reserved: number;
+  /** Committed total after the burst. Must never exceed the cap. */
+  readonly totalAfter: number;
+  readonly cap: number;
+  /**
+   * What the read-then-write pattern this replaced produces under the
+   * same burst. Recorded rather than described so the test can show the
+   * overspend instead of asserting the fix in the abstract.
+   */
+  readonly naiveTotalAfter: number;
+}
+
+/**
+ * Drives genuinely concurrent reservations against one cap.
+ *
+ * The whole point of reserveInferenceBudget is that it holds under
+ * concurrency, and that cannot be shown sequentially: a loop passes just
+ * as happily against the broken read-then-write version. So this fires
+ * the burst in parallel, each call on its own connection, exactly as
+ * separate requests would arrive, and reports both what the atomic path
+ * committed and what the naive path commits for comparison.
+ */
+export async function assertInferenceBudgetAtomicity(
+  databaseUrl: string
+): Promise<InferenceBudgetAtomicityObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_race_${suffix}`;
+  const org = "33333333-3333-4333-8333-333333333333";
+  const cap = 1_000;
+  const each = 100;
+  const burst = 30;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'Race')`, [org]);
+
+    const atomicBase = { organizationId: org, model: "atomic", periodStart: "2026-09-01" };
+    const outcomes = await Promise.all(
+      Array.from({ length: burst }, () =>
+        reserveInferenceBudget(databaseUrl, schema, {
+          ...atomicBase,
+          inputTokens: each,
+          outputTokens: 0,
+          maxTotalTokens: cap
+        })
+      )
+    );
+    const after = await getInferenceUsage(databaseUrl, schema, atomicBase);
+
+    // The same burst through read-check-write, on its own ledger row.
+    const naiveBase = { organizationId: org, model: "naive", periodStart: "2026-09-01" };
+    await Promise.all(
+      Array.from({ length: burst }, async () => {
+        const current = await getInferenceUsage(databaseUrl, schema, naiveBase);
+        if (current.inputTokens + current.outputTokens + each <= cap) {
+          await recordInferenceUsage(databaseUrl, schema, {
+            ...naiveBase,
+            inputTokens: each,
+            outputTokens: 0
+          });
+        }
+      })
+    );
+    const naiveAfter = await getInferenceUsage(databaseUrl, schema, naiveBase);
+
+    return {
+      reserved: outcomes.filter((outcome) => outcome.outcome === "reserved").length,
+      totalAfter: after.inputTokens + after.outputTokens,
+      cap,
+      naiveTotalAfter: naiveAfter.inputTokens + naiveAfter.outputTokens
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export async function assertInferenceBudgetPrecision(

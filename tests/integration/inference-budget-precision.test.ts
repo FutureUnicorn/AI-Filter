@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertInferenceBudgetAtomicity,
   assertInferenceBudgetPrecision,
+  recordInferenceUsage,
   reserveInferenceBudget
 } from "../../packages/db/src/index.ts";
 
@@ -56,6 +58,61 @@ test("a nonsensical cap is rejected at the boundary, not by a SQL cast", async (
       () => reserveInferenceBudget(databaseUrl, "public", { ...base, maxTotalTokens }),
       /non-negative safe integer maxTotalTokens/,
       `maxTotalTokens ${maxTotalTokens} was accepted`
+    );
+  }
+});
+
+test("concurrent reservations near the cap cannot overspend it", async () => {
+  // The P1 this ticket's review raised. A sequential loop cannot show it:
+  // the broken read-then-write version passes that just as happily. Thirty
+  // reservations of 100 fire in parallel against a cap of 1000, so only ten
+  // can legitimately win, and the observation records what the pattern this
+  // replaced does under the identical burst.
+  const observed = await assertInferenceBudgetAtomicity(requireDatabase());
+  assert.equal(observed.cap, 1000);
+  assert.equal(observed.reserved, 10, "exactly ten reservations of 100 fit under a 1000 cap");
+  assert.equal(observed.totalAfter, 1000);
+  assert.ok(
+    observed.totalAfter <= observed.cap,
+    `committed ${observed.totalAfter} against a cap of ${observed.cap}`
+  );
+  // The failure mode being prevented, shown rather than described.
+  assert.ok(
+    observed.naiveTotalAfter > observed.cap,
+    "read-then-write should overspend here; if it no longer does, this test has stopped proving anything"
+  );
+});
+
+test("a negative usage delta cannot walk the meter backwards", async () => {
+  // The table CHECK only sees the result of the addition, so -50 against a
+  // committed 100 lands as 50 and postpones the cap. Rejected at the
+  // boundary instead, on both write paths.
+  const databaseUrl = requireDatabase();
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    model: "gpt-5.6",
+    periodStart: "2026-09-01"
+  };
+  for (const [inputTokens, outputTokens] of [
+    [-50, 0],
+    [0, -1],
+    [1.5, 0]
+  ] as const) {
+    await assert.rejects(
+      () => recordInferenceUsage(databaseUrl, "public", { ...base, inputTokens, outputTokens }),
+      /non-negative integer/,
+      `recordInferenceUsage accepted ${inputTokens}/${outputTokens}`
+    );
+    await assert.rejects(
+      () =>
+        reserveInferenceBudget(databaseUrl, "public", {
+          ...base,
+          inputTokens,
+          outputTokens,
+          maxTotalTokens: 1_000
+        }),
+      /non-negative integer/,
+      `reserveInferenceBudget accepted ${inputTokens}/${outputTokens}`
     );
   }
 });
