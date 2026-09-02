@@ -9,6 +9,7 @@ import type {
   CitationInvalidEvidence,
   ContradictedEvidence,
   DomainPort,
+  EvidenceExtractionRun,
   EvidenceOutcome,
   ExtractionErrorEvidence,
   FailedEvidence,
@@ -595,3 +596,20 @@ export const auditEventSchema = z.strictObject({
   requestId: requestIdSchema,
   occurredAt: z.iso.datetime()
 }) satisfies z.ZodType<AuditEvent>;
+
+// ---- AF-40: persist model/prompt/schema/rubric versions ----
+
+export const evidenceExtractionRunSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  runId: z.uuid(),
+  organizationId: z.uuid(),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  provider: z.string().min(1),
+  model: z.string().min(1),
+  promptVersion: z.string().min(1),
+  extractionSchemaVersion: z.string().min(1),
+  extractionSchemaName: z.string().min(1),
+  rubricVersion: z.string().min(1),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<EvidenceExtractionRun>;

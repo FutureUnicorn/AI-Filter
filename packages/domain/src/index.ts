@@ -494,3 +494,31 @@ export interface AiStructuredCallResult {
 export interface AiAdapter {
   runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult>;
 }
+
+// ---- AF-40: persist model/prompt/schema/rubric versions ----
+//
+// A generic entityType/entityId pair (matching AuditEvent, AF-20)
+// rather than a foreign key into an "applications" table that doesn't
+// exist yet. rubricVersion is not part of AiCallMetadata (AF-34):
+// AiAdapter is a generic structured-output port with no concept of a
+// rubric, so the caller supplies it here at the point of persistence,
+// the same way it already supplies promptVersion/schemaVersion to the
+// adapter itself. The AI extraction schema's own version/name are
+// named extractionSchemaVersion/extractionSchemaName, not schemaVersion/
+// schemaName, so they cannot be confused with this record's own
+// VersionedRecord.schemaVersion (always CONTRACT_SCHEMA_VERSION) --
+// two genuinely different versions that happen to share a word.
+
+export interface EvidenceExtractionRun extends VersionedRecord {
+  readonly runId: string;
+  readonly organizationId: string;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly extractionSchemaVersion: string;
+  readonly extractionSchemaName: string;
+  readonly rubricVersion: string;
+  readonly createdAt: string;
+}
