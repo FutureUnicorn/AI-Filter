@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES, ROLE_STATUSES } from "@signal-audit/domain";
+import {
+  AUDIT_ACTIONS,
+  CONTRACT_SCHEMA_VERSION,
+  MAX_RUBRIC_CRITERIA,
+  MEMBERSHIP_ROLES,
+  MIN_RUBRIC_CRITERIA,
+  ROLE_STATUSES,
+  RUBRIC_STATUSES
+} from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   AuditEvent,
@@ -22,6 +30,8 @@ import type {
   QuarantinedEvidence,
   RetryingEvidence,
   Role,
+  Rubric,
+  RubricCriterion,
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
@@ -46,27 +56,6 @@ export interface BoundaryContract {
 // validation instead of being silently accepted.
 
 const schemaVersionSchema = z.literal(CONTRACT_SCHEMA_VERSION);
-
-/** Recursive JSON-value type: restricts a field to values that can
- * actually survive JSON.stringify / Response.json, without requiring any
- * particular shape. Used for `rejectedCitation`, which must preserve a
- * structurally malformed citation proposal (empty quote, impossible
- * offset) while still refusing something like a bigint that would throw
- * at the persist/transport boundary. */
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
-  z.union([
-    z.string(),
-    z.number().finite().refine((value) => !Object.is(value, -0), {
-      message: "must not be negative zero, which JSON serializes as 0"
-    }),
-    z.boolean(),
-    z.null(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema)
-  ])
-);
 
 const sourceCitationSchema = z.strictObject({
   document: z.string().min(1),
@@ -643,3 +632,91 @@ export const createRoleInputSchema = z.strictObject({
 });
 
 export type CreateRoleInput = z.infer<typeof createRoleInputSchema>;
+
+// ---- AF-25: rubric draft/edit ----
+
+export const rubricCriterionSchema = z.strictObject({
+  // Trimmed for the same reason description and evidenceGuidance are, and
+  // it matters more here: criterionId is the key the extraction pipeline
+  // matches an extracted item against, so " python " and "python" naming
+  // the same criterion would be two different keys, and a whitespace-only
+  // id would be a criterion nothing can ever cite. Trimming also makes the
+  // uniqueness rule below mean what it says -- without it, "a" and "a "
+  // are technically distinct and would both be accepted.
+  criterionId: z.string().trim().min(1),
+  description: z.string().trim().min(1).max(500),
+  evidenceGuidance: z.string().trim().min(1).max(500)
+}) satisfies z.ZodType<RubricCriterion>;
+
+/**
+ * Duplicate criterion IDs are rejected here because the layer that
+ * consumes a rubric already rejects them: mapRubricToEvidence throws
+ * `requires unique rubric criterion IDs; "<id>" appears more than once`
+ * rather than silently emitting two outcomes for one criterion, since
+ * that would contradict its one-outcome-per-criterion invariant.
+ *
+ * Without this check the two layers disagreed about what a valid rubric
+ * is, and the API was the more permissive one: a recruiter could save a
+ * rubric with the same criterion five times, get a 200, and only discover
+ * it was malformed when the first extraction run against that role blew
+ * up. A save that succeeds and a run that cannot is the worst split,
+ * because the failure surfaces far from the edit that caused it.
+ *
+ * Reported against the duplicate element's own index rather than the
+ * whole array, so an editor can highlight the offending row, and it names
+ * the earlier position so the author can see which two collide.
+ */
+function addDuplicateCriterionIdIssues(
+  criteria: readonly RubricCriterion[],
+  context: z.RefinementCtx
+): void {
+  const firstIndexById = new Map<string, number>();
+  criteria.forEach((criterion, index) => {
+    const firstIndex = firstIndexById.get(criterion.criterionId);
+    if (firstIndex === undefined) {
+      firstIndexById.set(criterion.criterionId, index);
+      return;
+    }
+    context.addIssue({
+      code: "custom",
+      path: ["criteria", index, "criterionId"],
+      message: `criterionId "${criterion.criterionId}" is already used by criterion ${firstIndex + 1}; a rubric cannot score the same criterion twice`
+    });
+  });
+}
+
+export const rubricSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  rubricId: z.uuid(),
+  roleId: z.uuid(),
+  version: z.number().int().min(1),
+  status: z.enum(RUBRIC_STATUSES),
+  criteria: z.array(rubricCriterionSchema),
+  approvedByUserId: z.uuid().optional(),
+  approvedAt: z.iso.datetime().optional(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime()
+})
+  // The stored/returned rubric carries the same rule as the input that
+  // produced it. A rubric that only became valid on the way in, and is
+  // invalid once read back, would leave the API describing something the
+  // pipeline still refuses to run.
+  .superRefine((value, context) => {
+    addDuplicateCriterionIdIssues(value.criteria, context);
+  }) satisfies z.ZodType<Rubric>;
+
+/**
+ * The 5-10 bound lives here, not only in AF-26's editor UI: an API caller
+ * that bypasses the UI (a script, a future integration) must not be able
+ * to save a 2-criterion or 40-criterion rubric just because the UI didn't
+ * stop it.
+ */
+export const upsertRubricDraftInputSchema = z
+  .strictObject({
+    criteria: z.array(rubricCriterionSchema).min(MIN_RUBRIC_CRITERIA).max(MAX_RUBRIC_CRITERIA)
+  })
+  .superRefine((value, context) => {
+    addDuplicateCriterionIdIssues(value.criteria, context);
+  });
+
+export type UpsertRubricDraftInput = z.infer<typeof upsertRubricDraftInputSchema>;
