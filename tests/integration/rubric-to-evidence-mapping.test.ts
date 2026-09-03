@@ -13,12 +13,22 @@ const SUBJECT = {
 import type { EvidenceExtractionItem } from "../../packages/ai/src/index.ts";
 
 function citing(criterionId: string, state: "supported" | "partially_supported" | "contradicted" | "unclear"): EvidenceExtractionItem {
-  return {
+  const item: EvidenceExtractionItem = {
     criterion_id: criterionId,
     state,
     quote: "Built and maintained Python microservices processing 2M+ events/day.",
     source: { document: "resume.txt", page_or_section: "Experience", offset: 0 }
   };
+  if (state === "contradicted") {
+    return {
+      ...item,
+      conflicting: {
+        quote: "No production Python services; internships only.",
+        source: { document: "cover-letter.txt", page_or_section: "Summary", offset: 12 }
+      }
+    };
+  }
+  return item;
 }
 
 function notFound(criterionId: string): EvidenceExtractionItem {
@@ -70,15 +80,34 @@ test("not_found maps with no citation field at all", () => {
   });
 });
 
-test("a contradicted item becomes a retryable extraction_error, not a half-reported contradiction", () => {
-  // AF-13's review made ContradictedEvidence require BOTH sides of the
-  // conflict, and an extraction item carries one quote. Constructing a
-  // contradicted outcome with the second side missing would produce a
-  // value that fails the persisted contract. It is also deliberately not
-  // downgraded to `unclear`: conflicting evidence and ambiguous evidence
-  // are different findings, and collapsing them loses the signal this
-  // criterion most needs a human for.
+test("a contradicted item with both sides maps to contradicted, not extraction_error", () => {
   const [outcome] = mapRubricToEvidence(SUBJECT, ["python_production"], [citing("python_production", "contradicted")]);
+  assert.equal(outcome?.kind, "contradicted");
+  if (outcome?.kind !== "contradicted") {
+    return;
+  }
+  assert.deepEqual(outcome.citation, {
+    document: "resume.txt",
+    pageOrSection: "Experience",
+    offset: 0,
+    quote: "Built and maintained Python microservices processing 2M+ events/day."
+  });
+  assert.deepEqual(outcome.conflictingCitation, {
+    document: "cover-letter.txt",
+    pageOrSection: "Summary",
+    offset: 12,
+    quote: "No production Python services; internships only."
+  });
+});
+
+test("a contradicted item missing the conflicting side stays a named extraction_error", () => {
+  const half: EvidenceExtractionItem = {
+    criterion_id: "python_production",
+    state: "contradicted",
+    quote: "Built and maintained Python microservices processing 2M+ events/day.",
+    source: { document: "resume.txt", page_or_section: "Experience", offset: 0 }
+  };
+  const [outcome] = mapRubricToEvidence(SUBJECT, ["python_production"], [half]);
   assert.equal(outcome?.kind, "extraction_error");
   if (outcome?.kind === "extraction_error") {
     assert.equal(outcome.errorCode, "contradiction_missing_conflicting_citation");
@@ -217,4 +246,82 @@ test("every returned outcome still validates against the persisted contract", ()
     outcomes.map((outcome) => outcome.criterionId),
     ["python_production", "aws_certification"]
   );
+});
+
+// ---- a citing outcome must satisfy the whole citation contract ----
+//
+// The persistability check used to restate sourceCitationSchema's rules
+// and omitted two of the four: a nonempty `document`, and an `offset` that
+// is an INTEGER rather than merely non-negative. So an item could pass
+// here and then fail the persisted contract downstream -- exactly what the
+// check exists to prevent. It now parses the schema instead of restating
+// it, because a restatement can drift and a parse cannot.
+
+function withSource(source: EvidenceExtractionItem["source"]): EvidenceExtractionItem {
+  return {
+    criterion_id: "python_production",
+    state: "supported",
+    quote: "Built and maintained Python microservices.",
+    source
+  };
+}
+
+test("a citing item whose citation cannot persist becomes invalid_citation, not a citing outcome", () => {
+  const rejected = [
+    { label: "empty document", source: { document: "", page_or_section: "Experience", offset: 0 } },
+    { label: "fractional offset", source: { document: "cv.pdf", page_or_section: "Experience", offset: 0.5 } },
+    {
+      label: "non-finite offset",
+      source: { document: "cv.pdf", page_or_section: "Experience", offset: Number.POSITIVE_INFINITY }
+    }
+  ] as const;
+
+  for (const { label, source } of rejected) {
+    const [outcome] = mapRubricToEvidence(SUBJECT, ["python_production"], [withSource(source)]);
+    assert.equal(outcome?.kind, "extraction_error", `${label} must not produce a citing outcome`);
+    assert.equal(
+      (outcome as { errorCode?: string }).errorCode,
+      "invalid_citation",
+      `${label} should be reported as an invalid citation`
+    );
+  }
+
+  // The control: the same item with a citation that does satisfy the
+  // contract still maps to a citing outcome, so the check is
+  // discriminating rather than rejecting everything.
+  const [ok] = mapRubricToEvidence(
+    SUBJECT,
+    ["python_production"],
+    [withSource({ document: "cv.pdf", page_or_section: "Experience", offset: 0 })]
+  );
+  assert.equal(ok?.kind, "supported");
+});
+
+test("the conflicting side gets the same citation contract as the primary one", () => {
+  // Both halves of a contradiction are persisted, so a second side that
+  // fails sourceCitationSchema makes the whole outcome unpersistable.
+  const base = {
+    criterion_id: "python_production",
+    state: "contradicted",
+    quote: "Still in the role as of 2026.",
+    source: { document: "cv.pdf", page_or_section: "Experience", offset: 0 }
+  } as const;
+
+  for (const bad of [
+    { quote: "Left in 2019.", source: { document: "", page_or_section: "History", offset: 40 } },
+    { quote: "Left in 2019.", source: { document: "cv.pdf", page_or_section: "History", offset: 1.5 } }
+  ]) {
+    const [outcome] = mapRubricToEvidence(SUBJECT, ["python_production"], [
+      { ...base, conflicting: bad } as EvidenceExtractionItem
+    ]);
+    assert.equal(outcome?.kind, "extraction_error");
+  }
+
+  const [ok] = mapRubricToEvidence(SUBJECT, ["python_production"], [
+    {
+      ...base,
+      conflicting: { quote: "Left in 2019.", source: { document: "cv.pdf", page_or_section: "History", offset: 40 } }
+    } as EvidenceExtractionItem
+  ]);
+  assert.equal(ok?.kind, "contradicted", "a two-sided contradiction with valid citations still persists");
 });

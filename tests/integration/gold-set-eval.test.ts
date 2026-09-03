@@ -12,9 +12,24 @@ import type { EvidenceExtractionItem, GoldSetCase } from "../../packages/ai/src/
 
 const cases = goldSet.cases as unknown as readonly GoldSetCase[];
 
-test("the gold set itself is non-trivial: at least one locked and one unlocked case", () => {
-  assert.ok(cases.some((c) => c.locked), "expected at least one locked holdout case");
-  assert.ok(cases.some((c) => !c.locked), "expected at least one unlocked case");
+// Replaces an earlier "at least one locked and one unlocked case" check.
+// That assertion only proved a boolean took both values, and the boolean
+// itself was removed in review (#26) because a flag sitting in the same
+// checked-in file as the expected labels cannot hold anything back. What
+// actually makes this suite non-trivial is spread: a gate whose cases all
+// expect the same kind, or which never expects a rejection, passes while
+// the pipeline is broken in every direction it does not look.
+test("the gold set itself is non-trivial: it spans distinct kinds and includes a rejection", () => {
+  const kinds = new Set(cases.flatMap((c) => Object.values(c.expectedKinds)));
+  assert.ok(kinds.size >= 4, `expected at least 4 distinct expected kinds, got ${kinds.size}: ${[...kinds].join(", ")}`);
+  assert.ok(
+    kinds.has("citation_invalid"),
+    "expected at least one case whose citation must be rejected, so the suite is not all happy-path"
+  );
+  assert.ok(
+    cases.some((c) => c.expectedReviewCriterionIds.length > 0),
+    "expected at least one case that must escalate to human review"
+  );
 });
 
 test("gold-set v1 meets every regression threshold", () => {
@@ -32,7 +47,6 @@ test("schema validity is scored across every simulated extraction item", () => {
 test("a regressed pipeline is actually caught: an uncaught hallucination fails citingRecall", () => {
   const brokenCase: GoldSetCase = {
     caseId: "regression-fixture",
-    locked: false,
     sourceText: "Built and maintained Python microservices processing 2M+ events/day.",
     rubricCriterionIds: ["postgres_experience"],
     simulatedExtraction: [
@@ -76,7 +90,6 @@ test("a malformed simulatedExtraction item lowers schemaValidityRate instead of 
   } as unknown as EvidenceExtractionItem;
   const caseWithBadItem: GoldSetCase = {
     caseId: "malformed-item-fixture",
-    locked: false,
     sourceText: "Built and maintained Python microservices processing 2M+ events/day.",
     rubricCriterionIds: ["postgres_experience"],
     simulatedExtraction: [malformedItem],
@@ -96,7 +109,6 @@ test("a malformed simulatedExtraction item lowers schemaValidityRate instead of 
 test("a typo'd expectedKinds key throws instead of silently scoring a perfect match", () => {
   const typoCase: GoldSetCase = {
     caseId: "typo-fixture",
-    locked: false,
     sourceText: "Built and maintained Python microservices processing 2M+ events/day.",
     rubricCriterionIds: ["postgres_experience"],
     simulatedExtraction: [],
@@ -109,7 +121,6 @@ test("a typo'd expectedKinds key throws instead of silently scoring a perfect ma
 test("a typo'd expectedReviewCriterionIds entry throws instead of vanishing into a false-perfect escalationRecall", () => {
   const typoCase: GoldSetCase = {
     caseId: "typo-review-fixture",
-    locked: false,
     sourceText: "Built and maintained Python microservices processing 2M+ events/day.",
     rubricCriterionIds: ["postgres_experience"],
     simulatedExtraction: [],
@@ -133,7 +144,6 @@ test("over-escalation is caught: routing a clean case to review fails escalation
   // human. That is precisely the shape of an over-escalation.
   const overEscalatingCase: GoldSetCase = {
     caseId: "over-escalation-fixture",
-    locked: false,
     sourceText: "Familiar with backend systems including some Python tooling.",
     rubricCriterionIds: ["python_production"],
     simulatedExtraction: [
@@ -175,7 +185,6 @@ test("escalationPrecision only counts genuine escalations, so a correctly-routed
   // metric is wired to a constant.
   const correctlyEscalatingCase: GoldSetCase = {
     caseId: "correct-escalation-fixture",
-    locked: false,
     sourceText: "Familiar with backend systems including some Python tooling.",
     rubricCriterionIds: ["python_production"],
     simulatedExtraction: [
