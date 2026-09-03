@@ -1415,3 +1415,131 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-25: rubric draft persistence and versioning ----
+
+export interface RubricPersistenceObservations {
+  readonly firstSaveVersion: number;
+  readonly editedSaveVersion: number;
+  readonly editedCriterionIds: readonly string[];
+  readonly draftRowsAfterEdit: number;
+  readonly versionAfterPublished: number;
+  readonly readBackIsDraft: boolean;
+  readonly unknownRoleOutcome: string;
+}
+
+/**
+ * Exercises upsertDraftRubric/getRubricForRole against real Postgres in a
+ * throwaway schema, so the documented versioning rule is proven rather
+ * than assumed. The rule (see upsertDraftRubric's own comment) is: edit
+ * the existing draft IN PLACE, keeping its version, and only allocate
+ * MAX(version) + 1 when inserting where no draft exists.
+ *
+ * Lives here rather than in the test because the pg Client is this
+ * package's dependency and the migrations it applies are its own files;
+ * this mirrors assertMembershipsTenantIsolation above.
+ */
+export async function assertRubricDraftPersistence(
+  databaseUrl: string
+): Promise<RubricPersistenceObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `rubric_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const criterion = (id: string): RubricCriterion => ({
+    criterionId: id,
+    description: `description for ${id}`,
+    evidenceGuidance: `guidance for ${id}`
+  });
+  const five = ["a", "b", "c", "d", "e"].map(criterion);
+  const editedFive = ["a", "b", "c", "d", "z"].map(criterion);
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    for (const file of ["0002_organizations_users_memberships.sql", "0009_roles.sql", "0010_rubrics.sql"]) {
+      await admin.query(`SET search_path TO "${schema}"`);
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO "${schema}".organizations (organization_id, name) VALUES ($1, 'Rubric Probe Org')`, [
+      organizationId
+    ]);
+    await admin.query(
+      `INSERT INTO "${schema}".users (user_id, email, display_name) VALUES ($1, 'probe@acme.test', 'Probe')`,
+      [userId]
+    );
+    const role = await createRole(databaseUrl, schema, {
+      organizationId,
+      title: "Backend Engineer",
+      createdByUserId: userId
+    });
+
+    const first = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    if (first.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected the first draft to save");
+    }
+    if (first.rubric.status !== "draft") {
+      throw new Error(`assertRubricDraftPersistence: first save should be a draft, got ${first.rubric.status}`);
+    }
+    if (first.rubric.criteria.map((entry) => entry.criterionId).join(",") !== "a,b,c,d,e") {
+      throw new Error("assertRubricDraftPersistence: criteria did not round-trip through jsonb in order");
+    }
+
+    // Editing replaces the whole list and must NOT allocate a new version:
+    // a draft is edited in place, which is what makes "the draft" a single
+    // unambiguous row for AF-26's editor to point at.
+    const edited = await upsertDraftRubric(databaseUrl, schema, role.roleId, editedFive);
+    if (edited.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected the edit to save");
+    }
+    const draftRows = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".rubrics WHERE role_id = $1 AND status = 'draft'`,
+      [role.roleId]
+    );
+
+    // Publishing is AF-27's transition, inserted directly here only so the
+    // next draft has a higher version to allocate past.
+    await admin.query(
+      `UPDATE "${schema}".rubrics
+          SET status = 'published', approved_by_user_id = $2, approved_at = CURRENT_TIMESTAMP
+        WHERE role_id = $1 AND status = 'draft'`,
+      [role.roleId, userId]
+    );
+    const afterPublished = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    if (afterPublished.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected a new draft after publishing");
+    }
+
+    // getRubricForRole prefers the draft over the higher-versioned published
+    // row, which is the ordering its own doc comment promises.
+    const readBack = await getRubricForRole(databaseUrl, schema, role.roleId);
+    if (readBack === undefined) {
+      throw new Error("assertRubricDraftPersistence: expected to read a rubric back");
+    }
+
+    const unknownRole = await upsertDraftRubric(
+      databaseUrl,
+      schema,
+      "99999999-9999-4999-8999-999999999999",
+      five
+    );
+
+    return {
+      firstSaveVersion: first.rubric.version,
+      editedSaveVersion: edited.rubric.version,
+      editedCriterionIds: edited.rubric.criteria.map((entry) => entry.criterionId),
+      draftRowsAfterEdit: Number(draftRows.rows[0]?.count ?? "-1"),
+      versionAfterPublished: afterPublished.rubric.version,
+      readBackIsDraft: readBack.status === "draft",
+      unknownRoleOutcome: unknownRole.outcome
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
