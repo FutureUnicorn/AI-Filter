@@ -11,14 +11,18 @@ import type { OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 // request/response mapping and metadata recording without touching
 // OpenAI at all.
 
-function fakeClient(outputText: string, capture?: { params?: unknown }): OpenAiResponsesClient {
+function fakeClient(
+  outputText: string,
+  capture?: { params?: unknown },
+  usage: { input_tokens: number; output_tokens: number } = { input_tokens: 120, output_tokens: 45 }
+): OpenAiResponsesClient {
   return {
     responses: {
       async create(params) {
         if (capture !== undefined) {
           capture.params = params;
         }
-        return { output_text: outputText };
+        return { output_text: outputText, usage };
       }
     }
   };
@@ -47,8 +51,18 @@ test("runStructuredCall records provider/model/prompt/schema metadata on every c
     model: "gpt-5.6",
     promptVersion: "v1",
     schemaVersion: "1.0.0",
-    schemaName: "evidence_response"
+    schemaName: "evidence_response",
+    usage: { inputTokens: 120, outputTokens: 45 }
   });
+});
+
+test("runStructuredCall surfaces the provider's real token usage, not an estimate", async () => {
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6" },
+    fakeClient("{}", undefined, { input_tokens: 900, output_tokens: 150 })
+  );
+  const result = await adapter.runStructuredCall(baseInput);
+  assert.deepEqual(result.metadata.usage, { inputTokens: 900, outputTokens: 150 });
 });
 
 test("runStructuredCall sends the system and user prompts as separate messages, in order", async () => {
@@ -94,6 +108,57 @@ test("different calls with different prompt/schema versions produce different me
   assert.equal(second.metadata.schemaVersion, "1.1.0");
 });
 
+// ---- AF-41 Codex findings: usage must never be lost or under-counted ----
+
+test("a provider response with no usage fails closed instead of metering as zero tokens", async () => {
+  const noUsageClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        return { output_text: JSON.stringify({ items: [] }) };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter({ apiKey: "unused", model: "gpt-5.6" }, noUsageClient);
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: Error) => {
+      assert.equal(error.name, "AiUsageUnavailableError");
+      // The point of failing closed: an unknown-cost call must not be
+      // recordable as a free one.
+      assert.match(error.message, /zero-token/);
+      return true;
+    }
+  );
+});
+
+test("a non-JSON response still surfaces the call's real token usage to the caller", async () => {
+  // A refusal/truncation is still a billed call. Before this fix
+  // JSON.parse threw before metadata existed, so the caller had no
+  // counts to hand to recordInferenceUsage and retries of failing
+  // responses stayed invisible to the budget.
+  let calls = 0;
+  const refusingClient: OpenAiResponsesClient = {
+    responses: {
+      async create() {
+        calls += 1;
+        return { output_text: "I'm sorry, I can't help with that.", usage: { input_tokens: 310, output_tokens: 12 } };
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter({ apiKey: "unused", model: "gpt-5.6" }, refusingClient);
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: Error & { metadata?: { usage?: { inputTokens: number; outputTokens: number }; model?: string } }) => {
+      assert.equal(error.name, "AiStructuredCallParseError");
+      assert.equal(error.metadata?.usage?.inputTokens, 310);
+      assert.equal(error.metadata?.usage?.outputTokens, 12);
+      assert.equal(error.metadata?.model, "gpt-5.6");
+      return true;
+    }
+  );
+  assert.equal(calls, 1);
+});
+
 // ---- AF-34 Codex findings ----
 
 test("candidate calls opt out of provider-side response retention", async () => {
@@ -114,7 +179,14 @@ test("metadata records the provider-resolved model, not just the requested alias
   const aliasClient: OpenAiResponsesClient = {
     responses: {
       async create() {
-        return { output_text: "{}", model: "gpt-5.6-2026-08-01" };
+        return {
+          output_text: "{}",
+          model: "gpt-5.6-2026-08-01",
+          // AF-41 fails closed on missing usage, so a fixture that omits it
+          // would throw AiUsageUnavailableError before reaching the
+          // resolved-model assertion this test is actually about.
+          usage: { input_tokens: 120, output_tokens: 8 }
+        };
       }
     }
   };
@@ -131,7 +203,11 @@ test("a non-JSON response still carries full call metadata to the caller", async
   const refusingClient: OpenAiResponsesClient = {
     responses: {
       async create() {
-        return { output_text: "I'm sorry, I can't help with that.", model: "gpt-5.6-2026-08-01" };
+        return {
+          output_text: "I'm sorry, I can't help with that.",
+          model: "gpt-5.6-2026-08-01",
+          usage: { input_tokens: 310, output_tokens: 12 }
+        };
       }
     }
   };

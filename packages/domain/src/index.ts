@@ -467,7 +467,19 @@ export interface AiStructuredCallInput {
   readonly userPrompt: string;
 }
 
-/** Recorded on every call so a later ticket (AF-40) can persist it. */
+/** Token counts the provider reported for one call, not an estimate. */
+export interface AiCallUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+/**
+ * Recorded on every call so AF-40 can persist it and AF-41 can meter
+ * it. `usage` is a fact about the response (the provider reports it),
+ * unlike promptVersion/schemaVersion/schemaName which the caller
+ * supplies as input -- that's why it lives here rather than on
+ * AiStructuredCallInput.
+ */
 export interface AiCallMetadata {
   readonly provider: string;
   /** The model the caller ASKED for, which may be a movable alias. */
@@ -484,6 +496,7 @@ export interface AiCallMetadata {
   readonly promptVersion: string;
   readonly schemaVersion: string;
   readonly schemaName: string;
+  readonly usage: AiCallUsage;
 }
 
 export interface AiStructuredCallResult {
@@ -521,4 +534,73 @@ export interface EvidenceExtractionRun extends VersionedRecord {
   readonly extractionSchemaName: string;
   readonly rubricVersion: string;
   readonly createdAt: string;
+}
+
+// ---- AF-41: inference cost/budget tracking ----
+//
+// A pure decision over numbers the caller already knows (accumulated
+// usage so far this period, and the configured cap) -- no I/O, no
+// period-length opinion. packages/db owns accumulating tokensUsedThisPeriod
+// (an UPSERT-increment ledger keyed by organization+model+period), and
+// whatever period length (daily, monthly) an operator configures is
+// just what value gets passed in as the period boundary; this function
+// doesn't know or care.
+
+export interface InferenceBudgetConfig {
+  readonly maxTokensPerPeriod: number;
+  /** e.g. 0.8 warns once 80% of the cap is used, before it is fully spent. */
+  readonly alertThresholdRatio: number;
+}
+
+export interface InferenceUsageSnapshot {
+  readonly tokensUsedThisPeriod: number;
+}
+
+/**
+ * Explicit, non-collapsing outcomes: "warning" (approaching the cap)
+ * and "capped" (at or over it) are structurally distinct, not two
+ * values of one generic status, because a caller must never mistake
+ * "you should slow down" for "you are blocked."
+ */
+export type InferenceBudgetStatus =
+  | { readonly outcome: "ok" }
+  | { readonly outcome: "warning"; readonly tokensUsedThisPeriod: number; readonly maxTokensPerPeriod: number }
+  | { readonly outcome: "capped"; readonly tokensUsedThisPeriod: number; readonly maxTokensPerPeriod: number };
+
+export function checkInferenceBudget(
+  usage: InferenceUsageSnapshot,
+  config: InferenceBudgetConfig
+): InferenceBudgetStatus {
+  const { tokensUsedThisPeriod } = usage;
+  const { maxTokensPerPeriod, alertThresholdRatio } = config;
+
+  // Validated rather than compared, because every comparison below is false
+  // against NaN. A malformed numeric environment value would therefore fall
+  // through to `ok` and silently disable the cap entirely: the one outcome a
+  // budget check must never produce by accident. `reserveInferenceBudget`
+  // already refuses a non-safe-integer cap, so this only brings the in-memory
+  // path up to the guarantee the database path already makes.
+  if (!Number.isSafeInteger(maxTokensPerPeriod) || maxTokensPerPeriod < 0) {
+    throw new Error(
+      `checkInferenceBudget requires a non-negative safe integer maxTokensPerPeriod, got: ${maxTokensPerPeriod}`
+    );
+  }
+  if (!Number.isFinite(alertThresholdRatio) || alertThresholdRatio < 0 || alertThresholdRatio > 1) {
+    throw new Error(
+      `checkInferenceBudget requires an alertThresholdRatio between 0 and 1, got: ${alertThresholdRatio}`
+    );
+  }
+  if (!Number.isFinite(tokensUsedThisPeriod) || tokensUsedThisPeriod < 0) {
+    throw new Error(
+      `checkInferenceBudget requires a non-negative tokensUsedThisPeriod, got: ${tokensUsedThisPeriod}`
+    );
+  }
+
+  if (tokensUsedThisPeriod >= maxTokensPerPeriod) {
+    return { outcome: "capped", tokensUsedThisPeriod, maxTokensPerPeriod };
+  }
+  if (tokensUsedThisPeriod >= maxTokensPerPeriod * alertThresholdRatio) {
+    return { outcome: "warning", tokensUsedThisPeriod, maxTokensPerPeriod };
+  }
+  return { outcome: "ok" };
 }

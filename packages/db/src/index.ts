@@ -391,6 +391,349 @@ export async function recordEvidenceExtractionRun(
   }
 }
 
+// ---- AF-41: inference cost/budget tracking ----
+
+export interface RecordInferenceUsageInput {
+  readonly organizationId: string;
+  readonly model: string;
+  /** The caller decides period granularity (e.g. today's date for a daily budget). */
+  readonly periodStart: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+/**
+ * Reads a Postgres bigint column, refusing to lose precision quietly.
+ *
+ * bigint arrives as a string precisely because it does not fit a JS
+ * number. Number("9007199254740993") is 9007199254740992 -- off by one,
+ * with no error -- and these values feed a budget comparison, so a
+ * silently wrong total is a silently wrong spending decision. Failing here
+ * is loud and fixable; the alternative is a cap that stops working
+ * correctly at a threshold nobody is watching for.
+ */
+function bigintColumnToNumber(raw: string, column: string): number {
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || String(value) !== raw.trim()) {
+    throw new Error(
+      `${column} is ${raw}, which exceeds the range a JavaScript number can hold exactly ` +
+        `(max ${Number.MAX_SAFE_INTEGER}); refusing to return a value that has silently lost precision`
+    );
+  }
+  return value;
+}
+
+/**
+ * Rejects a negative delta before it reaches the upsert. The table's
+ * CHECK only sees the RESULT of the addition, so once a row has a
+ * positive total, recording -50 against 100 silently lowers usage to 50:
+ * a faulty or untrusted caller could walk the meter backwards and
+ * postpone the cap indefinitely.
+ */
+function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
+  for (const [field, value] of [
+    ["inputTokens", input.inputTokens],
+    ["outputTokens", input.outputTokens]
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`recordInferenceUsage requires a non-negative safe integer ${field}, got: ${value}`);
+    }
+  }
+}
+
+/** Increments the existing row for this (organization, model, period), or creates it. */
+export async function recordInferenceUsage(
+  databaseUrl: string,
+  schema: string,
+  input: RecordInferenceUsageInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".inference_usage_ledger
+         (organization_id, model, period_start, input_tokens, output_tokens)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+         input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+         output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+         updated_at = CURRENT_TIMESTAMP`,
+      [input.organizationId, input.model, input.periodStart, input.inputTokens, input.outputTokens]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface GetInferenceUsageInput {
+  readonly organizationId: string;
+  readonly model: string;
+  readonly periodStart: string;
+}
+
+/** Returns 0/0 when no calls have been made yet this period -- there is nothing to cap against. */
+export async function getInferenceUsage(
+  databaseUrl: string,
+  schema: string,
+  input: GetInferenceUsageInput
+): Promise<{ inputTokens: number; outputTokens: number }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ input_tokens: string; output_tokens: string }>(
+      `SELECT input_tokens, output_tokens FROM "${schema}".inference_usage_ledger
+        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+      [input.organizationId, input.model, input.periodStart]
+    );
+    const row = result.rows[0];
+    return {
+      inputTokens: row === undefined ? 0 : bigintColumnToNumber(row.input_tokens, "input_tokens"),
+      outputTokens: row === undefined ? 0 : bigintColumnToNumber(row.output_tokens, "output_tokens")
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
+  /** Cap on (input + output) tokens for this organization/model/period. */
+  readonly maxTotalTokens: number;
+}
+
+export type ReserveInferenceBudgetOutcome =
+  | { readonly outcome: "reserved"; readonly reservationId: string; readonly totalTokensAfter: number }
+  | { readonly outcome: "cap_exceeded"; readonly totalTokensBefore: number; readonly maxTotalTokens: number };
+
+/**
+ * Atomic check-and-reserve. Reading the total with getInferenceUsage and
+ * then incrementing with recordInferenceUsage cannot be made safe by the
+ * caller: each opens its own connection, so they cannot share a
+ * transaction, and concurrent requests near the cap all read the same
+ * pre-increment total, all pass the check, and the burst spends
+ * arbitrarily far past the budget.
+ *
+ * Doing both in one statement closes that window. The INSERT ... ON
+ * CONFLICT DO UPDATE takes a row lock on conflict, so concurrent callers
+ * serialize on it, and the WHERE clause re-evaluates the cap against the
+ * row's committed value at that moment -- not against a total read
+ * earlier. When the guard fails the UPDATE affects no row, RETURNING is
+ * empty, and we report cap_exceeded instead of over-spending.
+ *
+ * What this writes is an ESTIMATE, in the same columns that otherwise hold
+ * provider-reported usage. Every reserved call must be followed by
+ * `settleInferenceReservation` with the real numbers, which applies the
+ * difference. Calling `recordInferenceUsage` instead double-counts the call.
+ */
+export async function reserveInferenceBudget(
+  databaseUrl: string,
+  schema: string,
+  input: ReserveInferenceBudgetInput
+): Promise<ReserveInferenceBudgetOutcome> {
+  assertSafeSchema(schema);
+  assertNonNegativeUsage(input);
+  // Validated here rather than left to the `$7::bigint` cast. An unchecked
+  // NaN or fractional value fails inside Postgres with a cast error that
+  // names neither the field nor the caller, and a negative cap would make
+  // every reservation fail as cap_exceeded rather than being rejected as
+  // the nonsense it is.
+  if (!Number.isSafeInteger(input.maxTotalTokens) || input.maxTotalTokens < 0) {
+    throw new Error(
+      `reserveInferenceBudget requires a non-negative safe integer maxTotalTokens, got: ${input.maxTotalTokens}`
+    );
+  }
+  const requested = input.inputTokens + input.outputTokens;
+  // A zero-token reservation is refused rather than granted. Both guards below
+  // are `<=`, so a caller sitting exactly at its cap satisfies
+  // `total + 0 <= cap` and is told `reserved`, forever: with no pre-call
+  // estimate it can keep reserving nothing and keep calling the provider after
+  // the budget should have blocked everything. That also contradicted the
+  // domain, where `checkInferenceBudget` treats zero usage against a zero cap
+  // as `capped`. Reserving nothing is not a meaningful request, so it is an
+  // error at the boundary rather than a silently granted no-op.
+  if (requested <= 0) {
+    throw new Error(
+      "reserveInferenceBudget requires a positive token estimate; " +
+        `reserving zero cannot be checked against a cap, got inputTokens=${input.inputTokens} outputTokens=${input.outputTokens}`
+    );
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const reserved = await client.query<{ reservation_id: string; total_tokens: string }>(
+      `WITH updated_ledger AS (
+         INSERT INTO "${schema}".inference_usage_ledger
+           (organization_id, model, period_start, input_tokens, output_tokens)
+         SELECT $1, $2, $3, $4, $5
+          WHERE $6::bigint <= $7::bigint
+         ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+           input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+           output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+           updated_at = clock_timestamp()
+          WHERE "${schema}".inference_usage_ledger.input_tokens
+              + "${schema}".inference_usage_ledger.output_tokens
+              + $6::bigint <= $7::bigint
+         RETURNING (input_tokens + output_tokens)::bigint AS total_tokens
+       ), created_reservation AS (
+         INSERT INTO "${schema}".inference_usage_reservations
+           (organization_id, model, period_start, reserved_input_tokens, reserved_output_tokens)
+         SELECT $1, $2, $3, $4, $5 FROM updated_ledger
+         RETURNING reservation_id
+       )
+       SELECT created_reservation.reservation_id, updated_ledger.total_tokens
+         FROM updated_ledger CROSS JOIN created_reservation`,
+      [
+        input.organizationId,
+        input.model,
+        input.periodStart,
+        input.inputTokens,
+        input.outputTokens,
+        requested,
+        input.maxTotalTokens
+      ]
+    );
+    const row = reserved.rows[0];
+    if (row !== undefined) {
+      return {
+        outcome: "reserved",
+        reservationId: row.reservation_id,
+        totalTokensAfter: bigintColumnToNumber(row.total_tokens, "total_tokens")
+      };
+    }
+    // Read back on the connection already open, rather than calling
+    // getInferenceUsage and opening a second one. This is the capped path,
+    // which is the hot one exactly when a tenant is hammering the cap.
+    // Summed in Postgres, not in JavaScript. Checking each bigint for safe-
+    // integer range and then adding the two numbers lets an unsafe total
+    // through: 6e15 input and 6e15 output are each individually safe, and
+    // their 1.2e16 sum is not, so it would be reported rounded while the
+    // per-column checks reported success. Adding first and converting once
+    // means `bigintColumnToNumber` sees the value actually being returned and
+    // fails loudly on it, which is the contract the rest of this path keeps.
+    const current = await client.query<{ total_tokens: string }>(
+      `SELECT (input_tokens + output_tokens)::bigint AS total_tokens
+         FROM "${schema}".inference_usage_ledger
+        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+      [input.organizationId, input.model, input.periodStart]
+    );
+    const currentRow = current.rows[0];
+    const totalTokensBefore =
+      currentRow === undefined ? 0 : bigintColumnToNumber(currentRow.total_tokens, "total_tokens");
+    return {
+      outcome: "cap_exceeded",
+      totalTokensBefore,
+      maxTotalTokens: input.maxTotalTokens
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface SettleInferenceReservationInput {
+  /** The durable identity returned from `reserveInferenceBudget`. */
+  readonly reservationId: string;
+  /** What the provider actually reported afterwards. */
+  readonly actualInputTokens: number;
+  readonly actualOutputTokens: number;
+}
+
+/**
+ * Replace a reservation with the provider's real numbers.
+ *
+ * A reservation has to be written before the call, when only an estimate
+ * exists, but it lands in the same two columns that afterwards hold
+ * provider-reported usage. Without this step the ledger is wrong either way:
+ * call `recordInferenceUsage` after the response and the estimate and the
+ * actual are both counted (reserve 100, consume 70, record 170); skip it and
+ * a column documented as provider-reported usage permanently holds a guess.
+ * Either way the cap is reached before the tokens were really spent.
+ *
+ * So settlement applies the difference rather than adding again. Over-
+ * estimates refund, under-estimates top up, and an exact estimate is a no-op.
+ * This is the call that pairs with `reserveInferenceBudget`;
+ * `recordInferenceUsage` is for the unreserved path and must not also be
+ * called for a reserved one.
+ *
+ * `GREATEST(0, ...)` is not defensive decoration. The columns carry
+ * `CHECK (>= 0)`, and a refund larger than the stored total would violate it
+ * and abort the statement: reachable whenever a period rolls over or a row is
+ * reset between the reservation and the response, which is exactly when a
+ * failed settlement would be least welcome.
+ */
+export async function settleInferenceReservation(
+  databaseUrl: string,
+  schema: string,
+  input: SettleInferenceReservationInput
+): Promise<{ readonly outcome: "settled" | "already_settled" }> {
+  assertSafeSchema(schema);
+  for (const [field, value] of [
+    ["actualInputTokens", input.actualInputTokens],
+    ["actualOutputTokens", input.actualOutputTokens]
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`settleInferenceReservation requires a non-negative safe integer ${field}, got: ${value}`);
+    }
+  }
+
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const reservation = await client.query<{
+        organization_id: string;
+        model: string;
+        period_start: string;
+        reserved_input_tokens: string;
+        reserved_output_tokens: string;
+        settled_at: string | null;
+      }>(
+        `SELECT organization_id, model, period_start, reserved_input_tokens, reserved_output_tokens, settled_at
+           FROM "${schema}".inference_usage_reservations
+          WHERE reservation_id = $1
+          FOR UPDATE`,
+        [input.reservationId]
+      );
+      const row = reservation.rows[0];
+      if (row === undefined) {
+        throw new Error(`inference usage reservation ${input.reservationId} does not exist`);
+      }
+      if (row.settled_at !== null) {
+        await client.query("COMMIT");
+        return { outcome: "already_settled" };
+      }
+      const inputDelta = input.actualInputTokens - bigintColumnToNumber(row.reserved_input_tokens, "reserved_input_tokens");
+      const outputDelta = input.actualOutputTokens - bigintColumnToNumber(row.reserved_output_tokens, "reserved_output_tokens");
+      const ledger = await client.query(
+        `UPDATE "${schema}".inference_usage_ledger
+            SET input_tokens = input_tokens + $4::bigint,
+                output_tokens = output_tokens + $5::bigint,
+                updated_at = clock_timestamp()
+          WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+        [row.organization_id, row.model, row.period_start, inputDelta, outputDelta]
+      );
+      if (ledger.rowCount !== 1) {
+        throw new Error(`inference usage reservation ${input.reservationId} has no matching ledger row`);
+      }
+      await client.query(
+        `UPDATE "${schema}".inference_usage_reservations
+            SET settled_at = clock_timestamp(), actual_input_tokens = $2, actual_output_tokens = $3
+          WHERE reservation_id = $1`,
+        [input.reservationId, input.actualInputTokens, input.actualOutputTokens]
+      );
+      await client.query("COMMIT");
+      return { outcome: "settled" };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
@@ -575,6 +918,283 @@ export async function assertExtractionRunOrganizationDelete(
     throw new Error(
       "assertExtractionRunOrganizationDelete: deleting the organization SUCCEEDED, but an extraction run still references it"
     );
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-41 review (#24): budget totals must not lose precision ----
+
+export interface InferenceBudgetPrecisionObservations {
+  /** Reading a bigint past MAX_SAFE_INTEGER must throw, not round. */
+  readonly oversizedReadRejection: string;
+  /** The value Number() would have silently returned instead. */
+  readonly silentlyRoundedValue: number;
+  readonly storedValue: string;
+  /** cap_exceeded reports the real committed total. */
+  readonly capExceededTotalBefore: number;
+}
+
+export interface InferenceBudgetAtomicityObservations {
+  /** How many of the concurrent reservations were granted. */
+  readonly reserved: number;
+  /** Committed total after the burst. Must never exceed the cap. */
+  readonly totalAfter: number;
+  readonly cap: number;
+  /**
+   * What the read-then-write pattern this replaced produces under the
+   * same burst. Recorded rather than described so the test can show the
+   * overspend instead of asserting the fix in the abstract.
+   */
+  readonly naiveTotalAfter: number;
+}
+
+/**
+ * Drives genuinely concurrent reservations against one cap.
+ *
+ * The whole point of reserveInferenceBudget is that it holds under
+ * concurrency, and that cannot be shown sequentially: a loop passes just
+ * as happily against the broken read-then-write version. So this fires
+ * the burst in parallel, each call on its own connection, exactly as
+ * separate requests would arrive, and reports both what the atomic path
+ * committed and what the naive path commits for comparison.
+ */
+export async function assertInferenceBudgetAtomicity(
+  databaseUrl: string
+): Promise<InferenceBudgetAtomicityObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_race_${suffix}`;
+  const org = "33333333-3333-4333-8333-333333333333";
+  const cap = 1_000;
+  const each = 100;
+  const burst = 30;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'Race')`, [org]);
+
+    const atomicBase = { organizationId: org, model: "atomic", periodStart: "2026-09-01" };
+    const outcomes = await Promise.all(
+      Array.from({ length: burst }, () =>
+        reserveInferenceBudget(databaseUrl, schema, {
+          ...atomicBase,
+          inputTokens: each,
+          outputTokens: 0,
+          maxTotalTokens: cap
+        })
+      )
+    );
+    const after = await getInferenceUsage(databaseUrl, schema, atomicBase);
+
+    // The same burst through read-check-write, on its own ledger row.
+    const naiveBase = { organizationId: org, model: "naive", periodStart: "2026-09-01" };
+    await Promise.all(
+      Array.from({ length: burst }, async () => {
+        const current = await getInferenceUsage(databaseUrl, schema, naiveBase);
+        if (current.inputTokens + current.outputTokens + each <= cap) {
+          await recordInferenceUsage(databaseUrl, schema, {
+            ...naiveBase,
+            inputTokens: each,
+            outputTokens: 0
+          });
+        }
+      })
+    );
+    const naiveAfter = await getInferenceUsage(databaseUrl, schema, naiveBase);
+
+    return {
+      reserved: outcomes.filter((outcome) => outcome.outcome === "reserved").length,
+      totalAfter: after.inputTokens + after.outputTokens,
+      cap,
+      naiveTotalAfter: naiveAfter.inputTokens + naiveAfter.outputTokens
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface InferenceReservationSettlementObservations {
+  /** Ledger totals after an over-estimate is settled with the real numbers. */
+  readonly overEstimate: { readonly inputTokens: number; readonly outputTokens: number };
+  /** Ledger totals after an under-estimate is settled. */
+  readonly underEstimate: { readonly inputTokens: number; readonly outputTokens: number };
+  /** Retrying a committed settlement must not apply its delta a second time. */
+  readonly duplicateSettlement: "already_settled";
+  /** What the ledger would have said had usage been recorded on top of the reservation. */
+  readonly doubleCountedTotal: number;
+}
+
+/**
+ * Exercise reserve-then-settle against a real ledger, in a disposable schema.
+ *
+ * The bug this pins is not visible in one call. A reservation writes an
+ * estimate into the same columns that afterwards hold provider-reported
+ * usage, so it only goes wrong on the second write: reserve 100, consume 70,
+ * and recording usage afterwards leaves 170 in a ledger the cap is read from.
+ * `doubleCountedTotal` records that, so the test can show the failure being
+ * prevented rather than describing it.
+ */
+export async function assertInferenceReservationSettlement(
+  databaseUrl: string
+): Promise<InferenceReservationSettlementObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `settle_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of ["0002_organizations_users_memberships.sql", "0007_inference_usage_ledger.sql"]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+
+    const period = "2026-09-01";
+    const read = async (model: string): Promise<{ inputTokens: number; outputTokens: number }> =>
+      getInferenceUsage(databaseUrl, schema, { organizationId: org, model, periodStart: period });
+
+    // Over-estimate: reserve 60/40, actually spend 45/25.
+    const overReservation = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org, model: "over", periodStart: period,
+      inputTokens: 60, outputTokens: 40, maxTotalTokens: 1000
+    });
+    if (overReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the over-estimate reservation to fit");
+    }
+    await settleInferenceReservation(databaseUrl, schema, {
+      reservationId: overReservation.reservationId,
+      actualInputTokens: 45, actualOutputTokens: 25
+    });
+    const overEstimate = await read("over");
+    const duplicateSettlement = await settleInferenceReservation(databaseUrl, schema, {
+      reservationId: overReservation.reservationId,
+      actualInputTokens: 45, actualOutputTokens: 25
+    });
+    if (duplicateSettlement.outcome !== "already_settled") {
+      throw new Error("assertInferenceReservationSettlement: a duplicate settlement adjusted the ledger again");
+    }
+
+    // What the old shape produced: the estimate, plus the real usage again.
+    // Deliberately never settled, so this model's row keeps the double count
+    // the settlement path exists to prevent.
+    const doubleCountReservation = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org, model: "double", periodStart: period,
+      inputTokens: 60, outputTokens: 40, maxTotalTokens: 1000
+    });
+    if (doubleCountReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the double-count reservation to fit");
+    }
+    await recordInferenceUsage(databaseUrl, schema, {
+      organizationId: org, model: "double", periodStart: period,
+      inputTokens: 45, outputTokens: 25
+    });
+    const doubled = await read("double");
+
+    // Under-estimate: reserve 10/10, actually spend 30/15. Its own handle: an
+    // earlier revision discarded this result and settled the "double"
+    // reservation above instead, which left the "under" row holding its raw
+    // estimate and quietly settled the row that is supposed to stay unsettled.
+    const underReservation = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org, model: "under", periodStart: period,
+      inputTokens: 10, outputTokens: 10, maxTotalTokens: 1000
+    });
+    if (underReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the under-estimate reservation to fit");
+    }
+    await settleInferenceReservation(databaseUrl, schema, {
+      reservationId: underReservation.reservationId,
+      actualInputTokens: 30, actualOutputTokens: 15
+    });
+    const underEstimate = await read("under");
+
+    return {
+      overEstimate,
+      underEstimate,
+      duplicateSettlement: duplicateSettlement.outcome,
+      doubleCountedTotal: doubled.inputTokens + doubled.outputTokens
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export async function assertInferenceBudgetPrecision(
+  databaseUrl: string
+): Promise<InferenceBudgetPrecisionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const oversized = "9007199254740993"; // MAX_SAFE_INTEGER + 2
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO inference_usage_ledger (organization_id, model, period_start, input_tokens, output_tokens)
+       VALUES ($1,'gpt-5.6','2026-09-01',$2::bigint,0)`,
+      [org, oversized]
+    );
+
+    let oversizedReadRejection = "";
+    try {
+      await getInferenceUsage(databaseUrl, schema, {
+        organizationId: org,
+        model: "gpt-5.6",
+        periodStart: "2026-09-01"
+      });
+      throw new Error("assertInferenceBudgetPrecision: an oversized bigint was read without complaint");
+    } catch (error) {
+      oversizedReadRejection = error instanceof Error ? error.message : String(error);
+    }
+
+    // A second tenant with an ordinary total, to read back the cap_exceeded path.
+    await admin.query(
+      `UPDATE inference_usage_ledger SET input_tokens = 900, output_tokens = 100 WHERE organization_id = $1`,
+      [org]
+    );
+    const capped = await reserveInferenceBudget(databaseUrl, schema, {
+      organizationId: org,
+      model: "gpt-5.6",
+      periodStart: "2026-09-01",
+      inputTokens: 500,
+      outputTokens: 0,
+      maxTotalTokens: 1_200
+    });
+
+    return {
+      oversizedReadRejection,
+      silentlyRoundedValue: Number(oversized),
+      storedValue: oversized,
+      capExceededTotalBefore: capped.outcome === "cap_exceeded" ? capped.totalTokensBefore : -1
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

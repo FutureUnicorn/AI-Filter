@@ -55,6 +55,9 @@ export interface OpenAiResponsesClient {
       /** The model that actually served the request, which can differ
        * from the requested one when that is a movable alias. */
       model?: string | undefined;
+      /** Absent when the provider reported no usage. Never defaulted to
+       * zero: an unmetered billable call must not look free. */
+      usage?: { input_tokens: number; output_tokens: number } | undefined;
     }>;
   };
 }
@@ -95,18 +98,50 @@ function wrapRealOpenAiClient(openai: OpenAI): OpenAiResponsesClient {
         // response.model is the model that actually served the call.
         // Discarding it made records produced by different revisions of
         // a movable alias indistinguishable after the alias moved.
-        return { output_text: response.output_text, model: response.model };
+        //
+        // Usage is passed through as-is, including absent. Defaulting it
+        // to 0/0 turned an unknown but potentially billable call into a
+        // legitimate free one: repeated responses in that state would
+        // never advance the ledger and could bypass the cap entirely.
+        // The adapter fails closed on it instead.
+        return {
+          output_text: response.output_text,
+          model: response.model,
+          ...(response.usage === undefined || response.usage === null
+            ? {}
+            : {
+                usage: {
+                  input_tokens: response.usage.input_tokens,
+                  output_tokens: response.usage.output_tokens
+                }
+              })
+        };
       }
     }
   };
 }
 
 /**
- * The call reached the provider and completed, but `output_text` was not
- * valid JSON (a structured-output refusal, a truncated response, an
- * empty body). Carries the call's metadata so the caller can still
- * record that the call happened -- and, once AF-41 adds token counts,
- * what it cost -- rather than losing every trace of it to a throw.
+ * The provider returned no usage data. Thrown rather than defaulted to
+ * zero so an unmetered call can never be mistaken for a free one; the
+ * caller decides whether to retry or halt, but it cannot silently
+ * under-count against the budget.
+ */
+export class AiUsageUnavailableError extends Error {
+  readonly model: string;
+
+  constructor(model: string) {
+    super(`Provider returned no usage for model ${model}; refusing to record it as a zero-token call.`);
+    this.name = "AiUsageUnavailableError";
+    this.model = model;
+  }
+}
+
+/**
+ * The call succeeded and was billed, but `output_text` was not valid
+ * JSON (a refusal, a truncated response, an empty body). Carries the
+ * call's metadata -- including real token usage -- so the caller can
+ * still record what the attempt cost before deciding whether to retry.
  */
 export class AiStructuredCallParseError extends Error {
   readonly metadata: AiCallMetadata;
@@ -152,19 +187,33 @@ export function createOpenAiAdapter(
         store: false
       });
 
-      // Built BEFORE parsing. A refusal, truncation or empty body is
-      // still a call that happened and was billed; constructing metadata
-      // afterwards meant JSON.parse threw first and the caller received
-      // no provider/model/prompt/schema information at all, defeating
-      // the requirement to record metadata on every call and leaving
-      // AF-40 unable to audit failed ones.
+      // Fail closed on unknown usage. The provider has already been
+      // called and may already have billed for it, so the one thing this
+      // must not do is report it as a zero-token call: that would let a
+      // provider degradation return usage-less responses indefinitely
+      // while the ledger never advances and the cap never trips.
+      if (response.usage === undefined || response.usage === null) {
+        throw new AiUsageUnavailableError(config.model);
+      }
+
+      // Metadata is built BEFORE parsing, deliberately. A refused,
+      // truncated, empty or otherwise non-JSON `output_text` still
+      // represents a call that was made and billed; building metadata
+      // afterwards meant JSON.parse threw first and the caller was left
+      // with no token counts to hand to recordInferenceUsage, so retries
+      // of failing responses stayed invisible to the budget and could
+      // accumulate unbounded cost.
       const metadata: AiCallMetadata = {
         provider: "openai",
         model: config.model,
         ...(response.model === undefined ? {} : { resolvedModel: response.model }),
         promptVersion: input.promptVersion,
         schemaVersion: input.schemaVersion,
-        schemaName: input.schemaName
+        schemaName: input.schemaName,
+        usage: {
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens
+        }
       };
 
       let output: unknown;
