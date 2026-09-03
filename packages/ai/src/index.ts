@@ -1300,7 +1300,7 @@ export function killSwitchRetryOutcome(
   };
 }
 
-// ---- AF-43: locked gold-set evaluation harness ----
+// ---- AF-43: gold-set regression harness ----
 //
 // Scores the real deterministic pipeline stages (mapRubricToEvidence,
 // validateCitation, routeForReview) against a versioned, synthetic gold
@@ -1313,9 +1313,24 @@ export function killSwitchRetryOutcome(
 // that needs a separate, provider-cost-incurring eval path this ticket
 // does not build.
 //
-// "locked" on a case is a workflow control (never inspect it while
-// tuning prompts/thresholds), not a CI filter -- every case runs here
-// regardless of locked.
+// These are REGRESSION FIXTURES, not a holdout, and the distinction is
+// deliberate after review (#26). An earlier revision carried a `locked`
+// boolean documented as "never inspect while tuning prompts or
+// thresholds". That claim could not hold: the flag, the inputs and the
+// expected labels all live in one checked-in JSON file that this test
+// imports, so anyone able to change a prompt or a threshold can read the
+// answers first and tune against them until CI passes. A policy-only
+// flag is an honour-system note, not an independent gate, and leaving it
+// in place would have advertised a guarantee the repository cannot
+// enforce.
+//
+// A real holdout needs the cases and their expected outputs to live in
+// an access-controlled evaluation asset that only a protected CI
+// workflow can read, so the labels are unavailable at tuning time. That
+// is infrastructure this ticket does not build -- and note it would also
+// put a credential in the path of standard validation, which
+// evals/README.md currently forbids -- so it belongs to its own ticket
+// rather than being implied here.
 
 /**
  * The gold set is synthetic and offline: no tenant owns these cases, and by
@@ -1326,7 +1341,7 @@ export function killSwitchRetryOutcome(
  *
  * A fixed nil-UUID organization plus a candidateId derived from the case ID
  * keeps the harness deterministic (two runs of the same case produce byte-
- * identical outcomes, which is what makes a locked gold set meaningful) while
+ * identical outcomes, which is what makes a regression gate meaningful) while
  * being obviously synthetic in any output, rather than borrowing a real
  * organization's UUID.
  */
@@ -1338,7 +1353,6 @@ function goldSetSubject(caseId: string): EvidenceSubject {
 
 export interface GoldSetCase {
   readonly caseId: string;
-  readonly locked: boolean;
   readonly sourceText: string;
   readonly rubricCriterionIds: readonly string[];
   readonly simulatedExtraction: readonly EvidenceExtractionItem[];
@@ -1374,7 +1388,7 @@ function isCitingKind(kind: EvidenceOutcomeKind): boolean {
 }
 
 /**
- * A gold-set fixture is hand-authored, versioned, and locked -- a typo
+ * A gold-set fixture is hand-authored and versioned -- a typo
  * in one of its labels is a fixture bug, not a pipeline regression, and
  * must never silently produce a passing (or falsely failing) score. Both
  * expectedKinds and expectedReviewCriterionIds are asserted against the
