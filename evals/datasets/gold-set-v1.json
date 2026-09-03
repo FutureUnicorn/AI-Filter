@@ -1,102 +1,158 @@
 {
   "version": "1.0.0",
-  "notes": "Synthetic only, per evals/datasets/README.md. 'locked' cases are a holdout: never inspect them while tuning prompts or thresholds, but CI evaluates every case, locked or not -- locked controls what engineers may look at, not what CI runs. Adversarial/scan/corrupt-file categories from AF-43's own description beyond 'hallucinated-citation' are deferred: prompt-injection gets its own depth in AF-44, and scan/corrupt-file handling depends on an ingestion file-parsing pipeline that does not exist yet.",
+  "notes": "Synthetic only, per evals/datasets/README.md. These are REGRESSION FIXTURES, not a holdout. An earlier revision marked some cases 'locked' and documented them as never to be inspected while tuning prompts or thresholds, but the flag, the inputs and the expected labels all live in this one checked-in file that the test imports, so anyone who can change a prompt or threshold can read the answers and tune against them until CI passes. A policy-only flag is an honour-system note rather than an independent gate, so the claim was removed instead of being left to imply a guarantee this repository cannot enforce. A real holdout needs the cases and their expected outputs in an access-controlled evaluation asset readable only by a protected CI workflow; that is separate infrastructure and its own ticket. Adversarial/scan/corrupt-file categories from AF-43's description beyond 'hallucinated-citation' are deferred: prompt-injection gets its own depth in AF-44, and scan/corrupt-file handling depends on an ingestion file-parsing pipeline that does not exist yet.",
   "cases": [
     {
       "caseId": "clean-supported",
-      "locked": false,
       "sourceText": "Built and maintained Python microservices processing 2M+ events/day.",
-      "rubricCriterionIds": ["python_production"],
+      "rubricCriterionIds": [
+        "python_production"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "python_production",
           "state": "supported",
           "quote": "Built and maintained Python microservices processing 2M+ events/day.",
-          "source": { "document": "resume.txt", "page_or_section": "Experience", "offset": 0 }
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "Experience",
+            "offset": 0
+          }
         }
       ],
-      "expectedKinds": { "python_production": "supported" },
+      "expectedKinds": {
+        "python_production": "supported"
+      },
       "expectedReviewCriterionIds": []
     },
     {
       "caseId": "clean-partially-supported",
-      "locked": false,
       "sourceText": "Contributed to a Python service migration for six weeks as an intern.",
-      "rubricCriterionIds": ["python_production"],
+      "rubricCriterionIds": [
+        "python_production"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "python_production",
           "state": "partially_supported",
           "quote": "Contributed to a Python service migration for six weeks as an intern.",
-          "source": { "document": "resume.txt", "page_or_section": "Experience", "offset": 0 }
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "Experience",
+            "offset": 0
+          }
         }
       ],
-      "expectedKinds": { "python_production": "partially_supported" },
+      "expectedKinds": {
+        "python_production": "partially_supported"
+      },
       "expectedReviewCriterionIds": []
     },
     {
       "caseId": "clean-not-found",
-      "locked": false,
       "sourceText": "Led a cross-functional design review for the mobile onboarding flow.",
-      "rubricCriterionIds": ["aws_certification"],
+      "rubricCriterionIds": [
+        "aws_certification"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "aws_certification",
           "state": "not_found",
           "quote": "",
-          "source": { "document": "resume.txt", "page_or_section": "", "offset": -1 }
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "",
+            "offset": -1
+          }
         }
       ],
-      "expectedKinds": { "aws_certification": "not_found" },
+      "expectedKinds": {
+        "aws_certification": "not_found"
+      },
       "expectedReviewCriterionIds": []
     },
     {
       "caseId": "ambiguous-unclear",
-      "locked": true,
       "sourceText": "Familiar with backend systems including some Python tooling.",
-      "rubricCriterionIds": ["python_production"],
+      "rubricCriterionIds": [
+        "python_production"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "python_production",
           "state": "unclear",
           "quote": "Familiar with backend systems including some Python tooling.",
-          "source": { "document": "resume.txt", "page_or_section": "Skills", "offset": 0 }
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "Skills",
+            "offset": 0
+          }
         }
       ],
-      "expectedKinds": { "python_production": "unclear" },
-      "expectedReviewCriterionIds": ["python_production"]
+      "expectedKinds": {
+        "python_production": "unclear"
+      },
+      "expectedReviewCriterionIds": [
+        "python_production"
+      ]
     },
     {
       "caseId": "contradiction",
-      "locked": true,
       "sourceText": "Resume states 5 years at Acme Corp. Cover letter states 2 years at Acme Corp.",
-      "rubricCriterionIds": ["tenure_5_years"],
+      "rubricCriterionIds": [
+        "tenure_5_years"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "tenure_5_years",
           "state": "contradicted",
-          "quote": "Resume states 5 years at Acme Corp. Cover letter states 2 years at Acme Corp.",
-          "source": { "document": "resume.txt", "page_or_section": "Experience", "offset": 0 }
+          "quote": "Resume states 5 years at Acme Corp.",
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "Experience",
+            "offset": 0
+          },
+          "conflicting": {
+            "quote": "Cover letter states 2 years at Acme Corp.",
+            "source": {
+              "document": "resume.txt",
+              "page_or_section": "Experience",
+              "offset": 36
+            }
+          }
         }
       ],
-      "expectedKinds": { "tenure_5_years": "contradicted" },
-      "expectedReviewCriterionIds": ["tenure_5_years"]
+      "expectedKinds": {
+        "tenure_5_years": "contradicted"
+      },
+      "expectedReviewCriterionIds": [
+        "tenure_5_years"
+      ]
     },
     {
       "caseId": "hallucinated-citation",
-      "locked": false,
       "sourceText": "Built and maintained Python microservices processing 2M+ events/day.",
-      "rubricCriterionIds": ["postgres_experience"],
+      "rubricCriterionIds": [
+        "postgres_experience"
+      ],
       "simulatedExtraction": [
         {
           "criterion_id": "postgres_experience",
           "state": "supported",
           "quote": "Designed PostgreSQL schemas for the core transactional workload.",
-          "source": { "document": "resume.txt", "page_or_section": "Experience", "offset": 0 }
+          "source": {
+            "document": "resume.txt",
+            "page_or_section": "Experience",
+            "offset": 0
+          }
         }
       ],
-      "expectedKinds": { "postgres_experience": "citation_invalid" },
-      "expectedReviewCriterionIds": ["postgres_experience"]
+      "expectedKinds": {
+        "postgres_experience": "citation_invalid"
+      },
+      "expectedReviewCriterionIds": [
+        "postgres_experience"
+      ]
     }
   ]
 }

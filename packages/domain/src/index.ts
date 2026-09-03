@@ -574,6 +574,28 @@ export function checkInferenceBudget(
   const { tokensUsedThisPeriod } = usage;
   const { maxTokensPerPeriod, alertThresholdRatio } = config;
 
+  // Validated rather than compared, because every comparison below is false
+  // against NaN. A malformed numeric environment value would therefore fall
+  // through to `ok` and silently disable the cap entirely: the one outcome a
+  // budget check must never produce by accident. `reserveInferenceBudget`
+  // already refuses a non-safe-integer cap, so this only brings the in-memory
+  // path up to the guarantee the database path already makes.
+  if (!Number.isSafeInteger(maxTokensPerPeriod) || maxTokensPerPeriod < 0) {
+    throw new Error(
+      `checkInferenceBudget requires a non-negative safe integer maxTokensPerPeriod, got: ${maxTokensPerPeriod}`
+    );
+  }
+  if (!Number.isFinite(alertThresholdRatio) || alertThresholdRatio < 0 || alertThresholdRatio > 1) {
+    throw new Error(
+      `checkInferenceBudget requires an alertThresholdRatio between 0 and 1, got: ${alertThresholdRatio}`
+    );
+  }
+  if (!Number.isFinite(tokensUsedThisPeriod) || tokensUsedThisPeriod < 0) {
+    throw new Error(
+      `checkInferenceBudget requires a non-negative tokensUsedThisPeriod, got: ${tokensUsedThisPeriod}`
+    );
+  }
+
   if (tokensUsedThisPeriod >= maxTokensPerPeriod) {
     return { outcome: "capped", tokensUsedThisPeriod, maxTokensPerPeriod };
   }

@@ -54,20 +54,14 @@ const schemaVersionSchema = z.literal(CONTRACT_SCHEMA_VERSION);
  * at the persist/transport boundary. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
-  z.union([
-    z.string(),
-    z.number().finite().refine((value) => !Object.is(value, -0), {
-      message: "must not be negative zero, which JSON serializes as 0"
-    }),
-    z.boolean(),
-    z.null(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema)
-  ])
-);
-
-const sourceCitationSchema = z.strictObject({
+/**
+ * Exported so packages/ai can ask "will this citation actually persist?"
+ * by parsing it, rather than restating the rules. AF-36 restated them and
+ * omitted two -- a nonempty document, and an offset that is an integer
+ * rather than merely non-negative -- which let 0.5 and Infinity through.
+ * A predicate that duplicates a schema drifts from it; parsing cannot.
+ */
+export const sourceCitationSchema = z.strictObject({
   document: z.string().min(1),
   pageOrSection: z.string().min(1),
   offset: z.number().int().min(0),
@@ -383,7 +377,11 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
  * and `buildApiError` parses its constructed body through
  * `apiErrorBodySchema` so a non-finite `details` value cannot escape as
  * a body that serializes to a different value than it type-checked as. */
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+// (JsonValue is declared once, above, next to the JSON machinery that
+// enforces it. The paragraph above explains what it buys HERE, on the
+// error-body surface; the declaration site explains what it buys for
+// rejectedCitation. Two duplicate declarations of it -- byte-identical,
+// from a merge -- used to sit here and made this file fail to compile.)
 
 /** The one shape every error response on the API surface takes. */
 export interface ApiErrorBody {

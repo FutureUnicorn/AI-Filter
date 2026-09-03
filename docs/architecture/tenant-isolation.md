@@ -46,3 +46,34 @@ Verified directly against Postgres 17.10: as a genuine non-superuser role, the p
 But **`POSTGRES_USER` in the official `postgres` Docker image (the one AF-11's infra runs) is created with superuser privileges** ([Docker Hub: "This variable will create the specified user with superuser power"](https://hub.docker.com/_/postgres)), and Postgres superusers unconditionally bypass row-level security, `FORCE ROW LEVEL SECURITY` included -- there is no configuration flag that changes this. AF-11's `web`/`worker`/`migrate` containers all connect as this same bootstrap superuser today (`infra/compose/runtime.yml`). That means this policy is currently a correct no-op: it will not block anything until the application connects as a distinct, non-superuser Postgres role.
 
 This is a real, separate finding, not a reason to abandon the policy: it costs nothing to have in place now, and it is already correct for the day a non-superuser app role exists. Creating that role is an infrastructure change to AF-11's Postgres bootstrapping, out of this ticket's scope (and not this repo's to change unilaterally without the person who owns that infrastructure). Flagging it here so it isn't mistaken for real protection in the meantime.
+
+## Consequence: the inference kill switch is per-deployment, not global (AF-42)
+
+The isolation decision above has an operational consequence worth stating
+explicitly, because the natural reading of "kill switch" is "stops
+everything, everywhere".
+
+`packages/db/migrations/0008_inference_kill_switch.sql` creates a
+singleton row that halts model calls for every organization within **one
+deployment's database**. `setInferenceKillSwitch` acts on exactly the one
+`databaseUrl` it is given. Since each pilot gets its own database, schema
+and credentials (per the decision above), engaging the switch in one
+pilot leaves model calls running in every other deployed pilot.
+
+That is the intended trade-off, not an oversight. A switch reaching
+across pilots would need a shared control plane holding credentials into
+every pilot database -- exactly the cross-tenant coupling this document
+exists to avoid, and it would reintroduce it for the sake of an
+operation that runs a handful of times a year.
+
+**What an incident responder must actually do:** during a provider
+incident, bad release, or cost spike, engage the switch **once per
+deployed pilot**. There is deliberately no single command that reaches
+all of them, so treat "engage the kill switch" as a per-deployment
+checklist item rather than a single action.
+
+Should the number of pilots ever make that impractical, the fix is a
+deliberate fan-out mechanism with its own audit trail and its own
+review of the credential-blast-radius question -- not widening this
+row's reach. Revisit alongside the RLS decision above, since both turn
+on the same "is there a shared multi-tenant database yet?" question.

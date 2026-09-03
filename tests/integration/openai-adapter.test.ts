@@ -91,7 +91,14 @@ test("runStructuredCall requests strict structured JSON output with the caller's
 
 test("runStructuredCall rejects JSON Schemas unsupported by OpenAI", async () => {
   const capture: { params?: unknown } = {};
-  const adapter = createOpenAiAdapter({ apiKey: "sk-test", model: "gpt-5.6" }, fakeClient("{}", capture));
+  // Explicitly disengaged rather than omitted. checkKillSwitch is required,
+  // and this construction had drifted back to the original
+  // `{ apiKey, model }` shape -- which compiles here only because test
+  // files are not in any package tsconfig, so nothing typechecks them.
+  const adapter = createOpenAiAdapter(
+    { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch },
+    fakeClient("{}", capture)
+  );
   await assert.rejects(() => adapter.runStructuredCall({ ...baseInput, jsonSchema: true }), {
     name: "TypeError",
     message: "OpenAI structured output requires an object JSON Schema."
