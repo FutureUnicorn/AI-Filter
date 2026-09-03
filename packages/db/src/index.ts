@@ -9,8 +9,16 @@ import type {
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
   MagicLinkTokenRecord,
-  MembershipRole
+  Membership,
+  MembershipRole,
+  Role,
+  RoleStatus,
+  Rubric,
+  RubricCriterion,
+  RubricStatus,
+  User
 } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 import { Client } from "pg";
 
 /** Persistence adapters will implement domain-owned ports in this package. */
@@ -636,6 +644,317 @@ export async function setInferenceKillSwitch(
   }
 }
 
+// ---- AF-23 prerequisite: resolve a redeemed magic link to a real user ----
+//
+// AF-16 built token generation/redemption but stopped at "this email is
+// verified" -- nothing yet turns that into a userId. A login-only token
+// (no invite) must resolve to a user who already exists: if one
+// redeems a login link for an email that was invited but never
+// completed onboarding, that is exactly the not-onboarded case,
+// reported honestly rather than papered over by silently creating a
+// user with no membership. An invite token (organizationId + role
+// present) may legitimately be the first thing that ever creates that
+// user, so it upserts both the user and the membership together,
+// atomically, since a user row without the invited membership would be
+// a stuck half-onboarded account.
+
+interface UserRow {
+  readonly user_id: string;
+  readonly email: string;
+  readonly display_name: string;
+  readonly created_at: Date;
+}
+
+function rowToUser(row: UserRow): User {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    userId: row.user_id,
+    email: row.email,
+    displayName: row.display_name,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export async function getUserByEmail(
+  databaseUrl: string,
+  schema: string,
+  email: string
+): Promise<User | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<UserRow>(
+      `SELECT user_id, email, display_name, created_at FROM "${schema}".users WHERE email = $1`,
+      [email]
+    );
+    return result.rows[0] === undefined ? undefined : rowToUser(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-23 prerequisite: fetch the caller's own memberships ----
+//
+// AF-19's authorizeResourceAccess takes a Membership[] but nothing before
+// AF-23 needed one for real, so no query existed to produce it. This is
+// the only place a session's bare userId ever becomes a set of
+// (organization, role) facts -- authorizeResourceAccess still owns the
+// actual decision, this just supplies its input.
+
+interface MembershipRow {
+  readonly membership_id: string;
+  readonly organization_id: string;
+  readonly user_id: string;
+  readonly role: MembershipRole;
+  readonly created_at: Date;
+}
+
+export async function getMembershipsForUser(
+  databaseUrl: string,
+  schema: string,
+  userId: string
+): Promise<readonly Membership[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<MembershipRow>(
+      `SELECT membership_id, organization_id, user_id, role, created_at
+         FROM "${schema}".memberships
+        WHERE user_id = $1`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      membershipId: row.membership_id,
+      organizationId: row.organization_id,
+      userId: row.user_id,
+      role: row.role,
+      createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Seeds one organization + user + membership and returns the user id.
+ *
+ * Exported for the same reason the assert* probes below are: pg lives in
+ * this package, so a test that needs real rows either goes through here
+ * or reaches for a driver it cannot resolve. It exists specifically so
+ * the route-level magic-link test can seed a real member and then drive
+ * the actual request/redeem handlers -- that test cannot live in this
+ * package, because the workspace boundaries forbid packages from
+ * importing apps.
+ *
+ * Idempotent on all three rows so repeated runs are safe. Synthetic
+ * fixtures only; callers in a hosted environment have no reason to
+ * invoke it.
+ */
+/**
+ * Provision a throwaway schema with only the migrations the magic-link
+ * routes touch, and return its name.
+ *
+ * Lives here rather than in the test because `pg` is a packages/db
+ * dependency and tests do not import it directly (the same reason
+ * seedOrganizationMembership is here). It exists because
+ * tests/integration/magic-link-route.test.ts previously pointed
+ * DATABASE_SCHEMA at `public` and assumed it was already migrated: true on a
+ * workstation after `pnpm dev:infra`, false in the Integration CI job, which
+ * starts a bare postgres service with no migrations applied. All three route
+ * tests passed locally and failed in CI.
+ */
+export async function provisionRouteProbeSchema(databaseUrl: string): Promise<string> {
+  const schema = `route_probe_${randomBytes(4).toString("hex")}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    for (const file of ["0002_organizations_users_memberships.sql", "0003_magic_link_tokens.sql"]) {
+      await admin.query(`SET search_path TO "${schema}"`);
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+  return schema;
+}
+
+/** Best-effort teardown for provisionRouteProbeSchema; each run is unique. */
+export async function dropProbeSchema(databaseUrl: string, schema: string): Promise<void> {
+  assertSafeSchema(schema);
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+  } catch {
+    // Best-effort: the next run uses a different suffix.
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export async function seedOrganizationMembership(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly organizationName: string;
+    readonly email: string;
+    readonly displayName: string;
+    readonly role: MembershipRole;
+  }
+): Promise<{ readonly userId: string }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".organizations (organization_id, name) VALUES ($1, $2)
+         ON CONFLICT (organization_id) DO NOTHING`,
+      [input.organizationId, input.organizationName]
+    );
+    const user = await client.query<{ user_id: string }>(
+      `INSERT INTO "${schema}".users (email, display_name) VALUES ($1, $2)
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+       RETURNING user_id`,
+      [input.email, input.displayName]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("seedOrganizationMembership did not produce a user row");
+    }
+    await client.query(
+      `INSERT INTO "${schema}".memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (organization_id, user_id) DO NOTHING`,
+      [input.organizationId, userId, input.role]
+    );
+    return { userId };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-23: role creation ----
+
+export interface CreateRoleInput {
+  readonly organizationId: string;
+  readonly title: string;
+  readonly createdByUserId: string;
+}
+
+interface RoleRow {
+  readonly role_id: string;
+  readonly organization_id: string;
+  readonly title: string;
+  readonly status: RoleStatus;
+  readonly created_by_user_id: string;
+  readonly created_at: Date;
+}
+
+export async function createRole(
+  databaseUrl: string,
+  schema: string,
+  input: CreateRoleInput
+): Promise<Role> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `INSERT INTO "${schema}".roles (organization_id, title, created_by_user_id)
+       VALUES ($1, $2, $3)
+       RETURNING role_id, organization_id, title, status, created_by_user_id, created_at`,
+      [input.organizationId, input.title, input.createdByUserId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("role insert returned no row");
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-24: recruiter roles list ----
+
+export async function listRolesForOrganization(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string
+): Promise<readonly Role[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
+         FROM "${schema}".roles
+        WHERE organization_id = $1
+        ORDER BY created_at DESC`,
+      [organizationId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** A single role, for routes that need to resolve roleId -> organizationId
+ * before they can authorize the caller against it (e.g. AF-25's rubric
+ * route: the role, not the rubric, is what's scoped to an organization). */
+export async function getRoleById(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Role | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
+         FROM "${schema}".roles
+        WHERE role_id = $1`,
+      [roleId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
   /** Cap on (input + output) tokens for this organization/model/period. */
   readonly maxTotalTokens: number;
@@ -867,6 +1186,118 @@ export async function settleInferenceReservation(
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-25: rubric draft/edit ----
+
+interface RubricRow {
+  readonly rubric_id: string;
+  readonly role_id: string;
+  readonly version: number;
+  readonly status: RubricStatus;
+  readonly criteria: readonly RubricCriterion[];
+  readonly approved_by_user_id: string | null;
+  readonly approved_at: Date | null;
+  readonly created_at: Date;
+  readonly updated_at: Date;
+}
+
+function rowToRubric(row: RubricRow): Rubric {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    rubricId: row.rubric_id,
+    roleId: row.role_id,
+    version: row.version,
+    status: row.status,
+    criteria: row.criteria,
+    ...(row.approved_by_user_id === null ? {} : { approvedByUserId: row.approved_by_user_id }),
+    ...(row.approved_at === null ? {} : { approvedAt: row.approved_at.toISOString() }),
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+const RUBRIC_COLUMNS =
+  "rubric_id, role_id, version, status, criteria, approved_by_user_id, approved_at, created_at, updated_at";
+
+/** The draft if one exists, else the highest-version published rubric, else undefined. */
+export async function getRubricForRole(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Rubric | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RubricRow>(
+      `SELECT ${RUBRIC_COLUMNS}
+         FROM "${schema}".rubrics
+        WHERE role_id = $1
+        ORDER BY (status = 'draft') DESC, version DESC
+        LIMIT 1`,
+      [roleId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToRubric(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export type UpsertDraftRubricOutcome =
+  | { readonly outcome: "saved"; readonly rubric: Rubric }
+  | { readonly outcome: "no_such_role" };
+
+/**
+ * Creates the role's first draft, or overwrites the existing one --
+ * never both in the same call, and never touches a published version.
+ * The role_id foreign key plus the one-draft-per-role partial unique
+ * index (migration 0010) are what make this safe under concurrent
+ * calls: a race to create the first draft fails one caller with a
+ * unique-violation rather than silently producing two drafts.
+ */
+export async function upsertDraftRubric(
+  databaseUrl: string,
+  schema: string,
+  roleId: string,
+  criteria: readonly RubricCriterion[]
+): Promise<UpsertDraftRubricOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const criteriaJson = JSON.stringify(criteria);
+    const updated = await client.query<RubricRow>(
+      `UPDATE "${schema}".rubrics
+          SET criteria = $2::jsonb, updated_at = CURRENT_TIMESTAMP
+        WHERE role_id = $1 AND status = 'draft'
+        RETURNING ${RUBRIC_COLUMNS}`,
+      [roleId, criteriaJson]
+    );
+    const updatedRow = updated.rows[0];
+    if (updatedRow !== undefined) {
+      return { outcome: "saved", rubric: rowToRubric(updatedRow) };
+    }
+
+    const roleExists = await client.query(`SELECT 1 FROM "${schema}".roles WHERE role_id = $1`, [roleId]);
+    if (roleExists.rows[0] === undefined) {
+      return { outcome: "no_such_role" };
+    }
+
+    const inserted = await client.query<RubricRow>(
+      `INSERT INTO "${schema}".rubrics (role_id, version, criteria)
+       VALUES ($1, COALESCE((SELECT MAX(version) FROM "${schema}".rubrics WHERE role_id = $1), 0) + 1, $2::jsonb)
+       RETURNING ${RUBRIC_COLUMNS}`,
+      [roleId, criteriaJson]
+    );
+    const insertedRow = inserted.rows[0];
+    if (insertedRow === undefined) {
+      throw new Error("rubric insert returned no row");
+    }
+    return { outcome: "saved", rubric: rowToRubric(insertedRow) };
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -1687,6 +2118,134 @@ export async function assertInferenceBudgetPrecision(
       silentlyRoundedValue: Number(oversized),
       storedValue: oversized,
       capExceededTotalBefore: capped.outcome === "cap_exceeded" ? capped.totalTokensBefore : -1
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-25: rubric draft persistence and versioning ----
+
+export interface RubricPersistenceObservations {
+  readonly firstSaveVersion: number;
+  readonly editedSaveVersion: number;
+  readonly editedCriterionIds: readonly string[];
+  readonly draftRowsAfterEdit: number;
+  readonly versionAfterPublished: number;
+  readonly readBackIsDraft: boolean;
+  readonly unknownRoleOutcome: string;
+}
+
+/**
+ * Exercises upsertDraftRubric/getRubricForRole against real Postgres in a
+ * throwaway schema, so the documented versioning rule is proven rather
+ * than assumed. The rule (see upsertDraftRubric's own comment) is: edit
+ * the existing draft IN PLACE, keeping its version, and only allocate
+ * MAX(version) + 1 when inserting where no draft exists.
+ *
+ * Lives here rather than in the test because the pg Client is this
+ * package's dependency and the migrations it applies are its own files;
+ * this mirrors assertMembershipsTenantIsolation above.
+ */
+export async function assertRubricDraftPersistence(
+  databaseUrl: string
+): Promise<RubricPersistenceObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `rubric_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const criterion = (id: string): RubricCriterion => ({
+    criterionId: id,
+    description: `description for ${id}`,
+    evidenceGuidance: `guidance for ${id}`
+  });
+  const five = ["a", "b", "c", "d", "e"].map(criterion);
+  const editedFive = ["a", "b", "c", "d", "z"].map(criterion);
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    for (const file of ["0002_organizations_users_memberships.sql", "0009_roles.sql", "0011_rubrics.sql"]) {
+      await admin.query(`SET search_path TO "${schema}"`);
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO "${schema}".organizations (organization_id, name) VALUES ($1, 'Rubric Probe Org')`, [
+      organizationId
+    ]);
+    await admin.query(
+      `INSERT INTO "${schema}".users (user_id, email, display_name) VALUES ($1, 'probe@acme.test', 'Probe')`,
+      [userId]
+    );
+    const role = await createRole(databaseUrl, schema, {
+      organizationId,
+      title: "Backend Engineer",
+      createdByUserId: userId
+    });
+
+    const first = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    if (first.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected the first draft to save");
+    }
+    if (first.rubric.status !== "draft") {
+      throw new Error(`assertRubricDraftPersistence: first save should be a draft, got ${first.rubric.status}`);
+    }
+    if (first.rubric.criteria.map((entry) => entry.criterionId).join(",") !== "a,b,c,d,e") {
+      throw new Error("assertRubricDraftPersistence: criteria did not round-trip through jsonb in order");
+    }
+
+    // Editing replaces the whole list and must NOT allocate a new version:
+    // a draft is edited in place, which is what makes "the draft" a single
+    // unambiguous row for AF-26's editor to point at.
+    const edited = await upsertDraftRubric(databaseUrl, schema, role.roleId, editedFive);
+    if (edited.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected the edit to save");
+    }
+    const draftRows = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".rubrics WHERE role_id = $1 AND status = 'draft'`,
+      [role.roleId]
+    );
+
+    // Publishing is AF-27's transition, inserted directly here only so the
+    // next draft has a higher version to allocate past.
+    await admin.query(
+      `UPDATE "${schema}".rubrics
+          SET status = 'published', approved_by_user_id = $2, approved_at = CURRENT_TIMESTAMP
+        WHERE role_id = $1 AND status = 'draft'`,
+      [role.roleId, userId]
+    );
+    const afterPublished = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    if (afterPublished.outcome !== "saved") {
+      throw new Error("assertRubricDraftPersistence: expected a new draft after publishing");
+    }
+
+    // getRubricForRole prefers the draft over the higher-versioned published
+    // row, which is the ordering its own doc comment promises.
+    const readBack = await getRubricForRole(databaseUrl, schema, role.roleId);
+    if (readBack === undefined) {
+      throw new Error("assertRubricDraftPersistence: expected to read a rubric back");
+    }
+
+    const unknownRole = await upsertDraftRubric(
+      databaseUrl,
+      schema,
+      "99999999-9999-4999-8999-999999999999",
+      five
+    );
+
+    return {
+      firstSaveVersion: first.rubric.version,
+      editedSaveVersion: edited.rubric.version,
+      editedCriterionIds: edited.rubric.criteria.map((entry) => entry.criterionId),
+      draftRowsAfterEdit: Number(draftRows.rows[0]?.count ?? "-1"),
+      versionAfterPublished: afterPublished.rubric.version,
+      readBackIsDraft: readBack.status === "draft",
+      unknownRoleOutcome: unknownRole.outcome
     };
   } finally {
     try {
