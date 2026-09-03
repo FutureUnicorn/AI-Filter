@@ -1588,17 +1588,34 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
  * shapes, so this one only needs to add the "override it" shape they
  * don't.
  */
+/**
+ * Every separator between words is `\s+`, never a literal space, and the
+ * `.`/`[\w\s]` spans carry the `s` flag so they cross newlines.
+ *
+ * Review (#27) found the reason: with literal spaces, ordinary document
+ * whitespace defeated the patterns. A resume that wrapped the very first
+ * regression case across two lines --
+ *
+ *     IGNORE ALL PREVIOUS
+ *     INSTRUCTIONS
+ *
+ * -- did not match the ignore-clause at all, and neither did a CRLF wrap,
+ * a tab, or a double space, all of which a real document produces without
+ * anyone attacking anything. That is a pre-model guard bypassed by a line
+ * break, and the same construction was in the Python port, so the text
+ * reached the provider on both paths.
+ */
 const INJECTION_PATTERNS: readonly RegExp[] = [
-  /ignore (all |any )?(the )?(previous|prior|above) instructions?/iu,
-  /disregard (all |any )?(the )?(previous|prior|above) instructions?/iu,
-  /you are now (a|an) [\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b/iu,
-  /new instructions?:/iu,
-  /(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system prompt/iu,
-  /reveal (your |the )?(system prompt|instructions)/iu,
-  /act as (a|an)\b.{0,40}(instead|from now)/iu,
-  /do not (follow|apply|use) (the )?(rubric|criteria|scoring)/iu,
-  /overrid(e|ing) (the )?(evaluation|scoring|rubric)/iu,
-  /mark (this|me) as (qualified|supported|approved|hired|a match)/iu,
+  /ignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?/isu,
+  /disregard\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?/isu,
+  /you\s+are\s+now\s+(a|an)\s+[\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b/isu,
+  /new\s+instructions?\s*:/isu,
+  /(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system\s+prompt/isu,
+  /reveal\s+(your\s+|the\s+)?(system\s+prompt|instructions)/isu,
+  /act\s+as\s+(a|an)\b.{0,40}(instead|from\s+now)/isu,
+  /do\s+not\s+(follow|apply|use)\s+(the\s+)?(rubric|criteria|scoring)/isu,
+  /overrid(e|ing)\s+(the\s+)?(evaluation|scoring|rubric)/isu,
+  /mark\s+(this|me)\s+as\s+(qualified|supported|approved|hired|a\s+match)/isu,
   /\[\s*system\s*\]/iu,
   /<\|im_start\|>/iu
 ];

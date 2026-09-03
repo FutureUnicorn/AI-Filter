@@ -16,18 +16,18 @@ import re
 from dataclasses import dataclass
 
 INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"ignore (all |any )?(the )?(previous|prior|above) instructions?", re.IGNORECASE),
-    re.compile(r"disregard (all |any )?(the )?(previous|prior|above) instructions?", re.IGNORECASE),
-    re.compile(r"you are now (a|an) [\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b", re.IGNORECASE),
-    re.compile(r"new instructions?:", re.IGNORECASE),
-    re.compile(r"(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system prompt", re.IGNORECASE),
-    re.compile(r"reveal (your |the )?(system prompt|instructions)", re.IGNORECASE),
-    re.compile(r"act as (a|an)\b.{0,40}(instead|from now)", re.IGNORECASE),
-    re.compile(r"do not (follow|apply|use) (the )?(rubric|criteria|scoring)", re.IGNORECASE),
-    re.compile(r"overrid(e|ing) (the )?(evaluation|scoring|rubric)", re.IGNORECASE),
-    re.compile(r"mark (this|me) as (qualified|supported|approved|hired|a match)", re.IGNORECASE),
-    re.compile(r"\[\s*system\s*\]", re.IGNORECASE),
-    re.compile(r"<\|im_start\|>", re.IGNORECASE),
+    re.compile(r"ignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?", re.IGNORECASE | re.DOTALL),
+    re.compile(r"disregard\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?", re.IGNORECASE | re.DOTALL),
+    re.compile(r"you\s+are\s+now\s+(a|an)\s+[\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"new\s+instructions?\s*:", re.IGNORECASE | re.DOTALL),
+    re.compile(r"(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system\s+prompt", re.IGNORECASE | re.DOTALL),
+    re.compile(r"reveal\s+(your\s+|the\s+)?(system\s+prompt|instructions)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"act\s+as\s+(a|an)\b.{0,40}(instead|from\s+now)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"do\s+not\s+(follow|apply|use)\s+(the\s+)?(rubric|criteria|scoring)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"overrid(e|ing)\s+(the\s+)?(evaluation|scoring|rubric)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"mark\s+(this|me)\s+as\s+(qualified|supported|approved|hired|a\s+match)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\[\s*system\s*\]", re.IGNORECASE | re.DOTALL),
+    re.compile(r"<\|im_start\|>", re.IGNORECASE | re.DOTALL),
 )
 
 
