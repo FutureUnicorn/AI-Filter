@@ -102,7 +102,7 @@ test("a negative usage delta cannot walk the meter backwards", async () => {
   ] as const) {
     await assert.rejects(
       () => recordInferenceUsage(databaseUrl, "public", { ...base, inputTokens, outputTokens }),
-      /non-negative integer/,
+      /non-negative safe integer/,
       `recordInferenceUsage accepted ${inputTokens}/${outputTokens}`
     );
     await assert.rejects(
@@ -113,7 +113,7 @@ test("a negative usage delta cannot walk the meter backwards", async () => {
           outputTokens,
           maxTotalTokens: 1_000
         }),
-      /non-negative integer/,
+      /non-negative safe integer/,
       `reserveInferenceBudget accepted ${inputTokens}/${outputTokens}`
     );
   }

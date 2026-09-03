@@ -1094,18 +1094,26 @@ export async function assertInferenceReservationSettlement(
     }
 
     // What the old shape produced: the estimate, plus the real usage again.
-    const underReservation = await reserveInferenceBudget(databaseUrl, schema, {
+    // Deliberately never settled, so this model's row keeps the double count
+    // the settlement path exists to prevent.
+    const doubleCountReservation = await reserveInferenceBudget(databaseUrl, schema, {
       organizationId: org, model: "double", periodStart: period,
       inputTokens: 60, outputTokens: 40, maxTotalTokens: 1000
     });
+    if (doubleCountReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the double-count reservation to fit");
+    }
     await recordInferenceUsage(databaseUrl, schema, {
       organizationId: org, model: "double", periodStart: period,
       inputTokens: 45, outputTokens: 25
     });
     const doubled = await read("double");
 
-    // Under-estimate: reserve 10/10, actually spend 30/15.
-    await reserveInferenceBudget(databaseUrl, schema, {
+    // Under-estimate: reserve 10/10, actually spend 30/15. Its own handle: an
+    // earlier revision discarded this result and settled the "double"
+    // reservation above instead, which left the "under" row holding its raw
+    // estimate and quietly settled the row that is supposed to stay unsettled.
+    const underReservation = await reserveInferenceBudget(databaseUrl, schema, {
       organizationId: org, model: "under", periodStart: period,
       inputTokens: 10, outputTokens: 10, maxTotalTokens: 1000
     });
