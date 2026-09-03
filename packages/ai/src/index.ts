@@ -62,9 +62,56 @@ export interface OpenAiResponsesClient {
   };
 }
 
+/**
+ * Explicit "this call site genuinely has no kill switch" marker, for
+ * tests and for adapters constructed outside the inference path. Named
+ * so that grepping for it finds every place the control is bypassed --
+ * which an optional field silently hid.
+ */
+export const alwaysDisengagedKillSwitch = async (): Promise<{ readonly engaged: boolean }> => ({
+  engaged: false
+});
+
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
+  /**
+   * Checked before every call; when it resolves `engaged: true`, the
+   * provider is never invoked.
+   *
+   * REQUIRED, not optional. While it was optional, every construction
+   * using the original `{ apiKey, model }` shape still compiled and
+   * called the provider without consulting the database, so engaging
+   * the switch could not reliably halt inference -- which is the entire
+   * point of the control. Making it mandatory means an adapter that
+   * skips the check cannot be built at all: it is a compile error.
+   *
+   * The caller injects it (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose row shape already
+   * matches). Injection rather than a direct import keeps packages/ai
+   * free of a dependency on packages/db, which the architecture rules
+   * forbid. Tests that genuinely do not exercise the switch pass
+   * `alwaysDisengagedKillSwitch` so the omission is explicit and
+   * greppable rather than silent.
+   */
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+/**
+ * Thrown instead of ever calling the provider when the kill switch is
+ * engaged. This adapter is generic (no concept of a criterionId or
+ * retry count), so it can only refuse the call and say why -- mapping
+ * that into an EvidenceOutcome (killSwitchRetryOutcome, below) is the
+ * caller's job, at whatever per-criterion layer actually knows those.
+ */
+export class InferenceKillSwitchEngagedError extends Error {
+  readonly reason: string | undefined;
+
+  constructor(reason: string | undefined) {
+    super(reason === undefined ? "Inference kill switch is engaged" : `Inference kill switch is engaged: ${reason}`);
+    this.name = "InferenceKillSwitchEngagedError";
+    this.reason = reason;
+  }
 }
 
 function isOpenAiJsonSchema(schema: unknown): schema is Record<string, unknown> {
@@ -161,6 +208,10 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      const status = await config.checkKillSwitch();
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
+      }
       if (!isOpenAiJsonSchema(input.jsonSchema)) {
         throw new TypeError("OpenAI structured output requires an object JSON Schema.");
       }
@@ -1194,4 +1245,56 @@ export function routeForReview(
 
   const routing = routeOutcomeForReview(input);
   return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
+}
+
+// ---- AF-42: inference kill switch ----
+//
+// The one place a kill-switch block turns into an EvidenceOutcome:
+// "retrying", never "failed" or "extraction_error". A halted call is
+// not a broken one -- the pipeline should pick this criterion back up
+// once an operator disengages the switch, not discard it or hand it to
+// AF-39's review queue as if something went wrong with the extraction
+// itself.
+
+export function killSwitchRetryOutcome(
+  subject: EvidenceSubject,
+  criterionId: string,
+  attempt: number,
+  maxAttempts: number
+): EvidenceOutcome {
+  // Same reason mapRubricToEvidence and outcomesForSchemaValidationFailure
+  // take a subject: every EvidenceOutcome kind carries organizationId and
+  // candidateId. A `retrying` outcome without them is not persistable, and
+  // this is the outcome that represents work deferred by the kill switch --
+  // exactly the state that has to survive until someone picks it back up.
+  assertPersistableSubject(subject, "killSwitchRetryOutcome");
+  // Checked here, where the caller is, rather than left to the schema. This
+  // function's whole promise is a persistable outcome, and
+  // `retryingEvidenceSchema` requires both counters to be positive integers
+  // with attempt <= maxAttempts. A zero, a fraction, or an attempt past the
+  // maximum is accepted here and then rejected at the write, so paused work
+  // fails only at the moment someone tries to save it: the point at which the
+  // kill switch was supposed to have safely deferred it.
+  for (const [field, value] of [
+    ["attempt", attempt],
+    ["maxAttempts", maxAttempts]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`killSwitchRetryOutcome requires a positive integer ${field}, got: ${value}`);
+    }
+  }
+  if (attempt > maxAttempts) {
+    throw new Error(
+      `killSwitchRetryOutcome cannot describe attempt ${attempt} of ${maxAttempts}; an exhausted retry is not a retrying outcome`
+    );
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "retrying",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
+    criterionId,
+    attempt,
+    maxAttempts
+  };
 }

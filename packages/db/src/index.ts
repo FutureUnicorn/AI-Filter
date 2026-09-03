@@ -498,6 +498,106 @@ export async function getInferenceUsage(
   }
 }
 
+export interface SetInferenceKillSwitchInput {
+  readonly engaged: boolean;
+  readonly reason?: string;
+  // No separate engagedByUserId: the audited actor below is the single
+  // source of truth. Carrying both let the singleton row name one person
+  // while the audit event named another, and the two are supposed to be
+  // the same fact recorded twice -- so the row is written from the actor.
+
+  /**
+   * Required to audit the transition. Every engage/disengage overwrites
+   * the singleton row -- including its actor, reason and timestamp -- so
+   * without an audit row the previous incident-control action leaves no
+   * trace at all once the next transition happens. `audit_events`
+   * already covers consequential `admin_action`s explicitly, and the
+   * transition plus its audit row now commit in ONE transaction, so a
+   * flipped switch can never exist without the record of who flipped it.
+   */
+  readonly audit: {
+    readonly organizationId: string;
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
+}
+
+/**
+ * The database CHECK constraint (migration 0008) is the real enforcement:
+ * engaging without a reason is rejected there, and the actor comes from
+ * the audited actorUserId rather than a second field
+ * regardless of what this function is called with, matching this
+ * codebase's habit of enforcing an invariant at more than one layer.
+ *
+ * The UPDATE's rowCount is checked and throws on 0, mirroring
+ * getInferenceKillSwitchStatus's own fail-closed handling of a missing
+ * singleton row -- without this, a missing seed row would make this
+ * function silently report success while changing nothing at all.
+ */
+export async function setInferenceKillSwitch(
+  databaseUrl: string,
+  schema: string,
+  input: SetInferenceKillSwitchInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const result = await client.query(
+        `UPDATE "${schema}".inference_kill_switch
+            SET engaged = $1,
+                reason = $2,
+                -- Cleared on disengage: "who engaged it" is meaningless
+                -- once it is off, and leaving the last engager's name on a
+                -- disengaged switch reads like they are still holding it.
+                engaged_by_user_id = CASE WHEN $1 THEN $3::uuid ELSE NULL END,
+                updated_at = clock_timestamp()
+          WHERE id = true`,
+        [input.engaged, input.reason ?? null, input.audit.actorUserId]
+      );
+      if (result.rowCount === 0) {
+        throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+      }
+      // The reason, kept where the next transition cannot overwrite it.
+      // The singleton above is the CURRENT state, so disengaging replaces or
+      // clears the reason the engage recorded; this row is the history. Same
+      // transaction as both the flip and the audit event, so a switch cannot
+      // end up flipped with no record of why.
+      await client.query(
+        `INSERT INTO "${schema}".inference_kill_switch_transitions
+           (engaged, reason, actor_user_id, request_id)
+         VALUES ($1, $2, $3, $4)`,
+        [input.engaged, input.reason ?? null, input.audit.actorUserId, input.audit.requestId]
+      );
+      // Same transaction, on the same client: the switch cannot end up
+      // flipped without the audit row recording who did it, and a
+      // failure here rolls the transition back rather than leaving an
+      // unattributed change behind.
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.audit.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "inference_kill_switch",
+          entityId: input.engaged ? "engaged" : "disengaged",
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
   /** Cap on (input + output) tokens for this organization/model/period. */
   readonly maxTotalTokens: number;
@@ -1131,6 +1231,111 @@ export async function assertInferenceReservationSettlement(
       underEstimate,
       duplicateSettlement: duplicateSettlement.outcome,
       doubleCountedTotal: doubled.inputTokens + doubled.outputTokens
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface KillSwitchTransitionObservations {
+  /** Whether engaging with no reason at all is refused by the table itself. */
+  readonly nullReasonRejected: boolean;
+  /** What the pre-review constraint did with the same row. */
+  readonly nullReasonAcceptedByOldConstraint: boolean;
+  /** Reasons in the append-only log, oldest first. */
+  readonly loggedReasons: readonly (string | null)[];
+  /** The reason left on the singleton after a later transition overwrote it. */
+  readonly singletonReasonAfterDisengage: string | null;
+}
+
+/**
+ * Exercise the kill-switch constraint and its transition log on a real
+ * Postgres, in a disposable schema.
+ *
+ * Both halves of this need a live server to mean anything. `reason ~ '...'`
+ * against a NULL reason evaluates to NULL rather than false, and Postgres
+ * accepts a CHECK that is true OR NULL, so the hole only exists in the
+ * database's three-valued logic and cannot be reproduced in TypeScript. The
+ * old constraint is rebuilt here and shown accepting the row it should have
+ * refused, so the test can prove the fix rather than assert it.
+ */
+export async function assertKillSwitchTransitionLog(
+  databaseUrl: string
+): Promise<KillSwitchTransitionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `kill_switch_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const actor = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0005_immutable_audit_events.sql",
+      "0008_inference_kill_switch.sql",
+      "0009_inference_kill_switch_nonblank_reason.sql",
+      "0010_kill_switch_reason_non_whitespace.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,'a@example.com','Probe Actor')`, [actor]);
+
+    const engageWithNullReason = async (): Promise<boolean> => {
+      try {
+        await admin.query(
+          `UPDATE inference_kill_switch
+              SET engaged = true, reason = NULL, engaged_by_user_id = $1 WHERE id = true`,
+          [actor]
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const acceptedNow = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // Rebuild the pre-review constraint and show it accepting the same row.
+    await admin.query(`ALTER TABLE inference_kill_switch DROP CONSTRAINT inference_kill_switch_check`);
+    await admin.query(
+      `ALTER TABLE inference_kill_switch ADD CONSTRAINT inference_kill_switch_check
+       CHECK ((engaged AND reason ~ '[^[:space:]]' AND engaged_by_user_id IS NOT NULL) OR NOT engaged)`
+    );
+    const acceptedBefore = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // The log keeps each transition's reason where the next cannot reach it.
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (true, 'runaway extraction loop', $1, 'req_00000000-0000-4000-8000-000000000001')`,
+      [actor]
+    );
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (false, NULL, $1, 'req_00000000-0000-4000-8000-000000000002')`,
+      [actor]
+    );
+    await admin.query(
+      `UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`
+    );
+
+    const logged = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch_transitions ORDER BY occurred_at`
+    );
+    const singleton = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch WHERE id = true`
+    );
+
+    return {
+      nullReasonRejected: !acceptedNow,
+      nullReasonAcceptedByOldConstraint: acceptedBefore,
+      loggedReasons: logged.rows.map((r) => r.reason),
+      singletonReasonAfterDisengage: singleton.rows[0]?.reason ?? null
     };
   } finally {
     await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
