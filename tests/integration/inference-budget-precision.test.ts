@@ -102,7 +102,7 @@ test("a negative usage delta cannot walk the meter backwards", async () => {
   ] as const) {
     await assert.rejects(
       () => recordInferenceUsage(databaseUrl, "public", { ...base, inputTokens, outputTokens }),
-      /non-negative integer/,
+      /non-negative safe integer/,
       `recordInferenceUsage accepted ${inputTokens}/${outputTokens}`
     );
     await assert.rejects(
@@ -113,7 +113,7 @@ test("a negative usage delta cannot walk the meter backwards", async () => {
           outputTokens,
           maxTotalTokens: 1_000
         }),
-      /non-negative integer/,
+      /non-negative safe integer/,
       `reserveInferenceBudget accepted ${inputTokens}/${outputTokens}`
     );
   }
@@ -155,29 +155,23 @@ test("settling a reservation replaces the estimate instead of adding to it", asy
   assert.equal(observed.overEstimate.inputTokens + observed.overEstimate.outputTokens, 70);
 });
 
-test("a refund larger than the stored total floors at zero instead of aborting", async () => {
-  // Reachable whenever a period rolls over or a row is reset between the
-  // reservation and the response. The columns carry CHECK (>= 0), so without
-  // the floor the statement aborts exactly when a failed settlement is least
-  // welcome.
+test("retrying settlement after a committed response cannot adjust the ledger twice", async () => {
+  // A worker can commit settlement and lose the response before it knows that
+  // it succeeded. Retrying must report the already-settled reservation rather
+  // than applying its refund/top-up a second time.
   const observed = await assertInferenceReservationSettlement(requireDatabase());
-  assert.deepEqual(observed.oversizedRefund, { inputTokens: 0, outputTokens: 0 });
+  assert.equal(observed.duplicateSettlement, "already_settled");
+  assert.deepEqual(observed.overEstimate, { inputTokens: 45, outputTokens: 25 });
 });
 
 test("settlement rejects nonsensical token counts at the boundary", async () => {
   const databaseUrl = requireDatabase();
   const base = {
-    organizationId: "11111111-1111-4111-8111-111111111111",
-    model: "gpt-5.6",
-    periodStart: "2026-09-01",
-    reservedInputTokens: 1,
-    reservedOutputTokens: 1,
+    reservationId: "11111111-1111-4111-8111-111111111111",
     actualInputTokens: 1,
     actualOutputTokens: 1
   };
   for (const field of [
-    "reservedInputTokens",
-    "reservedOutputTokens",
     "actualInputTokens",
     "actualOutputTokens"
   ] as const) {
