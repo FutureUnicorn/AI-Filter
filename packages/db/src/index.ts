@@ -435,8 +435,8 @@ function assertNonNegativeUsage(input: RecordInferenceUsageInput): void {
     ["inputTokens", input.inputTokens],
     ["outputTokens", input.outputTokens]
   ] as const) {
-    if (!Number.isInteger(value) || value < 0) {
-      throw new Error(`recordInferenceUsage requires a non-negative integer ${field}, got: ${value}`);
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`recordInferenceUsage requires a non-negative safe integer ${field}, got: ${value}`);
     }
   }
 }
@@ -504,7 +504,7 @@ export interface ReserveInferenceBudgetInput extends RecordInferenceUsageInput {
 }
 
 export type ReserveInferenceBudgetOutcome =
-  | { readonly outcome: "reserved"; readonly totalTokensAfter: number }
+  | { readonly outcome: "reserved"; readonly reservationId: string; readonly totalTokensAfter: number }
   | { readonly outcome: "cap_exceeded"; readonly totalTokensBefore: number; readonly maxTotalTokens: number };
 
 /**
@@ -562,19 +562,28 @@ export async function reserveInferenceBudget(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    const reserved = await client.query<{ total_tokens: string }>(
-      `INSERT INTO "${schema}".inference_usage_ledger
-         (organization_id, model, period_start, input_tokens, output_tokens)
-       SELECT $1, $2, $3, $4, $5
-        WHERE $6::bigint <= $7::bigint
-       ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
-         input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
-         output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
-         updated_at = clock_timestamp()
-        WHERE "${schema}".inference_usage_ledger.input_tokens
-            + "${schema}".inference_usage_ledger.output_tokens
-            + $6::bigint <= $7::bigint
-       RETURNING (input_tokens + output_tokens)::bigint AS total_tokens`,
+    const reserved = await client.query<{ reservation_id: string; total_tokens: string }>(
+      `WITH updated_ledger AS (
+         INSERT INTO "${schema}".inference_usage_ledger
+           (organization_id, model, period_start, input_tokens, output_tokens)
+         SELECT $1, $2, $3, $4, $5
+          WHERE $6::bigint <= $7::bigint
+         ON CONFLICT (organization_id, model, period_start) DO UPDATE SET
+           input_tokens = "${schema}".inference_usage_ledger.input_tokens + EXCLUDED.input_tokens,
+           output_tokens = "${schema}".inference_usage_ledger.output_tokens + EXCLUDED.output_tokens,
+           updated_at = clock_timestamp()
+          WHERE "${schema}".inference_usage_ledger.input_tokens
+              + "${schema}".inference_usage_ledger.output_tokens
+              + $6::bigint <= $7::bigint
+         RETURNING (input_tokens + output_tokens)::bigint AS total_tokens
+       ), created_reservation AS (
+         INSERT INTO "${schema}".inference_usage_reservations
+           (organization_id, model, period_start, reserved_input_tokens, reserved_output_tokens)
+         SELECT $1, $2, $3, $4, $5 FROM updated_ledger
+         RETURNING reservation_id
+       )
+       SELECT created_reservation.reservation_id, updated_ledger.total_tokens
+         FROM updated_ledger CROSS JOIN created_reservation`,
       [
         input.organizationId,
         input.model,
@@ -587,7 +596,11 @@ export async function reserveInferenceBudget(
     );
     const row = reserved.rows[0];
     if (row !== undefined) {
-      return { outcome: "reserved", totalTokensAfter: bigintColumnToNumber(row.total_tokens, "total_tokens") };
+      return {
+        outcome: "reserved",
+        reservationId: row.reservation_id,
+        totalTokensAfter: bigintColumnToNumber(row.total_tokens, "total_tokens")
+      };
     }
     // Read back on the connection already open, rather than calling
     // getInferenceUsage and opening a second one. This is the capped path,
@@ -619,12 +632,8 @@ export async function reserveInferenceBudget(
 }
 
 export interface SettleInferenceReservationInput {
-  readonly organizationId: string;
-  readonly model: string;
-  readonly periodStart: string;
-  /** What `reserveInferenceBudget` was told to hold, before the call. */
-  readonly reservedInputTokens: number;
-  readonly reservedOutputTokens: number;
+  /** The durable identity returned from `reserveInferenceBudget`. */
+  readonly reservationId: string;
   /** What the provider actually reported afterwards. */
   readonly actualInputTokens: number;
   readonly actualOutputTokens: number;
@@ -657,11 +666,9 @@ export async function settleInferenceReservation(
   databaseUrl: string,
   schema: string,
   input: SettleInferenceReservationInput
-): Promise<void> {
+): Promise<{ readonly outcome: "settled" | "already_settled" }> {
   assertSafeSchema(schema);
   for (const [field, value] of [
-    ["reservedInputTokens", input.reservedInputTokens],
-    ["reservedOutputTokens", input.reservedOutputTokens],
     ["actualInputTokens", input.actualInputTokens],
     ["actualOutputTokens", input.actualOutputTokens]
   ] as const) {
@@ -670,26 +677,58 @@ export async function settleInferenceReservation(
     }
   }
 
-  const inputDelta = input.actualInputTokens - input.reservedInputTokens;
-  const outputDelta = input.actualOutputTokens - input.reservedOutputTokens;
-  if (inputDelta === 0 && outputDelta === 0) return;
-
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    // No ON CONFLICT INSERT here, deliberately. Settling a reservation that
-    // was never made would create a row out of a refund, which is a way to
-    // write nonsense into the ledger rather than to correct it. If the row is
-    // gone the UPDATE matches nothing and the correction is dropped, which is
-    // the safer of the two wrong answers.
-    await client.query(
-      `UPDATE "${schema}".inference_usage_ledger
-          SET input_tokens = GREATEST(0, input_tokens + $4::bigint),
-              output_tokens = GREATEST(0, output_tokens + $5::bigint),
-              updated_at = clock_timestamp()
-        WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
-      [input.organizationId, input.model, input.periodStart, inputDelta, outputDelta]
-    );
+    await client.query("BEGIN");
+    try {
+      const reservation = await client.query<{
+        organization_id: string;
+        model: string;
+        period_start: string;
+        reserved_input_tokens: string;
+        reserved_output_tokens: string;
+        settled_at: string | null;
+      }>(
+        `SELECT organization_id, model, period_start, reserved_input_tokens, reserved_output_tokens, settled_at
+           FROM "${schema}".inference_usage_reservations
+          WHERE reservation_id = $1
+          FOR UPDATE`,
+        [input.reservationId]
+      );
+      const row = reservation.rows[0];
+      if (row === undefined) {
+        throw new Error(`inference usage reservation ${input.reservationId} does not exist`);
+      }
+      if (row.settled_at !== null) {
+        await client.query("COMMIT");
+        return { outcome: "already_settled" };
+      }
+      const inputDelta = input.actualInputTokens - bigintColumnToNumber(row.reserved_input_tokens, "reserved_input_tokens");
+      const outputDelta = input.actualOutputTokens - bigintColumnToNumber(row.reserved_output_tokens, "reserved_output_tokens");
+      const ledger = await client.query(
+        `UPDATE "${schema}".inference_usage_ledger
+            SET input_tokens = input_tokens + $4::bigint,
+                output_tokens = output_tokens + $5::bigint,
+                updated_at = clock_timestamp()
+          WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
+        [row.organization_id, row.model, row.period_start, inputDelta, outputDelta]
+      );
+      if (ledger.rowCount !== 1) {
+        throw new Error(`inference usage reservation ${input.reservationId} has no matching ledger row`);
+      }
+      await client.query(
+        `UPDATE "${schema}".inference_usage_reservations
+            SET settled_at = clock_timestamp(), actual_input_tokens = $2, actual_output_tokens = $3
+          WHERE reservation_id = $1`,
+        [input.reservationId, input.actualInputTokens, input.actualOutputTokens]
+      );
+      await client.query("COMMIT");
+      return { outcome: "settled" };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -997,8 +1036,8 @@ export interface InferenceReservationSettlementObservations {
   readonly overEstimate: { readonly inputTokens: number; readonly outputTokens: number };
   /** Ledger totals after an under-estimate is settled. */
   readonly underEstimate: { readonly inputTokens: number; readonly outputTokens: number };
-  /** Ledger totals after a refund larger than everything stored. */
-  readonly oversizedRefund: { readonly inputTokens: number; readonly outputTokens: number };
+  /** Retrying a committed settlement must not apply its delta a second time. */
+  readonly duplicateSettlement: "already_settled";
   /** What the ledger would have said had usage been recorded on top of the reservation. */
   readonly doubleCountedTotal: number;
 }
@@ -1034,19 +1073,28 @@ export async function assertInferenceReservationSettlement(
       getInferenceUsage(databaseUrl, schema, { organizationId: org, model, periodStart: period });
 
     // Over-estimate: reserve 60/40, actually spend 45/25.
-    await reserveInferenceBudget(databaseUrl, schema, {
+    const overReservation = await reserveInferenceBudget(databaseUrl, schema, {
       organizationId: org, model: "over", periodStart: period,
       inputTokens: 60, outputTokens: 40, maxTotalTokens: 1000
     });
+    if (overReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the over-estimate reservation to fit");
+    }
     await settleInferenceReservation(databaseUrl, schema, {
-      organizationId: org, model: "over", periodStart: period,
-      reservedInputTokens: 60, reservedOutputTokens: 40,
+      reservationId: overReservation.reservationId,
       actualInputTokens: 45, actualOutputTokens: 25
     });
     const overEstimate = await read("over");
+    const duplicateSettlement = await settleInferenceReservation(databaseUrl, schema, {
+      reservationId: overReservation.reservationId,
+      actualInputTokens: 45, actualOutputTokens: 25
+    });
+    if (duplicateSettlement.outcome !== "already_settled") {
+      throw new Error("assertInferenceReservationSettlement: a duplicate settlement adjusted the ledger again");
+    }
 
     // What the old shape produced: the estimate, plus the real usage again.
-    await reserveInferenceBudget(databaseUrl, schema, {
+    const underReservation = await reserveInferenceBudget(databaseUrl, schema, {
       organizationId: org, model: "double", periodStart: period,
       inputTokens: 60, outputTokens: 40, maxTotalTokens: 1000
     });
@@ -1061,29 +1109,19 @@ export async function assertInferenceReservationSettlement(
       organizationId: org, model: "under", periodStart: period,
       inputTokens: 10, outputTokens: 10, maxTotalTokens: 1000
     });
+    if (underReservation.outcome !== "reserved") {
+      throw new Error("assertInferenceReservationSettlement: expected the under-estimate reservation to fit");
+    }
     await settleInferenceReservation(databaseUrl, schema, {
-      organizationId: org, model: "under", periodStart: period,
-      reservedInputTokens: 10, reservedOutputTokens: 10,
+      reservationId: underReservation.reservationId,
       actualInputTokens: 30, actualOutputTokens: 15
     });
     const underEstimate = await read("under");
 
-    // A refund bigger than everything stored, which the CHECK would reject.
-    await reserveInferenceBudget(databaseUrl, schema, {
-      organizationId: org, model: "floor", periodStart: period,
-      inputTokens: 5, outputTokens: 5, maxTotalTokens: 1000
-    });
-    await settleInferenceReservation(databaseUrl, schema, {
-      organizationId: org, model: "floor", periodStart: period,
-      reservedInputTokens: 1_000_000, reservedOutputTokens: 1_000_000,
-      actualInputTokens: 0, actualOutputTokens: 0
-    });
-    const oversizedRefund = await read("floor");
-
     return {
       overEstimate,
       underEstimate,
-      oversizedRefund,
+      duplicateSettlement: duplicateSettlement.outcome,
       doubleCountedTotal: doubled.inputTokens + doubled.outputTokens
     };
   } finally {
