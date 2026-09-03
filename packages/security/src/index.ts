@@ -99,7 +99,33 @@ export function verifyMagicLinkToken(
  * for staging or production throws rather than printing a credential
  * where it could be captured.
  */
-export function createConsoleMagicLinkEmailSender(appEnv: string = "development"): MagicLinkEmailSender {
+/**
+ * Validated outbound-email settings. Declared structurally here rather
+ * than imported from packages/config, because the workspace boundary
+ * rules allow packages/security to depend only on contracts and domain
+ * (see tests/architecture/check-workspace-boundaries.mjs). The caller
+ * passes values that packages/config has already validated.
+ */
+export interface MagicLinkEmailDelivery {
+  readonly endpoint: string;
+  readonly apiKey: string;
+  readonly from: string;
+}
+
+/**
+ * `appEnv` has no default ON PURPOSE. It used to default to
+ * "development", so the one production call site --
+ * `createConsoleMagicLinkEmailSender()` in the magic-link request route
+ * -- type-checked while never passing an environment, which made the
+ * hosted-environment guard below unreachable dead code. A hosted deploy
+ * therefore selected the local console sender silently. Requiring the
+ * argument turns that mistake into a compile error, the same way
+ * OpenAiAdapterConfig.checkKillSwitch is mandatory rather than optional.
+ *
+ * Prefer createMagicLinkEmailSender below; it is the single place the
+ * adapter is chosen from environment configuration.
+ */
+export function createConsoleMagicLinkEmailSender(appEnv: string): MagicLinkEmailSender {
   if (appEnv === "staging" || appEnv === "production") {
     throw new Error(
       "createConsoleMagicLinkEmailSender is local-development only; a hosted environment needs a real email adapter"
@@ -107,21 +133,102 @@ export function createConsoleMagicLinkEmailSender(appEnv: string = "development"
   }
   return {
     async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
-      // Structured log records that delivery happened, with no PII in it.
+      // The structured log records that delivery happened and carries no
+      // PII or credential. That property is unchanged and load-bearing:
+      // logStructured output is retained, shipped and searchable, so a
+      // magic link in it is a durable bearer credential sitting in a log
+      // store.
       logStructured("info", "magic_link.queued");
-      // Keep the local developer hint non-sensitive: even terminal output must
-      // avoid exposing the raw recipient or bearer token.
+      // stderr is a DIFFERENT channel from that retained log stream, and
+      // this is the one place the real link is allowed to appear. It is
+      // the local developer's only way to obtain the token, because no
+      // email is actually sent in a local environment.
       //
-      // The `g` flag is load-bearing, not tidiness. Without it only the
-      // FIRST token parameter is redacted, so a link carrying the
-      // parameter twice -- which nothing rejects, since a duplicated
-      // query parameter is well-formed -- printed the second one to the
-      // terminal in full. A redaction that stops at the first match is a
-      // leak for every input the author did not picture.
-      const safeLink = input.link.replace(/([?&])token=[^&]*/gi, "$1token=[REDACTED]");
-      process.stderr.write(`\n[dev magic link] to: [REDACTED_EMAIL]\n[dev magic link] open: ${safeLink}\n\n`);
+      // An earlier revision redacted the token here too. That looked
+      // like defence in depth and was really a denial of service against
+      // the whole feature: the request stored a valid token and returned
+      // 202, but no channel anywhere yielded the credential, so the
+      // redeem endpoint -- and every session-gated route behind it,
+      // including role creation -- became unreachable without editing
+      // the database by hand.
+      //
+      // Do not "harden" this back. The guard above already makes it
+      // impossible to reach in staging or production, which is where a
+      // leak would matter; the selection in
+      // createMagicLinkEmailSender enforces the same thing from the
+      // other side.
+      process.stderr.write(
+        `\n[dev magic link] to: ${input.email}\n[dev magic link] open: ${input.link}\n\n`
+      );
     }
   };
+}
+
+/**
+ * Vendor-neutral hosted delivery: one authenticated HTTPS POST. An
+ * endpoint, a bearer key and a from address are the shape Resend,
+ * Postmark, SendGrid and Mailgun all accept, so no provider SDK is
+ * chosen here -- consistent with this file's existing position that the
+ * vendor is not this ticket's decision.
+ */
+export function createHttpMagicLinkEmailSender(
+  delivery: MagicLinkEmailDelivery
+): MagicLinkEmailSender {
+  return {
+    async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
+      const response = await fetch(delivery.endpoint, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${delivery.apiKey}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          from: delivery.from,
+          to: input.email,
+          subject: "Your sign-in link",
+          text: `Open this link to sign in. It expires shortly and can be used once.\n\n${input.link}\n`
+        })
+      });
+      if (!response.ok) {
+        // Deliberately does not include the response body: a provider
+        // error payload can echo the recipient address back, and this
+        // message reaches error logs.
+        throw new Error(`Magic-link email delivery failed with status ${response.status}`);
+      }
+      // Same non-PII structured event the console path emits, so the
+      // two adapters are indistinguishable in the retained log stream.
+      logStructured("info", "magic_link.queued");
+    }
+  };
+}
+
+/**
+ * The single point at which the delivery adapter is chosen, so no route
+ * decides for itself. Local environments get the console sender and its
+ * real stderr link; hosted environments get real email and fail closed
+ * if it is not configured.
+ */
+export function createMagicLinkEmailSender(input: {
+  readonly appEnv: string;
+  readonly delivery?: MagicLinkEmailDelivery | undefined;
+}): MagicLinkEmailSender {
+  if (input.appEnv === "staging" || input.appEnv === "production") {
+    if (input.delivery === undefined) {
+      // Fails closed rather than degrading to console. packages/config
+      // already requires these variables for staging/production, so
+      // reaching this means someone constructed a config by hand; it
+      // must still not silently mint undeliverable credentials.
+      throw new Error(
+        `Magic-link email delivery is not configured for ${input.appEnv}; refusing to fall back to the local console sender, which cannot deliver in a hosted environment`
+      );
+    }
+    return createHttpMagicLinkEmailSender(input.delivery);
+  }
+  // A local environment may still have delivery configured (pointing at
+  // a mail catcher, say); honour it rather than overriding the operator.
+  return input.delivery === undefined
+    ? createConsoleMagicLinkEmailSender(input.appEnv)
+    : createHttpMagicLinkEmailSender(input.delivery);
 }
 
 // ---- AF-19: server-side resource authorization ----

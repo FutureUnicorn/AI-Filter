@@ -24,6 +24,30 @@ const optionalPreviewCommitSha = z.preprocess(
   z.string().regex(/^[a-f0-9]{7,64}$/u).optional()
 );
 
+// Outbound magic-link email delivery. Optional in the schema and then
+// REQUIRED for staging/production by the superRefine below, so a hosted
+// deployment that forgets them fails at config load rather than silently
+// falling back to the local console sender -- which is exactly how a
+// hosted environment ended up minting sign-in tokens that nothing could
+// deliver and nobody could redeem.
+//
+// Deliberately vendor-neutral: an endpoint, a bearer key and a from
+// address are what Resend, Postmark, SendGrid and Mailgun all accept, so
+// packages/security keeps its "no vendor is chosen by this ticket"
+// position instead of taking a dependency on one provider's SDK.
+const optionalUrl = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().url().optional()
+);
+const optionalSecret = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().trim().min(1).optional()
+);
+const optionalEmailAddress = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().email().optional()
+);
+
 const rawEnvironmentSchema = z
   .object({
     APP_ENV: z.enum(APP_ENVIRONMENTS),
@@ -46,9 +70,31 @@ const rawEnvironmentSchema = z
     WEB_PORT: portValue,
     WORKER_PORT: portValue,
     PREVIEW_ID: optionalPreviewId,
-    PREVIEW_COMMIT_SHA: optionalPreviewCommitSha
+    PREVIEW_COMMIT_SHA: optionalPreviewCommitSha,
+    MAGIC_LINK_EMAIL_ENDPOINT: optionalUrl,
+    MAGIC_LINK_EMAIL_API_KEY: optionalSecret,
+    MAGIC_LINK_EMAIL_FROM: optionalEmailAddress
   })
   .superRefine((value, context) => {
+    // A hosted environment has no terminal for anyone to read, so the
+    // console sender cannot deliver there. Requiring the delivery
+    // settings here means the failure is a startup config error naming
+    // the missing variable, not a 202 for a link that never arrives.
+    if (value.APP_ENV === "staging" || value.APP_ENV === "production") {
+      for (const field of [
+        "MAGIC_LINK_EMAIL_ENDPOINT",
+        "MAGIC_LINK_EMAIL_API_KEY",
+        "MAGIC_LINK_EMAIL_FROM"
+      ] as const) {
+        if (value[field] === undefined) {
+          context.addIssue({
+            code: "custom",
+            path: [field],
+            message: `${field} is required for ${value.APP_ENV}; a hosted environment cannot deliver magic links through the local console sender`
+          });
+        }
+      }
+    }
     if (value.APP_ENV === "preview") {
       if (value.PREVIEW_ID === undefined) {
         context.addIssue({
@@ -100,6 +146,17 @@ export interface EnvironmentConfig {
     readonly id: string;
     readonly commitSha: string;
   };
+  /**
+   * Present whenever outbound magic-link email is configured, and
+   * guaranteed present for staging/production by the schema above. Its
+   * absence is what selects the local console sender, so this being
+   * optional is the whole environment decision, not a convenience.
+   */
+  readonly magicLinkEmail?: {
+    readonly endpoint: string;
+    readonly apiKey: string;
+    readonly from: string;
+  };
 }
 
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
@@ -138,6 +195,17 @@ export function loadEnvironmentConfig(source: EnvironmentSource): EnvironmentCon
           preview: {
             id: value.PREVIEW_ID,
             commitSha: value.PREVIEW_COMMIT_SHA
+          }
+        }
+      : {}),
+    ...(value.MAGIC_LINK_EMAIL_ENDPOINT !== undefined &&
+    value.MAGIC_LINK_EMAIL_API_KEY !== undefined &&
+    value.MAGIC_LINK_EMAIL_FROM !== undefined
+      ? {
+          magicLinkEmail: {
+            endpoint: value.MAGIC_LINK_EMAIL_ENDPOINT,
+            apiKey: value.MAGIC_LINK_EMAIL_API_KEY,
+            from: value.MAGIC_LINK_EMAIL_FROM
           }
         }
       : {})

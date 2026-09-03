@@ -8,7 +8,7 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { createMagicLinkToken, getMembershipsForUser, getUserByEmail } from "@signal-audit/db";
-import { createConsoleMagicLinkEmailSender, generateMagicLinkToken } from "@signal-audit/security";
+import { createMagicLinkEmailSender, generateMagicLinkToken } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -61,7 +61,17 @@ export async function POST(request: NextRequest): Promise<Response> {
         expiresAt: generated.expiresAt
       });
       const link = `${new URL(request.url).origin}/auth/redeem?token=${generated.token}`;
-      await createConsoleMagicLinkEmailSender().sendMagicLink({ email, link });
+      // The adapter is selected from validated environment configuration,
+      // not hardcoded: passing config.appEnv is what makes the
+      // hosted-environment guard live. The previous call passed no
+      // argument at all, so the sender always believed it was in
+      // development and a hosted deployment silently used the console
+      // adapter -- storing a valid token that nothing could deliver.
+      const emailSender = createMagicLinkEmailSender({
+        appEnv: config.appEnv,
+        delivery: config.magicLinkEmail
+      });
+      await emailSender.sendMagicLink({ email, link });
     }
     // Same response regardless of the branch above.
     return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
