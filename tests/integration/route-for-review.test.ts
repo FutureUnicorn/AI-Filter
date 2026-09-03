@@ -3,31 +3,50 @@ import test from "node:test";
 
 import { CONTRACT_SCHEMA_VERSION, EVIDENCE_OUTCOME_KINDS } from "../../packages/domain/src/index.ts";
 import type { EvidenceOutcome, EvidenceOutcomeKind } from "../../packages/domain/src/index.ts";
+import { safeParseEvidenceOutcome } from "../../packages/contracts/src/index.ts";
 import {
   outcomesForSchemaValidationFailure,
   parseEvidenceExtractionResponse,
   routeForReview
 } from "../../packages/ai/src/index.ts";
 
+const ORG_ID = "11111111-1111-4111-8111-111111111111";
+const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
+const SUBJECT = { organizationId: ORG_ID, candidateId: CANDIDATE_ID };
+
 const citation = { document: "d", pageOrSection: "p", offset: 0, quote: "q" };
+// A contradiction is a claim about two cited facts, so ContradictedEvidence
+// requires both sides.
+const conflictingCitation = { document: "d", pageOrSection: "p", offset: 0, quote: "q2" };
 
 /** One sample per kind, matching tests/unit/evidence-outcome-domain.test.ts. */
+/**
+ * One sample per kind. Every EvidenceOutcome kind carries organizationId
+ * and candidateId, and `contradicted` carries both citations -- these
+ * fixtures had drifted from all three, and nothing caught it because test
+ * files are not in any package tsconfig, so `pnpm typecheck` never reads
+ * this file.
+ */
 const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
-  supported: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "supported", criterionId: "c", citation },
+  supported: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "supported", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c", citation },
   partially_supported: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "partially_supported",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     citation
   },
-  contradicted: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "contradicted", criterionId: "c", citation },
-  unclear: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "unclear", criterionId: "c", citation },
-  not_found: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", criterionId: "c" },
-  processing: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "processing", criterionId: "c" },
-  retrying: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "retrying", criterionId: "c", attempt: 1, maxAttempts: 3 },
+  contradicted: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "contradicted", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c", citation, conflictingCitation },
+  unclear: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "unclear", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c", citation },
+  not_found: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "not_found", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c" },
+  processing: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "processing", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c" },
+  retrying: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "retrying", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c", attempt: 1, maxAttempts: 3 },
   extraction_error: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "extraction_error",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     errorCode: "e",
     message: "m",
@@ -36,20 +55,26 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   citation_invalid: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "citation_invalid",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     reason: "r",
     rejectedCitation: citation
   },
-  invalid_source: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "invalid_source", criterionId: "c", reason: "r" },
+  invalid_source: { schemaVersion: CONTRACT_SCHEMA_VERSION, kind: "invalid_source", organizationId: ORG_ID, candidateId: CANDIDATE_ID, criterionId: "c", reason: "r" },
   unsupported_file: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "unsupported_file",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     reason: "r"
   },
   quarantined: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "quarantined",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     quarantineClass: "malicious",
     reason: "r",
@@ -58,6 +83,8 @@ const samples: Record<EvidenceOutcomeKind, EvidenceOutcome> = {
   failed: {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "failed",
+    organizationId: ORG_ID,
+    candidateId: CANDIDATE_ID,
     criterionId: "c",
     errorCode: "e",
     message: "m",
@@ -147,7 +174,7 @@ test("schema validation failure converts into one persistable extraction_error p
   if (parsed.ok) {
     return;
   }
-  const outcomes = outcomesForSchemaValidationFailure(["python", "aws"], parsed.failure);
+  const outcomes = outcomesForSchemaValidationFailure(SUBJECT, ["python", "aws"], parsed.failure);
   assert.equal(outcomes.length, 2);
   for (const outcome of outcomes) {
     assert.equal(outcome.kind, "extraction_error");
@@ -179,4 +206,47 @@ test("an injection signal keeps an already-flagged outcome in review", () => {
     assert.match(routing.reason, /conflict/i);
     assert.match(routing.reason, /injection indicator/i);
   }
+});
+
+// These fixtures are typed `Record<EvidenceOutcomeKind, EvidenceOutcome>`,
+// but nothing was enforcing that: test files are not in any package
+// tsconfig, so `pnpm typecheck` never reads this file and the fixtures had
+// silently drifted from the contract (missing organizationId, candidateId,
+// and conflictingCitation) while still "type annotated". Parsing them
+// through the real schema is the check the type annotation only looked
+// like it was making.
+test("every fixture actually satisfies the evidence outcome contract", () => {
+  for (const [kind, sample] of Object.entries(samples)) {
+    const parsed = safeParseEvidenceOutcome(sample);
+    assert.equal(parsed.success, true, `${kind} fixture does not satisfy evidenceOutcomeSchema`);
+  }
+});
+
+test("schema-failure outcomes are persistable, not just shaped like outcomes", () => {
+  // The whole point of this path is keeping a rejected payload visible to a
+  // human. An outcome that cannot be stored does not do that.
+  const parsedResponse = parseEvidenceExtractionResponse({ not: "the schema" });
+  assert.equal(parsedResponse.ok, false);
+  if (parsedResponse.ok) {
+    return;
+  }
+  for (const outcome of outcomesForSchemaValidationFailure(SUBJECT, ["python"], parsedResponse.failure)) {
+    assert.equal(safeParseEvidenceOutcome(outcome).success, true);
+  }
+});
+
+test("an unattributable subject is refused rather than producing unstorable outcomes", () => {
+  const parsedResponse = parseEvidenceExtractionResponse({ not: "the schema" });
+  assert.equal(parsedResponse.ok, false);
+  if (parsedResponse.ok) {
+    return;
+  }
+  assert.throws(
+    () => outcomesForSchemaValidationFailure({ organizationId: "org-1", candidateId: "c" }, ["python"], parsedResponse.failure),
+    /requires a UUID organizationId/
+  );
+  assert.throws(
+    () => outcomesForSchemaValidationFailure({ organizationId: ORG_ID, candidateId: "  " }, ["python"], parsedResponse.failure),
+    /requires a non-empty candidateId/
+  );
 });

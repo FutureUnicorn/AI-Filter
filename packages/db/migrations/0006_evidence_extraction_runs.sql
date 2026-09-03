@@ -1,3 +1,24 @@
+-- On the shared 0006 prefix with
+-- 0006_audit_events_delete_and_membership_fixes.sql: it stays, deliberately.
+--
+-- Renumbering this file to 0007 was tried and reverted, for two reasons
+-- found by checking rather than by reasoning about it:
+--
+--   1. 0007 is free on this branch but TAKEN one branch later, by
+--      0007_inference_usage_ledger.sql on AF-41. Resolving that pushes a
+--      renumber through every branch above, each of which adds its own next
+--      number, so the cascade does not terminate cheaply.
+--   2. This file defines reject_append_only_mutation(), which later
+--      migrations call. Its sort position is load-bearing -- it cannot move
+--      after its consumers, which also rules out "use the next free number".
+--
+-- The ordering is not actually ambiguous. infra/compose/runtime.yml applies
+-- migrations with `for migration in /migrations/*.sql`, a shell glob, which
+-- sorts lexicographically: 0006_audit_events... runs before
+-- 0006_evidence_extraction_runs..., the order they need. What was ambiguous
+-- is prose that says "0006" without a filename, so references name the full
+-- file instead.
+
 -- AF-40: persist which model, prompt, schema, and rubric version
 -- produced each evidence-extraction run, for reproducibility and
 -- audit. Append-only for the same reason as audit_events (0005): a
@@ -19,7 +40,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE TABLE IF NOT EXISTS evidence_extraction_runs (
   run_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+  organization_id uuid NOT NULL REFERENCES organizations (organization_id),
   entity_type text NOT NULL CHECK (length(entity_type) > 0),
   entity_id text NOT NULL CHECK (length(entity_id) > 0),
   provider text NOT NULL CHECK (length(provider) > 0),
@@ -45,3 +66,12 @@ DROP TRIGGER IF EXISTS evidence_extraction_runs_reject_truncate ON evidence_extr
 CREATE TRIGGER evidence_extraction_runs_reject_truncate
   BEFORE TRUNCATE ON evidence_extraction_runs
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- Idempotent repair for any database where this table was created before
+-- the cascade was removed. Dropping and re-adding is the only way to
+-- change a foreign key's delete action.
+ALTER TABLE evidence_extraction_runs
+  DROP CONSTRAINT IF EXISTS evidence_extraction_runs_organization_id_fkey;
+ALTER TABLE evidence_extraction_runs
+  ADD CONSTRAINT evidence_extraction_runs_organization_id_fkey
+  FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);
