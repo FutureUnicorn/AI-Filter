@@ -12,6 +12,7 @@ import type {
   ContradictedEvidence,
   DomainPort,
   EvidenceOutcome,
+  EvidenceOutcomeKind,
   PartiallySupportedEvidence,
   SourceCitation,
   SupportedEvidence,
@@ -62,9 +63,56 @@ export interface OpenAiResponsesClient {
   };
 }
 
+/**
+ * Explicit "this call site genuinely has no kill switch" marker, for
+ * tests and for adapters constructed outside the inference path. Named
+ * so that grepping for it finds every place the control is bypassed --
+ * which an optional field silently hid.
+ */
+export const alwaysDisengagedKillSwitch = async (): Promise<{ readonly engaged: boolean }> => ({
+  engaged: false
+});
+
 export interface OpenAiAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
+  /**
+   * Checked before every call; when it resolves `engaged: true`, the
+   * provider is never invoked.
+   *
+   * REQUIRED, not optional. While it was optional, every construction
+   * using the original `{ apiKey, model }` shape still compiled and
+   * called the provider without consulting the database, so engaging
+   * the switch could not reliably halt inference -- which is the entire
+   * point of the control. Making it mandatory means an adapter that
+   * skips the check cannot be built at all: it is a compile error.
+   *
+   * The caller injects it (e.g. `() => getInferenceKillSwitchStatus(
+   * databaseUrl, schema)` from packages/db, whose row shape already
+   * matches). Injection rather than a direct import keeps packages/ai
+   * free of a dependency on packages/db, which the architecture rules
+   * forbid. Tests that genuinely do not exercise the switch pass
+   * `alwaysDisengagedKillSwitch` so the omission is explicit and
+   * greppable rather than silent.
+   */
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+/**
+ * Thrown instead of ever calling the provider when the kill switch is
+ * engaged. This adapter is generic (no concept of a criterionId or
+ * retry count), so it can only refuse the call and say why -- mapping
+ * that into an EvidenceOutcome (killSwitchRetryOutcome, below) is the
+ * caller's job, at whatever per-criterion layer actually knows those.
+ */
+export class InferenceKillSwitchEngagedError extends Error {
+  readonly reason: string | undefined;
+
+  constructor(reason: string | undefined) {
+    super(reason === undefined ? "Inference kill switch is engaged" : `Inference kill switch is engaged: ${reason}`);
+    this.name = "InferenceKillSwitchEngagedError";
+    this.reason = reason;
+  }
 }
 
 function isOpenAiJsonSchema(schema: unknown): schema is Record<string, unknown> {
@@ -161,6 +209,10 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      const status = await config.checkKillSwitch();
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
+      }
       if (!isOpenAiJsonSchema(input.jsonSchema)) {
         throw new TypeError("OpenAI structured output requires an object JSON Schema.");
       }
@@ -1194,4 +1246,314 @@ export function routeForReview(
 
   const routing = routeOutcomeForReview(input);
   return context.injectionIndicatorDetected === true ? withInjectionSignal(routing) : routing;
+}
+
+// ---- AF-42: inference kill switch ----
+//
+// The one place a kill-switch block turns into an EvidenceOutcome:
+// "retrying", never "failed" or "extraction_error". A halted call is
+// not a broken one -- the pipeline should pick this criterion back up
+// once an operator disengages the switch, not discard it or hand it to
+// AF-39's review queue as if something went wrong with the extraction
+// itself.
+
+export function killSwitchRetryOutcome(
+  subject: EvidenceSubject,
+  criterionId: string,
+  attempt: number,
+  maxAttempts: number
+): EvidenceOutcome {
+  // Same reason mapRubricToEvidence and outcomesForSchemaValidationFailure
+  // take a subject: every EvidenceOutcome kind carries organizationId and
+  // candidateId. A `retrying` outcome without them is not persistable, and
+  // this is the outcome that represents work deferred by the kill switch --
+  // exactly the state that has to survive until someone picks it back up.
+  assertPersistableSubject(subject, "killSwitchRetryOutcome");
+  // Checked here, where the caller is, rather than left to the schema. This
+  // function's whole promise is a persistable outcome, and
+  // `retryingEvidenceSchema` requires both counters to be positive integers
+  // with attempt <= maxAttempts. A zero, a fraction, or an attempt past the
+  // maximum is accepted here and then rejected at the write, so paused work
+  // fails only at the moment someone tries to save it: the point at which the
+  // kill switch was supposed to have safely deferred it.
+  for (const [field, value] of [
+    ["attempt", attempt],
+    ["maxAttempts", maxAttempts]
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`killSwitchRetryOutcome requires a positive integer ${field}, got: ${value}`);
+    }
+  }
+  if (attempt > maxAttempts) {
+    throw new Error(
+      `killSwitchRetryOutcome cannot describe attempt ${attempt} of ${maxAttempts}; an exhausted retry is not a retrying outcome`
+    );
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "retrying",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
+    criterionId,
+    attempt,
+    maxAttempts
+  };
+}
+
+// ---- AF-43: gold-set regression harness ----
+//
+// Scores the real deterministic pipeline stages (mapRubricToEvidence,
+// validateCitation, routeForReview) against a versioned, synthetic gold
+// set -- never a live model call, matching evals/README.md's own rule
+// that standard validation must not require provider credentials. This
+// is a self-consistency harness: it proves the deterministic code
+// produces the expected result for a known, hand-authored input, so it
+// catches a regression in mapping/validation/routing logic. It cannot
+// and does not claim anything about how well a real model performs --
+// that needs a separate, provider-cost-incurring eval path this ticket
+// does not build.
+//
+// These are REGRESSION FIXTURES, not a holdout, and the distinction is
+// deliberate after review (#26). An earlier revision carried a `locked`
+// boolean documented as "never inspect while tuning prompts or
+// thresholds". That claim could not hold: the flag, the inputs and the
+// expected labels all live in one checked-in JSON file that this test
+// imports, so anyone able to change a prompt or a threshold can read the
+// answers first and tune against them until CI passes. A policy-only
+// flag is an honour-system note, not an independent gate, and leaving it
+// in place would have advertised a guarantee the repository cannot
+// enforce.
+//
+// A real holdout needs the cases and their expected outputs to live in
+// an access-controlled evaluation asset that only a protected CI
+// workflow can read, so the labels are unavailable at tuning time. That
+// is infrastructure this ticket does not build -- and note it would also
+// put a credential in the path of standard validation, which
+// evals/README.md currently forbids -- so it belongs to its own ticket
+// rather than being implied here.
+
+/**
+ * The gold set is synthetic and offline: no tenant owns these cases, and by
+ * evals/README.md's rule the harness never makes a live model call. But
+ * `mapRubricToEvidence` builds real EvidenceOutcomes, and every kind now
+ * carries organizationId and candidateId, so it requires a subject that
+ * `assertPersistableSubject` accepts.
+ *
+ * A fixed nil-UUID organization plus a candidateId derived from the case ID
+ * keeps the harness deterministic (two runs of the same case produce byte-
+ * identical outcomes, which is what makes a regression gate meaningful) while
+ * being obviously synthetic in any output, rather than borrowing a real
+ * organization's UUID.
+ */
+const GOLD_SET_ORGANIZATION_ID = "00000000-0000-4000-8000-000000000000";
+
+function goldSetSubject(caseId: string): EvidenceSubject {
+  return { organizationId: GOLD_SET_ORGANIZATION_ID, candidateId: `gold-set:${caseId}` };
+}
+
+export interface GoldSetCase {
+  readonly caseId: string;
+  readonly sourceText: string;
+  readonly rubricCriterionIds: readonly string[];
+  readonly simulatedExtraction: readonly EvidenceExtractionItem[];
+  readonly expectedKinds: Readonly<Record<string, EvidenceOutcomeKind>>;
+  readonly expectedReviewCriterionIds: readonly string[];
+}
+
+export interface GoldSetScore {
+  readonly totalCases: number;
+  readonly schemaValidityRate: number;
+  readonly outcomeAccuracy: number;
+  readonly citingPrecision: number;
+  readonly citingRecall: number;
+  readonly escalationRecall: number;
+  /**
+   * Of everything routed to human review, how much genuinely warranted
+   * it. Recall alone cannot fail when routing over-escalates -- flagging
+   * every clean outcome scores a perfect recall -- so precision is what
+   * actually catches that regression.
+   */
+  readonly escalationPrecision: number;
+}
+
+const CITING_KINDS: ReadonlySet<EvidenceOutcomeKind> = new Set([
+  "supported",
+  "partially_supported",
+  "contradicted",
+  "unclear"
+]);
+
+function isCitingKind(kind: EvidenceOutcomeKind): boolean {
+  return CITING_KINDS.has(kind);
+}
+
+/**
+ * A gold-set fixture is hand-authored and versioned -- a typo
+ * in one of its labels is a fixture bug, not a pipeline regression, and
+ * must never silently produce a passing (or falsely failing) score. Both
+ * expectedKinds and expectedReviewCriterionIds are asserted against the
+ * case's own rubricCriterionIds so a misspelled or stray key fails loud
+ * at eval time instead of being quietly invisible to every metric that
+ * only ever looks up expected labels by a real outcome's criterionId.
+ */
+function assertGoldSetCaseIntegrity(goldCase: GoldSetCase): void {
+  const criterionIds = new Set(goldCase.rubricCriterionIds);
+  for (const expectedCriterionId of Object.keys(goldCase.expectedKinds)) {
+    if (!criterionIds.has(expectedCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedKinds["${expectedCriterionId}"], which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+  for (const reviewCriterionId of goldCase.expectedReviewCriterionIds) {
+    if (!criterionIds.has(reviewCriterionId)) {
+      throw new Error(
+        `Gold set case "${goldCase.caseId}" has expectedReviewCriterionIds entry "${reviewCriterionId}", which is not one of its rubricCriterionIds -- likely a typo in the fixture.`
+      );
+    }
+  }
+}
+
+export function scoreGoldSet(cases: readonly GoldSetCase[]): GoldSetScore {
+  let totalItems = 0;
+  let validItems = 0;
+  let totalCriteria = 0;
+  let correctKinds = 0;
+  let truePositive = 0;
+  let falsePositive = 0;
+  let falseNegative = 0;
+  let reviewExpectedCount = 0;
+  let reviewCorrectlyFlagged = 0;
+  let reviewIncorrectlyFlagged = 0;
+
+  for (const goldCase of cases) {
+    assertGoldSetCaseIntegrity(goldCase);
+
+    const parsedItems: EvidenceExtractionItem[] = [];
+    for (const item of goldCase.simulatedExtraction) {
+      totalItems += 1;
+      const parsed = evidenceExtractionItemSchema.safeParse(item);
+      if (parsed.success) {
+        validItems += 1;
+        parsedItems.push(parsed.data);
+      }
+    }
+
+    // Only schema-valid items reach the real mapping/validation pipeline:
+    // that pipeline assumes a well-formed EvidenceExtractionItem shape
+    // (mapExtractedItem's switch has no default because the type claims
+    // to be exhaustive), so a malformed fixture item must lower
+    // schemaValidityRate above, not crash everything below.
+    const mapped = mapRubricToEvidence(goldSetSubject(goldCase.caseId), goldCase.rubricCriterionIds, parsedItems);
+    const validated = mapped.map((outcome) => validateCitation(outcome, goldCase.sourceText));
+
+    for (const outcome of validated) {
+      totalCriteria += 1;
+      const expectedKind = goldCase.expectedKinds[outcome.criterionId];
+      if (expectedKind === outcome.kind) {
+        correctKinds += 1;
+      }
+
+      const expectedCiting = expectedKind !== undefined && isCitingKind(expectedKind);
+      const actualCiting = isCitingKind(outcome.kind);
+      if (expectedCiting && actualCiting) {
+        truePositive += 1;
+      } else if (!expectedCiting && actualCiting) {
+        falsePositive += 1;
+      } else if (expectedCiting && !actualCiting) {
+        falseNegative += 1;
+      }
+    }
+
+    // Seeded from the case's own expected IDs, not discovered by
+    // iterating real outcomes: assertGoldSetCaseIntegrity above already
+    // guarantees every one of these IDs has a matching outcome (they are
+    // all drawn from rubricCriterionIds, and mapRubricToEvidence always
+    // produces exactly one outcome per rubric criterion), so the
+    // denominator can never be silently short.
+    const uniqueReviewCriterionIds = new Set(goldCase.expectedReviewCriterionIds);
+    reviewExpectedCount += uniqueReviewCriterionIds.size;
+
+    // Every validated outcome is routed, not just the expected-review
+    // ones. Iterating only the expected IDs meant routeForReview was
+    // never called for negative examples, so a regression that flagged
+    // `supported` / `partially_supported` / `not_found` for review left
+    // escalationRecall at 1 and every other metric untouched -- the gate
+    // passed while the system sent ALL clean evidence to human review.
+    // Recording the false positives gives that failure a metric to trip.
+    for (const outcome of validated) {
+      const shouldEscalate = uniqueReviewCriterionIds.has(outcome.criterionId);
+      const didEscalate = routeForReview(outcome).needsReview;
+      if (shouldEscalate && didEscalate) {
+        reviewCorrectlyFlagged += 1;
+      } else if (!shouldEscalate && didEscalate) {
+        reviewIncorrectlyFlagged += 1;
+      }
+    }
+  }
+
+  return {
+    totalCases: cases.length,
+    schemaValidityRate: totalItems === 0 ? 1 : validItems / totalItems,
+    outcomeAccuracy: totalCriteria === 0 ? 1 : correctKinds / totalCriteria,
+    citingPrecision: truePositive + falsePositive === 0 ? 1 : truePositive / (truePositive + falsePositive),
+    citingRecall: truePositive + falseNegative === 0 ? 1 : truePositive / (truePositive + falseNegative),
+    escalationRecall: reviewExpectedCount === 0 ? 1 : reviewCorrectlyFlagged / reviewExpectedCount,
+    escalationPrecision:
+      reviewCorrectlyFlagged + reviewIncorrectlyFlagged === 0
+        ? 1
+        : reviewCorrectlyFlagged / (reviewCorrectlyFlagged + reviewIncorrectlyFlagged)
+  };
+}
+
+export interface GoldSetThresholds {
+  readonly minSchemaValidityRate: number;
+  readonly minOutcomeAccuracy: number;
+  readonly minCitingPrecision: number;
+  readonly minCitingRecall: number;
+  readonly minEscalationRecall: number;
+  readonly minEscalationPrecision: number;
+}
+
+/**
+ * This synthetic, hand-authored gold set requires a perfect score:
+ * every case has one obviously-correct answer, so anything less than
+ * 1.0 means the deterministic pipeline regressed, not that a real
+ * model produced an imperfect-but-reasonable answer. Do not relax
+ * these to make a failing build pass -- fix the regression instead.
+ */
+export const GOLD_SET_V1_THRESHOLDS: GoldSetThresholds = {
+  minSchemaValidityRate: 1,
+  minOutcomeAccuracy: 1,
+  minCitingPrecision: 1,
+  minCitingRecall: 1,
+  minEscalationRecall: 1,
+  minEscalationPrecision: 1
+};
+
+export type GoldSetGate =
+  | { readonly passed: true }
+  | { readonly passed: false; readonly failures: readonly string[] };
+
+export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetThresholds): GoldSetGate {
+  const failures: string[] = [];
+  if (score.schemaValidityRate < thresholds.minSchemaValidityRate) {
+    failures.push(`schemaValidityRate ${score.schemaValidityRate} < ${thresholds.minSchemaValidityRate}`);
+  }
+  if (score.outcomeAccuracy < thresholds.minOutcomeAccuracy) {
+    failures.push(`outcomeAccuracy ${score.outcomeAccuracy} < ${thresholds.minOutcomeAccuracy}`);
+  }
+  if (score.citingPrecision < thresholds.minCitingPrecision) {
+    failures.push(`citingPrecision ${score.citingPrecision} < ${thresholds.minCitingPrecision}`);
+  }
+  if (score.citingRecall < thresholds.minCitingRecall) {
+    failures.push(`citingRecall ${score.citingRecall} < ${thresholds.minCitingRecall}`);
+  }
+  if (score.escalationRecall < thresholds.minEscalationRecall) {
+    failures.push(`escalationRecall ${score.escalationRecall} < ${thresholds.minEscalationRecall}`);
+  }
+  if (score.escalationPrecision < thresholds.minEscalationPrecision) {
+    failures.push(`escalationPrecision ${score.escalationPrecision} < ${thresholds.minEscalationPrecision}`);
+  }
+  return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }

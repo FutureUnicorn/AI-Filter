@@ -114,11 +114,41 @@ export interface CreateMagicLinkTokenInput {
   readonly expiresAt: Date;
 }
 
+/**
+ * The membership lookup below is unavoidably cross-organization: a plain
+ * login token names no organization, so there is no app.current_org_id
+ * to scope it with. AF-18's memberships policy requires exactly that
+ * setting (0004_tenant_scoped_rls.sql), so under a role RLS actually
+ * applies to, the SELECT returns zero rows for *every* email -- and the
+ * caller would reject every legitimate login with "no membership".
+ *
+ * Today that does not happen, because AF-11's app role is the postgres
+ * image's bootstrap superuser and superusers bypass RLS -- the migration
+ * documents this as a known gap. But "the security control is currently
+ * inert" is not something to depend on silently: the moment the role is
+ * tightened, this must fail loudly and say what to change, not lock out
+ * the entire user base behind an error that claims their account does
+ * not exist.
+ */
+async function assertMembershipLookupVisible(client: Client, schema: string): Promise<void> {
+  const rls = await client.query<{ active: boolean }>(
+    `SELECT row_security_active('"${schema}".memberships'::regclass) AS active`
+  );
+  if (rls.rows[0]?.active === true) {
+    throw new Error(
+      `cannot verify membership for a login magic link: row-level security is active on "${schema}".memberships ` +
+        `for the current database role, so the cross-organization lookup a login token requires can never match. ` +
+        `Grant this role BYPASSRLS, or move the lookup into a SECURITY DEFINER function owned by the table owner.`
+    );
+  }
+}
+
 async function emailHasMembership(
   client: Client,
   schema: string,
   email: string
 ): Promise<boolean> {
+  await assertMembershipLookupVisible(client, schema);
   const found = await client.query(
     `SELECT 1
        FROM "${schema}".users u
@@ -149,6 +179,14 @@ async function provisionInvitedMembership(
   if (userId === undefined) {
     throw new Error("invite redemption did not produce a user row");
   }
+  // Unlike the login lookup, an invite names its organization, so there
+  // is a correct value for AF-18's memberships policy -- whose WITH CHECK
+  // would otherwise reject this INSERT outright under a role RLS applies
+  // to. is_local = true ties it to the enclosing transaction (this is
+  // only ever called inside redeemMagicLinkToken's BEGIN/COMMIT), so it
+  // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
+  // sharing the connection.
+  await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
   // Applying the invited role (below) makes one destructive direction
   // reachable that DO NOTHING made impossible: a re-invite naming a
   // non-owner role for the organization's only owner would leave it with
@@ -493,6 +531,106 @@ export async function getInferenceUsage(
       inputTokens: row === undefined ? 0 : bigintColumnToNumber(row.input_tokens, "input_tokens"),
       outputTokens: row === undefined ? 0 : bigintColumnToNumber(row.output_tokens, "output_tokens")
     };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface SetInferenceKillSwitchInput {
+  readonly engaged: boolean;
+  readonly reason?: string;
+  // No separate engagedByUserId: the audited actor below is the single
+  // source of truth. Carrying both let the singleton row name one person
+  // while the audit event named another, and the two are supposed to be
+  // the same fact recorded twice -- so the row is written from the actor.
+
+  /**
+   * Required to audit the transition. Every engage/disengage overwrites
+   * the singleton row -- including its actor, reason and timestamp -- so
+   * without an audit row the previous incident-control action leaves no
+   * trace at all once the next transition happens. `audit_events`
+   * already covers consequential `admin_action`s explicitly, and the
+   * transition plus its audit row now commit in ONE transaction, so a
+   * flipped switch can never exist without the record of who flipped it.
+   */
+  readonly audit: {
+    readonly organizationId: string;
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
+}
+
+/**
+ * The database CHECK constraint (migration 0008) is the real enforcement:
+ * engaging without a reason is rejected there, and the actor comes from
+ * the audited actorUserId rather than a second field
+ * regardless of what this function is called with, matching this
+ * codebase's habit of enforcing an invariant at more than one layer.
+ *
+ * The UPDATE's rowCount is checked and throws on 0, mirroring
+ * getInferenceKillSwitchStatus's own fail-closed handling of a missing
+ * singleton row -- without this, a missing seed row would make this
+ * function silently report success while changing nothing at all.
+ */
+export async function setInferenceKillSwitch(
+  databaseUrl: string,
+  schema: string,
+  input: SetInferenceKillSwitchInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      const result = await client.query(
+        `UPDATE "${schema}".inference_kill_switch
+            SET engaged = $1,
+                reason = $2,
+                -- Cleared on disengage: "who engaged it" is meaningless
+                -- once it is off, and leaving the last engager's name on a
+                -- disengaged switch reads like they are still holding it.
+                engaged_by_user_id = CASE WHEN $1 THEN $3::uuid ELSE NULL END,
+                updated_at = clock_timestamp()
+          WHERE id = true`,
+        [input.engaged, input.reason ?? null, input.audit.actorUserId]
+      );
+      if (result.rowCount === 0) {
+        throw new Error("inference_kill_switch has no row; the seed insert from migration 0008 is missing");
+      }
+      // The reason, kept where the next transition cannot overwrite it.
+      // The singleton above is the CURRENT state, so disengaging replaces or
+      // clears the reason the engage recorded; this row is the history. Same
+      // transaction as both the flip and the audit event, so a switch cannot
+      // end up flipped with no record of why.
+      await client.query(
+        `INSERT INTO "${schema}".inference_kill_switch_transitions
+           (engaged, reason, actor_user_id, request_id)
+         VALUES ($1, $2, $3, $4)`,
+        [input.engaged, input.reason ?? null, input.audit.actorUserId, input.audit.requestId]
+      );
+      // Same transaction, on the same client: the switch cannot end up
+      // flipped without the audit row recording who did it, and a
+      // failure here rolls the transition back rather than leaving an
+      // unattributed change behind.
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.audit.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "inference_kill_switch",
+          entityId: input.engaged ? "engaged" : "disengaged",
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -859,8 +997,258 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       throw new Error("memberships RLS WITH CHECK must reject a cross-tenant insert");
     }
   } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
+      await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-43 review follow-up: proves the magic-link auth path behaves
+ * correctly under a database role that RLS actually applies to -- not
+ * only under the bootstrap superuser that bypasses it. Two independent
+ * claims, both of which were broken before:
+ *
+ *  1. A plain login token's membership lookup is unavoidably
+ *     cross-organization, so AF-18's per-org policy hides every row from
+ *     it. It must fail with a message naming the real cause, never
+ *     degrade into "this email has no membership" -- which would reject
+ *     every legitimate sign-in while blaming the user's account.
+ *  2. An invite redemption *is* possible, because an invite names its
+ *     organization: scoping the transaction with app.current_org_id lets
+ *     the membership write through the WITH CHECK, and a re-invite that
+ *     names a different role actually applies it.
+ *
+ * Runs against a throwaway schema and a throwaway LOGIN role, both named
+ * with a random suffix so concurrent runs cannot collide, and both
+ * dropped in `finally`.
+ */
+export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `mlrls_probe_${suffix}`;
+  const role = `mlrls_app_${suffix}`;
+  const password = randomBytes(16).toString("hex");
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const memberEmail = `member_${suffix}@acme.test`;
+  const invitedEmail = `invited_${suffix}@acme.test`;
+
+  const probeUrl = new URL(databaseUrl);
+  probeUrl.username = role;
+  probeUrl.password = password;
+  const probeDatabaseUrl = probeUrl.toString();
+
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0003_magic_link_tokens.sql"), "utf8"));
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A')`, [organizationId]);
+    await admin.query(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Member') RETURNING user_id`,
+      [memberEmail]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role)
+       SELECT $1, user_id, 'recruiter' FROM users WHERE email = $2`,
+      [organizationId, memberEmail]
+    );
+
+    // Control: as the superuser, RLS is bypassed, so the existing login
+    // path still works exactly as it does today. Without this, claim 1
+    // below could pass for the wrong reason (a lookup that is simply
+    // broken for everyone).
+    await createMagicLinkToken(databaseUrl, schema, {
+      tokenHash: `superuser-login-${suffix}`,
+      email: memberEmail,
+      expiresAt
+    });
+
+    // Claim 1: the same call under a role RLS applies to must name RLS
+    // as the cause, not report the member as having no membership.
+    let loginError: unknown;
+    try {
+      await createMagicLinkToken(probeDatabaseUrl, schema, {
+        tokenHash: `rls-login-${suffix}`,
+        email: memberEmail,
+        expiresAt
+      });
+    } catch (error) {
+      loginError = error;
+    }
+    const loginMessage = loginError instanceof Error ? loginError.message : String(loginError);
+    if (loginError === undefined) {
+      throw new Error("expected the login membership lookup to fail loudly under active row-level security");
+    }
+    if (!loginMessage.includes("row-level security is active")) {
+      throw new Error(
+        `login magic link under RLS must explain the real cause, got: ${loginMessage}`
+      );
+    }
+
+    // Claim 2: an invite names its organization, so redemption works
+    // under the same role -- and the named role is actually applied.
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-invite-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "recruiter" },
+      expiresAt
+    });
+    const firstRedemption = await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-invite-${suffix}`);
+    if (!firstRedemption.justRedeemed) {
+      throw new Error("invite redemption must succeed under active row-level security");
+    }
+    const afterInvite = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterInvite.rows[0]?.role !== "recruiter") {
+      throw new Error(
+        `invite redemption must provision the membership under RLS, got: ${JSON.stringify(afterInvite.rows)}`
+      );
+    }
+
+    // A promotion re-invite: DO NOTHING would report success here while
+    // silently leaving the old role in place.
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-reinvite-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "admin" },
+      expiresAt
+    });
+    await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);
+    const afterPromotion = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterPromotion.rows[0]?.role !== "admin") {
+      throw new Error(
+        `a re-invite naming a new role must apply it, got: ${JSON.stringify(afterPromotion.rows)}`
+      );
+    }
+
+    // A re-invite that would strand the organization with no owner is
+    // refused, loudly, and leaves the existing membership untouched.
+    await admin.query(`UPDATE memberships SET role = 'owner' WHERE organization_id = $1`, [organizationId]);
+    await admin.query(
+      `DELETE FROM memberships
+        WHERE organization_id = $1
+          AND user_id <> (SELECT user_id FROM users WHERE email = $2)`,
+      [organizationId, invitedEmail]
+    );
+    await createMagicLinkToken(probeDatabaseUrl, schema, {
+      tokenHash: `rls-demote-${suffix}`,
+      email: invitedEmail,
+      invite: { organizationId, role: "recruiter" },
+      expiresAt
+    });
+    let demotionError: unknown;
+    try {
+      await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-demote-${suffix}`);
+    } catch (error) {
+      demotionError = error;
+    }
+    if (demotionError === undefined) {
+      throw new Error("demoting the last owner of an organization must be refused, not applied silently");
+    }
+    const afterRefusal = await admin.query<{ role: string }>(
+      `SELECT m.role FROM memberships m INNER JOIN users u ON u.user_id = m.user_id WHERE u.email = $1`,
+      [invitedEmail]
+    );
+    if (afterRefusal.rows[0]?.role !== "owner") {
+      throw new Error(
+        `a refused demotion must roll back and leave the membership intact, got: ${JSON.stringify(afterRefusal.rows)}`
+      );
+    }
+
+    // app.current_org_id must not survive the transaction that sets it.
+    //
+    // Scope of this check, stated exactly: it verifies the *mechanism*
+    // provisionInvitedMembership relies on -- that is_local => true is
+    // discarded at COMMIT and is_local => false is not -- on a connection
+    // this probe holds open across that COMMIT. It does not observe
+    // provisionInvitedMembership's own connection, because
+    // redeemMagicLinkToken opens and ends that one itself, so nothing
+    // outside can read its settings after the fact. Flipping is_local in
+    // provisionInvitedMembership therefore does NOT fail this assertion;
+    // that argument rests on reading the call, which is one line away.
+    //
+    // Worth being blunt about why that residual gap is acceptable today:
+    // every entry point in this module constructs its own Client and
+    // ends it in a finally, so there is no pool for a stale setting to
+    // leak into. is_local => true is the right thing to write anyway --
+    // it is correct the day a pool is introduced, and this check is what
+    // proves that keyword still means what the comment claims.
+    //
+    // An earlier version of this assertion ran on `admin`, which never
+    // called set_config at all. current_setting is per-connection, so it
+    // passed no matter what, and measured nothing. The is_local => false
+    // leg below is the control that keeps this one honest: if a
+    // session-scoped setting did not survive COMMIT either, the
+    // assertion above would again be measuring nothing.
+    const scoped = new Client({ connectionString: probeDatabaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await scoped.connect();
+      const readOrgSetting = async (): Promise<string> => {
+        const row = await scoped.query<{ value: string }>(
+          `SELECT coalesce(nullif(current_setting('app.current_org_id', true), ''), '') AS value`
+        );
+        return row.rows[0]?.value ?? "";
+      };
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error("set_config must take effect inside its own transaction");
+      }
+      await scoped.query("COMMIT");
+      const afterCommit = await readOrgSetting();
+      if (afterCommit !== "") {
+        throw new Error(
+          `app.current_org_id must be transaction-local; it survived COMMIT on the same connection as ${afterCommit}`
+        );
+      }
+
+      await scoped.query("BEGIN");
+      await scoped.query(`SELECT set_config('app.current_org_id', $1, false)`, [organizationId]);
+      await scoped.query("COMMIT");
+      if ((await readOrgSetting()) !== organizationId) {
+        throw new Error(
+          "control failed: a session-scoped set_config should survive COMMIT, so the transaction-local assertion above proves nothing"
+        );
+      }
+    } finally {
+      await scoped.end().catch(() => undefined);
+    }
+  } finally {
+    // Separate attempts on purpose: roles are cluster-wide, not
+    // schema-scoped, so a failing DROP SCHEMA must not skip DROP ROLE and
+    // leave a login role behind on every run against a persistent cluster.
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    try {
       await admin.query(`DROP ROLE IF EXISTS ${role}`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
@@ -1131,6 +1519,111 @@ export async function assertInferenceReservationSettlement(
       underEstimate,
       duplicateSettlement: duplicateSettlement.outcome,
       doubleCountedTotal: doubled.inputTokens + doubled.outputTokens
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface KillSwitchTransitionObservations {
+  /** Whether engaging with no reason at all is refused by the table itself. */
+  readonly nullReasonRejected: boolean;
+  /** What the pre-review constraint did with the same row. */
+  readonly nullReasonAcceptedByOldConstraint: boolean;
+  /** Reasons in the append-only log, oldest first. */
+  readonly loggedReasons: readonly (string | null)[];
+  /** The reason left on the singleton after a later transition overwrote it. */
+  readonly singletonReasonAfterDisengage: string | null;
+}
+
+/**
+ * Exercise the kill-switch constraint and its transition log on a real
+ * Postgres, in a disposable schema.
+ *
+ * Both halves of this need a live server to mean anything. `reason ~ '...'`
+ * against a NULL reason evaluates to NULL rather than false, and Postgres
+ * accepts a CHECK that is true OR NULL, so the hole only exists in the
+ * database's three-valued logic and cannot be reproduced in TypeScript. The
+ * old constraint is rebuilt here and shown accepting the row it should have
+ * refused, so the test can prove the fix rather than assert it.
+ */
+export async function assertKillSwitchTransitionLog(
+  databaseUrl: string
+): Promise<KillSwitchTransitionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `kill_switch_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const actor = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0005_immutable_audit_events.sql",
+      "0008_inference_kill_switch.sql",
+      "0009_inference_kill_switch_nonblank_reason.sql",
+      "0010_kill_switch_reason_non_whitespace.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,'a@example.com','Probe Actor')`, [actor]);
+
+    const engageWithNullReason = async (): Promise<boolean> => {
+      try {
+        await admin.query(
+          `UPDATE inference_kill_switch
+              SET engaged = true, reason = NULL, engaged_by_user_id = $1 WHERE id = true`,
+          [actor]
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const acceptedNow = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // Rebuild the pre-review constraint and show it accepting the same row.
+    await admin.query(`ALTER TABLE inference_kill_switch DROP CONSTRAINT inference_kill_switch_check`);
+    await admin.query(
+      `ALTER TABLE inference_kill_switch ADD CONSTRAINT inference_kill_switch_check
+       CHECK ((engaged AND reason ~ '[^[:space:]]' AND engaged_by_user_id IS NOT NULL) OR NOT engaged)`
+    );
+    const acceptedBefore = await engageWithNullReason();
+    await admin.query(`UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`);
+
+    // The log keeps each transition's reason where the next cannot reach it.
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (true, 'runaway extraction loop', $1, 'req_00000000-0000-4000-8000-000000000001')`,
+      [actor]
+    );
+    await admin.query(
+      `INSERT INTO inference_kill_switch_transitions (engaged, reason, actor_user_id, request_id)
+       VALUES (false, NULL, $1, 'req_00000000-0000-4000-8000-000000000002')`,
+      [actor]
+    );
+    await admin.query(
+      `UPDATE inference_kill_switch SET engaged = false, reason = NULL, engaged_by_user_id = NULL WHERE id = true`
+    );
+
+    const logged = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch_transitions ORDER BY occurred_at`
+    );
+    const singleton = await admin.query<{ reason: string | null }>(
+      `SELECT reason FROM inference_kill_switch WHERE id = true`
+    );
+
+    return {
+      nullReasonRejected: !acceptedNow,
+      nullReasonAcceptedByOldConstraint: acceptedBefore,
+      loggedReasons: logged.rows.map((r) => r.reason),
+      singletonReasonAfterDisengage: singleton.rows[0]?.reason ?? null
     };
   } finally {
     await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
