@@ -276,7 +276,7 @@ test("a legitimate offset still passes, so the guard is not rejecting everything
   assert.equal(result.kind, "supported");
 });
 
-test("the rejected citation is preserved verbatim, malformed values included", () => {
+test("the rejected citation is preserved, rendered JSON-safe rather than dropped", () => {
   // The reason CitationInvalidEvidence types rejectedCitation as `unknown`:
   // this kind exists to carry what was actually rejected, including a
   // proposal that could never satisfy SourceCitation. A helper that narrows
@@ -286,6 +286,52 @@ test("the rejected citation is preserved verbatim, malformed values included", (
   const result = validateCitation(outcome, "Built Python services.");
   assert.equal(result.kind, "citation_invalid");
   if (result.kind === "citation_invalid") {
-    assert.deepEqual(result.rejectedCitation, malformed, "the rejected proposal must survive intact");
+    // Two requirements pull against each other here. The proposal must be
+    // preserved -- that is the entire purpose of this kind -- but the
+    // outcome must also persist, and jsonValueSchema rejects non-finite
+    // numbers, so copying NaN through produced a citation_invalid that
+    // could never reach review. Non-finite values are rendered as their
+    // string form: every other field intact, and the offset still legible
+    // as what was actually claimed.
+    assert.deepEqual(result.rejectedCitation, { ...malformed, offset: "NaN" });
+    assert.equal(safeParseEvidenceOutcome(result).success, true);
+  }
+});
+
+// AF-38 review round 3 (#21). The round-2 offset guard rejected exactly the
+// values JSON cannot carry, so the citation_invalid it produced was itself
+// unpersistable -- the same failure that made rejectedCitation `unknown`,
+// reached one layer further down.
+
+test("a citation_invalid for a non-finite offset is itself persistable", () => {
+  for (const offset of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    const result = validateCitation(af38Citing("Built", offset), "Built Python services.");
+    assert.equal(result.kind, "citation_invalid");
+    assert.equal(
+      safeParseEvidenceOutcome(result).success,
+      true,
+      `citation_invalid for offset ${offset} cannot be persisted, so it never reaches review`
+    );
+  }
+});
+
+test("the rejected offset is preserved rather than dropped or zeroed", () => {
+  // Serializable, but still shows the reviewer what was actually claimed.
+  const result = validateCitation(af38Citing("Built", Number.NaN), "Built Python services.");
+  if (result.kind === "citation_invalid") {
+    assert.equal((result.rejectedCitation as { offset: unknown }).offset, "NaN");
+  }
+});
+
+test("a citing outcome with no citation fails closed instead of throwing", () => {
+  // isCitingEvidence narrows on `kind` alone, which is all it can do for a
+  // payload that has not been through the schema. This used to throw a
+  // TypeError out of a validator whose job is inspecting untrusted output.
+  for (const citation of [undefined, null]) {
+    const outcome = { ...af38Citing("Built", 0), citation } as unknown as EvidenceOutcome;
+    const result = validateCitation(outcome, "Built Python services.");
+    assert.equal(result.kind, "citation_invalid");
+    assert.match((result as { reason: string }).reason, /carries no citation/);
+    assert.equal(safeParseEvidenceOutcome(result).success, true);
   }
 });
