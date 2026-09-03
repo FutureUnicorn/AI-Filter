@@ -24,18 +24,20 @@ test("owner and admin can do everything", () => {
   }
 });
 
-test("recruiter can review candidates and record decisions, nothing else", () => {
+test("recruiter can review candidates, record decisions, and manage roles -- nothing else", () => {
   assert.equal(roleHasCapability("recruiter", "review_candidates"), true);
   assert.equal(roleHasCapability("recruiter", "record_decision"), true);
+  assert.equal(roleHasCapability("recruiter", "manage_roles"), true);
   assert.equal(roleHasCapability("recruiter", "approve_rubric"), false);
   assert.equal(roleHasCapability("recruiter", "view_audit_reports"), false);
   assert.equal(roleHasCapability("recruiter", "access_admin_settings"), false);
 });
 
-test("auditor is read-only: can view audit reports, cannot review, decide, or administer", () => {
+test("auditor is read-only: can view audit reports, cannot review, decide, administer, or manage roles", () => {
   assert.equal(roleHasCapability("auditor", "view_audit_reports"), true);
   assert.equal(roleHasCapability("auditor", "review_candidates"), false);
   assert.equal(roleHasCapability("auditor", "record_decision"), false);
   assert.equal(roleHasCapability("auditor", "approve_rubric"), false);
   assert.equal(roleHasCapability("auditor", "access_admin_settings"), false);
+  assert.equal(roleHasCapability("auditor", "manage_roles"), false);
 });

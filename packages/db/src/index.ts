@@ -9,8 +9,13 @@ import type {
   MagicLinkInvite,
   MagicLinkRedemptionAttempt,
   MagicLinkTokenRecord,
-  MembershipRole
+  Membership,
+  MembershipRole,
+  Role,
+  RoleStatus,
+  User
 } from "@signal-audit/domain";
+import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 import { Client } from "pg";
 
 /** Persistence adapters will implement domain-owned ports in this package. */
@@ -631,6 +636,206 @@ export async function setInferenceKillSwitch(
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-23 prerequisite: resolve a redeemed magic link to a real user ----
+//
+// AF-16 built token generation/redemption but stopped at "this email is
+// verified" -- nothing yet turns that into a userId. A login-only token
+// (no invite) must resolve to a user who already exists: if one
+// redeems a login link for an email that was invited but never
+// completed onboarding, that is exactly the not-onboarded case,
+// reported honestly rather than papered over by silently creating a
+// user with no membership. An invite token (organizationId + role
+// present) may legitimately be the first thing that ever creates that
+// user, so it upserts both the user and the membership together,
+// atomically, since a user row without the invited membership would be
+// a stuck half-onboarded account.
+
+interface UserRow {
+  readonly user_id: string;
+  readonly email: string;
+  readonly display_name: string;
+  readonly created_at: Date;
+}
+
+function rowToUser(row: UserRow): User {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    userId: row.user_id,
+    email: row.email,
+    displayName: row.display_name,
+    createdAt: row.created_at.toISOString()
+  };
+}
+
+export async function getUserByEmail(
+  databaseUrl: string,
+  schema: string,
+  email: string
+): Promise<User | undefined> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<UserRow>(
+      `SELECT user_id, email, display_name, created_at FROM "${schema}".users WHERE email = $1`,
+      [email]
+    );
+    return result.rows[0] === undefined ? undefined : rowToUser(result.rows[0]);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-23 prerequisite: fetch the caller's own memberships ----
+//
+// AF-19's authorizeResourceAccess takes a Membership[] but nothing before
+// AF-23 needed one for real, so no query existed to produce it. This is
+// the only place a session's bare userId ever becomes a set of
+// (organization, role) facts -- authorizeResourceAccess still owns the
+// actual decision, this just supplies its input.
+
+interface MembershipRow {
+  readonly membership_id: string;
+  readonly organization_id: string;
+  readonly user_id: string;
+  readonly role: MembershipRole;
+  readonly created_at: Date;
+}
+
+export async function getMembershipsForUser(
+  databaseUrl: string,
+  schema: string,
+  userId: string
+): Promise<readonly Membership[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<MembershipRow>(
+      `SELECT membership_id, organization_id, user_id, role, created_at
+         FROM "${schema}".memberships
+        WHERE user_id = $1`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      membershipId: row.membership_id,
+      organizationId: row.organization_id,
+      userId: row.user_id,
+      role: row.role,
+      createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Seeds one organization + user + membership and returns the user id.
+ *
+ * Exported for the same reason the assert* probes below are: pg lives in
+ * this package, so a test that needs real rows either goes through here
+ * or reaches for a driver it cannot resolve. It exists specifically so
+ * the route-level magic-link test can seed a real member and then drive
+ * the actual request/redeem handlers -- that test cannot live in this
+ * package, because the workspace boundaries forbid packages from
+ * importing apps.
+ *
+ * Idempotent on all three rows so repeated runs are safe. Synthetic
+ * fixtures only; callers in a hosted environment have no reason to
+ * invoke it.
+ */
+export async function seedOrganizationMembership(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly organizationName: string;
+    readonly email: string;
+    readonly displayName: string;
+    readonly role: MembershipRole;
+  }
+): Promise<{ readonly userId: string }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".organizations (organization_id, name) VALUES ($1, $2)
+         ON CONFLICT (organization_id) DO NOTHING`,
+      [input.organizationId, input.organizationName]
+    );
+    const user = await client.query<{ user_id: string }>(
+      `INSERT INTO "${schema}".users (email, display_name) VALUES ($1, $2)
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+       RETURNING user_id`,
+      [input.email, input.displayName]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("seedOrganizationMembership did not produce a user row");
+    }
+    await client.query(
+      `INSERT INTO "${schema}".memberships (organization_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (organization_id, user_id) DO NOTHING`,
+      [input.organizationId, userId, input.role]
+    );
+    return { userId };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-23: role creation ----
+
+export interface CreateRoleInput {
+  readonly organizationId: string;
+  readonly title: string;
+  readonly createdByUserId: string;
+}
+
+interface RoleRow {
+  readonly role_id: string;
+  readonly organization_id: string;
+  readonly title: string;
+  readonly status: RoleStatus;
+  readonly created_by_user_id: string;
+  readonly created_at: Date;
+}
+
+export async function createRole(
+  databaseUrl: string,
+  schema: string,
+  input: CreateRoleInput
+): Promise<Role> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RoleRow>(
+      `INSERT INTO "${schema}".roles (organization_id, title, created_by_user_id)
+       VALUES ($1, $2, $3)
+       RETURNING role_id, organization_id, title, status, created_by_user_id, created_at`,
+      [input.organizationId, input.title, input.createdByUserId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("role insert returned no row");
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      roleId: row.role_id,
+      organizationId: row.organization_id,
+      title: row.title,
+      status: row.status,
+      createdByUserId: row.created_by_user_id,
+      createdAt: row.created_at.toISOString()
+    };
   } finally {
     await client.end().catch(() => undefined);
   }

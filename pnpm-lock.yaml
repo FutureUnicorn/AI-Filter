@@ -35,6 +35,9 @@ importers:
       '@signal-audit/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@signal-audit/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@signal-audit/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -56,6 +59,9 @@ importers:
       react-dom:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       '@types/react':
         specifier: 19.2.2
