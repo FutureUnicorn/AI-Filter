@@ -214,7 +214,7 @@ test("the development magic-link sender delivers a usable link on stderr and not
 
 test("the development magic-link sender refuses to run in a hosted environment", () => {
   for (const appEnv of ["staging", "production"]) {
-    assert.throws(() => createConsoleMagicLinkEmailSender(appEnv), /local-development only/);
+    assert.throws(() => createConsoleMagicLinkEmailSender(appEnv), /hosted environment/);
   }
 });
 
@@ -222,13 +222,45 @@ test("the development magic-link sender refuses to run in a hosted environment",
 // called createConsoleMagicLinkEmailSender() with no argument, so appEnv
 // defaulted to "development" no matter where the code was deployed.
 test("hosted selection fails closed instead of degrading to the console sender", () => {
-  for (const appEnv of ["staging", "production"]) {
+  // `preview` is in this list because review (#28) found it missing. It is a
+  // hosted per-PR/per-SHA deployment, not a developer terminal, so falling
+  // through to the console sender wrote the raw recipient address and bearer
+  // link to the stderr of a hosted process and delivered the link to nobody.
+  for (const appEnv of ["preview", "staging", "production"]) {
     assert.throws(
       () => createMagicLinkEmailSender({ appEnv }),
       /refusing to fall back to the local console sender/,
       `${appEnv} without delivery configuration must not silently use the console sender`
     );
   }
+});
+
+test("the console sender itself refuses every hosted environment, not just staging and production", () => {
+  // Second boundary: even a caller that bypasses createMagicLinkEmailSender
+  // and constructs the console sender directly cannot get it in a hosted
+  // environment. Belt and braces on purpose -- the selector is the intended
+  // door, but this is the function that actually holds the credential.
+  for (const appEnv of ["preview", "staging", "production"]) {
+    assert.throws(
+      () => createConsoleMagicLinkEmailSender(appEnv),
+      /hosted environment/,
+      `${appEnv} must not be able to construct the console sender`
+    );
+  }
+  for (const appEnv of ["development", "test"]) {
+    assert.doesNotThrow(() => createConsoleMagicLinkEmailSender(appEnv));
+  }
+});
+
+test("a hosted preview with delivery configured is served by the real adapter", () => {
+  // The fix must not make preview unusable, only honest: configured
+  // delivery is accepted exactly as staging and production are.
+  assert.doesNotThrow(() =>
+    createMagicLinkEmailSender({
+      appEnv: "preview",
+      delivery: { endpoint: "https://mail.test/send", apiKey: "k", from: "no-reply@acme.test" }
+    })
+  );
 });
 
 test("local selection uses the console sender, and honours configured delivery when present", () => {

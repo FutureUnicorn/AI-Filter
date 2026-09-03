@@ -91,3 +91,34 @@ test("one pnpm lockfile is authoritative", () => {
   visit(repositoryRoot);
   assert.deepEqual(lockfiles, [path.join(repositoryRoot, "pnpm-lock.yaml")]);
 });
+
+// packages/security must not depend on packages/config (see
+// dependency-cruiser.config.cjs), so the set of environments allowed to use
+// the local console magic-link sender is declared in both. That duplication
+// is deliberate, but it is only safe if the two cannot drift: review (#28)
+// was caused by exactly one list being narrower than the other's intent.
+// This asserts they stay identical, so adding a hosted environment to one
+// without the other fails here rather than in a preview deployment.
+test("the local-console environment lists in config and security are identical", async () => {
+  const [config, security] = await Promise.all([
+    import("../../packages/config/src/index.ts"),
+    import("../../packages/security/src/index.ts")
+  ]);
+  const fromConfig = [...config.LOCAL_CONSOLE_ENVIRONMENTS].sort();
+  // security keeps a Set privately; isHostedEnvironment is the observable
+  // contract, so derive the list through it across every real environment.
+  const fromSecurity = config.APP_ENVIRONMENTS.filter(
+    (appEnv) => !security.isHostedEnvironment(appEnv)
+  ).sort();
+  assert.deepEqual(
+    fromSecurity,
+    fromConfig,
+    "packages/security's console-allowed environments must match packages/config's LOCAL_CONSOLE_ENVIRONMENTS"
+  );
+  // And pin the intent itself, so widening both at once still gets noticed.
+  assert.deepEqual(fromConfig, ["development", "test"]);
+  for (const appEnv of ["preview", "staging", "production"] as const) {
+    assert.equal(config.isHostedEnvironment(appEnv), true, `${appEnv} must be hosted`);
+    assert.equal(security.isHostedEnvironment(appEnv), true, `${appEnv} must be hosted`);
+  }
+});

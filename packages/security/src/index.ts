@@ -125,10 +125,30 @@ export interface MagicLinkEmailDelivery {
  * Prefer createMagicLinkEmailSender below; it is the single place the
  * adapter is chosen from environment configuration.
  */
+/**
+ * The only two environments with a terminal a developer can read.
+ *
+ * `preview` is deliberately NOT here. Review (#28) caught it: preview is a
+ * hosted per-PR/per-SHA deployment in this repo -- it derives its own
+ * database schema and runs on a box nobody is watching -- so treating it as
+ * local wrote the raw recipient address and bearer link to the stderr of a
+ * hosted process, and delivered the link to nobody. Anything that is not
+ * development or test is hosted, and hosted means a real delivery adapter.
+ *
+ * Expressed once and shared by every guard below, so a future environment
+ * added to APP_ENVIRONMENTS is hosted by default rather than silently
+ * inheriting the console sender by omission.
+ */
+const LOCAL_CONSOLE_ENVIRONMENTS: ReadonlySet<string> = new Set(["development", "test"]);
+
+export function isHostedEnvironment(appEnv: string): boolean {
+  return !LOCAL_CONSOLE_ENVIRONMENTS.has(appEnv);
+}
+
 export function createConsoleMagicLinkEmailSender(appEnv: string): MagicLinkEmailSender {
-  if (appEnv === "staging" || appEnv === "production") {
+  if (isHostedEnvironment(appEnv)) {
     throw new Error(
-      "createConsoleMagicLinkEmailSender is local-development only; a hosted environment needs a real email adapter"
+      `createConsoleMagicLinkEmailSender is limited to development and test; ${appEnv} is a hosted environment and needs a real email adapter`
     );
   }
   return {
@@ -212,10 +232,10 @@ export function createMagicLinkEmailSender(input: {
   readonly appEnv: string;
   readonly delivery?: MagicLinkEmailDelivery | undefined;
 }): MagicLinkEmailSender {
-  if (input.appEnv === "staging" || input.appEnv === "production") {
+  if (isHostedEnvironment(input.appEnv)) {
     if (input.delivery === undefined) {
       // Fails closed rather than degrading to console. packages/config
-      // already requires these variables for staging/production, so
+      // already requires these variables for every hosted environment, so
       // reaching this means someone constructed a config by hand; it
       // must still not silently mint undeliverable credentials.
       throw new Error(

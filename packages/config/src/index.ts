@@ -10,6 +10,24 @@ export const APP_ENVIRONMENTS = [
 
 export type AppEnvironment = (typeof APP_ENVIRONMENTS)[number];
 
+/**
+ * The environments that have a terminal a developer can actually read, and
+ * are therefore allowed to deliver magic links through the local console
+ * sender. Everything else in APP_ENVIRONMENTS is hosted -- including
+ * `preview`, which is a per-PR/per-SHA deployment, not a workstation.
+ *
+ * Mirrors LOCAL_CONSOLE_ENVIRONMENTS in packages/security. The two are
+ * separate because packages/security must not depend on packages/config
+ * (see dependency-cruiser.config.cjs); an architecture test asserts they
+ * stay identical so they cannot drift.
+ */
+export const LOCAL_CONSOLE_ENVIRONMENTS: readonly AppEnvironment[] = ["development", "test"];
+
+/** True for every environment that must use a real delivery adapter. */
+export function isHostedEnvironment(appEnv: AppEnvironment): boolean {
+  return !LOCAL_CONSOLE_ENVIRONMENTS.includes(appEnv);
+}
+
 const booleanValue = z
   .enum(["true", "false"])
   .transform((value) => value === "true");
@@ -80,7 +98,18 @@ const rawEnvironmentSchema = z
     // console sender cannot deliver there. Requiring the delivery
     // settings here means the failure is a startup config error naming
     // the missing variable, not a 202 for a link that never arrives.
-    if (value.APP_ENV === "staging" || value.APP_ENV === "production") {
+    //
+    // `preview` counts as hosted, which review (#28) caught: an earlier
+    // revision listed only staging and production, so a preview
+    // deployment with no delivery settings loaded cleanly and then wrote
+    // the raw recipient address and bearer link to the stderr of a hosted
+    // process. Preview is a per-PR/per-SHA deployment here -- it even
+    // derives its own database schema -- not a developer terminal.
+    //
+    // Derived by exclusion rather than by listing the hosted names, so an
+    // environment added to APP_ENVIRONMENTS later is hosted by default
+    // instead of silently skipping this requirement.
+    if (!LOCAL_CONSOLE_ENVIRONMENTS.includes(value.APP_ENV)) {
       for (const field of [
         "MAGIC_LINK_EMAIL_ENDPOINT",
         "MAGIC_LINK_EMAIL_API_KEY",
