@@ -80,9 +80,14 @@ for (const sample of LEGITIMATE_RESUME_SAMPLES) {
   });
 }
 
+const SUBJECT = {
+  organizationId: "11111111-1111-4111-8111-111111111111",
+  candidateId: "22222222-2222-4222-8222-222222222222"
+};
+
 test("quarantineForInjection quarantines every criterion for the document, not just one", () => {
   const criterionIds = ["python_production", "aws_certification", "tenure_5_years"];
-  const outcomes = quarantineForInjection(criterionIds, ["ignore previous instructions"]);
+  const outcomes = quarantineForInjection(SUBJECT, criterionIds, ["ignore previous instructions"]);
   assert.equal(outcomes.length, 3);
   for (const outcome of outcomes) {
     assert.equal(outcome.kind, "quarantined");
@@ -96,9 +101,33 @@ test("quarantineForInjection quarantines every criterion for the document, not j
 });
 
 test("quarantineForInjection preserves each criterionId exactly", () => {
-  const outcomes = quarantineForInjection(["a", "b"], ["pattern"]);
+  const outcomes = quarantineForInjection(SUBJECT, ["a", "b"], ["pattern"]);
   assert.deepEqual(
     outcomes.map((o) => o.criterionId),
     ["a", "b"]
+  );
+});
+
+// A quarantine is the outcome an operator has to act on, so it is worth
+// pinning that the attribution actually reaches every outcome rather than
+// just satisfying the compiler at the boundary. Without this, dropping the
+// two fields back out of the mapped object would still type-check as long
+// as the parameter stayed.
+test("every quarantined outcome carries the subject, so an operator can tell whose document it was", () => {
+  const outcomes = quarantineForInjection(SUBJECT, ["a", "b", "c"], ["pattern"]);
+  for (const outcome of outcomes) {
+    assert.equal(outcome.organizationId, SUBJECT.organizationId);
+    assert.equal(outcome.candidateId, SUBJECT.candidateId);
+  }
+});
+
+test("an unattributable quarantine is refused where the caller is, not at the write", () => {
+  assert.throws(
+    () => quarantineForInjection({ organizationId: SUBJECT.organizationId, candidateId: "  " }, ["a"], ["p"]),
+    /non-empty candidateId/
+  );
+  assert.throws(
+    () => quarantineForInjection({ organizationId: "not-a-uuid", candidateId: "c" }, ["a"], ["p"]),
+    /UUID organizationId/
   );
 });

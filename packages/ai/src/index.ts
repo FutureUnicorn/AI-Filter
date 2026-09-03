@@ -1622,13 +1622,25 @@ export function scanForPromptInjection(text: string): PromptInjectionScanResult 
  * whose text happened to contain the pattern.
  */
 export function quarantineForInjection(
+  subject: EvidenceSubject,
   criterionIds: readonly string[],
   matchedPatterns: readonly string[]
 ): EvidenceOutcome[] {
+  // Same reason mapRubricToEvidence, outcomesForSchemaValidationFailure and
+  // killSwitchRetryOutcome take a subject: every EvidenceOutcome kind carries
+  // organizationId and candidateId, so an outcome without them is not
+  // persistable. It matters most here. A quarantine is the outcome an operator
+  // has to act on, and one that cannot say which organization and candidate
+  // the adversarial document belongs to is not actionable -- it would fail at
+  // the write, after the detection that produced it had already been thrown
+  // away.
+  assertPersistableSubject(subject, "quarantineForInjection");
   const reason = `Prompt-injection indicator detected: ${matchedPatterns.join(", ")}`;
   return criterionIds.map((criterionId) => ({
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "quarantined",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
     criterionId,
     quarantineClass: "malicious",
     reason,
