@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
+import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES, ROLE_STATUSES } from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
   AuditEvent,
@@ -21,6 +21,7 @@ import type {
   ProcessingEvidence,
   QuarantinedEvidence,
   RetryingEvidence,
+  Role,
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
@@ -613,3 +614,30 @@ export const evidenceExtractionRunSchema = z.strictObject({
   rubricVersion: z.string().min(1),
   createdAt: z.iso.datetime()
 }) satisfies z.ZodType<EvidenceExtractionRun>;
+
+// ---- AF-23: role creation ----
+
+export const roleSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  roleId: z.uuid(),
+  organizationId: z.uuid(),
+  title: z.string().min(1),
+  status: z.enum(ROLE_STATUSES),
+  createdByUserId: z.uuid(),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Role>;
+
+/**
+ * organizationId is required in the body, not inferred from the caller's
+ * only membership: a caller can belong to more than one organization
+ * (AF-15 puts no limit on memberships-per-user), so the request must say
+ * which one it means. The route authorizes it server-side against the
+ * caller's own memberships (authorizeResourceAccess) -- this schema only
+ * shapes the input, it grants nothing.
+ */
+export const createRoleInputSchema = z.strictObject({
+  organizationId: z.uuid(),
+  title: z.string().trim().min(1).max(200)
+});
+
+export type CreateRoleInput = z.infer<typeof createRoleInputSchema>;

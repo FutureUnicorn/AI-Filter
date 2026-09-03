@@ -391,14 +391,16 @@ export type Capability =
   | "review_candidates"
   | "record_decision"
   | "view_audit_reports"
-  | "access_admin_settings";
+  | "access_admin_settings"
+  | "manage_roles";
 
 export const CAPABILITIES: readonly Capability[] = [
   "approve_rubric",
   "review_candidates",
   "record_decision",
   "view_audit_reports",
-  "access_admin_settings"
+  "access_admin_settings",
+  "manage_roles"
 ] as const;
 
 /**
@@ -409,9 +411,9 @@ export const CAPABILITIES: readonly Capability[] = [
  * future capabilities will belong to owner only.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<MembershipRole, readonly Capability[]>> = {
-  owner: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings"],
-  admin: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings"],
-  recruiter: ["review_candidates", "record_decision"],
+  owner: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings", "manage_roles"],
+  admin: ["approve_rubric", "review_candidates", "record_decision", "view_audit_reports", "access_admin_settings", "manage_roles"],
+  recruiter: ["review_candidates", "record_decision", "manage_roles"],
   auditor: ["view_audit_reports"]
 };
 
@@ -630,4 +632,28 @@ export function checkInferenceKillSwitch(status: InferenceKillSwitchStatus): Inf
     allowed: false,
     reason: status.reason ?? "Inference is currently halted by an operator kill switch."
   };
+}
+
+// ---- AF-23: role creation ----
+//
+// "Role" here is a hiring role (a job), not to be confused with
+// MembershipRole (owner/admin/recruiter/auditor) above -- two different
+// concepts that happen to share the English word. A role starts in
+// draft (no rubric yet, nothing can be imported against it) and only
+// ever reaches active once EPIC 3's later tickets (rubric approval,
+// AF-27) let it. closed is terminal: a closed role's rubric can no
+// longer accept new imports, matching the immutability invariant
+// AF-27 will enforce on published rubric versions.
+
+export type RoleStatus = "draft" | "active" | "closed";
+
+export const ROLE_STATUSES: readonly RoleStatus[] = ["draft", "active", "closed"] as const;
+
+export interface Role extends VersionedRecord {
+  readonly roleId: string;
+  readonly organizationId: string;
+  readonly title: string;
+  readonly status: RoleStatus;
+  readonly createdByUserId: string;
+  readonly createdAt: string;
 }
