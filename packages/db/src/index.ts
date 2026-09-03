@@ -753,6 +753,49 @@ export async function getMembershipsForUser(
  * fixtures only; callers in a hosted environment have no reason to
  * invoke it.
  */
+/**
+ * Provision a throwaway schema with only the migrations the magic-link
+ * routes touch, and return its name.
+ *
+ * Lives here rather than in the test because `pg` is a packages/db
+ * dependency and tests do not import it directly (the same reason
+ * seedOrganizationMembership is here). It exists because
+ * tests/integration/magic-link-route.test.ts previously pointed
+ * DATABASE_SCHEMA at `public` and assumed it was already migrated: true on a
+ * workstation after `pnpm dev:infra`, false in the Integration CI job, which
+ * starts a bare postgres service with no migrations applied. All three route
+ * tests passed locally and failed in CI.
+ */
+export async function provisionRouteProbeSchema(databaseUrl: string): Promise<string> {
+  const schema = `route_probe_${randomBytes(4).toString("hex")}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    for (const file of ["0002_organizations_users_memberships.sql", "0003_magic_link_tokens.sql"]) {
+      await admin.query(`SET search_path TO "${schema}"`);
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+  return schema;
+}
+
+/** Best-effort teardown for provisionRouteProbeSchema; each run is unique. */
+export async function dropProbeSchema(databaseUrl: string, schema: string): Promise<void> {
+  assertSafeSchema(schema);
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+  } catch {
+    // Best-effort: the next run uses a different suffix.
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
 export async function seedOrganizationMembership(
   databaseUrl: string,
   schema: string,

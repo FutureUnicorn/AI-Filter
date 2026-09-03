@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import moduleHooks from "node:module";
 import test from "node:test";
 
-import { seedOrganizationMembership } from "../../packages/db/src/index.ts";
+import {
+  dropProbeSchema,
+  provisionRouteProbeSchema,
+  seedOrganizationMembership
+} from "../../packages/db/src/index.ts";
 import { SESSION_COOKIE_NAME, verifySessionToken } from "../../packages/security/src/index.ts";
 
 /**
@@ -48,12 +52,12 @@ function requireDatabase(): string {
  * available without changing their signatures. Set to `test`, which
  * selects the console sender -- the same path a developer runs locally.
  */
-function applyRouteEnvironment(databaseUrl: string): void {
+function applyRouteEnvironment(databaseUrl: string, routeSchema: string): void {
   Object.assign(process.env, {
     APP_ENV: "test",
     DEPLOYMENT_COMMIT_SHA: "0000000",
     DATABASE_URL: databaseUrl,
-    DATABASE_SCHEMA: "public",
+    DATABASE_SCHEMA: routeSchema,
     STORAGE_ENDPOINT: "http://localhost:9000",
     STORAGE_REGION: "us-east-1",
     STORAGE_BUCKET: "signal-audit-test",
@@ -87,8 +91,8 @@ async function captureStderr(action: () => Promise<void>): Promise<string> {
   return chunks.join("");
 }
 
-async function seedRecruiter(databaseUrl: string, email: string): Promise<void> {
-  await seedOrganizationMembership(databaseUrl, "public", {
+async function seedRecruiter(databaseUrl: string, schema: string, email: string): Promise<void> {
+  await seedOrganizationMembership(databaseUrl, schema, {
     organizationId: ORGANIZATION_ID,
     organizationName: "Route Test Org",
     email,
@@ -177,96 +181,111 @@ test("a magic link produced by the request route can actually be redeemed by the
   const databaseUrl = requireDatabase();
   // Unique per run so repeated runs never collide on the users table.
   const email = `route-test-${Date.now()}@acme.test`;
-  applyRouteEnvironment(databaseUrl);
-  await seedRecruiter(databaseUrl, email);
+  const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    applyRouteEnvironment(databaseUrl, routeSchema);
+    await seedRecruiter(databaseUrl, routeSchema, email);
 
-  const requestRoute = await loadRoute(REQUEST_ROUTE);
-  const redeemRoute = await loadRoute(REDEEM_ROUTE);
+    const requestRoute = await loadRoute(REQUEST_ROUTE);
+    const redeemRoute = await loadRoute(REDEEM_ROUTE);
 
-  let requestStatus = 0;
-  const emitted = await captureStderr(async () => {
-    const response = await requestRoute.POST(
-      jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email }, "request-key-1")
+    let requestStatus = 0;
+    const emitted = await captureStderr(async () => {
+      const response = await requestRoute.POST(
+        jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email }, "request-key-1")
+      );
+      requestStatus = response.status;
+    });
+    assert.equal(requestStatus, 202, "requesting a link for a real member must be accepted");
+
+    // The credential must be obtainable. Before this round the same
+    // assertion failed: stderr carried only `token=[REDACTED]`.
+    const token = /[?&]token=([^\s&]+)/u.exec(emitted)?.[1];
+    assert.ok(
+      token !== undefined && token !== "[REDACTED]",
+      `a usable token must be obtainable from the local delivery channel, got: ${JSON.stringify(emitted)}`
     );
-    requestStatus = response.status;
-  });
-  assert.equal(requestStatus, 202, "requesting a link for a real member must be accepted");
 
-  // The credential must be obtainable. Before this round the same
-  // assertion failed: stderr carried only `token=[REDACTED]`.
-  const token = /[?&]token=([^\s&]+)/u.exec(emitted)?.[1];
-  assert.ok(
-    token !== undefined && token !== "[REDACTED]",
-    `a usable token must be obtainable from the local delivery channel, got: ${JSON.stringify(emitted)}`
-  );
+    const redeemResponse = await redeemRoute.POST(
+      jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-1")
+    );
+    assert.equal(redeemResponse.status, 200, await redeemResponse.clone().text());
 
-  const redeemResponse = await redeemRoute.POST(
-    jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-1")
-  );
-  assert.equal(redeemResponse.status, 200, await redeemResponse.clone().text());
+    const body = (await redeemResponse.json()) as { email: string; userId: string };
+    assert.equal(body.email, email);
 
-  const body = (await redeemResponse.json()) as { email: string; userId: string };
-  assert.equal(body.email, email);
-
-  // A session cookie that actually verifies is the point of the round
-  // trip: it is the prerequisite the role-creation API sits behind.
-  const cookie = redeemResponse.headers.get("set-cookie");
-  assert.ok(cookie !== null && cookie.includes(SESSION_COOKIE_NAME), "redemption must set a session cookie");
-  const sessionToken = new RegExp(`${SESSION_COOKIE_NAME}=([^;]+)`, "u").exec(cookie)?.[1];
-  assert.ok(sessionToken !== undefined, "the session cookie must carry a token");
-  const verification = verifySessionToken(decodeURIComponent(sessionToken), SESSION_SECRET);
-  assert.equal(verification.outcome, "valid");
-  assert.equal(verification.outcome === "valid" ? verification.userId : undefined, body.userId);
+    // A session cookie that actually verifies is the point of the round
+    // trip: it is the prerequisite the role-creation API sits behind.
+    const cookie = redeemResponse.headers.get("set-cookie");
+    assert.ok(cookie !== null && cookie.includes(SESSION_COOKIE_NAME), "redemption must set a session cookie");
+    const sessionToken = new RegExp(`${SESSION_COOKIE_NAME}=([^;]+)`, "u").exec(cookie)?.[1];
+    assert.ok(sessionToken !== undefined, "the session cookie must carry a token");
+    const verification = verifySessionToken(decodeURIComponent(sessionToken), SESSION_SECRET);
+    assert.equal(verification.outcome, "valid");
+    assert.equal(verification.outcome === "valid" ? verification.userId : undefined, body.userId);
+  } finally {
+    await dropProbeSchema(databaseUrl, routeSchema);
+  }
 });
 
 test("a redeemed magic link cannot be redeemed twice through the route", async () => {
   const databaseUrl = requireDatabase();
   const email = `route-test-single-use-${Date.now()}@acme.test`;
-  applyRouteEnvironment(databaseUrl);
-  await seedRecruiter(databaseUrl, email);
+  const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    applyRouteEnvironment(databaseUrl, routeSchema);
+    await seedRecruiter(databaseUrl, routeSchema, email);
 
-  const requestRoute = await loadRoute(REQUEST_ROUTE);
-  const redeemRoute = await loadRoute(REDEEM_ROUTE);
+    const requestRoute = await loadRoute(REQUEST_ROUTE);
+    const redeemRoute = await loadRoute(REDEEM_ROUTE);
 
-  const emitted = await captureStderr(async () => {
-    await requestRoute.POST(
-      jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email }, "request-key-2")
+    const emitted = await captureStderr(async () => {
+      await requestRoute.POST(
+        jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email }, "request-key-2")
+      );
+    });
+    const token = /[?&]token=([^\s&]+)/u.exec(emitted)?.[1];
+    assert.ok(token !== undefined && token !== "[REDACTED]");
+
+    const first = await redeemRoute.POST(
+      jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-2a")
     );
-  });
-  const token = /[?&]token=([^\s&]+)/u.exec(emitted)?.[1];
-  assert.ok(token !== undefined && token !== "[REDACTED]");
+    assert.equal(first.status, 200);
 
-  const first = await redeemRoute.POST(
-    jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-2a")
-  );
-  assert.equal(first.status, 200);
-
-  const second = await redeemRoute.POST(
-    jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-2b")
-  );
-  assert.equal(second.status, 401, "a single-use token must not be redeemable twice");
+    const second = await redeemRoute.POST(
+      jsonRequest("http://localhost:3000/api/auth/magic-link/redeem", { token }, "redeem-key-2b")
+    );
+    assert.equal(second.status, 401, "a single-use token must not be redeemable twice");
+  } finally {
+    await dropProbeSchema(databaseUrl, routeSchema);
+  }
 });
 
 test("requesting a link for an unknown email still returns 202 and mints nothing", async () => {
   const databaseUrl = requireDatabase();
-  applyRouteEnvironment(databaseUrl);
+  const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    applyRouteEnvironment(databaseUrl, routeSchema);
 
-  const requestRoute = await loadRoute(REQUEST_ROUTE);
+    const requestRoute = await loadRoute(REQUEST_ROUTE);
 
-  let status = 0;
-  const emitted = await captureStderr(async () => {
-    const response = await requestRoute.POST(
-      jsonRequest(
-        "http://localhost:3000/api/auth/magic-link/request",
-        { email: `nobody-${Date.now()}@acme.test` },
-        "request-key-3"
-      )
-    );
-    status = response.status;
-  });
+    let status = 0;
+    const emitted = await captureStderr(async () => {
+      const response = await requestRoute.POST(
+        jsonRequest(
+          "http://localhost:3000/api/auth/magic-link/request",
+          { email: `nobody-${Date.now()}@acme.test` },
+          "request-key-3"
+        )
+      );
+      status = response.status;
+    });
 
-  // Same response as the success path, so the endpoint is not an
-  // account-existence oracle -- but no credential is created either.
-  assert.equal(status, 202);
-  assert.equal(/[?&]token=/u.test(emitted), false, "no link may be emitted for an email with no membership");
+    // Same response as the success path, so the endpoint is not an
+    // account-existence oracle -- but no credential is created either.
+    assert.equal(status, 202);
+    assert.equal(/[?&]token=/u.test(emitted), false, "no link may be emitted for an email with no membership");
+  } finally {
+    await dropProbeSchema(databaseUrl, routeSchema);
+  }
 });

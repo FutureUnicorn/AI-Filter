@@ -99,26 +99,44 @@ test("one pnpm lockfile is authoritative", () => {
 // was caused by exactly one list being narrower than the other's intent.
 // This asserts they stay identical, so adding a hosted environment to one
 // without the other fails here rather than in a preview deployment.
-test("the local-console environment lists in config and security are identical", async () => {
-  const [config, security] = await Promise.all([
-    import("../../packages/config/src/index.ts"),
-    import("../../packages/security/src/index.ts")
-  ]);
-  const fromConfig = [...config.LOCAL_CONSOLE_ENVIRONMENTS].sort();
-  // security keeps a Set privately; isHostedEnvironment is the observable
-  // contract, so derive the list through it across every real environment.
-  const fromSecurity = config.APP_ENVIRONMENTS.filter(
-    (appEnv) => !security.isHostedEnvironment(appEnv)
-  ).sort();
+test("the local-console environment lists in config and security are identical", () => {
+  // Read as source text rather than imported. This suite runs in the
+  // Architecture CI job, which installs dependencies and runs
+  // test:architecture with no build step, so packages/security's own
+  // `@signal-audit/contracts` import resolves to a dist/ that does not
+  // exist there -- a runtime import() failed with ERR_MODULE_NOT_FOUND in
+  // CI while passing locally, where an earlier build had left dist/ behind.
+  // An architecture test asserting a source-level invariant should not
+  // depend on compiled output to do it.
+  const read = (relative: string): string => fs.readFileSync(path.join(repositoryRoot, relative), "utf8");
+  const listFrom = (source: string, declaration: RegExp): string[] => {
+    const match = source.match(declaration);
+    assert.ok(match, `could not find ${declaration} -- the declaration moved, so this guard is no longer checking anything`);
+    const captured = match[1] ?? "";
+    return [...captured.matchAll(/"([a-z]+)"/gu)]
+      .map((entry) => entry[1])
+      .filter((name): name is string => name !== undefined)
+      .sort();
+  };
+
+  const fromConfig = listFrom(
+    read("packages/config/src/index.ts"),
+    /LOCAL_CONSOLE_ENVIRONMENTS: readonly AppEnvironment\[\] = \[([^\]]*)\]/u
+  );
+  const fromSecurity = listFrom(
+    read("packages/security/src/index.ts"),
+    /LOCAL_CONSOLE_ENVIRONMENTS: ReadonlySet<string> = new Set\(\[([^\]]*)\]/u
+  );
+
   assert.deepEqual(
     fromSecurity,
     fromConfig,
     "packages/security's console-allowed environments must match packages/config's LOCAL_CONSOLE_ENVIRONMENTS"
   );
-  // And pin the intent itself, so widening both at once still gets noticed.
+  // Pin the intent itself, so widening both at once still gets noticed.
+  // preview is hosted: it is a per-PR deployment, not a developer terminal.
   assert.deepEqual(fromConfig, ["development", "test"]);
-  for (const appEnv of ["preview", "staging", "production"] as const) {
-    assert.equal(config.isHostedEnvironment(appEnv), true, `${appEnv} must be hosted`);
-    assert.equal(security.isHostedEnvironment(appEnv), true, `${appEnv} must be hosted`);
+  for (const appEnv of ["preview", "staging", "production"]) {
+    assert.equal(fromConfig.includes(appEnv), false, `${appEnv} must be hosted, not console-allowed`);
   }
 });
