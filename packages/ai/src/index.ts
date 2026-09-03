@@ -1557,3 +1557,110 @@ export function checkGoldSetThresholds(score: GoldSetScore, thresholds: GoldSetT
   }
   return failures.length === 0 ? { passed: true } : { passed: false, failures };
 }
+
+// ---- AF-44: resume prompt-injection detection ----
+//
+// Resumes are untrusted input (SYSTEM_POLICY in scripts/extract_evidence.py
+// already says this). "Confirm the model never follows embedded
+// instructions" needs a live model call to verify -- that is the
+// provider-cost-incurring eval path AF-43 explicitly does not build,
+// not something a regex scan can prove. What this file provides
+// instead, and what "the pipeline quarantines/flags them" actually
+// asks for: a deterministic, regression-tested pre-filter that catches
+// known instruction-injection phrasings before or alongside a model
+// call, and a function turning a detection into the quarantine outcome
+// the ticket names. This is a heuristic first layer, not a claim of
+// completeness -- no regex list catches every possible phrasing, and
+// the regression suite (tests/) exists specifically so new bypasses
+// found later get added here as new cases, not just fixed once.
+
+/**
+ * `you are now (a|an)` and bare `system prompt` were originally
+ * unqualified, unlike every other entry here -- both matched ordinary
+ * resume language with no instructional intent at all ("Designed system
+ * prompts and evaluation tooling", "You are now a much stronger
+ * communicator"), which a real LLM/prompt-engineering candidate's resume
+ * would trigger on sight. Both are narrowed to the actual attack shape:
+ * a role-hijack addressed at an assistant/model/bot, or an instructional
+ * verb (ignore/disregard/override/bypass/forget) acting on the system
+ * prompt specifically. The bracket-marker and "reveal ... system prompt"
+ * patterns below already cover the other real system-prompt attack
+ * shapes, so this one only needs to add the "override it" shape they
+ * don't.
+ */
+/**
+ * Every separator between words is `\s+`, never a literal space, and the
+ * `.`/`[\w\s]` spans carry the `s` flag so they cross newlines.
+ *
+ * Review (#27) found the reason: with literal spaces, ordinary document
+ * whitespace defeated the patterns. A resume that wrapped the very first
+ * regression case across two lines --
+ *
+ *     IGNORE ALL PREVIOUS
+ *     INSTRUCTIONS
+ *
+ * -- did not match the ignore-clause at all, and neither did a CRLF wrap,
+ * a tab, or a double space, all of which a real document produces without
+ * anyone attacking anything. That is a pre-model guard bypassed by a line
+ * break, and the same construction was in the Python port, so the text
+ * reached the provider on both paths.
+ */
+const INJECTION_PATTERNS: readonly RegExp[] = [
+  /ignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?/isu,
+  /disregard\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+instructions?/isu,
+  /you\s+are\s+now\s+(a|an)\s+[\w\s]{0,30}(assistant|ai\b|model|chatbot|bot|agent)\b/isu,
+  /new\s+instructions?\s*:/isu,
+  /(ignore|disregard|override|bypass|forget)[\w\s]{0,40}system\s+prompt/isu,
+  /reveal\s+(your\s+|the\s+)?(system\s+prompt|instructions)/isu,
+  /act\s+as\s+(a|an)\b.{0,40}(instead|from\s+now)/isu,
+  /do\s+not\s+(follow|apply|use)\s+(the\s+)?(rubric|criteria|scoring)/isu,
+  /overrid(e|ing)\s+(the\s+)?(evaluation|scoring|rubric)/isu,
+  /mark\s+(this|me)\s+as\s+(qualified|supported|approved|hired|a\s+match)/isu,
+  /\[\s*system\s*\]/iu,
+  /<\|im_start\|>/iu
+];
+
+export interface PromptInjectionScanResult {
+  readonly detected: boolean;
+  readonly matchedPatterns: readonly string[];
+}
+
+export function scanForPromptInjection(text: string): PromptInjectionScanResult {
+  const matchedPatterns = INJECTION_PATTERNS.filter((pattern) => pattern.test(text)).map(
+    (pattern) => pattern.source
+  );
+  return { detected: matchedPatterns.length > 0, matchedPatterns };
+}
+
+/**
+ * A detected injection quarantines every criterion for the document,
+ * not just one: if the source material itself is adversarial, every
+ * extraction attempt against it is suspect, not only the criterion
+ * whose text happened to contain the pattern.
+ */
+export function quarantineForInjection(
+  subject: EvidenceSubject,
+  criterionIds: readonly string[],
+  matchedPatterns: readonly string[]
+): EvidenceOutcome[] {
+  // Same reason mapRubricToEvidence, outcomesForSchemaValidationFailure and
+  // killSwitchRetryOutcome take a subject: every EvidenceOutcome kind carries
+  // organizationId and candidateId, so an outcome without them is not
+  // persistable. It matters most here. A quarantine is the outcome an operator
+  // has to act on, and one that cannot say which organization and candidate
+  // the adversarial document belongs to is not actionable -- it would fail at
+  // the write, after the detection that produced it had already been thrown
+  // away.
+  assertPersistableSubject(subject, "quarantineForInjection");
+  const reason = `Prompt-injection indicator detected: ${matchedPatterns.join(", ")}`;
+  return criterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "quarantined",
+    organizationId: subject.organizationId,
+    candidateId: subject.candidateId,
+    criterionId,
+    quarantineClass: "malicious",
+    reason,
+    operatorActionRequired: true
+  }));
+}
