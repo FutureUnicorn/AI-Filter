@@ -73,3 +73,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Known limitation | `publishRubric` sets `approved_at`/`updated_at` with `CURRENT_TIMESTAMP`, which is transaction-start time rather than statement time. Five `CURRENT_TIMESTAMP` uses remain in `packages/db`, two of them pre-existing on the baseline from AF-25's rubric edit path, against seven `clock_timestamp()` uses. Reviewer feedback on AF-20 established `clock_timestamp()` as the convention for `occurred_at` on audit rows, where ordering is load-bearing. Not changed here: it is a pre-existing baseline inconsistency across several call sites, not something AF-27 introduced, and silently rewriting five timestamp semantics mid-replay is a behaviour change outside this delta. Flagged for a follow-up decision. |
 | Product check | Approval records a named approver and freezes the version. No score, rank, or automatic decision. |
 
+### PR #37 — AF-28 secure direct file upload
+
+| | |
+|---|---|
+| Original base | `feature/AF-27-rubric-approval-and-publishing` |
+| Original head | `feature/AF-28-secure-file-upload` |
+| Commits in range | 4: `1d01384` (AF-28), `22536a3` + `cb5ebcc` (stale carry-forwards), `cbf85b2` (`fix(AF-28): constrain file_intakes to its own tenant's roles`) |
+| Replayed | **`1d01384` and `cbf85b2`.** Unlike #35 and #36 this range contains a second genuine AF-28 commit, and it is the one that addresses plan section 16: `file_intakes` referencing `organization_id` and `role_id` independently with no guarantee the role belongs to that organization. Dropping it would have reintroduced the exact integrity hole the plan calls out. |
+| Plan section 16 outcome | Preserved as a real database-level guarantee, not application-level filtering: `roles` gains `UNIQUE (role_id, organization_id)` and `file_intakes` gains `FOREIGN KEY (role_id, organization_id) REFERENCES roles (role_id, organization_id)`. A cross-tenant row is now unrepresentable. Covered by `tests/integration/file-intake-tenant-integrity.test.ts`, which the same commit added. |
+| Conflicts | `package.json` (registry) and `packages/db/src/index.ts` (2 hunks). |
+| Resolution | Registry: union, integration 28 + 1 = 29, `typecheck:tests` asserted intact. `packages/db`: both hunk boundaries fell **inside function bodies**, so a keep-both concatenation would have produced a file that does not parse (the failure mode hit earlier in this repo's history). Took HEAD for both hunks, preserving the AF-28 feature additions plus the probes already on the branch, then appended `cbf85b2`'s single self-contained `assertFileIntakeTenantIntegrity` extracted whole from the commit. Verified afterwards: no markers, and each `assert*` probe declared exactly once. |
+| Migration changes | **`0012_file_intakes.sql` renumbered to `0013_`** (`0012_` taken by AF-27's trigger). Two live references existed and were updated: `packages/db/src/index.ts` (the probe's migration loader, which reads the file by name) and the error message in `file-intake-tenant-integrity.test.ts`. Renaming alone would have left the probe reading a dead path. |
+| Dependency | `packages/ingestion` gains `@aws-sdk/s3-request-presigner@3.1115.0`; lockfile updated and `--frozen-lockfile` install succeeds. |
+| Tests executed | 15 migrations replayed from an empty database, **then replayed a second time over the migrated database** because the new FK is added through a conditional `DO` block rather than `ADD CONSTRAINT IF NOT EXISTS`; both passes clean. Full `pnpm check`. |
+| Result | exit 0 — 51 unit, 311 integration, 17 architecture, 27 Python, zero failures. |
+| Product check | Presigned direct upload plus intake rows. No score, rank, or automatic decision. |
+

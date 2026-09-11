@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { BoundaryContract } from "@signal-audit/contracts";
 import type { DomainPort } from "@signal-audit/domain";
 
@@ -77,6 +78,37 @@ export async function verifySyntheticStorageRoundTrip(
     await client
       .send(new DeleteObjectCommand({ Bucket: options.bucket, Key: key }))
       .catch(() => undefined);
+    client.destroy();
+  }
+}
+
+// ---- AF-28: secure direct file upload ----
+//
+// The browser PUTs straight to this URL; the file never passes through
+// the web process (Next.js route handlers never see the file bytes, only
+// the metadata needed to mint the URL). "One-use" is enforced at the
+// application layer, not the storage protocol: a presigned URL is valid
+// for anyone holding it until it expires, so the short TTL plus
+// packages/db's file_intakes row (started 'pending', transitioned to
+// 'uploaded' exactly once by a WHERE status = 'pending' update) are what
+// make a completed upload non-replayable, not the URL itself.
+
+const UPLOAD_URL_TTL_SECONDS = 15 * 60;
+
+export async function createPresignedUploadUrl(
+  options: StorageConnectionOptions,
+  key: string,
+  contentType: string,
+  expiresInSeconds: number = UPLOAD_URL_TTL_SECONDS
+): Promise<string> {
+  const client = storageClient(options);
+  try {
+    return await getSignedUrl(
+      client,
+      new PutObjectCommand({ Bucket: options.bucket, Key: key, ContentType: contentType }),
+      { expiresIn: expiresInSeconds }
+    );
+  } finally {
     client.destroy();
   }
 }
