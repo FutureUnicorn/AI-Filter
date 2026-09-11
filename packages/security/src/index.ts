@@ -358,6 +358,11 @@ const REDACTED = "[REDACTED]";
  */
 export const LOG_EVENT_NAMES = [
   "log.rejected_message",
+  // Delivery failed after the token row was already written. Emitted by the
+  // magic-link request route, which deliberately still answers 202 so that a
+  // provider outage cannot be used as an account-existence oracle; this event
+  // is how an operator sees the failure the caller is not told about.
+  "magic_link.delivery_failed",
   "magic_link.queued",
   "web.environment_health_failed",
   "worker.environment_health_failed",

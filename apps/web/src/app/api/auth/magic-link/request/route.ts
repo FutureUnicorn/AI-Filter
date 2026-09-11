@@ -8,7 +8,7 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { createMagicLinkToken, getMembershipsForUser, getUserByEmail } from "@signal-audit/db";
-import { createMagicLinkEmailSender, generateMagicLinkToken } from "@signal-audit/security";
+import { createMagicLinkEmailSender, generateMagicLinkToken, logStructured } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -71,9 +71,30 @@ export async function POST(request: NextRequest): Promise<Response> {
         appEnv: config.appEnv,
         delivery: config.magicLinkEmail
       });
-      await emailSender.sendMagicLink({ email, link });
+      // Delivery failure must not become an account-existence oracle.
+      //
+      // Only this branch sends mail, so letting a provider exception reach
+      // the outer catch made the public response differ by whether the
+      // address had an account: an unknown address got 202, a known address
+      // whose send failed got 500. An attacker needs no access to the
+      // provider for that to leak -- any outage turns the endpoint into a
+      // membership check.
+      //
+      // So the send is contained here and the public boundary stays 202
+      // either way. The failure is not swallowed: it is logged for
+      // operators, and it is worth noting the token row has already been
+      // written, so the link is dead until the user asks again. Structured,
+      // event-name-only logging keeps the address and the bearer token out
+      // of the retained log stream (AF-21).
+      try {
+        await emailSender.sendMagicLink({ email, link });
+      } catch (deliveryError) {
+        logStructured("error", "magic_link.delivery_failed");
+        console.error("magic-link delivery failed", deliveryError);
+      }
     }
-    // Same response regardless of the branch above.
+    // Same response regardless of the branch above, including when delivery
+    // above failed. Indistinguishable by design.
     return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
   } catch (error) {
     console.error("magic-link request failed", error);

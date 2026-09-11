@@ -151,6 +151,10 @@ interface RouteModule {
   POST(request: Request): Promise<Response>;
 }
 
+interface GetRouteModule {
+  GET(request: Request): Promise<Response>;
+}
+
 /**
  * Loaded through a runtime-built specifier rather than a static import.
  *
@@ -174,8 +178,18 @@ async function loadRoute(relativePath: string): Promise<RouteModule> {
   return (await import(specifier)) as RouteModule;
 }
 
+async function loadGetRoute(relativePath: string): Promise<GetRouteModule> {
+  if (!resolutionRegistered) {
+    registerExtensionlessTsResolution();
+    resolutionRegistered = true;
+  }
+  const specifier = new URL(relativePath, import.meta.url).href;
+  return (await import(specifier)) as GetRouteModule;
+}
+
 const REQUEST_ROUTE = "../../apps/web/src/app/api/auth/magic-link/request/route.ts";
 const REDEEM_ROUTE = "../../apps/web/src/app/api/auth/magic-link/redeem/route.ts";
+const EMAIL_LINK_ROUTE = "../../apps/web/src/app/auth/redeem/route.ts";
 
 test("a magic link produced by the request route can actually be redeemed by the redeem route", async () => {
   const databaseUrl = requireDatabase();
@@ -286,6 +300,124 @@ test("requesting a link for an unknown email still returns 202 and mints nothing
     assert.equal(status, 202);
     assert.equal(/[?&]token=/u.test(emitted), false, "no link may be emitted for an email with no membership");
   } finally {
+    await dropProbeSchema(databaseUrl, routeSchema);
+  }
+});
+
+// ---- PR #82 review, blocking issue 1 ----
+//
+// The request route emails `/auth/redeem?token=...`, but the only redemption
+// implementation was `POST /api/auth/magic-link/redeem`. Nothing served the
+// emailed path, so a real recipient clicking a real link got a 404 -- while
+// the round-trip test above passed, because it extracted the token itself and
+// called the API handler directly. That is the exact gap this test closes: it
+// drives the URL the user actually receives, verbatim, with no rewriting.
+test("the URL delivered in the email is itself redeemable, not just the API handler", async () => {
+  const databaseUrl = requireDatabase();
+  const email = `email-link-${Date.now()}@acme.test`;
+  const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    applyRouteEnvironment(databaseUrl, routeSchema);
+    await seedRecruiter(databaseUrl, routeSchema, email);
+
+    const requestRoute = await loadRoute(REQUEST_ROUTE);
+    const emitted = await captureStderr(async () => {
+      const response = await requestRoute.POST(
+        jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email }, "email-link-key-1")
+      );
+      assert.equal(response.status, 202);
+    });
+
+    // Take the whole URL, not the token: the point is that what was
+    // delivered resolves, so reassembling a different URL here would
+    // reintroduce the blind spot.
+    const deliveredLink = /(http:\/\/\S*\/auth\/redeem\?token=[^\s&]+)/u.exec(emitted)?.[1];
+    assert.ok(
+      deliveredLink !== undefined,
+      `the delivery channel must carry a complete redeem URL, got: ${JSON.stringify(emitted)}`
+    );
+    assert.ok(!deliveredLink.includes("[REDACTED]"), "the delivered URL must carry a usable token");
+
+    const emailLinkRoute = await loadGetRoute(EMAIL_LINK_ROUTE);
+    const response = await emailLinkRoute.GET(new Request(deliveredLink, { method: "GET" }));
+
+    // A redirect, not a 404: the defect was that this path had no handler.
+    assert.ok(
+      response.status >= 300 && response.status < 400,
+      `the delivered URL must redirect, got ${response.status}`
+    );
+    const location = response.headers.get("location");
+    assert.ok(location !== null && !location.includes("token="), "the consumed token must not survive in the redirect");
+
+    const cookie = response.headers.get("set-cookie");
+    assert.ok(
+      cookie !== null && cookie.includes(SESSION_COOKIE_NAME),
+      "following the emailed link must establish a session"
+    );
+    const sessionToken = new RegExp(`${SESSION_COOKIE_NAME}=([^;]+)`, "u").exec(cookie)?.[1];
+    assert.ok(sessionToken !== undefined);
+    const verification = verifySessionToken(decodeURIComponent(sessionToken), SESSION_SECRET);
+    assert.equal(verification.outcome, "valid", "the session minted from the emailed link must verify");
+
+    // Single use is what makes a GET entry point defensible; prove it holds
+    // through this path too rather than assuming the SQL covers it.
+    const second = await emailLinkRoute.GET(new Request(deliveredLink, { method: "GET" }));
+    assert.equal(second.headers.get("set-cookie"), null, "a consumed link must not mint a second session");
+  } finally {
+    await dropProbeSchema(databaseUrl, routeSchema);
+  }
+});
+
+// ---- PR #82 review, blocking issue 2 ----
+//
+// Only the known-account branch sends mail, so a provider exception used to
+// reach the outer catch and return 500, while an unknown address returned 202
+// without attempting a send. Any provider outage therefore turned the
+// endpoint into an account-existence oracle, with no attacker access to the
+// provider required. The public response must be identical either way.
+test("a delivery failure for a known account is indistinguishable from an unknown account", async () => {
+  const databaseUrl = requireDatabase();
+  const knownEmail = `oracle-known-${Date.now()}@acme.test`;
+  const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    applyRouteEnvironment(databaseUrl, routeSchema);
+    await seedRecruiter(databaseUrl, routeSchema, knownEmail);
+
+    // A hosted environment with delivery pointed at a closed port: the HTTP
+    // sender's fetch rejects, which is a real provider failure rather than a
+    // stubbed one, and needs no network access.
+    Object.assign(process.env, {
+      APP_ENV: "staging",
+      MAGIC_LINK_EMAIL_ENDPOINT: "http://127.0.0.1:1/send",
+      MAGIC_LINK_EMAIL_API_KEY: "test-key",
+      MAGIC_LINK_EMAIL_FROM: "no-reply@acme.test"
+    });
+
+    const requestRoute = await loadRoute(REQUEST_ROUTE);
+    const knownResponse = await requestRoute.POST(
+      jsonRequest("http://localhost:3000/api/auth/magic-link/request", { email: knownEmail }, "oracle-key-1")
+    );
+    const unknownResponse = await requestRoute.POST(
+      jsonRequest(
+        "http://localhost:3000/api/auth/magic-link/request",
+        { email: `oracle-unknown-${Date.now()}@acme.test` },
+        "oracle-key-2"
+      )
+    );
+
+    assert.equal(knownResponse.status, 202, "a known account whose delivery failed must still answer 202");
+    assert.equal(unknownResponse.status, unknownResponse.status, "sanity");
+    assert.equal(
+      knownResponse.status,
+      unknownResponse.status,
+      "delivery failure must not make the response differ by whether the account exists"
+    );
+    // Bodies too: a difference there leaks just as much as a status would.
+    assert.equal(await knownResponse.clone().text(), await unknownResponse.clone().text());
+  } finally {
+    delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
+    delete process.env.MAGIC_LINK_EMAIL_API_KEY;
+    delete process.env.MAGIC_LINK_EMAIL_FROM;
     await dropProbeSchema(databaseUrl, routeSchema);
   }
 });
