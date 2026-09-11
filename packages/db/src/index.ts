@@ -1303,6 +1303,47 @@ export async function upsertDraftRubric(
   }
 }
 
+// ---- AF-27: named approval and immutable rubric publishing ----
+
+export type PublishRubricOutcome =
+  | { readonly outcome: "published"; readonly rubric: Rubric }
+  | { readonly outcome: "no_draft" };
+
+/**
+ * The UPDATE's own WHERE status = 'draft' is what makes "approve the
+ * current draft" atomic and race-free -- two concurrent publish calls
+ * can't both succeed, and once the first one wins, migration
+ * 0012_immutable_published_rubrics.sql's trigger makes the resulting row
+ * permanently unreachable to any future UPDATE, this function included.
+ * (That migration was authored as 0011 on the original branch; 0011 was
+ * already taken by the rubrics table itself on the reconstruction
+ * baseline, so it was renumbered and this reference follows it.)
+ */
+export async function publishRubric(
+  databaseUrl: string,
+  schema: string,
+  rubricId: string,
+  approvedByUserId: string
+): Promise<PublishRubricOutcome> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<RubricRow>(
+      `UPDATE "${schema}".rubrics
+          SET status = 'published', approved_by_user_id = $2, approved_at = CURRENT_TIMESTAMP,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE rubric_id = $1 AND status = 'draft'
+        RETURNING ${RUBRIC_COLUMNS}`,
+      [rubricId, approvedByUserId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? { outcome: "no_draft" } : { outcome: "published", rubric: rowToRubric(row) };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-22: exercise memberships RLS with a real non-superuser role ----
 
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
@@ -2152,6 +2193,118 @@ export interface RubricPersistenceObservations {
  * package's dependency and the migrations it applies are its own files;
  * this mirrors assertMembershipsTenantIsolation above.
  */
+export interface PublishedRubricImmutabilityObservations {
+  /** The draft -> published transition itself must be allowed. */
+  readonly publishSucceeded: boolean;
+  /** A second publish of the same row must not find a draft to publish. */
+  readonly republishOutcome: string;
+  /** Raised by migration 0012's trigger on UPDATE of a published row. */
+  readonly updateRejection: string;
+  /** And on DELETE, which a BEFORE UPDATE-only trigger would have missed. */
+  readonly deleteRejection: string;
+  /** A draft belonging to a later version stays mutable. */
+  readonly draftStillMutable: boolean;
+}
+
+/**
+ * AF-27 shipped the published-rubric immutability trigger with no test at
+ * all, which is the failure mode the stacked-PR chain kept producing: a
+ * feature-to-feature PR never ran CI, so an integrity control could ship
+ * unexercised. Immutability is a claim about what the database refuses, so
+ * it has to be proven against a real database rather than inferred from the
+ * DDL.
+ *
+ * Both UPDATE and DELETE are checked deliberately. The trigger is declared
+ * `BEFORE UPDATE OR DELETE`, and a version covering only UPDATE would still
+ * pass a test that checked one of them.
+ */
+export async function assertPublishedRubricImmutability(
+  databaseUrl: string
+): Promise<PublishedRubricImmutabilityObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `publish_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const criterion = (id: string): RubricCriterion => ({
+    criterionId: id,
+    description: `description for ${id}`,
+    evidenceGuidance: `guidance for ${id}`
+  });
+  const five = ["a", "b", "c", "d", "e"].map(criterion);
+
+  const rejectionOf = async (sql: string, params: readonly unknown[]): Promise<string> => {
+    try {
+      await admin.query(sql, [...params]);
+      return "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0011_rubrics.sql",
+      "0012_immutable_published_rubrics.sql"
+    ]) {
+      await admin.query(`SET search_path TO "${schema}"`);
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(
+      `INSERT INTO "${schema}".organizations (organization_id, name) VALUES ($1, 'Publish Probe Org')`,
+      [organizationId]
+    );
+    await admin.query(
+      `INSERT INTO "${schema}".users (user_id, email, display_name) VALUES ($1, 'probe@acme.test', 'Probe')`,
+      [userId]
+    );
+    const role = await createRole(databaseUrl, schema, {
+      organizationId,
+      title: "Backend Engineer",
+      createdByUserId: userId
+    });
+
+    const draft = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    if (draft.outcome !== "saved") {
+      throw new Error("assertPublishedRubricImmutability: expected the draft to save");
+    }
+    const published = await publishRubric(databaseUrl, schema, draft.rubric.rubricId, userId);
+    const publishSucceeded = published.outcome === "published";
+
+    // The row is now published. Everything below must be refused by the
+    // database, not merely by application code.
+    const republish = await publishRubric(databaseUrl, schema, draft.rubric.rubricId, userId);
+    const updateRejection = await rejectionOf(
+      `UPDATE "${schema}".rubrics SET criteria = '[]'::jsonb WHERE rubric_id = $1`,
+      [draft.rubric.rubricId]
+    );
+    const deleteRejection = await rejectionOf(`DELETE FROM "${schema}".rubrics WHERE rubric_id = $1`, [
+      draft.rubric.rubricId
+    ]);
+
+    // Publishing must not freeze the table: a fresh draft is still editable.
+    const nextDraft = await upsertDraftRubric(databaseUrl, schema, role.roleId, five);
+    const draftStillMutable =
+      nextDraft.outcome === "saved" &&
+      (await upsertDraftRubric(databaseUrl, schema, role.roleId, five)).outcome === "saved";
+
+    return {
+      publishSucceeded,
+      republishOutcome: republish.outcome,
+      updateRejection,
+      deleteRejection,
+      draftStillMutable
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
 export async function assertRubricDraftPersistence(
   databaseUrl: string
 ): Promise<RubricPersistenceObservations> {

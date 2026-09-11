@@ -54,3 +54,22 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 51 unit, 309 integration, 17 architecture, 27 Python, zero failures. |
 | Product check | Adds `ProtectedCharacteristicCategory` / `ProtectedCharacteristicFlag`, a fairness guard that flags criteria proxying for protected characteristics. No score, rank, or automatic decision introduced (plan section 23). |
 
+### PR #36 — AF-27 named approval and immutable rubric publishing
+
+| | |
+|---|---|
+| Original base | `feature/AF-26-rubric-criterion-editor` |
+| Original head | `feature/AF-27-rubric-approval-and-publishing` |
+| Commits in range | 3: `b60d37d` (AF-27), `14fc056` (AF-21 redactPii propagation), `83699c3` (AF-43 db fixes) |
+| Replayed | **`b60d37d` only.** Same two stale carry-forwards as #35, excluded for the same verified reason. |
+| Files changed | `apps/web/src/app/api/roles/[roleId]/rubric/publish/route.ts`, `apps/web/src/app/roles/[roleId]/rubric/page.tsx`, `packages/db/src/index.ts`, migration, plus added test and registry |
+| Conflicts | None from the cherry-pick (`packages/db` auto-merged). |
+| Migration changes | **`0011_immutable_published_rubrics.sql` renumbered to `0012_`.** `0011_` was already taken by `0011_rubrics.sql` on the baseline. Grepped for references to the old filename across `*.ts/*.sql/*.mjs/*.md/*.json` before renaming: none existed. Ordering verified semantically, not just numerically: the trigger targets the `rubrics` table created by `0011`, so it must sort after it. 14 migrations replay from an empty database in filename order. |
+| Stale reference fixed | `publishRubric`'s doc comment said "migration 0011's trigger". Left alone it would have pointed at the rubrics table migration instead of the trigger. Updated to name `0012_immutable_published_rubrics.sql` and to record why it moved. |
+| Extra coverage added | AF-27 shipped the immutability trigger **and** `publishRubric` with **zero tests**. Added `assertPublishedRubricImmutability` (packages/db, house `assert*` probe pattern, since `pg` lives there) and `tests/integration/published-rubric-immutability.test.ts`, registered in `test:integration`. It asserts: the draft to published transition is allowed; republish returns `no_draft`; UPDATE of a published row is refused by the database with a message naming the reason; DELETE is refused separately; a later draft stays editable. |
+| Negative controls | Narrowing the trigger to `BEFORE UPDATE` only (dropping DELETE) fails the test; removing the trigger entirely fails it. Both confirmed, so the DELETE assertion is load-bearing rather than decorative. |
+| Tests executed | Full `pnpm check` against a database migrated from zero. |
+| Result | exit 0 — 51 unit, 310 integration, 17 architecture, 27 Python, zero failures. |
+| Known limitation | `publishRubric` sets `approved_at`/`updated_at` with `CURRENT_TIMESTAMP`, which is transaction-start time rather than statement time. Five `CURRENT_TIMESTAMP` uses remain in `packages/db`, two of them pre-existing on the baseline from AF-25's rubric edit path, against seven `clock_timestamp()` uses. Reviewer feedback on AF-20 established `clock_timestamp()` as the convention for `occurred_at` on audit rows, where ordering is load-bearing. Not changed here: it is a pre-existing baseline inconsistency across several call sites, not something AF-27 introduced, and silently rewriting five timestamp semantics mid-replay is a behaviour change outside this delta. Flagged for a follow-up decision. |
+| Product check | Approval records a named approver and freezes the version. No score, rank, or automatic decision. |
+
