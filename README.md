@@ -105,15 +105,35 @@ set to a Postgres connection string whose role can `CREATE SCHEMA` and
 `CREATE ROLE` -- not merely any reachable database. The probe builds a
 throwaway schema and a throwaway login role, exercises the policy as that
 role, and drops both afterwards, so it needs the privileges to create them.
-The local Postgres `pnpm dev:infra` starts already qualifies. Everything it
-creates is namespaced and removed, so pointing it at your local development
-database is safe.
+The local Postgres `pnpm dev:infra` starts already qualifies: the official
+image creates `POSTGRES_USER` "with superuser power", so `signal_audit_local`
+can create both. Everything the probe creates is namespaced and removed, so
+pointing it at your local development database is safe.
 
 ```bash
 pnpm dev:infra
 SIGNAL_AUDIT_RLS_DATABASE_URL=postgresql://signal_audit_local:local-only-password@localhost:5432/signal_audit_local \
   pnpm test:integration
 ```
+
+#### Using a native Postgres instead of `dev:infra`
+
+If Docker is not running and you point this at a Postgres you installed
+directly, the role you create by hand is **not** a superuser — unlike the
+one the container makes — so it needs the two privileges granted
+explicitly:
+
+```bash
+createuser signal_audit_local --createdb
+createdb signal_audit_local --owner signal_audit_local
+psql -c 'ALTER ROLE signal_audit_local CREATEROLE'
+```
+
+`CREATEROLE` is the non-obvious one. Without it the probe fails with
+`permission denied to create role` (SQLSTATE `42501`), raised from inside a
+test whose name is about row-level security — so it reads as a
+tenant-isolation failure rather than a missing privilege, and sends you
+looking at the policy instead of at the role.
 
 CI's integration job sets this the same way against its own disposable
 database service.
