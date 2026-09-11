@@ -5,16 +5,9 @@ import {
   idempotencyErrorResponse,
   withRequestId
 } from "@signal-audit/contracts";
-import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getUserByEmail, redeemMagicLinkToken } from "@signal-audit/db";
-import {
-  SESSION_COOKIE_NAME,
-  createSessionToken,
-  hashMagicLinkToken,
-  verifyMagicLinkToken
-} from "@signal-audit/security";
+import { SESSION_COOKIE_NAME } from "@signal-audit/security";
 import { z } from "zod";
-import { readSessionSecret } from "../../../../../lib/session";
+import { SESSION_COOKIE_OPTIONS, redeemMagicLinkForSession } from "../../../../../lib/magic-link";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
@@ -55,24 +48,18 @@ export async function POST(request: NextRequest): Promise<Response> {
   }
 
   try {
-    const config = loadEnvironmentConfig(process.env);
-    const attempt = await redeemMagicLinkToken(
-      config.database.url,
-      config.database.schema,
-      hashMagicLinkToken(parsed.data.token)
-    );
-    const verification = verifyMagicLinkToken(attempt);
-    if (verification.outcome !== "valid") {
+    // Shared with GET /auth/redeem, the URL the email actually contains, so
+    // the two entry points cannot drift about what redemption means.
+    const redemption = await redeemMagicLinkForSession(parsed.data.token);
+    if (redemption.outcome === "invalid") {
       const error = buildApiError({
         requestId,
         code: "unauthorized",
-        message: `Magic link is ${verification.outcome.replace("_", " ")}.`
+        message: `Magic link is ${redemption.reason}.`
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-
-    const user = await getUserByEmail(config.database.url, config.database.schema, verification.email);
-    if (user === undefined) {
+    if (redemption.outcome === "no_account") {
       const error = buildApiError({
         requestId,
         code: "not_found",
@@ -81,18 +68,11 @@ export async function POST(request: NextRequest): Promise<Response> {
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const sessionToken = createSessionToken(user.userId, readSessionSecret());
     const response = NextResponse.json(
-      { schemaVersion: user.schemaVersion, userId: user.userId, email: user.email },
+      { schemaVersion: redemption.schemaVersion, userId: redemption.userId, email: redemption.email },
       { status: 200, headers: withRequestId(undefined, requestId) }
     );
-    response.cookies.set(SESSION_COOKIE_NAME, sessionToken, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 12 * 60 * 60
-    });
+    response.cookies.set(SESSION_COOKIE_NAME, redemption.sessionToken, SESSION_COOKIE_OPTIONS);
     return response;
   } catch (error) {
     console.error("magic-link redeem failed", error);
