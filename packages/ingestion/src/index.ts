@@ -10,6 +10,7 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { ALLOWED_SNIFFED_MIME_TYPES, evaluateCanonicalTextQuality } from "@signal-audit/domain";
 import type { CanonicalTextPage } from "@signal-audit/domain";
+import { parse as parseCsv } from "csv-parse/sync";
 import { fileTypeFromBuffer } from "file-type";
 import { extractRawText } from "mammoth";
 import { PDFParse } from "pdf-parse";
@@ -203,6 +204,41 @@ export interface SniffedFile {
   readonly zipUncompressedBytes?: number | undefined;
 }
 
+/**
+ * file-type only ever detects binary formats by magic bytes; its own
+ * readme says as much and lists .csv by name as one it will never
+ * identify (github.com/sindresorhus/file-type, "not able to detect...
+ * .csv"). A real CSV upload therefore always sniffs as undefined from
+ * fileTypeFromBuffer alone -- discovered here, live, while verifying
+ * AF-31 against a genuine file, not assumed. This is deliberately
+ * narrow: a null byte or invalid UTF-8 anywhere fails it outright (real
+ * binary data, not text), and what's left still has to actually parse
+ * as at least one non-empty CSV row, so a renamed but content-free or
+ * garbage file still won't pass.
+ */
+export function looksLikeCsvText(buffer: Buffer): boolean {
+  if (buffer.includes(0)) {
+    return false;
+  }
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    return false;
+  }
+  try {
+    const records = parseCsv(decoded, {
+      bom: true,
+      trim: true,
+      skip_empty_lines: true,
+      relax_column_count: true
+    }) as string[][];
+    return records.length > 0 && (records[0]?.length ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Fetches the uploaded object once and derives every fact AF-29's pure
  * evaluateFileValidation (packages/domain) needs to decide on it.
  * file-type reports docx with its specific OOXML mime, not a generic
@@ -211,11 +247,12 @@ export interface SniffedFile {
 export async function sniffUploadedFile(options: StorageConnectionOptions, key: string): Promise<SniffedFile> {
   const bytes = await fetchObjectBytes(options, key);
   const detected = await fileTypeFromBuffer(bytes);
+  const sniffedMimeType = detected?.mime ?? (looksLikeCsvText(bytes) ? ALLOWED_SNIFFED_MIME_TYPES.csv : undefined);
   const zipSummary =
     detected?.mime === ALLOWED_SNIFFED_MIME_TYPES.docx ? inspectZipCentralDirectory(bytes) : undefined;
   return {
     sizeBytes: bytes.length,
-    sniffedMimeType: detected?.mime,
+    sniffedMimeType,
     sha256Hash: createHash("sha256").update(bytes).digest("hex"),
     ...(zipSummary === undefined ? {} : { zipUncompressedBytes: zipSummary.totalUncompressedBytes })
   };
@@ -258,4 +295,34 @@ export async function extractCanonicalTextFromDocx(buffer: Buffer): Promise<Cano
   const result = await extractRawText({ buffer });
   const text = result.value;
   return toResult([{ pageNumber: 1, text, characterCount: text.length }]);
+}
+
+// ---- AF-31: CSV mapping and ten-row preview ----
+
+export interface ParsedCsv {
+  readonly headers: readonly string[];
+  readonly rows: readonly Readonly<Record<string, string>>[];
+}
+
+/**
+ * Parses with columns:false (raw string[][]) and builds the
+ * header-to-value records by hand, rather than csv-parse's own
+ * columns:true mode -- that mode consumes the header row internally and
+ * never hands it back, and packages/domain's validateCsvColumnMapping
+ * needs the real header list to check a recruiter's mapping against.
+ */
+export function parseCsvFile(buffer: Buffer): ParsedCsv {
+  const records = parseCsv(buffer, { bom: true, trim: true, skip_empty_lines: true }) as string[][];
+  if (records.length === 0) {
+    return { headers: [], rows: [] };
+  }
+  const [headerRow, ...dataRows] = records as [string[], ...string[][]];
+  const rows = dataRows.map((values) => {
+    const row: Record<string, string> = {};
+    headerRow.forEach((header, index) => {
+      row[header] = values[index] ?? "";
+    });
+    return row;
+  });
+  return { headers: headerRow, rows };
 }

@@ -135,3 +135,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 65 unit, 311 integration, 20 architecture, 27 Python, zero failures. |
 | Product check | Text extraction only. No score, rank, or automatic decision. |
 
+### PR #40 — AF-31 CSV mapping and ten-row preview
+
+| | |
+|---|---|
+| Original base | `feature/AF-30-canonical-text-parser` |
+| Original head | `feature/AF-31-csv-mapping-and-preview` |
+| Commits in range | 4: `3340f33` (AF-31), `0cf256e` + `2f8d2e6` (stale carry-forwards), `aae40da` (`fix(AF-31): move csv-text-sniff off the unit suite so CI's Unit job can load it`) |
+| Replayed | **`3340f33` and `aae40da`.** The second is plan section 15's test-placement fix and had to be kept. |
+| Plan section 15 — CSV sniffing | Preserved: `looksLikeCsvText` exists in `packages/ingestion` and is wired as the fallback at the sniff site (`detected?.mime ?? (looksLikeCsvText(bytes) ? ... : undefined)`), because `file-type` cannot identify plain CSV text. The moved test references it 7 times. |
+| Plan section 15 — test placement | Preserved. `csv-text-sniff.test.ts` lives in `tests/integration/`, not `tests/unit/`. Reason verified in the scripts rather than assumed: `test:integration` runs `build:packages &&` first while `test:unit:ts` does not, so a test importing built ingestion artifacts can only load from the integration suite. The earlier arrangement passed locally only because an earlier step had already built `dist`, which is the false green the plan describes. |
+| Conflicts | `package.json` on both cherry-picks. |
+| Resolution — union rule deliberately overridden | The union resolver **aborted** on the second pick, refusing to register `tests/unit/csv-text-sniff.test.ts` because that path no longer exists on disk. That abort was correct and the rule was wrong for this case: this is an intentional relocation, not an accidental unregistration. Resolved by hand as union-minus-the-move: unit loses `csv-text-sniff.test.ts` (11 entries), integration gains it (30 entries), architecture unchanged. Asserted afterwards that the file is registered in integration, absent from unit, every registered path exists, and `typecheck:tests` survives. |
+| Migration changes | None. |
+| Tests executed | 17 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 75 unit, 316 integration, 20 architecture, 27 Python, zero failures. |
+| Product check | CSV column mapping and a bounded ten-row preview. No score, rank, or automatic decision. |
+
