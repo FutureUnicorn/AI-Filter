@@ -168,3 +168,19 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 82 unit, 316 integration, 20 architecture, 27 Python, zero failures. |
 | Product check | Import finalization creates application rows idempotently. No score, rank, or automatic decision. |
 
+### PR #42 — AF-33 processing/failure status UI
+
+| | |
+|---|---|
+| Original base | `feature/AF-32-idempotent-import-finalization` |
+| Original head | `feature/AF-33-import-status-ui` |
+| Commits in range | 4: `1bff684` (AF-33), `390560e` + `0b49166` (stale carry-forwards), `dc305de` (AF-31 csv relocation, already applied) |
+| Replayed | `1bff684` only. |
+| Conflicts | `package.json` (registry). Resolved automatically by the generalized resolver, which dropped the stale relocated `csv-text-sniff` registration and unioned the rest: unit 12 + 1 = 13, integration 30, architecture 4; `typecheck:tests` intact. |
+| Migration changes | None. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 87 unit, 316 integration, 20 architecture, 27 Python, zero failures. |
+| Product check | Status and error surfaces for an import. Read-only reporting; no score, rank, or automatic decision. |
+
+**Block complete: #35 through #42 (AF-26 to AF-33) replayed.**
+
