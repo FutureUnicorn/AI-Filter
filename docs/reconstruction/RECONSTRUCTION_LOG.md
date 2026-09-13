@@ -300,3 +300,18 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 140 unit, 336 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Requires a named actor and a non-whitespace reason on every correction. Strengthens attribution and auditability; no score or ranking. |
 
+### PR #55 — AF-60 report every metric with its sample size and limitations
+
+| | |
+|---|---|
+| Original base | `feature/AF-58-failed-document-rate` (parallel line) |
+| Original head | `feature/AF-60-sample-sizes-and-limitations` |
+| Commits in range | 2: `4fbfacb` (AF-60), `13499be` (`docs: record why there is no sample-pooling helper`) |
+| Replayed | both. |
+| Conflicts | `package.json`, `packages/contracts`, `packages/domain`. Kept HEAD on source, then ported. |
+| Ported | domain: `METRIC_LIMITATION_CODES`, `MetricLimitationCode`, `MetricLimitation`, `MetricSample`, `SummarizeMetricInput`, `summarizeMetric`, `describeFailedDocumentRate`. contracts: `metricLimitationSchema`, `metricSampleSchema`, plus the **non-exported** `metricSampleObjectSchema` that `metricSampleSchema` is built from, which the export-only scan missed and the typecheck caught. Wired `MetricLimitation`/`MetricSample` as type imports and `METRIC_LIMITATION_CODES` as a value import into contracts. |
+| Migration changes | None. |
+| Tests executed | 21 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 148 unit, 342 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Every metric is reported with its sample size and an explicit limitations list, which is the opposite of a bare score. Directly supports the product's honesty constraints; no ranking introduced. |
+
