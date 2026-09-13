@@ -35,6 +35,14 @@ function migrationFilenames(): readonly string[] {
     .sort();
 }
 
+function migrationPrefixes(): readonly string[] {
+  return migrationFilenames().map((name) => {
+    const prefix = /^(\d+)_/u.exec(name)?.[1];
+    assert.ok(prefix !== undefined, `migration ${name} must start with a numeric prefix`);
+    return prefix;
+  });
+}
+
 test("no new migration reuses a numeric prefix", () => {
   const byPrefix = new Map<string, string[]>();
   for (const name of migrationFilenames()) {
@@ -55,11 +63,7 @@ test("no new migration reuses a numeric prefix", () => {
 });
 
 test("every grandfathered duplicate still exists, so the exemption list cannot rot", () => {
-  const present = new Set(
-    migrationFilenames()
-      .map((name) => /^(\d+)_/u.exec(name)?.[1])
-      .filter((prefix): prefix is string => prefix !== undefined)
-  );
+  const present = new Set(migrationPrefixes());
   for (const prefix of GRANDFATHERED_DUPLICATE_PREFIXES) {
     assert.ok(
       present.has(prefix),
@@ -69,8 +73,7 @@ test("every grandfathered duplicate still exists, so the exemption list cannot r
   // An exemption that no longer covers a real duplicate is dead weight that
   // would silently permit a future collision on that number.
   const counts = new Map<string, number>();
-  for (const name of migrationFilenames()) {
-    const prefix = /^(\d+)_/u.exec(name)![1];
+  for (const prefix of migrationPrefixes()) {
     counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
   }
   for (const prefix of GRANDFATHERED_DUPLICATE_PREFIXES) {
@@ -85,8 +88,7 @@ test("migration filename order matches numeric order", () => {
   // Filename sort and numeric sort agree only while prefixes are
   // zero-padded to the same width. A future `010_` next to `0100_` would
   // reorder silently, so the width is pinned rather than assumed.
-  const names = migrationFilenames();
-  const widths = new Set(names.map((name) => /^(\d+)_/u.exec(name)![1].length));
+  const widths = new Set(migrationPrefixes().map((prefix) => prefix.length));
   assert.deepEqual(
     [...widths],
     [4],

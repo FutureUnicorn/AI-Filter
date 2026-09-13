@@ -118,3 +118,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Negative controls | Recreating the exact AF-29 collision fails the test; adding a 3-digit prefix fails it. Both confirmed. |
 | Result | 3/3 pass; architecture suite 17 to 20. |
 
+### PR #39 — AF-30 PDF/DOCX canonical text parser
+
+| | |
+|---|---|
+| Original base | `feature/AF-29-file-validation-and-quarantine` |
+| Original head | `feature/AF-30-canonical-text-parser` |
+| Commits in range | 3: `d9400f1` (AF-30), `3528968` + `3bf3805` (stale carry-forwards) |
+| Replayed | `d9400f1` only. |
+| Conflicts | `package.json` (registry). Union: unit 9 + 1 = 10, integration 29, architecture 4; `typecheck:tests` asserted intact. |
+| Migration changes | **`0014_canonical_text_extractions.sql` renumbered to `0015_`**, colliding with AF-29's `0014_file_intake_validation.sql`. Dependency checked rather than assumed: it references `file_intakes (intake_id)` from `0013_`, so execution order was already satisfied and this collision was a latent hazard rather than an active break. Renumbered anyway, since a duplicate prefix leaves order depending on the rest of the filename. No external references. |
+| Guard caught it | The prefix guard added after AF-29 flagged the duplicate before the gate ran. |
+| Dependencies | `packages/ingestion` gains `mammoth@1.12.1` and `pdf-parse@2.4.5`; `--frozen-lockfile` install succeeds. |
+| Defect found in my own work | The prefix guard failed `typecheck:tests` with three errors: a non-null assertion and two possibly-undefined regex results. `node --test` type-strips, so running the file directly passed while the real gate did not. Fixed by extracting a `migrationPrefixes()` helper that asserts the prefix exists once, rather than by loosening the assertions or the tsconfig. Negative control re-run afterwards to confirm the guard still fires. This is the modern `typecheck:tests` safeguard (plan section 14) doing exactly its job. |
+| Tests executed | 17 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 65 unit, 311 integration, 20 architecture, 27 Python, zero failures. |
+| Product check | Text extraction only. No score, rank, or automatic decision. |
+

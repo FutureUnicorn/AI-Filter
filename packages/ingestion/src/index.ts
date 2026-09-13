@@ -8,8 +8,11 @@ import {
   S3Client
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { ALLOWED_SNIFFED_MIME_TYPES } from "@signal-audit/domain";
+import { ALLOWED_SNIFFED_MIME_TYPES, evaluateCanonicalTextQuality } from "@signal-audit/domain";
+import type { CanonicalTextPage } from "@signal-audit/domain";
 import { fileTypeFromBuffer } from "file-type";
+import { extractRawText } from "mammoth";
+import { PDFParse } from "pdf-parse";
 import type { BoundaryContract } from "@signal-audit/contracts";
 import type { DomainPort } from "@signal-audit/domain";
 
@@ -216,4 +219,43 @@ export async function sniffUploadedFile(options: StorageConnectionOptions, key: 
     sha256Hash: createHash("sha256").update(bytes).digest("hex"),
     ...(zipSummary === undefined ? {} : { zipUncompressedBytes: zipSummary.totalUncompressedBytes })
   };
+}
+
+// ---- AF-30: PDF/DOCX canonical text parser ----
+
+export interface CanonicalTextResult {
+  readonly pages: readonly CanonicalTextPage[];
+  readonly quality: ReturnType<typeof evaluateCanonicalTextQuality>;
+}
+
+function toResult(pages: readonly CanonicalTextPage[]): CanonicalTextResult {
+  return { pages, quality: evaluateCanonicalTextQuality(pages) };
+}
+
+/** Genuinely per-page: pdf-parse's own page numbering, not an assumption. */
+export async function extractCanonicalTextFromPdf(buffer: Buffer): Promise<CanonicalTextResult> {
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const result = await parser.getText();
+    return toResult(
+      result.pages.map((page) => ({ pageNumber: page.num, text: page.text, characterCount: page.text.length }))
+    );
+  } finally {
+    await parser.destroy();
+  }
+}
+
+/**
+ * mammoth reads the document's actual paragraph/run content, not a
+ * rendered layout -- DOCX stores no reliable page-break positions
+ * without a full layout engine (Word computes page breaks at render
+ * time from margins/fonts/print settings, none of which live in the
+ * XML), so this is always exactly one page. Documented here rather than
+ * quietly inventing a page count AF-30's own "page-aware" promise
+ * doesn't actually hold for this format.
+ */
+export async function extractCanonicalTextFromDocx(buffer: Buffer): Promise<CanonicalTextResult> {
+  const result = await extractRawText({ buffer });
+  const text = result.value;
+  return toResult([{ pageNumber: 1, text, characterCount: text.length }]);
 }
