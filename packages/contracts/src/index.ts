@@ -21,6 +21,8 @@ import type {
   Application,
   ApplicationQueueEntry,
   AuditEvent,
+  CanonicalTextExtraction,
+  CanonicalTextPage,
   CitationInvalidEvidence,
   ContradictedEvidence,
   CsvColumnMapping,
@@ -28,16 +30,15 @@ import type {
   EvidenceExtractionRun,
   EvidenceOutcome,
   ExtractionErrorEvidence,
+  FailedDocumentRate,
   FailedEvidence,
+  FileIntake,
   ImportRow,
   InvalidSourceEvidence,
   Membership,
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
-  CanonicalTextExtraction,
-  CanonicalTextPage,
-  FileIntake,
   ProcessingEvidence,
   QuarantinedEvidence,
   RetryingEvidence,
@@ -910,3 +911,23 @@ export const applicationReviewQueueSchema = z
   .refine((queue) => new Set(queue.appliedStates).size === queue.appliedStates.length, {
     message: "appliedStates must not repeat a state"
   });
+
+/**
+ * AF-58. `failedRate` is nullable on purpose -- see summarizeFailedDocuments:
+ * a role where nothing has resolved yet has no rate, and 0 would read as
+ * "nothing failed". `.nullable()` forces every consumer to handle that.
+ */
+export const failedDocumentRateSchema = z.strictObject({
+  schemaVersion: schemaVersionSchema,
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  uploaded: z.number().int().min(0),
+  failed: z.number().int().min(0),
+  quarantined: z.number().int().min(0),
+  rejected: z.number().int().min(0),
+  extractionEmpty: z.number().int().min(0),
+  extractionSucceeded: z.number().int().min(0),
+  resolved: z.number().int().min(0),
+  inFlight: z.number().int().min(0),
+  failedRate: z.number().min(0).max(1).nullable()
+}) satisfies z.ZodType<FailedDocumentRate>;

@@ -234,3 +234,21 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 115 unit, 325 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Filters are explicit and user-chosen, which is the product's stated alternative to hidden ordering. No score, rank, or automatic decision. |
 
+### PR #49 — AF-58 failed-document rate per role (parallel line, plan section 7)
+
+| | |
+|---|---|
+| Original base | `feature/AF-33-import-status-ui` (the AF-58/AF-60 line, not the AF-45 line) |
+| Original head | `feature/AF-58-failed-document-rate` |
+| Commits in range | 1: `1fede60` |
+| Replayed | `1fede60`. |
+| Conflicts | `package.json` plus `packages/contracts`, `packages/db`, `packages/domain`. Expected: AF-58 forks from AF-33 and so predates AF-45/46/47's changes to those files. |
+| Resolution | Kept HEAD on every source conflict via `git checkout --ours`, then ported the genuinely missing declarations. Ported: `FailedDocumentCounts`, `FailedDocumentRate`, `summarizeFailedDocuments` (domain); `failedDocumentRateSchema` (contracts); `getFailedDocumentRate`, `assertFailedDocumentRateAccuracy` (db). Wired the four import entries the ported code needed. `InferenceKillSwitchRow` and `getInferenceKillSwitchStatus` again not ported (AF-42, not on `develop`). |
+| Tooling defects found and fixed | My first attempt corrupted three files and was reset with `git reset --hard` rather than patched. Two real bugs in the extractor, both of which produced silently truncated code: (1) it searched for the terminating `;` starting at the doc comment, so a semicolon in prose ended the block early, yielding a 12-line fragment of a 135-line function; (2) it tracked only braces, so `export const x = z.strictObject({...}).refine(...)` terminated at the object literal's `}`, before the `)` and the chained calls. Now it locates the end from the declaration and tracks `()`, `[]` and `{}` together. Switched from regex hunk-resolution to `git checkout --ours`, which cannot mis-pair markers. |
+| **Database conflict resolved (plan section 16)** | The probe inserted a `file_intakes` row in org B pointing at org A's role, and its comment stated that `file_intakes` "carries INDEPENDENT foreign keys ... with no composite (organization_id, role_id) constraint". **That premise is no longer true on this branch:** AF-28's `cbf85b2`, preserved earlier here, added exactly that composite FK, so the row is now unrepresentable and the insert failed. Resolved by keeping the check and strengthening it: the probe now asserts the database **refuses** the insert with `file_intakes_role_organization_fkey`, which is a stronger statement than asserting a query filtered the row out afterwards, and it fails if that constraint is ever dropped. The stale comment was replaced with the real history. No test was weakened and no constraint was relaxed. |
+| Negative control | Removing the composite FK from `0013_file_intakes.sql` fails the strengthened assertion. Confirmed, then restored. |
+| Migration changes | None of its own. Remapper repointed three historical references in the ported probe: `0012_file_intakes` to `0013_`, `0013_file_intake_validation` to `0014_`, `0014_canonical_text_extractions` to `0015_`. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 121 unit, 328 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | A per-role pipeline-health metric over documents. Measures failure rates of processing, not candidates. No score, rank, or automatic decision. |
+
