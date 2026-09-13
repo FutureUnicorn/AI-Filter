@@ -267,3 +267,19 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 131 unit, 329 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | An evidence card shows the quote and its source location for human reading. Presentation of cited evidence, no score or ranking. |
 
+### PR #51 — AF-49 append-only evidence corrections
+
+| | |
+|---|---|
+| Original base | `feature/AF-48-evidence-card-with-source-context` |
+| Original head | `feature/AF-49-append-only-evidence-corrections` |
+| Commits in range | 1: `b843fe6` |
+| Replayed | `b843fe6`. |
+| Conflicts | `package.json` and `packages/db`. Kept HEAD on source, ported `CorrectEvidenceOutcomeInput`, `EvidenceCorrectionResult`, `RecordedEvidenceRevision`, `correctEvidenceOutcome`, `listEvidenceRevisionsForApplication`, `assertEvidenceCorrectionsAppendOnly`. |
+| Migration changes | **`0017_evidence_corrections.sql` renumbered to `0018_`**, colliding with AF-48's `0017_evidence_outcomes.sql`. Remapper repointed four historical references. |
+| Third extractor defect found and fixed | `EvidenceCorrectionResult` is a three-member union of object literals; the tool kept only the first member, because a member ends its line with `}` and the rule "brace closed and nothing follows on this line" was satisfied. That silently produced a type that compiled at the declaration but failed at every other use (`"nothing_to_correct"` not assignable to `"recorded"`). Now a `type` alias terminates only on `;`, and the brace rule additionally refuses to stop when the next non-whitespace character continues the expression (`|`, `&`, `.`, `)`, `,`, `]`, `}`). |
+| AF-13 drift resolved | Again, in two places: the `assertEvidenceCorrectionsAppendOnly` outcome factory and `tests/unit/evidence-corrections.test.ts`'s `supported`/`notFound` helpers. Attributed with `organizationId`/`candidateId` rather than relaxing the types. |
+| Tests executed | 20 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 140 unit, 330 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Corrections are append-only: a correction supersedes rather than overwrites, so the original evidence and its revision history both survive. Supports auditability; no score or ranking. |
+

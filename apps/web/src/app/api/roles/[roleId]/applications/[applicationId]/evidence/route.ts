@@ -5,9 +5,9 @@ import {
   getMembershipsForUser,
   getRoleById,
   getRubricForRole,
-  listCurrentEvidenceOutcomesForApplication
+  listEvidenceRevisionsForApplication
 } from "@signal-audit/db";
-import { buildEvidenceCardSet } from "@signal-audit/domain";
+import { buildCorrectedEvidenceCardSet } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -83,7 +83,10 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const recorded = await listCurrentEvidenceOutcomesForApplication(
+    // AF-49: the full revision history, not just the current outcome.
+    // A card has to be able to show what it was corrected from, and a
+    // caller holding only the current value cannot reconstruct that.
+    const revisions = await listEvidenceRevisionsForApplication(
       config.database.url,
       config.database.schema,
       role.organizationId,
@@ -91,10 +94,10 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     );
 
     return Response.json(
-      buildEvidenceCardSet(
+      buildCorrectedEvidenceCardSet(
         application.applicationId,
         rubric.criteria.map((criterion) => criterion.criterionId),
-        recorded
+        revisions
       ),
       { status: 200, headers: withRequestId(undefined, requestId) }
     );
