@@ -252,3 +252,18 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 121 unit, 328 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | A per-role pipeline-health metric over documents. Measures failure rates of processing, not candidates. No score, rank, or automatic decision. |
 
+### PR #50 — AF-48 evidence card with source context
+
+| | |
+|---|---|
+| Original base | `feature/AF-47-explicit-state-filters` |
+| Original head | `feature/AF-48-evidence-card-with-source-context` |
+| Commits in range | 2: `be21e38` (AF-48), `9cabe29` (`harden 0016 against five defects found reviewing it`) |
+| Replayed | **both.** The second hardens the migration and is part of AF-48's own delta. |
+| Conflicts | `package.json`, `packages/db`, `packages/domain`. Kept HEAD on source via `git checkout --ours`, then ported. Ported from domain: `EvidenceCardCitation`, `EvidenceCard`, `EvidenceCardSet`, `buildEvidenceCard`, `buildEvidenceCardSet`. From db: `RecordEvidenceOutcomeInput`, `RecordedEvidenceOutcome`, `recordEvidenceOutcome`, `listCurrentEvidenceOutcomesForApplication`, `getApplicationById`, `assertEvidenceOutcomePersistence`. |
+| Migration changes | **`0016_evidence_outcomes.sql` renumbered to `0017_`**, colliding with AF-32's `0016_applications_and_import_finalization.sql`. Confirmed the `9cabe29` hardening travelled with the renamed file (18 constraints present). Remapper repointed three historical references in the ported probe. |
+| AF-13 drift resolved | AF-48 predates the tenant-identity change, so its outcome fixtures failed `typecheck:tests` in three places: `tests/unit/evidence-card.test.ts` samples and the `assertEvidenceOutcomePersistence` factory were missing `organizationId`/`candidateId`, and its `contradicted` sample was missing `conflictingCitation`, which `ContradictedEvidence` requires. Fixed by **attributing the fixtures**, not by relaxing the types: the tests now exercise the shape the product actually persists. This is the fourth ticket in this reconstruction to carry AF-13 drift. |
+| Tests executed | 19 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 131 unit, 329 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | An evidence card shows the quote and its source location for human reading. Presentation of cited evidence, no score or ranking. |
+
