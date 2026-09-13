@@ -204,3 +204,19 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 96 unit, 321 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | A tenant-scoped queue with explicit state counts. `buildApplicationReviewQueue` rejects counts that do not partition the total. No score, rank, or automatic decision. |
 
+### PR #47 — AF-46 preserve original applicant ordering
+
+| | |
+|---|---|
+| Original base | `feature/AF-45-tenant-scoped-application-review-queue` |
+| Original head | `feature/AF-46-preserve-original-applicant-ordering` |
+| Commits in range | 1: `fa86dfa` |
+| Replayed | `fa86dfa`. |
+| Conflicts | `package.json` (registry). Union: unit 15, integration 31; `typecheck:tests` intact. |
+| Gate failure and fix | Failed first on the same class as AF-45: the new `assertApplicantOrderingPreserved` probe loads `0012_file_intakes.sql` by name. Automated it rather than hand-patching each time, since every remaining ported probe will carry historical filenames: `remap_migrations.py` matches on the descriptive suffix, which renumbering never changes, and **refuses to guess** when a suffix matches zero or several files on disk. Repointed `0012_file_intakes` to `0013_` and `0015_applications_and_import_finalization` to `0016_`. |
+| Note on gate ordering | The hard-coded-reference guard added during AF-45 does catch this, but `pnpm check` runs integration before architecture, so the `ENOENT` surfaces first. The guard remains the durable net; the remapper is what keeps it from recurring. |
+| Migration changes | None of its own. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 103 unit, 322 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Preserves the employer's original import order as a stable tiebreak. Explicitly not a ranking: order comes from the source file, not from any score. |
+

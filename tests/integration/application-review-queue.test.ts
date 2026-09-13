@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { assertApplicationQueueTenantIsolation } from "../../packages/db/src/index.ts";
+import {
+  assertApplicantOrderingPreserved,
+  assertApplicationQueueTenantIsolation
+} from "../../packages/db/src/index.ts";
 import { applicationReviewQueueSchema } from "../../packages/contracts/src/index.ts";
 import { CONTRACT_SCHEMA_VERSION, buildApplicationReviewQueue } from "../../packages/domain/src/index.ts";
 import type { Application } from "../../packages/domain/src/index.ts";
@@ -84,4 +87,17 @@ test("an unknown evidence state is rejected rather than rendered as an empty cel
     entries: [{ ...firstEntry, evidenceState: "reviewed" }]
   };
   assert.equal(applicationReviewQueueSchema.safeParse(invented).success, false);
+});
+
+test("two imports sharing a created_at keep the employer's original order in the database", async () => {
+  // AF-46. The pure comparator is covered in tests/unit; this is the
+  // half that only a real database can answer -- that the SQL ORDER BY
+  // agrees with it, on the fixture where a weaker one silently differs.
+  const databaseUrl = process.env.SIGNAL_AUDIT_RLS_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.length === 0) {
+    assert.fail(
+      "SIGNAL_AUDIT_RLS_DATABASE_URL must be set so CI exercises queue ordering against real Postgres"
+    );
+  }
+  await assertApplicantOrderingPreserved(databaseUrl);
 });

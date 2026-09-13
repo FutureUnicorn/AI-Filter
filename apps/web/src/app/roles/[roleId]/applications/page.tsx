@@ -43,11 +43,14 @@ const EVIDENCE_STATE_LABELS: Readonly<Record<QueueEntry["evidenceState"], string
  *
  * Two things are deliberately absent rather than mocked. There is no
  * per-criterion evidence verdict column, because nothing persists
- * EvidenceOutcome yet -- only whether an extraction run happened.
- * And there are no filters or ordering controls: AF-46 owns applicant
- * ordering and AF-47 owns state filters, so inventing either here would
- * be work those tickets then have to undo. This shows the honest state
- * and the counts, and says plainly what it cannot yet tell you.
+ * EvidenceOutcome yet -- only whether an extraction run happened. And
+ * there are no filters: AF-47 owns those, so inventing them here would
+ * be work that ticket then has to undo.
+ *
+ * AF-46: the order is the employer's own file order, and the caption
+ * says so out loud. That is a product guarantee, not an implementation
+ * detail -- a recruiter has to be able to tell that this list is not
+ * quietly ranked, and the only way to tell from a screen is to be told.
  */
 export default function ApplicationReviewQueuePage() {
   const params = useParams<{ roleId: string }>();
@@ -112,8 +115,9 @@ export default function ApplicationReviewQueuePage() {
           ) : (
             <table>
               <caption>
-                Every imported application for this role, in import order. Evidence state reflects whether extraction
-                has run — per-criterion verdicts are not stored yet, so none are shown.
+                Every imported application for this role, in the order the file was uploaded in. This queue is never
+                ranked, scored or prioritised — there is no score to sort by. Evidence state reflects whether
+                extraction has run; per-criterion verdicts are not stored yet, so none are shown.
               </caption>
               <thead>
                 <tr>
