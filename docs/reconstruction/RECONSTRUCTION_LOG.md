@@ -152,3 +152,19 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 75 unit, 316 integration, 20 architecture, 27 Python, zero failures. |
 | Product check | CSV column mapping and a bounded ten-row preview. No score, rank, or automatic decision. |
 
+### PR #41 — AF-32 idempotent import finalization
+
+| | |
+|---|---|
+| Original base | `feature/AF-31-csv-mapping-and-preview` |
+| Original head | `feature/AF-32-idempotent-import-finalization` |
+| Commits in range | 6: `3ecc0d6` (AF-32), `e27cb01` + `f200594` (stale carry-forwards), `a076c38` (AF-31's csv move, already applied here as `aae40da`), `d78943a` (`reject whitespace-only candidate name and email`), `5aff3a2` (`constrain applications to its own tenant's role and intake`) |
+| Replayed | **`3ecc0d6`, `d78943a`, `5aff3a2`.** `a076c38` skipped as an already-applied duplicate of the AF-31 relocation, not as noise. |
+| Plan section 16 class | `5aff3a2` is the same tenant-integrity pattern as AF-28 and was kept: `applications` gains composite FKs on **both** `(role_id, organization_id)` and `(intake_id, organization_id)`, so an application cannot point at another tenant's role or another tenant's file intake. Database-level, not application filtering. |
+| Conflicts | `package.json` on the first pick. |
+| Resolution — resolver generalized | Every branch from here on still registers `tests/unit/csv-text-sniff.test.ts`, which AF-31 relocated, so the union resolver aborted again. Rather than hand-resolving this on each of the remaining replays, the resolver now recognises a deliberate relocation: a registered path missing from disk is dropped **only** when a file of the same name exists in another test directory, and is still fatal otherwise. That distinguishes "moved" from "deleted or renamed away" instead of trusting either blindly. Result: unit 12, integration 30, architecture 4, `typecheck:tests` intact. |
+| Migration changes | **`0015_applications_and_import_finalization.sql` renumbered to `0016_`**, colliding with AF-30's `0015_canonical_text_extractions.sql`. Its tables reference `organizations`, `roles` and `file_intakes` from `0002`/`0009`/`0013`, so ordering is satisfied at `0016`. No external references. Guard confirms uniqueness. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 82 unit, 316 integration, 20 architecture, 27 Python, zero failures. |
+| Product check | Import finalization creates application rows idempotently. No score, rank, or automatic decision. |
+
