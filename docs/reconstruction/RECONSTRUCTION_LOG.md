@@ -7,7 +7,8 @@ base-to-head delta onto a modern baseline, never as a wholesale branch merge.
 
 | | |
 |---|---|
-| Baseline ref | `origin/integrate-af23-25` @ `616464f` (head of PR #82) |
+| Baseline ref | `origin/integrate-af23-25` @ **`616464f2467da3e05911e9a5d43fc1d7c3227114`** (head of PR #82) |
+| Drift watch | Recorded 2026-09-13: #82 head is still that exact SHA, `develop` is still `543daba49`, and both are 0 commits ahead of this branch. **PR #82 is `CHANGES_REQUESTED` and unmerged, so this baseline is provisional.** An explicit reconciliation against the final merged #82 (or whatever `develop` becomes) is required before the final integration PR is opened, and must be re-checked rather than assumed from this line. |
 | Why not `develop` | PR #82 is **OPEN, not merged**; `develop` is still at `543daba`. Plan §3 and the operator's rule 10 both direct using the #82 repaired state as the baseline and leaving `develop` untouched. |
 | Rule 9 check | AF-23/AF-24/AF-25 artifacts confirmed present at the baseline: `lib/session.ts`, `api/roles/route.ts`, `roles/page.tsx`, `api/roles/[roleId]/rubric/route.ts`, `0009_roles.sql`, `0011_rubrics.sql`, and the role/rubric/session test suites. |
 | Baseline gate | `pnpm check` exit 0 — 39 unit, 307 integration, 17 architecture, 27 Python, zero failures. 13 migrations replay from an empty database in filename order. |
@@ -89,4 +90,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Tests executed | 15 migrations replayed from an empty database, **then replayed a second time over the migrated database** because the new FK is added through a conditional `DO` block rather than `ADD CONSTRAINT IF NOT EXISTS`; both passes clean. Full `pnpm check`. |
 | Result | exit 0 — 51 unit, 311 integration, 17 architecture, 27 Python, zero failures. |
 | Product check | Presigned direct upload plus intake rows. No score, rank, or automatic decision. |
+
+### PR #38 — AF-29 file allowlist, MIME validation, hash and quarantine
+
+| | |
+|---|---|
+| Original base | `feature/AF-28-secure-file-upload` |
+| Original head | `feature/AF-29-file-validation-and-quarantine` |
+| Commits in range | 3: `a5afc7e` (AF-29), `817c195` + `73bd192` (stale carry-forwards) |
+| Replayed | `a5afc7e` only. |
+| Conflicts | `package.json` (registry). Union: unit 8 + 1 = 9, integration 29, architecture 3; `typecheck:tests` asserted intact. |
+| Migration changes | **`0013_file_intake_validation.sql` renumbered to `0014_`.** This was not merely a duplicate prefix, it was an active ordering hazard: against `0013_file_intakes.sql`, filename sort puts `0013_file_intake_validation.sql` **first** (`_` sorts before `s`), and the validation migration is `ALTER TABLE file_intakes ADD COLUMN ...`. Replayed as authored it would have altered a table that did not exist yet. Verified by sorting the two names directly rather than assuming. No external references to the old filename existed. |
+| Stale reference fixed | The migration's own header said "extends file_intakes (AF-28, migration 0012)". `0012_` is AF-27's rubric trigger on this baseline and file_intakes is now `0013_`, so the comment pointed at the wrong file twice over. Updated to name `0013_file_intakes.sql`. |
+| Dependencies | `packages/ingestion` gains `file-type@22.0.2` and a `@signal-audit/domain` workspace link; `--frozen-lockfile` install succeeds. |
+| Tests executed | 16 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 60 unit, 311 integration, 17 architecture, 27 Python, zero failures. |
+| Product check | Validation classifies and quarantines files. No score, rank, or automatic candidate decision. |
 
