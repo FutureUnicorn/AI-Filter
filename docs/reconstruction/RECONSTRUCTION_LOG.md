@@ -220,3 +220,17 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 103 unit, 322 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Preserves the employer's original import order as a stable tiebreak. Explicitly not a ranking: order comes from the source file, not from any score. |
 
+### PR #48 — AF-47 explicit state filters
+
+| | |
+|---|---|
+| Original base | `feature/AF-46-preserve-original-applicant-ordering` |
+| Original head | `feature/AF-47-explicit-state-filters` |
+| Commits in range | 1: `c8a0f86` |
+| Replayed | `c8a0f86`. |
+| Conflicts | `package.json` (registry). Union: unit 16, integration 31; `typecheck:tests` intact. |
+| Migration changes | None. Remapper reported no stale references. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 115 unit, 325 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Filters are explicit and user-chosen, which is the product's stated alternative to hidden ordering. No score, rank, or automatic decision. |
+

@@ -25,6 +25,8 @@ interface ReviewQueue {
   readonly totalCount: number;
   readonly pendingExtractionCount: number;
   readonly extractedCount: number;
+  readonly appliedStates: readonly QueueEntry["evidenceState"][];
+  readonly shownCount: number;
   readonly entries: readonly QueueEntry[];
 }
 
@@ -38,6 +40,19 @@ const EVIDENCE_STATE_LABELS: Readonly<Record<QueueEntry["evidenceState"], string
   extracted: "Evidence extracted"
 };
 
+const FILTERABLE_STATES: readonly QueueEntry["evidenceState"][] = ["pending_extraction", "extracted"];
+
+/**
+ * AF-47 names four filters. Three of them cannot be answered from
+ * anything stored: incomplete, contradiction and error are per-criterion
+ * EvidenceOutcome kinds, and nothing persists those. They are shown
+ * disabled with the reason rather than omitted, because a recruiter who
+ * filters for contradictions and gets an empty list would reasonably
+ * conclude there are none -- offering a filter that quietly matches
+ * nothing is worse than not offering it.
+ */
+const UNAVAILABLE_FILTERS: readonly string[] = ["Incomplete", "Contradiction", "Error"];
+
 /**
  * AF-45: the recruiter's main working view for a role.
  *
@@ -46,6 +61,12 @@ const EVIDENCE_STATE_LABELS: Readonly<Record<QueueEntry["evidenceState"], string
  * EvidenceOutcome yet -- only whether an extraction run happened. And
  * there are no filters: AF-47 owns those, so inventing them here would
  * be work that ticket then has to undo.
+ *
+ * AF-47: filters are explicit checkboxes that name the state they
+ * select, and the counts they are compared against stay whole, so the
+ * screen can always say how much a filter is hiding. The three states
+ * the ticket names that nothing persists are shown disabled with the
+ * reason, not omitted.
  *
  * AF-46: the order is the employer's own file order, and the caption
  * says so out loud. That is a product guarantee, not an implementation
@@ -56,6 +77,7 @@ export default function ApplicationReviewQueuePage() {
   const params = useParams<{ roleId: string }>();
   const roleId = params.roleId;
   const [state, setState] = useState<QueueState>({ kind: "loading" });
+  const [selected, setSelected] = useState<readonly QueueEntry["evidenceState"][]>([]);
 
   useEffect(() => {
     if (roleId === undefined) {
@@ -64,7 +86,8 @@ export default function ApplicationReviewQueuePage() {
     }
     let cancelled = false;
     setState({ kind: "loading" });
-    fetch(`/api/roles/${encodeURIComponent(roleId)}/applications`, {
+    const query = selected.map((value) => `state=${encodeURIComponent(value)}`).join("&");
+    fetch(`/api/roles/${encodeURIComponent(roleId)}/applications${query === "" ? "" : `?${query}`}`, {
       headers: { Accept: "application/json" }
     })
       .then(async (response) => {
@@ -81,6 +104,8 @@ export default function ApplicationReviewQueuePage() {
             totalCount: body.totalCount ?? 0,
             pendingExtractionCount: body.pendingExtractionCount ?? 0,
             extractedCount: body.extractedCount ?? 0,
+            appliedStates: body.appliedStates ?? [],
+            shownCount: body.shownCount ?? 0,
             entries: body.entries ?? []
           }
         });
@@ -92,7 +117,13 @@ export default function ApplicationReviewQueuePage() {
     return () => {
       cancelled = true;
     };
-  }, [roleId]);
+  }, [roleId, selected]);
+
+  const toggle = (value: QueueEntry["evidenceState"]): void => {
+    setSelected((current) =>
+      current.includes(value) ? current.filter((entry) => entry !== value) : [...current, value]
+    );
+  };
 
   return (
     <main>
@@ -105,13 +136,38 @@ export default function ApplicationReviewQueuePage() {
       {state.kind === "ready" && (
         <>
           <p>
-            {state.queue.totalCount} imported {state.queue.totalCount === 1 ? "application" : "applications"} ·{" "}
-            {state.queue.extractedCount} with evidence extracted · {state.queue.pendingExtractionCount} not yet
+            {state.queue.appliedStates.length === 0
+              ? `${state.queue.totalCount} imported ${state.queue.totalCount === 1 ? "application" : "applications"}`
+              : `Showing ${state.queue.shownCount} of ${state.queue.totalCount}`}{" "}
+            · {state.queue.extractedCount} with evidence extracted · {state.queue.pendingExtractionCount} not yet
             processed.
           </p>
 
+          <fieldset>
+            <legend>Filter by state</legend>
+            {FILTERABLE_STATES.map((value) => (
+              <label key={value}>
+                <input type="checkbox" checked={selected.includes(value)} onChange={() => toggle(value)} />{" "}
+                {EVIDENCE_STATE_LABELS[value]}
+              </label>
+            ))}
+            {UNAVAILABLE_FILTERS.map((label) => (
+              <label key={label} title="Needs per-criterion evidence outcomes, which are not stored yet.">
+                <input type="checkbox" disabled />
+                {" "}
+                {label} <span aria-hidden="true">—</span>{" "}
+                <small>not available yet: per-criterion evidence outcomes are not stored</small>
+              </label>
+            ))}
+          </fieldset>
+
           {state.queue.totalCount === 0 ? (
             <p>No applications imported for this role yet.</p>
+          ) : state.queue.shownCount === 0 ? (
+            <p>
+              No applications match this filter. {state.queue.totalCount} are hidden by it — clear the filter to see
+              them.
+            </p>
           ) : (
             <table>
               <caption>
