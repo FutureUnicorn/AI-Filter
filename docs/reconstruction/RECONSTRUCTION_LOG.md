@@ -283,3 +283,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 140 unit, 330 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Corrections are append-only: a correction supersedes rather than overwrites, so the original evidence and its revision history both survive. Supports auditability; no score or ranking. |
 
+### PR #52 — AF-50 require correction reason and actor
+
+| | |
+|---|---|
+| Original base | `feature/AF-49-append-only-evidence-corrections` |
+| Original head | `feature/AF-50-require-correction-reason-and-actor` |
+| Commits in range | 2: `f1a57c2` (AF-50), `4b5c0bf` (`drop the duplicate registration guard, correct the kill-switch claim`) |
+| Replayed | **both.** The chore does three things here: deleting the duplicate guard (a no-op, since AF-45's copy was already skipped), unregistering it in `package.json` (applied), and correcting a false comment in AF-50's migration (kept). |
+| Migration changes | **`0018_correction_attribution.sql` renumbered to `0019_`**, colliding with AF-49's `0018_evidence_corrections.sql`. The chore's comment correction removed a claim that `0009`'s kill-switch reason uses `length(trim(x)) > 0`; accurate on this branch, where the baseline already carries AF-42's `0010_kill_switch_reason_non_whitespace.sql` POSIX-class fix. |
+| Conflicts | `package.json` twice, plus `packages/contracts` and `packages/db`. Registry resolved to the chore's intent, with `tests/architecture/test-file-registration.test.ts` unregistered on both sides and asserts that AF-22's surviving guard and `typecheck:tests` both remain. |
+| Two flaws found in my own tooling | (1) The remapper missed `"../../packages/db/migrations/0018_correction_attribution.sql"` because its pattern required a quote immediately before the digits, so path-qualified references were invisible. (2) Worse, it **rewrote historical filenames inside comments**, silently falsifying the guard's own explanation of why `0013_file_intake_validation.sql` was renumbered. Reverted that file and fixed the tool: it now skips comment lines and matches path-qualified names. |
+| Latent baseline defect found | With the path pattern fixed, the remapper found a stale reference inherited from the baseline: `tests/integration/rubric-contracts.test.ts` told an operator to point the database at `packages/db/migrations/0010_rubrics.sql`, which PR #82 renumbered to `0011_`. A wrong filename in a setup instruction, corrected. |
+| AF-13 drift resolved | `tests/integration/correction-attribution.test.ts` fixtures attributed. Wrote `attribute_outcomes.py` for this, now the fifth ticket carrying the same drift. |
+| Tests executed | 21 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 140 unit, 336 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Requires a named actor and a non-whitespace reason on every correction. Strengthens attribution and auditability; no score or ranking. |
+

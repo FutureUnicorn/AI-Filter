@@ -184,7 +184,7 @@ test("a draft round-trips, edits in place, and only allocates a new version when
   if (databaseUrl === undefined || databaseUrl.length === 0) {
     assert.fail(
       "SIGNAL_AUDIT_RLS_DATABASE_URL must be set to a real Postgres connection string so this test exercises " +
-        "packages/db/migrations/0010_rubrics.sql for real, including the one-draft-per-role unique index. " +
+        "packages/db/migrations/0011_rubrics.sql for real, including the one-draft-per-role unique index. " +
         "Locally: run `pnpm dev:infra`, then set it to " +
         "postgresql://signal_audit_local:local-only-password@localhost:5432/signal_audit_local (see README.md)."
     );
