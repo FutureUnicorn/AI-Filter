@@ -7,6 +7,7 @@ import {
   APPLICATION_EVIDENCE_STATES,
   APPLICATION_IMPORT_FIELDS,
   AUDIT_ACTIONS,
+  CANDIDATE_DECISION_KINDS,
   CONTRACT_SCHEMA_VERSION,
   FILE_INTAKE_STATUSES,
   IMPORT_ROW_OUTCOMES,
@@ -22,6 +23,7 @@ import type {
   Application,
   ApplicationQueueEntry,
   AuditEvent,
+  CandidateDecision,
   CanonicalTextExtraction,
   CanonicalTextPage,
   CitationInvalidEvidence,
@@ -1003,3 +1005,26 @@ export const metricSampleSchema = metricSampleObjectSchema
       path: ["value"]
     }
   );
+
+export const candidateDecisionSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  decisionId: z.uuid(),
+  organizationId: z.uuid(),
+  applicationId: z.uuid(),
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema,
+  decidedByUserId: z.uuid(),
+  supersedesDecisionId: z.uuid().optional(),
+  decidedAt: z.iso.datetime()
+}) satisfies z.ZodType<CandidateDecision>;
+
+/**
+ * What a caller may send. Note what is absent: no decidedByUserId. The
+ * actor is the session's own user, never a value in the request, so a
+ * caller cannot record a decision in someone else's name -- and there is
+ * nothing here a non-human caller could fill in to become one.
+ */
+export const recordCandidateDecisionInputSchema = z.strictObject({
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema
+});

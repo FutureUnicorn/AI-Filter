@@ -33,6 +33,14 @@ interface EvidenceCard {
   readonly recordedAt: string;
 }
 
+interface WorkflowStatus {
+  readonly status: "undecided" | "advance" | "hold" | "decline";
+  readonly decidedByUserId?: string;
+  readonly rationale?: string;
+  readonly decidedAt?: string;
+  readonly revisionCount?: number;
+}
+
 interface EvidenceCardSet {
   readonly applicationId: string;
   readonly cards: readonly EvidenceCard[];
@@ -79,6 +87,7 @@ export default function EvidenceCardPage() {
   const params = useParams<{ roleId: string; applicationId: string }>();
   const { roleId, applicationId } = params;
   const [state, setState] = useState<CardState>({ kind: "loading" });
+  const [workflow, setWorkflow] = useState<WorkflowStatus | undefined>(undefined);
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {
@@ -112,6 +121,20 @@ export default function EvidenceCardPage() {
         if (cancelled) return;
         setState({ kind: "error", message: error instanceof Error ? error.message : "Request failed." });
       });
+    // AF-51: the workflow status is read from the decision log, which is
+    // the only thing that holds it. Deliberately a separate request:
+    // failing to load a status must not blank the evidence, and failing
+    // to load evidence must not imply a candidate is undecided.
+    fetch(
+      `/api/roles/${encodeURIComponent(roleId)}/applications/${encodeURIComponent(applicationId)}/decisions`,
+      { headers: { Accept: "application/json" } }
+    )
+      .then(async (response) => (response.ok ? ((await response.json()) as WorkflowStatus) : undefined))
+      .then((value) => {
+        if (!cancelled) setWorkflow(value);
+      })
+      .catch(() => undefined);
+
     return () => {
       cancelled = true;
     };
@@ -121,6 +144,30 @@ export default function EvidenceCardPage() {
     <main>
       <p className="eyebrow">Evidence</p>
       <h1>Evidence for this application</h1>
+
+      {workflow !== undefined && (
+        <p>
+          <strong>Workflow status:</strong>{" "}
+          {workflow.status === "undecided"
+            ? "No decision recorded yet"
+            : `${workflow.status} — recorded by ${workflow.decidedByUserId ?? "unknown"} on ${workflow.decidedAt ?? "unknown"}`}
+          {workflow.status !== "undecided" && workflow.rationale !== undefined && (
+            <>
+              <br />
+              <small>Rationale: {workflow.rationale}</small>
+            </>
+          )}
+          {workflow.revisionCount !== undefined && workflow.revisionCount > 0 && (
+            <>
+              <br />
+              <small>
+                Revised {workflow.revisionCount} {workflow.revisionCount === 1 ? "time" : "times"}; every earlier
+                decision is kept.
+              </small>
+            </>
+          )}
+        </p>
+      )}
 
       {state.kind === "loading" && <p>Loading evidence…</p>}
       {state.kind === "error" && <p role="alert">Could not load evidence: {state.message}</p>}

@@ -315,3 +315,20 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 148 unit, 342 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Every metric is reported with its sample size and an explicit limitations list, which is the opposite of a bare score. Directly supports the product's honesty constraints; no ranking introduced. |
 
+### PR #56 — AF-51 named human advance/hold/decline recording
+
+| | |
+|---|---|
+| Original base | `feature/AF-50-require-correction-reason-and-actor` |
+| Original head | `feature/AF-51-named-human-decision-recording` |
+| Commits in range | 1: `6328d2a` |
+| Replayed | `6328d2a`. |
+| Conflicts | `package.json`, `packages/contracts`, `packages/db`, `packages/domain`. Kept HEAD on source, then ported the decision types, schemas, writers and the `assertCandidateDecisionIntegrity` probe. |
+| Registry | AF-51 predates AF-50's chore, so it re-registers the deleted `test-file-registration.test.ts`. Added that path to the resolver as an explicit **deliberate removal** (distinct from the relocation rule): a branch predating a removal re-registering the file is not a suite going missing. Its own new `decision-path-isolation.test.ts` was registered normally, giving architecture 5. |
+| Migration changes | **`0019_candidate_decisions.sql` renumbered to `0020_`**, colliding with AF-50's `0019_correction_attribution.sql`. Remapper repointed six historical references in the ported probe. |
+| Tooling added | `wire_imports.py`: ported declarations reference domain names the target file does not import, and the caller must state type-versus-value, since passing a value name as a type compiles here and fails at runtime. |
+| Test conflict resolved | Three checks in `tests/unit/candidate-decisions.test.ts` failed `typecheck:tests` as comparisons with no overlap. Cause: `assert.equal` carries an assertion signature in the pinned `@types/node`, so asserting on `status.status` narrows the union at the call site, making the defensive checks that followed unreachable or always-true. Resolved by removing the one unreachable `throw` and **unwrapping** the two conditional blocks so their assertions run unconditionally, which is stronger than guarding them with a condition the compiler has proven cannot be false. The fourth guard, inside the `CANDIDATE_DECISION_KINDS` loop, has no narrowing assertion before it and was left alone. No assertion was deleted or weakened. |
+| Tests executed | 22 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 157 unit, 343 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | Records a **named human's** advance/hold/decline with a rationale, and derives status by following supersedes links rather than by timestamp. This is the human-decision path the product requires; no automatic decision, score or ranking. |
+
