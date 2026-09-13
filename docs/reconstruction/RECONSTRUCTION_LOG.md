@@ -184,3 +184,23 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 
 **Block complete: #35 through #42 (AF-26 to AF-33) replayed.**
 
+## Block 2 — the AF-45 line
+
+### PR #44 — AF-45 tenant-scoped application review queue
+
+| | |
+|---|---|
+| Original base | `feature/AF-33-import-status-ui` |
+| Original head | `feature/AF-45-tenant-scoped-application-review-queue` |
+| Commits in range | 2: `3085cc4` (AF-45), `39c3152` (`test: guard against a registered test file that does not exist`) |
+| Replayed | **`3085cc4` only.** `39c3152` adds `tests/architecture/test-file-registration.test.ts`, a second registration guard. Its own header states that AF-22's `test-registration.test.ts` "is the version that should survive", that this is "a deliberate local copy, not a duplicate to reconcile now", and to "fold it into AF-22's version when that actually arrives". On this baseline AF-22's guard is already present, so that condition is satisfied. Verified the baseline version covers the same three drift directions (on-disk-unregistered, registered-missing, registered-twice) before skipping, rather than taking the comment's word for it. |
+| Conflicts | `package.json` (registry) and `packages/db/src/index.ts` (3 hunks). |
+| Resolution | Registry: union, unit 14, integration 31; `typecheck:tests` intact. `packages/db`: hunk boundaries again fell inside function bodies, so HEAD was kept for all three hunks and the genuinely missing declarations lifted across as complete units. Ported: `listApplicationsForRole`, `listEvidenceExtractionRunsForEntities`, `assertApplicationQueueTenantIsolation`, plus the private `ApplicationRow` and `rowToApplication` that the first typecheck proved were dangling. `InferenceKillSwitchRow` and `getInferenceKillSwitchStatus` were **deliberately not ported**: they belong to AF-42, whose PR is not on `develop`, and pulling them in would drag an unrelated ticket into this branch. |
+| Tooling added | `port_exports.py` in the scratchpad: lifts a complete top-level declaration (doc comment included) by brace matching, then asserts each requested name is declared exactly once. Written because keep-both concatenation across a mid-function hunk boundary produces a file that does not parse. |
+| Gate failure and fix | The first full gate **failed**: `assertApplicationQueueTenantIsolation` loaded `0012_file_intakes.sql` and `0015_applications_and_import_finalization.sql` by name, both renumbered earlier in this reconstruction. It surfaced only as an `ENOENT` inside a probe at test time, never at build time. Remapped to `0013_` and `0016_`. |
+| Extra fix | Added a fourth invariant to the migration guard: **every migration filename hard-coded in source must exist on disk**, scanning `packages`, `apps`, `scripts` and `tests` rather than a hand-kept list. Comment lines are skipped, since a filename in prose records history and is not a dependency the code resolves. Negative control: reintroducing the `0012_file_intakes.sql` reference in real code fails the test, while the same name in a comment does not. |
+| Migration changes | None of its own. |
+| Tests executed | 18 migrations replayed from an empty database; full `pnpm check`. |
+| Result | exit 0 — 96 unit, 321 integration, 21 architecture, 27 Python, zero failures. |
+| Product check | A tenant-scoped queue with explicit state counts. `buildApplicationReviewQueue` rejects counts that do not partition the total. No score, rank, or automatic decision. |
+

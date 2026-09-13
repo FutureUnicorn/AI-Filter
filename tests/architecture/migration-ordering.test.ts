@@ -95,3 +95,63 @@ test("migration filename order matches numeric order", () => {
     `every migration prefix must be 4 digits or filename order stops matching numeric order, got widths: ${[...widths].join(", ")}`
   );
 });
+
+/**
+ * A migration referenced by name in source is a dependency the compiler cannot
+ * see. Renumbering during this reconstruction silently broke two of them:
+ * `assertApplicationQueueTenantIsolation` still loaded `0012_file_intakes.sql`
+ * after that file became `0013_`, and the failure only surfaced as an ENOENT
+ * deep inside a probe at test time, not at build time.
+ *
+ * Scans source rather than a hand-kept list, so a new hard-coded reference is
+ * covered the moment it is written.
+ */
+test("every migration filename hard-coded in source exists on disk", () => {
+  const roots = ["packages", "apps", "scripts", "tests"];
+  const offenders: string[] = [];
+  const onDisk = new Set(migrationFilenames());
+
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === "dist" || entry.name === ".next") {
+          continue;
+        }
+        walk(full);
+        continue;
+      }
+      if (!/\.(ts|tsx|mjs|js)$/u.test(entry.name)) {
+        continue;
+      }
+      // Comment lines are skipped: a migration named in prose (including the
+      // history recorded above) documents what a file used to be called and is
+      // not a dependency the code resolves. Only a live string literal is.
+      const lines = fs.readFileSync(full, "utf8").split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+          continue;
+        }
+        for (const match of line.matchAll(/["'`](\d{4}_[a-z0-9_]+\.sql)["'`]/gu)) {
+          const name = match[1];
+          if (name !== undefined && !onDisk.has(name)) {
+            offenders.push(`${path.relative(repositoryRoot, full)} references ${name}`);
+          }
+        }
+      }
+    }
+  };
+  for (const root of roots) {
+    const full = path.join(repositoryRoot, root);
+    if (fs.existsSync(full)) {
+      walk(full);
+    }
+  }
+
+  assert.deepEqual(
+    [...new Set(offenders)],
+    [],
+    `source references migrations that do not exist:\n${[...new Set(offenders)].join("\n")}`
+  );
+});
