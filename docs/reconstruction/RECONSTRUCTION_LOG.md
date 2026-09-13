@@ -107,3 +107,14 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 60 unit, 311 integration, 17 architecture, 27 Python, zero failures. |
 | Product check | Validation classifies and quarantines files. No score, rank, or automatic candidate decision. |
 
+### Extra fix — migration prefix guard (plan section 12)
+
+| | |
+|---|---|
+| Why now | AF-29 proved the risk is live, not theoretical: `0013_file_intake_validation.sql` beside `0013_file_intakes.sql` sorts first (`_` before `s`), so an `ALTER TABLE` would have run before its `CREATE TABLE`. Nothing in the repository would have caught it. |
+| Added | `tests/architecture/migration-ordering.test.ts`, registered in `test:architecture`. |
+| Invariants | (1) no new migration reuses a numeric prefix; (2) every grandfathered exemption still covers a real duplicate, so the exemption list cannot rot into a silent permit; (3) every prefix is 4 digits, since filename order only matches numeric order while the width is fixed. |
+| Grandfathering | `0006` and `0009` were already duplicated on the baseline. Plan section 12 warns against casually renaming migrations that may already be deployed, so they are recorded as known exceptions rather than renumbered. Shrinking that list is safe; growing it is what the test prevents. |
+| Negative controls | Recreating the exact AF-29 collision fails the test; adding a 3-digit prefix fails it. Both confirmed. |
+| Result | 3/3 pass; architecture suite 17 to 20. |
+
