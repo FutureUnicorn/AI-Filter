@@ -10,6 +10,24 @@ export const APP_ENVIRONMENTS = [
 
 export type AppEnvironment = (typeof APP_ENVIRONMENTS)[number];
 
+/**
+ * The environments that have a terminal a developer can actually read, and
+ * are therefore allowed to deliver magic links through the local console
+ * sender. Everything else in APP_ENVIRONMENTS is hosted -- including
+ * `preview`, which is a per-PR/per-SHA deployment, not a workstation.
+ *
+ * Mirrors LOCAL_CONSOLE_ENVIRONMENTS in packages/security. The two are
+ * separate because packages/security must not depend on packages/config
+ * (see dependency-cruiser.config.cjs); an architecture test asserts they
+ * stay identical so they cannot drift.
+ */
+export const LOCAL_CONSOLE_ENVIRONMENTS: readonly AppEnvironment[] = ["development", "test"];
+
+/** True for every environment that must use a real delivery adapter. */
+export function isHostedEnvironment(appEnv: AppEnvironment): boolean {
+  return !LOCAL_CONSOLE_ENVIRONMENTS.includes(appEnv);
+}
+
 const booleanValue = z
   .enum(["true", "false"])
   .transform((value) => value === "true");
@@ -22,6 +40,61 @@ const optionalPreviewId = z.preprocess(
 const optionalPreviewCommitSha = z.preprocess(
   (value) => (value === "" ? undefined : value),
   z.string().regex(/^[a-f0-9]{7,64}$/u).optional()
+);
+
+// Outbound magic-link email delivery. Optional in the schema and then
+// REQUIRED for staging/production by the superRefine below, so a hosted
+// deployment that forgets them fails at config load rather than silently
+// falling back to the local console sender -- which is exactly how a
+// hosted environment ended up minting sign-in tokens that nothing could
+// deliver and nobody could redeem.
+//
+// Deliberately vendor-neutral: an endpoint, a bearer key and a from
+// address are what Resend, Postmark, SendGrid and Mailgun all accept, so
+// packages/security keeps its "no vendor is chosen by this ticket"
+// position instead of taking a dependency on one provider's SDK.
+/**
+ * An absolute http(s) origin and nothing else: no path, query or fragment. A
+ * value like `https://app.example/redeem` would silently produce
+ * `https://app.example/redeem/auth/redeem?token=...`, so the shape is pinned
+ * here rather than trusted to the caller.
+ */
+const optionalOrigin = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z
+    .string()
+    .url()
+    .refine((value) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        return false;
+      }
+      return (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        (parsed.pathname === "" || parsed.pathname === "/") &&
+        parsed.search === "" &&
+        parsed.hash === "" &&
+        parsed.username === "" &&
+        parsed.password === ""
+      );
+    }, "PUBLIC_APP_ORIGIN must be a bare http(s) origin with no path, query, fragment or credentials")
+    .transform((value) => new URL(value).origin)
+    .optional()
+);
+
+const optionalUrl = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().url().optional()
+);
+const optionalSecret = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().trim().min(1).optional()
+);
+const optionalEmailAddress = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().email().optional()
 );
 
 const rawEnvironmentSchema = z
@@ -46,9 +119,65 @@ const rawEnvironmentSchema = z
     WEB_PORT: portValue,
     WORKER_PORT: portValue,
     PREVIEW_ID: optionalPreviewId,
-    PREVIEW_COMMIT_SHA: optionalPreviewCommitSha
+    PREVIEW_COMMIT_SHA: optionalPreviewCommitSha,
+    /**
+     * The canonical public origin this deployment is reached at, used to build
+     * links that are emailed to people.
+     *
+     * Not derived from the incoming request. Review (#83) found that building
+     * a magic-link URL from `new URL(request.url).origin` lets an
+     * unauthenticated caller choose the host: a request submitted for a victim
+     * with `Host: attacker.example` produces a real, signed link pointing at
+     * the attacker, and the victim clicking it hands over a redeemable bearer
+     * token. The request host is attacker-controlled input; this is not.
+     */
+    PUBLIC_APP_ORIGIN: optionalOrigin,
+    MAGIC_LINK_EMAIL_ENDPOINT: optionalUrl,
+    MAGIC_LINK_EMAIL_API_KEY: optionalSecret,
+    MAGIC_LINK_EMAIL_FROM: optionalEmailAddress
   })
   .superRefine((value, context) => {
+    // A hosted environment has no terminal for anyone to read, so the
+    // console sender cannot deliver there. Requiring the delivery
+    // settings here means the failure is a startup config error naming
+    // the missing variable, not a 202 for a link that never arrives.
+    //
+    // `preview` counts as hosted, which review (#28) caught: an earlier
+    // revision listed only staging and production, so a preview
+    // deployment with no delivery settings loaded cleanly and then wrote
+    // the raw recipient address and bearer link to the stderr of a hosted
+    // process. Preview is a per-PR/per-SHA deployment here -- it even
+    // derives its own database schema -- not a developer terminal.
+    //
+    // Derived by exclusion rather than by listing the hosted names, so an
+    // environment added to APP_ENVIRONMENTS later is hosted by default
+    // instead of silently skipping this requirement.
+    if (!LOCAL_CONSOLE_ENVIRONMENTS.includes(value.APP_ENV)) {
+      for (const field of [
+        "MAGIC_LINK_EMAIL_ENDPOINT",
+        "MAGIC_LINK_EMAIL_API_KEY",
+        "MAGIC_LINK_EMAIL_FROM"
+      ] as const) {
+        if (value[field] === undefined) {
+          context.addIssue({
+            code: "custom",
+            path: [field],
+            message: `${field} is required for ${value.APP_ENV}; a hosted environment cannot deliver magic links through the local console sender`
+          });
+        }
+      }
+      // A hosted deployment must state its own public origin. Falling back to
+      // the request host is what made emailed links attacker-steerable, so
+      // there is deliberately no fallback here: the deployment fails to boot
+      // rather than sending a link to a host it was told at request time.
+      if (value.PUBLIC_APP_ORIGIN === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["PUBLIC_APP_ORIGIN"],
+          message: `PUBLIC_APP_ORIGIN is required for ${value.APP_ENV}; emailed links must come from a configured origin, never from the incoming request host`
+        });
+      }
+    }
     if (value.APP_ENV === "preview") {
       if (value.PREVIEW_ID === undefined) {
         context.addIssue({
@@ -96,9 +225,27 @@ export interface EnvironmentConfig {
     readonly web: number;
     readonly worker: number;
   };
+  /**
+   * The origin to use when building a link that leaves the system. Always
+   * present: configured explicitly for a hosted environment (enforced by the
+   * schema), and derived from the local web port for development and test.
+   * Never taken from an incoming request.
+   */
+  readonly publicAppOrigin: string;
   readonly preview?: {
     readonly id: string;
     readonly commitSha: string;
+  };
+  /**
+   * Present whenever outbound magic-link email is configured, and
+   * guaranteed present for staging/production by the schema above. Its
+   * absence is what selects the local console sender, so this being
+   * optional is the whole environment decision, not a convenience.
+   */
+  readonly magicLinkEmail?: {
+    readonly endpoint: string;
+    readonly apiKey: string;
+    readonly from: string;
   };
 }
 
@@ -133,11 +280,26 @@ export function loadEnvironmentConfig(source: EnvironmentSource): EnvironmentCon
       web: value.WEB_PORT,
       worker: value.WORKER_PORT
     },
+    // Hosted environments must configure this; the schema refuses to load
+    // without it. Development and test fall back to the local web port, which
+    // is a fixed local value rather than anything a request can influence.
+    publicAppOrigin: value.PUBLIC_APP_ORIGIN ?? `http://localhost:${value.WEB_PORT}`,
     ...(value.PREVIEW_ID !== undefined && value.PREVIEW_COMMIT_SHA !== undefined
       ? {
           preview: {
             id: value.PREVIEW_ID,
             commitSha: value.PREVIEW_COMMIT_SHA
+          }
+        }
+      : {}),
+    ...(value.MAGIC_LINK_EMAIL_ENDPOINT !== undefined &&
+    value.MAGIC_LINK_EMAIL_API_KEY !== undefined &&
+    value.MAGIC_LINK_EMAIL_FROM !== undefined
+      ? {
+          magicLinkEmail: {
+            endpoint: value.MAGIC_LINK_EMAIL_ENDPOINT,
+            apiKey: value.MAGIC_LINK_EMAIL_API_KEY,
+            from: value.MAGIC_LINK_EMAIL_FROM
           }
         }
       : {})

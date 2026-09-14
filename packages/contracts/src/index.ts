@@ -2,25 +2,54 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { AUDIT_ACTIONS, CONTRACT_SCHEMA_VERSION, MEMBERSHIP_ROLES } from "@signal-audit/domain";
+import {
+  ALLOWED_FILE_TYPES,
+  APPLICATION_EVIDENCE_STATES,
+  APPLICATION_IMPORT_FIELDS,
+  AUDIT_ACTIONS,
+  CANDIDATE_DECISION_KINDS,
+  CONTRACT_SCHEMA_VERSION,
+  FILE_INTAKE_STATUSES,
+  IMPORT_ROW_OUTCOMES,
+  MAX_RUBRIC_CRITERIA,
+  MEMBERSHIP_ROLES,
+  METRIC_LIMITATION_CODES,
+  MIN_RUBRIC_CRITERIA,
+  ROLE_STATUSES,
+  RUBRIC_STATUSES
+} from "@signal-audit/domain";
 import type { ContractSchemaVersion } from "@signal-audit/domain";
 import type {
+  Application,
+  ApplicationQueueEntry,
   AuditEvent,
+  CandidateDecision,
+  CanonicalTextExtraction,
+  CanonicalTextPage,
   CitationInvalidEvidence,
   ContradictedEvidence,
+  CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRun,
   EvidenceOutcome,
   ExtractionErrorEvidence,
+  FailedDocumentRate,
   FailedEvidence,
+  FileIntake,
+  ImportRow,
   InvalidSourceEvidence,
   Membership,
+  MetricLimitation,
+  MetricSample,
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
   ProcessingEvidence,
   QuarantinedEvidence,
   RetryingEvidence,
+  Role,
+  Rubric,
+  RubricCriterion,
   SourceCitation,
   SupportedEvidence,
   UnclearEvidence,
@@ -613,3 +642,389 @@ export const evidenceExtractionRunSchema = z.strictObject({
   rubricVersion: z.string().min(1),
   createdAt: z.iso.datetime()
 }) satisfies z.ZodType<EvidenceExtractionRun>;
+
+// ---- AF-23: role creation ----
+
+export const roleSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  roleId: z.uuid(),
+  organizationId: z.uuid(),
+  title: z.string().min(1),
+  status: z.enum(ROLE_STATUSES),
+  createdByUserId: z.uuid(),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Role>;
+
+/**
+ * organizationId is required in the body, not inferred from the caller's
+ * only membership: a caller can belong to more than one organization
+ * (AF-15 puts no limit on memberships-per-user), so the request must say
+ * which one it means. The route authorizes it server-side against the
+ * caller's own memberships (authorizeResourceAccess) -- this schema only
+ * shapes the input, it grants nothing.
+ */
+export const createRoleInputSchema = z.strictObject({
+  organizationId: z.uuid(),
+  title: z.string().trim().min(1).max(200)
+});
+
+export type CreateRoleInput = z.infer<typeof createRoleInputSchema>;
+
+// ---- AF-25: rubric draft/edit ----
+
+export const rubricCriterionSchema = z.strictObject({
+  // Trimmed for the same reason description and evidenceGuidance are, and
+  // it matters more here: criterionId is the key the extraction pipeline
+  // matches an extracted item against, so " python " and "python" naming
+  // the same criterion would be two different keys, and a whitespace-only
+  // id would be a criterion nothing can ever cite. Trimming also makes the
+  // uniqueness rule below mean what it says -- without it, "a" and "a "
+  // are technically distinct and would both be accepted.
+  criterionId: z.string().trim().min(1),
+  description: z.string().trim().min(1).max(500),
+  evidenceGuidance: z.string().trim().min(1).max(500)
+}) satisfies z.ZodType<RubricCriterion>;
+
+/**
+ * Duplicate criterion IDs are rejected here because the layer that
+ * consumes a rubric already rejects them: mapRubricToEvidence throws
+ * `requires unique rubric criterion IDs; "<id>" appears more than once`
+ * rather than silently emitting two outcomes for one criterion, since
+ * that would contradict its one-outcome-per-criterion invariant.
+ *
+ * Without this check the two layers disagreed about what a valid rubric
+ * is, and the API was the more permissive one: a recruiter could save a
+ * rubric with the same criterion five times, get a 200, and only discover
+ * it was malformed when the first extraction run against that role blew
+ * up. A save that succeeds and a run that cannot is the worst split,
+ * because the failure surfaces far from the edit that caused it.
+ *
+ * Reported against the duplicate element's own index rather than the
+ * whole array, so an editor can highlight the offending row, and it names
+ * the earlier position so the author can see which two collide.
+ */
+function addDuplicateCriterionIdIssues(
+  criteria: readonly RubricCriterion[],
+  context: z.RefinementCtx
+): void {
+  const firstIndexById = new Map<string, number>();
+  criteria.forEach((criterion, index) => {
+    const firstIndex = firstIndexById.get(criterion.criterionId);
+    if (firstIndex === undefined) {
+      firstIndexById.set(criterion.criterionId, index);
+      return;
+    }
+    context.addIssue({
+      code: "custom",
+      path: ["criteria", index, "criterionId"],
+      message: `criterionId "${criterion.criterionId}" is already used by criterion ${firstIndex + 1}; a rubric cannot score the same criterion twice`
+    });
+  });
+}
+
+export const rubricSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  rubricId: z.uuid(),
+  roleId: z.uuid(),
+  version: z.number().int().min(1),
+  status: z.enum(RUBRIC_STATUSES),
+  criteria: z.array(rubricCriterionSchema),
+  approvedByUserId: z.uuid().optional(),
+  approvedAt: z.iso.datetime().optional(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime()
+})
+  // The stored/returned rubric carries the same rule as the input that
+  // produced it. A rubric that only became valid on the way in, and is
+  // invalid once read back, would leave the API describing something the
+  // pipeline still refuses to run.
+  .superRefine((value, context) => {
+    addDuplicateCriterionIdIssues(value.criteria, context);
+  }) satisfies z.ZodType<Rubric>;
+
+/**
+ * The 5-10 bound lives here, not only in AF-26's editor UI: an API caller
+ * that bypasses the UI (a script, a future integration) must not be able
+ * to save a 2-criterion or 40-criterion rubric just because the UI didn't
+ * stop it.
+ */
+export const upsertRubricDraftInputSchema = z
+  .strictObject({
+    criteria: z.array(rubricCriterionSchema).min(MIN_RUBRIC_CRITERIA).max(MAX_RUBRIC_CRITERIA)
+  })
+  .superRefine((value, context) => {
+    addDuplicateCriterionIdIssues(value.criteria, context);
+  });
+
+export type UpsertRubricDraftInput = z.infer<typeof upsertRubricDraftInputSchema>;
+
+// ---- AF-28: secure direct file upload ----
+
+export const fileIntakeSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  intakeId: z.uuid(),
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  storageKey: z.string().min(1),
+  declaredFilename: z.string().min(1),
+  declaredMimeType: z.string().min(1),
+  status: z.enum(FILE_INTAKE_STATUSES),
+  createdByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+  sniffedMimeType: z.string().min(1).optional(),
+  sizeBytes: z.number().int().min(0).optional(),
+  sha256Hash: z.string().min(1).optional(),
+  rejectionReason: z.string().min(1).optional()
+}) satisfies z.ZodType<FileIntake>;
+
+const ALLOWED_FILE_EXTENSION_PATTERN = new RegExp(`\\.(${ALLOWED_FILE_TYPES.join("|")})$`, "iu");
+
+/**
+ * Checks the declared filename's extension against the allowlist -- a
+ * cheap, purely-cosmetic gate on what the client claims, not a security
+ * boundary. AF-29 owns the real boundary: sniffing the uploaded bytes'
+ * actual type once they land, which is the only check a malicious client
+ * can't simply lie past by naming a file resume.pdf.
+ */
+export const requestFileUploadInputSchema = z.strictObject({
+  declaredFilename: z.string().trim().min(1).max(255).regex(ALLOWED_FILE_EXTENSION_PATTERN, {
+    message: `Filename must end in one of: ${ALLOWED_FILE_TYPES.join(", ")}`
+  }),
+  declaredMimeType: z.string().trim().min(1)
+});
+
+export type RequestFileUploadInput = z.infer<typeof requestFileUploadInputSchema>;
+
+// ---- AF-30: PDF/DOCX canonical text parser ----
+
+const canonicalTextPageSchema = z.strictObject({
+  pageNumber: z.number().int().min(1),
+  text: z.string(),
+  characterCount: z.number().int().min(0)
+}) satisfies z.ZodType<CanonicalTextPage>;
+
+export const canonicalTextExtractionSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  extractionId: z.uuid(),
+  intakeId: z.uuid(),
+  pages: z.array(canonicalTextPageSchema),
+  totalPages: z.number().int().min(1),
+  quality: z.enum(["full", "partial", "empty"]),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<CanonicalTextExtraction>;
+
+// ---- AF-31: CSV mapping and ten-row preview ----
+
+export const csvColumnMappingEntrySchema = z.strictObject({
+  field: z.enum(APPLICATION_IMPORT_FIELDS),
+  csvColumnHeader: z.string().trim().min(1)
+}) satisfies z.ZodType<CsvColumnMapping>;
+
+/**
+ * mapping is optional: an empty POST body is how the recruiter discovers
+ * the file's headers before choosing one, not an error. Once a mapping is
+ * supplied it's validated for real (packages/domain's
+ * validateCsvColumnMapping) before any preview rows are computed.
+ */
+export const csvPreviewInputSchema = z.strictObject({
+  mapping: z.array(csvColumnMappingEntrySchema).max(APPLICATION_IMPORT_FIELDS.length).optional()
+});
+
+export type CsvPreviewInput = z.infer<typeof csvPreviewInputSchema>;
+
+// ---- AF-32: idempotent import finalization ----
+
+export const applicationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  applicationId: z.uuid(),
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  intakeId: z.uuid(),
+  sourceRowNumber: z.number().int().min(1),
+  candidateFullName: z.string().min(1),
+  candidateEmail: z.string().min(1),
+  externalReferenceId: z.string().min(1).optional(),
+  appliedAt: z.string().min(1).optional(),
+  createdAt: z.iso.datetime()
+}) satisfies z.ZodType<Application>;
+
+export const importRowSchema = z.strictObject({
+  importRowId: z.uuid(),
+  intakeId: z.uuid(),
+  rowNumber: z.number().int().min(1),
+  outcome: z.enum(IMPORT_ROW_OUTCOMES),
+  applicationId: z.uuid().optional(),
+  failureReason: z.string().min(1).optional()
+}) satisfies z.ZodType<ImportRow>;
+
+/**
+ * mapping here is required (unlike AF-31's preview): finalizing without
+ * a mapping makes no sense, there is no discovery mode for this action.
+ * The Idempotency-Key header, not this body, is what makes a retry safe
+ * -- see packages/db's finalizeCsvImport for the actual replay-vs-
+ * conflict logic that key drives.
+ */
+export const finalizeCsvImportInputSchema = z.strictObject({
+  mapping: z.array(csvColumnMappingEntrySchema).min(1).max(APPLICATION_IMPORT_FIELDS.length)
+});
+
+export type FinalizeCsvImportInput = z.infer<typeof finalizeCsvImportInputSchema>;
+
+// ---- AF-45: tenant-scoped application review queue ----
+
+export const applicationQueueEntrySchema = z.strictObject({
+  application: applicationSchema,
+  evidenceState: z.enum(APPLICATION_EVIDENCE_STATES),
+  extractionRunCount: z.number().int().min(0),
+  lastExtractionAt: z.iso.datetime().optional()
+}) satisfies z.ZodType<ApplicationQueueEntry>;
+
+/**
+ * The counts are validated as a partition, not as three free integers:
+ * a response where pendingExtractionCount + extractedCount does not
+ * equal totalCount is describing a queue that cannot exist, and the
+ * contract should reject it rather than let a UI render a total that
+ * disagrees with its own breakdown.
+ */
+export const applicationReviewQueueSchema = z
+  .strictObject({
+    schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+    roleId: z.uuid(),
+    totalCount: z.number().int().min(0),
+    pendingExtractionCount: z.number().int().min(0),
+    extractedCount: z.number().int().min(0),
+    appliedStates: z.array(z.enum(APPLICATION_EVIDENCE_STATES)),
+    shownCount: z.number().int().min(0),
+    entries: z.array(applicationQueueEntrySchema)
+  })
+  .refine((queue) => queue.pendingExtractionCount + queue.extractedCount === queue.totalCount, {
+    message: "pendingExtractionCount and extractedCount must sum to totalCount"
+  })
+  .refine((queue) => queue.entries.length === queue.shownCount, {
+    message: "shownCount must match the number of entries returned"
+  })
+  .refine((queue) => queue.shownCount <= queue.totalCount, {
+    message: "shownCount cannot exceed totalCount"
+  })
+  .refine((queue) => queue.appliedStates.length > 0 || queue.shownCount === queue.totalCount, {
+    message: "an unfiltered queue must show every application it counted"
+  })
+  .refine(
+    (queue) => queue.entries.every((entry) => queue.appliedStates.length === 0 || queue.appliedStates.includes(entry.evidenceState)),
+    { message: "every entry returned must match one of the applied state filters" }
+  )
+  .refine((queue) => new Set(queue.appliedStates).size === queue.appliedStates.length, {
+    message: "appliedStates must not repeat a state"
+  });
+
+/**
+ * AF-58. `failedRate` is nullable on purpose -- see summarizeFailedDocuments:
+ * a role where nothing has resolved yet has no rate, and 0 would read as
+ * "nothing failed". `.nullable()` forces every consumer to handle that.
+ */
+export const failedDocumentRateSchema = z.strictObject({
+  schemaVersion: schemaVersionSchema,
+  organizationId: z.uuid(),
+  roleId: z.uuid(),
+  uploaded: z.number().int().min(0),
+  failed: z.number().int().min(0),
+  quarantined: z.number().int().min(0),
+  rejected: z.number().int().min(0),
+  extractionEmpty: z.number().int().min(0),
+  extractionSucceeded: z.number().int().min(0),
+  resolved: z.number().int().min(0),
+  inFlight: z.number().int().min(0),
+  failedRate: z.number().min(0).max(1).nullable()
+}) satisfies z.ZodType<FailedDocumentRate>;
+
+/**
+ * Mirrors 0018's CHECK exactly: a reason must contain at least one
+ * character that is not whitespace.
+ *
+ * Deliberately not `.min(1)`, which accepts "   ", and deliberately not
+ * `.trim().min(1)` either -- JavaScript's String.trim strips the full
+ * Unicode whitespace set while Postgres's trim() strips spaces only, so
+ * that pairing would make the two layers disagree in a direction the
+ * database is looser. Asking both "does this contain a non-whitespace
+ * character" makes them the same question.
+ *
+ * Verified against Postgres 17 rather than assumed: JS /\S/u and
+ * `~ '[^[:space:]]'` agree on U+00A0 (both whitespace), U+3000 (both
+ * whitespace) and U+200B (both non-whitespace). That last one is a
+ * shared gap, not a divergence -- a reason of a single zero-width space
+ * satisfies both. Left alone on purpose: closing it in TypeScript only
+ * would break the mirror this schema exists to maintain, and there is a
+ * test asserting the two layers still agree.
+ */
+export const correctionReasonSchema = z
+  .string()
+  .refine((value) => /\S/u.test(value), "must contain at least one non-whitespace character");
+
+export const recordEvidenceCorrectionInputSchema = z.strictObject({
+  outcome: evidenceOutcomeSchema,
+  reason: correctionReasonSchema
+});
+
+/**
+ * AF-60. `value` is nullable at the contract boundary on purpose: a metric
+ * whose sample cannot support it must be structurally incapable of
+ * carrying a number, not merely accompanied by a warning that a renderer
+ * can drop. `limitations` is required and may be empty -- an absent field
+ * would be indistinguishable from "no limitations known", which is the
+ * claim this ticket exists to prevent making by accident.
+ */
+export const metricLimitationSchema = z.strictObject({
+  code: z.enum(METRIC_LIMITATION_CODES),
+  detail: z.string().min(1)
+}) satisfies z.ZodType<MetricLimitation>;
+
+const metricSampleObjectSchema = z.strictObject({
+  schemaVersion: schemaVersionSchema,
+  metric: z.string().min(1),
+  value: z.number().finite().nullable(),
+  sampleSize: z.number().int().min(0),
+  population: z.number().int().min(0),
+  minimumSampleSize: z.number().int().min(0),
+  limitations: z.array(metricLimitationSchema)
+}) satisfies z.ZodType<MetricSample>;
+
+export const metricSampleSchema = metricSampleObjectSchema
+  .refine((sample) => sample.sampleSize <= sample.population, {
+    message: "sampleSize cannot exceed population",
+    path: ["sampleSize"]
+  })
+  .refine(
+    (sample) =>
+      sample.value === null || (sample.sampleSize > 0 && sample.sampleSize >= sample.minimumSampleSize),
+    {
+      // The invariant the whole ticket rests on: a value may not cross the
+      // boundary unless its own sample supports it. Without this the schema
+      // would happily transport the exact thing summarizeMetric refuses to
+      // produce.
+      message: "a value must not be reported when sampleSize is 0 or below minimumSampleSize",
+      path: ["value"]
+    }
+  );
+
+export const candidateDecisionSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  decisionId: z.uuid(),
+  organizationId: z.uuid(),
+  applicationId: z.uuid(),
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema,
+  decidedByUserId: z.uuid(),
+  supersedesDecisionId: z.uuid().optional(),
+  decidedAt: z.iso.datetime()
+}) satisfies z.ZodType<CandidateDecision>;
+
+/**
+ * What a caller may send. Note what is absent: no decidedByUserId. The
+ * actor is the session's own user, never a value in the request, so a
+ * caller cannot record a decision in someone else's name -- and there is
+ * nothing here a non-human caller could fill in to become one.
+ */
+export const recordCandidateDecisionInputSchema = z.strictObject({
+  decision: z.enum(CANDIDATE_DECISION_KINDS),
+  rationale: correctionReasonSchema
+});

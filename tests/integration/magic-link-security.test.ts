@@ -86,33 +86,49 @@ test("an unconsumed but expired token is expired, not already_consumed", () => {
   assert.deepEqual(result, { outcome: "expired" });
 });
 
-test("createConsoleMagicLinkEmailSender does not leak the recipient or raw token", async (t) => {
+// These two tests asserted that the console sender redacted the token
+// from stderr as well as from the log stream. That is the behaviour
+// review (#28) rejected: it left no channel yielding a usable link, so
+// the request endpoint minted a valid token, returned 202, and the redeem
+// endpoint was unreachable without editing the database by hand.
+//
+// The property worth protecting is narrower and is still enforced below:
+// the credential and the recipient must never enter the RETAINED
+// structured log stream, which is shipped and searchable. stderr in a
+// local environment is the deliberate delivery channel, and the
+// hosted-environment guard is what keeps it local.
+test("the console sender keeps the credential out of the retained log stream", async (t) => {
   const logMock = t.mock.method(console, "log", () => undefined);
+  const errorMock = t.mock.method(console, "error", () => undefined);
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const sender = createConsoleMagicLinkEmailSender("development");
   await sender.sendMagicLink({ email: "user@acme.test", link: "https://example.test/verify?token=abc" });
-  const dumped = [
+
+  // The retained stream: structured JSON via console.log / console.error.
+  const logged = [
     ...logMock.mock.calls.map((call) => String(call.arguments[0])),
-    ...stderrMock.mock.calls.map((call) => String(call.arguments[0]))
+    ...errorMock.mock.calls.map((call) => String(call.arguments[0]))
   ].join("\n");
-  assert.equal(dumped.includes("user@acme.test"), false);
-  assert.equal(dumped.includes("token=abc"), false);
-  assert.equal(dumped.includes("token=[REDACTED]"), true);
+  assert.equal(logged.includes("user@acme.test"), false, "the recipient must not enter the retained log stream");
+  assert.equal(logged.includes("token=abc"), false, "the credential must not enter the retained log stream");
+  assert.match(logged, /magic_link\.queued/, "delivery is recorded as a non-PII event");
+
+  // The local delivery channel: it must carry a redeemable link.
+  const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("");
+  assert.equal(written.includes("token=abc"), true, "a local developer must be able to redeem the link");
 });
 
-test("every token parameter is redacted, not just the first", async (t) => {
+test("the console sender preserves every token parameter, so a duplicated one is still redeemable", async (t) => {
   // A duplicated query parameter is well-formed and nothing rejects it.
-  // Before the `g` flag, the second token printed to the terminal in full
-  // -- a redaction that stops at the first match leaks on every input its
-  // author did not picture.
+  // The earlier concern here was a redaction that stopped at the first
+  // match; now that the local channel deliberately carries the real
+  // link, the equivalent risk is a rewrite that mangles the link and
+  // yields a token the redeem endpoint rejects. Assert it is verbatim.
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const sender = createConsoleMagicLinkEmailSender("development");
-  await sender.sendMagicLink({
-    email: "user@acme.test",
-    link: "https://example.test/verify?a=1&token=FIRST_SECRET&b=2&token=SECOND_SECRET&c=3"
-  });
+  const link = "https://example.test/verify?a=1&token=FIRST_SECRET&b=2&token=SECOND_SECRET&c=3";
+  await sender.sendMagicLink({ email: "user@acme.test", link });
   const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("");
-  assert.doesNotMatch(written, /FIRST_SECRET/, "the first token must not reach the terminal");
-  assert.doesNotMatch(written, /SECOND_SECRET/, "the second token must not reach the terminal either");
-  assert.equal(written.match(/token=\[REDACTED\]/g)?.length, 2, "both parameters must be redacted");
+  assert.equal(written.includes(link), true, "the link must reach the terminal byte-for-byte");
+  assert.doesNotMatch(written, /\[REDACTED\]/u, "a redacted token cannot be redeemed");
 });
