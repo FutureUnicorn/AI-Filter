@@ -1,15 +1,20 @@
 import {
   buildApiError,
+  checkIdempotencyRequirement,
   generateRequestId,
+  idempotencyErrorResponse,
   recordEvidenceCorrectionInputSchema,
   withRequestId
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
+  claimIdempotentRequest,
+  completeIdempotentRequest,
   correctEvidenceOutcome,
   getApplicationById,
   getMembershipsForUser,
-  getRoleById
+  getRoleById,
+  releaseIdempotentRequest
 } from "@signal-audit/db";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../../../lib/session";
@@ -47,6 +52,24 @@ interface RouteContext {
  */
 export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
+
+  // Review #83, P2, the same gap as the decision endpoint. Corrections are
+  // append-only, so a retry after a lost response does not overwrite -- it
+  // records a SECOND correction superseding the first, changing the evidence
+  // history with a correction no reviewer made.
+  const idempotency = checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key"));
+  const idempotencyError = idempotencyErrorResponse(idempotency, requestId);
+  if (idempotencyError !== undefined) {
+    return Response.json(idempotencyError.body, {
+      status: idempotencyError.status,
+      headers: withRequestId(undefined, requestId)
+    });
+  }
+  const idempotencyKey = idempotency.required && idempotency.outcome === "present" ? idempotency.key : undefined;
+  if (idempotencyKey === undefined) {
+    const error = buildApiError({ requestId, code: "invalid_request", message: "Idempotency-Key is required." });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+  }
   const { roleId, applicationId, criterionId } = await context.params;
   const userId = readSessionUserId(request);
   if (userId === undefined) {
@@ -107,16 +130,51 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const result = await correctEvidenceOutcome(config.database.url, config.database.schema, {
+    // Claimed after authorization, and scoped by organization, so a key can
+    // neither be consumed nor probed across tenants.
+    const claim = await claimIdempotentRequest(config.database.url, config.database.schema, {
       organizationId: role.organizationId,
-      applicationId: application.applicationId,
-      criterionId,
-      outcome: parsedBody.outcome,
-      correctedByUserId: userId,
-      reason: parsedBody.reason
+      endpoint: "evidence_corrections.record",
+      idempotencyKey,
+      payload: { applicationId: application.applicationId, criterionId, ...parsedBody }
     });
+    if (claim.outcome === "replay") {
+      return Response.json(claim.body, { status: claim.status, headers: withRequestId(undefined, requestId) });
+    }
+    if (claim.outcome === "fingerprint_mismatch") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "This Idempotency-Key was already used with a different request body."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+    if (claim.outcome === "in_flight") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "A request with this Idempotency-Key is still in progress."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+
+    let result;
+    try {
+      result = await correctEvidenceOutcome(config.database.url, config.database.schema, {
+        organizationId: role.organizationId,
+        applicationId: application.applicationId,
+        criterionId,
+        outcome: parsedBody.outcome,
+        correctedByUserId: userId,
+        reason: parsedBody.reason
+      });
+    } catch (error) {
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
+      throw error;
+    }
 
     if (result.outcome === "nothing_to_correct") {
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -125,6 +183,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
     if (result.outcome === "superseded") {
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       // Losing the race is a 409 and says why: the reviewer's "before"
       // is no longer what they were looking at, so re-reading and
       // re-deciding is the correct next step, not a silent retry.
@@ -136,13 +195,12 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    return Response.json(
-      {
-        evidenceOutcomeId: result.evidenceOutcomeId,
-        supersededEvidenceOutcomeId: result.supersededId
-      },
-      { status: 201, headers: withRequestId(undefined, requestId) }
-    );
+    const body = {
+      evidenceOutcomeId: result.evidenceOutcomeId,
+      supersededEvidenceOutcomeId: result.supersededId
+    };
+    await completeIdempotentRequest(config.database.url, config.database.schema, claim.requestId, 201, body);
+    return Response.json(body, { status: 201, headers: withRequestId(undefined, requestId) });
   } catch (error) {
     console.error("evidence correction failed", error);
     const apiError = buildApiError({

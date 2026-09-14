@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4418,6 +4418,237 @@ export interface RecordCandidateDecisionInput {
    * the code-level half of what 0019's NOT NULL enforces.
    */
   readonly decidedByUserId: string;
+}
+
+// ---- Review #83: durable idempotency for append-only human actions ----
+
+export interface IdempotentRequestObservations {
+  readonly firstClaim: string;
+  readonly retryClaim: string;
+  readonly retryStatus: number;
+  readonly retryBody: unknown;
+  readonly mismatchClaim: string;
+  readonly inFlightClaim: string;
+  readonly recordCount: number;
+  readonly otherTenantClaim: string;
+  readonly claimAfterRelease: string;
+  /** The same key string on a DIFFERENT endpoint must not collide. */
+  readonly sameKeyOtherEndpoint: string;
+}
+
+/**
+ * Exercises the whole idempotency lifecycle against a real database, in its
+ * own schema so repeated runs never collide.
+ *
+ * Real Postgres matters here: the mechanism IS the unique index plus
+ * `ON CONFLICT DO NOTHING`. A fake would be asserting the test's own model of
+ * a constraint rather than the constraint that ships.
+ */
+export async function assertIdempotentRequestSemantics(
+  databaseUrl: string
+): Promise<IdempotentRequestObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `idem_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const endpoint = "candidate_decisions.record";
+  const key = `key-${suffix}`;
+  const payload = { applicationId: "a1", decision: "advance" };
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of ["0002_organizations_users_memberships.sql", "0022_idempotent_requests.sql"]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+
+    const claim = (organizationId: string, body: unknown): Promise<IdempotentRequestClaim> =>
+      claimIdempotentRequest(databaseUrl, schema, { organizationId, endpoint, idempotencyKey: key, payload: body });
+
+    const first = await claim(orgA, payload);
+    // Same key and payload while the first is still unfinished.
+    const inFlight = await claim(orgA, payload);
+
+    if (first.outcome !== "claimed") {
+      throw new Error(`probe expected the first call to claim, got ${first.outcome}`);
+    }
+    await completeIdempotentRequest(databaseUrl, schema, first.requestId, 201, { decisionId: "d1" });
+
+    const retry = await claim(orgA, payload);
+    const mismatch = await claim(orgA, { ...payload, decision: "decline" });
+    const otherTenant = await claim(orgB, payload);
+
+    const count = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".idempotent_requests
+        WHERE organization_id = $1 AND endpoint = $2 AND idempotency_key = $3`,
+      [orgA, endpoint, key]
+    );
+
+    // Release-then-reclaim, on a separate key so it cannot disturb the above.
+    const releaseKey = `release-${suffix}`;
+    const toRelease = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId: orgA,
+      endpoint,
+      idempotencyKey: releaseKey,
+      payload
+    });
+    if (toRelease.outcome !== "claimed") {
+      throw new Error("probe expected to claim the release key");
+    }
+    await releaseIdempotentRequest(databaseUrl, schema, toRelease.requestId);
+    const afterRelease = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId: orgA,
+      endpoint,
+      idempotencyKey: releaseKey,
+      payload
+    });
+
+    // A client generating one key per user action may legitimately send the
+    // same value to two endpoints. Keying on the endpoint is what stops one
+    // replaying the other's response.
+    const otherEndpoint = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId: orgA,
+      endpoint: "evidence_corrections.record",
+      idempotencyKey: key,
+      payload
+    });
+
+    return {
+      firstClaim: first.outcome,
+      retryClaim: retry.outcome,
+      retryStatus: retry.outcome === "replay" ? retry.status : -1,
+      retryBody: retry.outcome === "replay" ? retry.body : undefined,
+      mismatchClaim: mismatch.outcome,
+      inFlightClaim: inFlight.outcome,
+      recordCount: Number(count.rows[0]?.count ?? "-1"),
+      otherTenantClaim: otherTenant.outcome,
+      claimAfterRelease: afterRelease.outcome,
+      sameKeyOtherEndpoint: otherEndpoint.outcome
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export type IdempotentRequestClaim =
+  /** This caller owns the operation; run it, then call completeIdempotentRequest. */
+  | { readonly outcome: "claimed"; readonly requestId: string }
+  /** A completed request with this key and the same payload; replay verbatim. */
+  | { readonly outcome: "replay"; readonly status: number; readonly body: unknown }
+  /** Same key, different payload. A client bug, refused rather than replayed. */
+  | { readonly outcome: "fingerprint_mismatch" }
+  /** Same key and payload, still running. A concurrent duplicate. */
+  | { readonly outcome: "in_flight" };
+
+/**
+ * Claims an idempotency key, or reports what already happened under it.
+ *
+ * The INSERT is the lock. `ON CONFLICT DO NOTHING` plus the unique index
+ * means exactly one concurrent caller can claim a key, so this cannot be
+ * raced into recording the operation twice -- checking first and inserting
+ * afterwards could be.
+ */
+export async function claimIdempotentRequest(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly endpoint: string;
+    readonly idempotencyKey: string;
+    readonly payload: unknown;
+  }
+): Promise<IdempotentRequestClaim> {
+  assertSafeSchema(schema);
+  const fingerprint = createHash("sha256").update(JSON.stringify(input.payload ?? null)).digest("hex");
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const claimed = await client.query<{ idempotent_request_id: string }>(
+      `INSERT INTO "${schema}".idempotent_requests
+         (organization_id, endpoint, idempotency_key, request_fingerprint)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (organization_id, endpoint, idempotency_key) DO NOTHING
+       RETURNING idempotent_request_id`,
+      [input.organizationId, input.endpoint, input.idempotencyKey, fingerprint]
+    );
+    const claimedId = claimed.rows[0]?.idempotent_request_id;
+    if (claimedId !== undefined) {
+      return { outcome: "claimed", requestId: claimedId };
+    }
+
+    const existing = await client.query<{
+      request_fingerprint: string;
+      response_status: number | null;
+      response_body: unknown;
+    }>(
+      `SELECT request_fingerprint, response_status, response_body
+         FROM "${schema}".idempotent_requests
+        WHERE organization_id = $1 AND endpoint = $2 AND idempotency_key = $3`,
+      [input.organizationId, input.endpoint, input.idempotencyKey]
+    );
+    const row = existing.rows[0];
+    if (row === undefined) {
+      // Only reachable if the row was deleted between the two statements,
+      // which nothing does. Reported rather than retried silently.
+      throw new Error("idempotency record vanished between claim and read");
+    }
+    if (row.request_fingerprint !== fingerprint) {
+      return { outcome: "fingerprint_mismatch" };
+    }
+    if (row.response_status === null) {
+      return { outcome: "in_flight" };
+    }
+    return { outcome: "replay", status: row.response_status, body: row.response_body };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Records the response so a later retry replays it rather than re-running. */
+export async function completeIdempotentRequest(
+  databaseUrl: string,
+  schema: string,
+  requestId: string,
+  status: number,
+  body: unknown
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `UPDATE "${schema}".idempotent_requests
+          SET response_status = $2, response_body = $3::jsonb, completed_at = clock_timestamp()
+        WHERE idempotent_request_id = $1`,
+      [requestId, status, JSON.stringify(body ?? null)]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Releases a claim whose operation failed, so the client can retry the same
+ * key rather than being permanently locked out by a transient error. */
+export async function releaseIdempotentRequest(
+  databaseUrl: string,
+  schema: string,
+  requestId: string
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `DELETE FROM "${schema}".idempotent_requests WHERE idempotent_request_id = $1 AND response_status IS NULL`,
+      [requestId]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
 }
 
 export type CandidateDecisionResult =

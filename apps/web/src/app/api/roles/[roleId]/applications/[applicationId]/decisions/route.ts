@@ -1,16 +1,21 @@
 import {
   buildApiError,
+  checkIdempotencyRequirement,
   generateRequestId,
+  idempotencyErrorResponse,
   recordCandidateDecisionInputSchema,
   withRequestId
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
+  claimIdempotentRequest,
+  completeIdempotentRequest,
   getApplicationById,
   getMembershipsForUser,
   getRoleById,
   listCandidateDecisionsForApplication,
-  recordCandidateDecision
+  recordCandidateDecision,
+  releaseIdempotentRequest
 } from "@signal-audit/db";
 import { deriveCandidateWorkflowStatus } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
@@ -51,6 +56,26 @@ interface RouteContext {
 export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, applicationId } = await context.params;
+
+  // Review #83, P2. MUTATING_HTTP_METHODS requires a key for every POST, and
+  // this endpoint neither required nor replayed one. A retry after a lost 201
+  // recorded a SECOND decision that superseded the first: not a duplicate
+  // delivery, a fabricated human decision that the supersede chain then
+  // presents as current.
+  const idempotency = checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key"));
+  const idempotencyError = idempotencyErrorResponse(idempotency, requestId);
+  if (idempotencyError !== undefined) {
+    return Response.json(idempotencyError.body, {
+      status: idempotencyError.status,
+      headers: withRequestId(undefined, requestId)
+    });
+  }
+  const idempotencyKey = idempotency.required && idempotency.outcome === "present" ? idempotency.key : undefined;
+  if (idempotencyKey === undefined) {
+    const error = buildApiError({ requestId, code: "invalid_request", message: "Idempotency-Key is required." });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+  }
+
   const userId = readSessionUserId(request);
   if (userId === undefined) {
     const error = buildApiError({ requestId, code: "unauthorized", message: "Sign in required." });
@@ -99,15 +124,55 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const result = await recordCandidateDecision(config.database.url, config.database.schema, {
+    // Claimed after authorization, so an unauthorized caller cannot consume
+    // or probe a key, and scoped by organization so one tenant's keys are
+    // invisible to another.
+    const claim = await claimIdempotentRequest(config.database.url, config.database.schema, {
       organizationId: role.organizationId,
-      applicationId: application.applicationId,
-      decision: parsedBody.decision,
-      rationale: parsedBody.rationale,
-      decidedByUserId: userId
+      endpoint: "candidate_decisions.record",
+      idempotencyKey,
+      payload: { applicationId: application.applicationId, ...parsedBody }
     });
+    if (claim.outcome === "replay") {
+      // The original response, verbatim. A fresh 201 here would be
+      // indistinguishable from having recorded a second decision.
+      return Response.json(claim.body, { status: claim.status, headers: withRequestId(undefined, requestId) });
+    }
+    if (claim.outcome === "fingerprint_mismatch") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "This Idempotency-Key was already used with a different request body."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+    if (claim.outcome === "in_flight") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "A request with this Idempotency-Key is still in progress."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+
+    let result;
+    try {
+      result = await recordCandidateDecision(config.database.url, config.database.schema, {
+        organizationId: role.organizationId,
+        applicationId: application.applicationId,
+        decision: parsedBody.decision,
+        rationale: parsedBody.rationale,
+        decidedByUserId: userId
+      });
+    } catch (error) {
+      // Release on failure so the client can retry the same key rather than
+      // being locked out permanently by a transient fault.
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
+      throw error;
+    }
 
     if (result.outcome === "superseded") {
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -123,6 +188,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     // the caller has no membership for, so this cannot be used to probe
     // whether an application id exists in another tenant.
     if (result.outcome === "no_such_application") {
+      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       const error = buildApiError({
         requestId,
         code: "not_found",
@@ -131,10 +197,12 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    return Response.json(
-      { decisionId: result.decisionId, ...(result.supersededId === undefined ? {} : { supersededDecisionId: result.supersededId }) },
-      { status: 201, headers: withRequestId(undefined, requestId) }
-    );
+    const body = {
+      decisionId: result.decisionId,
+      ...(result.supersededId === undefined ? {} : { supersededDecisionId: result.supersededId })
+    };
+    await completeIdempotentRequest(config.database.url, config.database.schema, claim.requestId, 201, body);
+    return Response.json(body, { status: 201, headers: withRequestId(undefined, requestId) });
   } catch (error) {
     console.error("recording a candidate decision failed", error);
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not record the decision." });
