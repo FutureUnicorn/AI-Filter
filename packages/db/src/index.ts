@@ -37,6 +37,7 @@ import {
   CONTRACT_SCHEMA_VERSION,
   canonicalizeCsvColumnMapping,
   classifyCsvImportRow,
+  normalizeAppliedAt,
   compareApplicationsBySourceOrder,
   mapCsvRowToApplication,
   summarizeFailedDocuments,
@@ -1673,6 +1674,28 @@ function rowToImportRow(row: ImportRowRow): ImportRow {
 
 const IMPORT_ROW_COLUMNS = "import_row_id, intake_id, row_number, outcome, application_id, failure_reason";
 
+/**
+ * Canonicalizes an optional appliedAt for storage. Returns null when absent.
+ *
+ * Throws if the value is unparseable, which should be unreachable:
+ * classifyCsvImportRow fails such a row before it reaches here. The throw is
+ * deliberate rather than a silent null, because a null would quietly discard
+ * a date the operator supplied, and reaching it would mean validation and
+ * persistence had drifted apart.
+ */
+function normalizedAppliedAt(raw: string | undefined): string | null {
+  if (raw === undefined) {
+    return null;
+  }
+  const normalized = normalizeAppliedAt(raw);
+  if (normalized.outcome === "invalid") {
+    throw new Error(
+      `finalizeCsvImport received an appliedAt that classifyCsvImportRow should already have failed: ${JSON.stringify(raw)}`
+    );
+  }
+  return normalized.value;
+}
+
 async function insertImportRow(
   client: Client,
   schema: string,
@@ -1758,7 +1781,11 @@ export async function finalizeCsvImport(
               values.candidateFullName,
               values.candidateEmail,
               values.externalReferenceId ?? null,
-              values.appliedAt ?? null
+              // Normalized rather than passed through. classifyCsvImportRow
+              // has already failed the row if this is not a date, so by here
+              // it parses; storing the canonical instant keeps the column
+              // from holding whatever format the spreadsheet happened to use.
+              normalizedAppliedAt(values.appliedAt)
             ]
           );
           applicationId = inserted.rows[0]?.application_id;

@@ -1104,6 +1104,52 @@ export type ImportRowClassification =
   | { readonly outcome: "failed"; readonly reason: string }
   | { readonly outcome: "skipped" };
 
+/**
+ * Normalizes an optional `appliedAt` cell to an ISO instant, or reports that
+ * it is not a date at all.
+ *
+ * Review #83, P2: mapping accepted any non-empty string here and handed it
+ * straight to a `timestamptz` column. A cell such as `not-a-date` raised a
+ * PostgreSQL cast error *inside the single import transaction*, rolling back
+ * every valid row and answering 500. One malformed optional date is supposed
+ * to be one failed row, which is the whole point of per-row accounting.
+ *
+ * Deliberately strict rather than lenient. `new Date("2026-13-45")` and
+ * `new Date("garbage")` both yield Invalid Date, but `new Date("2026")` is
+ * accepted by the runtime as a year, which would silently turn a stray
+ * number in a spreadsheet column into January 1st. So the value must look
+ * like a date before it is parsed, and must survive the round trip.
+ */
+export function normalizeAppliedAt(
+  raw: string
+): { readonly outcome: "normalized"; readonly value: string } | { readonly outcome: "invalid" } {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { outcome: "invalid" };
+  }
+  // ISO-ish only: YYYY-MM-DD, optionally with a time and zone. A bare year
+  // or a locale format like 03/04/2026 is ambiguous between day and month
+  // and is refused rather than guessed at.
+  if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/u.test(trimmed)) {
+    return { outcome: "invalid" };
+  }
+  const parsed = new Date(trimmed.includes("T") || trimmed.includes(" ") ? trimmed : `${trimmed}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    return { outcome: "invalid" };
+  }
+  // Catches values the pattern admits but the calendar does not, such as
+  // 2026-02-30, which Date would otherwise roll forward into March.
+  const [year, month, day] = trimmed.slice(0, 10).split("-").map(Number);
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() + 1 !== month ||
+    (trimmed.length === 10 && parsed.getUTCDate() !== day)
+  ) {
+    return { outcome: "invalid" };
+  }
+  return { outcome: "normalized", value: parsed.toISOString() };
+}
+
 /** Pure: given the same mapped values AF-31's preview already computes
  * for a row, decides its fate without ever touching the database. */
 export function classifyCsvImportRow(
@@ -1115,6 +1161,16 @@ export function classifyCsvImportRow(
   }
   if (missingRequired.length > 0) {
     return { outcome: "failed", reason: `Missing required field(s): ${missingRequired.join(", ")}` };
+  }
+  // Validated here, before the row reaches the database, so an unparseable
+  // optional date fails its own row instead of aborting the transaction that
+  // is importing everybody else's.
+  const appliedAt = values.appliedAt;
+  if (appliedAt !== undefined && normalizeAppliedAt(appliedAt).outcome === "invalid") {
+    return {
+      outcome: "failed",
+      reason: `appliedAt is not a valid date: ${JSON.stringify(appliedAt)}. Use YYYY-MM-DD or a full ISO 8601 timestamp.`
+    };
   }
   return { outcome: "processed" };
 }
