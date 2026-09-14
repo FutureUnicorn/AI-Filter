@@ -116,6 +116,21 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
+    // Added with the per-application lock (review #83): serializing on the
+    // parent applications row means the writer can now discover that the row
+    // is absent for this organization. Reported as not_found rather than
+    // forbidden, the same way resource authorization treats an organization
+    // the caller has no membership for, so this cannot be used to probe
+    // whether an application id exists in another tenant.
+    if (result.outcome === "no_such_application") {
+      const error = buildApiError({
+        requestId,
+        code: "not_found",
+        message: "No such application for this organization."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+
     return Response.json(
       { decisionId: result.decisionId, ...(result.supersededId === undefined ? {} : { supersededDecisionId: result.supersededId }) },
       { status: 201, headers: withRequestId(undefined, requestId) }

@@ -4395,7 +4395,11 @@ export interface RecordCandidateDecisionInput {
 
 export type CandidateDecisionResult =
   | { readonly outcome: "recorded"; readonly decisionId: string; readonly supersededId?: string }
-  | { readonly outcome: "superseded" };
+  | { readonly outcome: "superseded" }
+  /** The application does not exist for this organization, so there is
+   * nothing to decide on and no parent row to serialize against. Distinct
+   * from "superseded", which means a concurrent writer won a real race. */
+  | { readonly outcome: "no_such_application" };
 
 /**
  * Appends a decision, superseding the current one if there is one.
@@ -4420,6 +4424,33 @@ export async function recordCandidateDecision(
     await client.connect();
     await client.query("BEGIN");
     try {
+      // Serialize on the PARENT application row, before reading the head.
+      //
+      // Review #83, P1: locking the head cannot serialize a candidate's first
+      // decision, because there is no head row yet and `FOR UPDATE` cannot
+      // lock a row that does not exist. Two first-time transactions both read
+      // no head, both inserted a NULL predecessor, and 0020's partial unique
+      // index excludes NULLs by its own predicate, so both committed. The
+      // result was two roots and two current states, with a later read
+      // arbitrarily picking one by timestamp.
+      //
+      // The application row always exists (candidate_decisions has a foreign
+      // key to it), so this lock always has something to take, which is
+      // precisely what the head lock could not guarantee. Scoped by
+      // organization_id as well so a guessed application_id from another
+      // tenant cannot be used to take a lock here.
+      const application = await client.query<{ application_id: string }>(
+        `SELECT application_id
+           FROM "${schema}".applications
+          WHERE organization_id = $1 AND application_id = $2
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId]
+      );
+      if (application.rows[0] === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "no_such_application" };
+      }
+
       const head = await client.query<{ decision_id: string }>(
         `SELECT d.decision_id
            FROM "${schema}".candidate_decisions d
@@ -4430,8 +4461,7 @@ export async function recordCandidateDecision(
                WHERE s.supersedes_decision_id = d.decision_id
             )
           ORDER BY d.decided_at DESC, d.decision_id DESC
-          LIMIT 1
-          FOR UPDATE`,
+          LIMIT 1`,
         [input.organizationId, input.applicationId]
       );
       const supersededId = head.rows[0]?.decision_id;
@@ -4518,6 +4548,141 @@ export async function listCandidateDecisionsForApplication(
  * AF-51: proves the decision log is the only place a candidate's status
  * can change, and that every row in it names a person and a reason.
  */
+export interface ConcurrentFirstDecisionObservations {
+  /** How many of the two racing first decisions were accepted as "recorded". */
+  readonly recorded: number;
+  /** How many were told a concurrent writer won. */
+  readonly superseded: number;
+  /** Rows whose supersedes_decision_id is NULL. Must be exactly 1. */
+  readonly rootCount: number;
+  /** Rows nothing supersedes. Must be exactly 1. */
+  readonly headCount: number;
+  /** Total rows written by the race. */
+  readonly totalDecisions: number;
+}
+
+/**
+ * Review #83, P1. The existing integrity probe starts after a first decision
+ * exists, so it exercises the head lock and cannot reach this case at all.
+ *
+ * With no decisions yet there is no head row, and `FOR UPDATE` cannot lock a
+ * row that does not exist. Two first-time transactions both read no head,
+ * both insert a NULL predecessor, and 0020's partial unique index excludes
+ * NULLs by its own predicate, so both commit: two roots, two current states,
+ * and a later read that picks one by timestamp while the other sits
+ * unchained.
+ *
+ * Genuine concurrency matters here. A sequential pair cannot reproduce it,
+ * because the second call sees the first one's committed head and supersedes
+ * it correctly, which is exactly why the defect survived review. These two
+ * calls are fired without awaiting the first.
+ */
+export async function assertConcurrentFirstDecisionHasOneRoot(
+  databaseUrl: string
+): Promise<ConcurrentFirstDecisionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `first_decision_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    // Same list the integrity probe loads, plus 0021. Trimming it is not
+    // safe: 0020's composite foreign key onto applications needs the unique
+    // constraint a later migration adds, and omitting it fails at CREATE
+    // TABLE with "no unique constraint matching given keys".
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0013_file_intakes.sql",
+      "0016_applications_and_import_finalization.sql",
+      "0017_evidence_outcomes.sql",
+      "0018_evidence_corrections.sql",
+      "0019_correction_attribution.sql",
+      "0020_candidate_decisions.sql",
+      "0021_single_decision_root.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A')`, [organizationId]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Decider') RETURNING user_id`,
+      [`first_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [organizationId, role.rows[0]?.role_id, `first/${suffix}.csv`, userId]
+    );
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Casey', $4) RETURNING application_id`,
+      [organizationId, role.rows[0]?.role_id, intake.rows[0]?.intake_id, `casey_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (applicationId === undefined) {
+      throw new Error("probe could not create an application");
+    }
+
+    // Both fired before either is awaited, on separate connections, so they
+    // genuinely overlap rather than running back to back.
+    const attempt = (decision: "advance" | "hold"): Promise<CandidateDecisionResult> =>
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        decision,
+        rationale: `first decision via ${decision}`,
+        decidedByUserId: userId
+      });
+    const [first, second] = await Promise.all([attempt("advance"), attempt("hold")]);
+
+    const roots = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".candidate_decisions
+        WHERE application_id = $1 AND supersedes_decision_id IS NULL`,
+      [applicationId]
+    );
+    const heads = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".candidate_decisions d
+        WHERE d.application_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM "${schema}".candidate_decisions s WHERE s.supersedes_decision_id = d.decision_id
+          )`,
+      [applicationId]
+    );
+    const total = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".candidate_decisions WHERE application_id = $1`,
+      [applicationId]
+    );
+    const outcomes = [first.outcome, second.outcome];
+
+    return {
+      recorded: outcomes.filter((outcome) => outcome === "recorded").length,
+      superseded: outcomes.filter((outcome) => outcome === "superseded").length,
+      rootCount: Number(roots.rows[0]?.count ?? "-1"),
+      headCount: Number(heads.rows[0]?.count ?? "-1"),
+      totalDecisions: Number(total.rows[0]?.count ?? "-1")
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
 export async function assertCandidateDecisionIntegrity(databaseUrl: string): Promise<void> {
   const suffix = randomBytes(4).toString("hex");
   const schema = `decision_probe_${suffix}`;
@@ -4538,7 +4703,8 @@ export async function assertCandidateDecisionIntegrity(databaseUrl: string): Pro
       "0017_evidence_outcomes.sql",
       "0018_evidence_corrections.sql",
       "0019_correction_attribution.sql",
-      "0020_candidate_decisions.sql"
+      "0020_candidate_decisions.sql",
+      "0021_single_decision_root.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
     }
