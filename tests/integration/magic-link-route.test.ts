@@ -66,6 +66,9 @@ function applyRouteEnvironment(databaseUrl: string, routeSchema: string): void {
     STORAGE_FORCE_PATH_STYLE: "true",
     WEB_PORT: "3000",
     WORKER_PORT: "3001",
+    // Deliberately not localhost:3000, so a link built from the request host
+    // is distinguishable from one built from configuration.
+    PUBLIC_APP_ORIGIN: "https://canonical.acme.test",
     SESSION_SECRET
   });
   delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
@@ -331,7 +334,9 @@ test("the URL delivered in the email is itself redeemable, not just the API hand
     // Take the whole URL, not the token: the point is that what was
     // delivered resolves, so reassembling a different URL here would
     // reintroduce the blind spot.
-    const deliveredLink = /(http:\/\/\S*\/auth\/redeem\?token=[^\s&]+)/u.exec(emitted)?.[1];
+    // Matches either scheme: the link now comes from PUBLIC_APP_ORIGIN, which
+    // is https in this harness, rather than from the request URL.
+    const deliveredLink = /(https?:\/\/\S*\/auth\/redeem\?token=[^\s&]+)/u.exec(emitted)?.[1];
     assert.ok(
       deliveredLink !== undefined,
       `the delivery channel must carry a complete redeem URL, got: ${JSON.stringify(emitted)}`
@@ -420,4 +425,114 @@ test("a delivery failure for a known account is indistinguishable from an unknow
     delete process.env.MAGIC_LINK_EMAIL_FROM;
     await dropProbeSchema(databaseUrl, routeSchema);
   }
+});
+
+// ---- PR #83 review, P1: attacker-controlled origin ----
+//
+// The request route built the emailed link from `new URL(request.url).origin`.
+// The endpoint is unauthenticated and accepts an arbitrary `Host`, so an
+// attacker could request a link for a victim while supplying
+// `Host: attacker.example`. The victim received a genuine, signed link
+// pointing at the attacker and handed over a redeemable bearer token simply by
+// clicking it.
+//
+// Each hostile shape is a separate case on purpose: a fix that reads a
+// different header, or that trusts a forwarded host, would pass one and fail
+// another.
+const HOSTILE_ORIGINS: readonly {
+  readonly label: string;
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+}[] = [
+  { label: "hostile Host header", url: "http://attacker.example/api/auth/magic-link/request", headers: {} },
+  {
+    label: "hostile X-Forwarded-Host",
+    url: "http://localhost:3000/api/auth/magic-link/request",
+    headers: { "x-forwarded-host": "attacker.example" }
+  },
+  {
+    label: "hostile X-Forwarded-Host with https proto",
+    url: "http://localhost:3000/api/auth/magic-link/request",
+    headers: { "x-forwarded-host": "attacker.example", "x-forwarded-proto": "https" }
+  },
+  {
+    label: "hostile Forwarded header",
+    url: "http://localhost:3000/api/auth/magic-link/request",
+    headers: { forwarded: "host=attacker.example;proto=https" }
+  },
+  { label: "host with an embedded port", url: "http://attacker.example:8443/api/auth/magic-link/request", headers: {} }
+];
+
+for (const [index, hostile] of HOSTILE_ORIGINS.entries()) {
+  test(`a hostile request origin cannot change the emailed link: ${hostile.label}`, async () => {
+    const databaseUrl = requireDatabase();
+    const email = `origin-${Date.now()}-${index}@acme.test`;
+    const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+    try {
+      applyRouteEnvironment(databaseUrl, routeSchema);
+      await seedRecruiter(databaseUrl, routeSchema, email);
+
+      const requestRoute = await loadRoute(REQUEST_ROUTE);
+      const emitted = await captureStderr(async () => {
+        const response = await requestRoute.POST(
+          new Request(hostile.url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "Idempotency-Key": `origin-key-${index}`,
+              ...hostile.headers
+            },
+            body: JSON.stringify({ email })
+          })
+        );
+        assert.equal(response.status, 202);
+      });
+
+      const link = /(https?:\/\/\S*\/auth\/redeem\?token=[^\s&]+)/u.exec(emitted)?.[1];
+      assert.ok(link !== undefined, `expected a delivered link, got: ${JSON.stringify(emitted)}`);
+
+      // The assertion that matters: the link's origin is the configured one,
+      // whatever the request claimed.
+      assert.equal(
+        new URL(link).origin,
+        "https://canonical.acme.test",
+        `the emailed link must use the configured origin, got ${new URL(link).origin}`
+      );
+      assert.ok(!link.includes("attacker.example"), "the attacker host must not appear anywhere in the link");
+    } finally {
+      await dropProbeSchema(databaseUrl, routeSchema);
+    }
+  });
+}
+
+// A hosted deployment must not be able to boot without the configured origin,
+// since the previous behaviour was to silently fall back to the request host.
+test("a hosted environment refuses to load without PUBLIC_APP_ORIGIN", async () => {
+  const { loadEnvironmentConfig } = await import("../../packages/config/src/index.ts");
+  const base: Record<string, string> = {
+    APP_ENV: "staging",
+    DEPLOYMENT_COMMIT_SHA: "abc1234",
+    DATABASE_URL: "postgresql://local:local@localhost:5432/local",
+    DATABASE_SCHEMA: "public",
+    STORAGE_ENDPOINT: "http://localhost:9000",
+    STORAGE_REGION: "us-east-1",
+    STORAGE_BUCKET: "signal-audit-staging",
+    STORAGE_ACCESS_KEY_ID: "k",
+    STORAGE_SECRET_ACCESS_KEY: "secret-value-long",
+    STORAGE_FORCE_PATH_STYLE: "true",
+    WEB_PORT: "3000",
+    WORKER_PORT: "3001",
+    MAGIC_LINK_EMAIL_ENDPOINT: "https://mail.test/send",
+    MAGIC_LINK_EMAIL_API_KEY: "key",
+    MAGIC_LINK_EMAIL_FROM: "no-reply@acme.test"
+  };
+  assert.throws(() => loadEnvironmentConfig(base), /PUBLIC_APP_ORIGIN is required for staging/u);
+
+  // And it must be a bare origin: a value carrying a path would silently
+  // produce `https://app.test/x/auth/redeem?token=...`.
+  assert.throws(
+    () => loadEnvironmentConfig({ ...base, PUBLIC_APP_ORIGIN: "https://app.test/subpath" }),
+    /bare http\(s\) origin/u
+  );
+  assert.doesNotThrow(() => loadEnvironmentConfig({ ...base, PUBLIC_APP_ORIGIN: "https://app.test" }));
 });

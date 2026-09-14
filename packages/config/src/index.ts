@@ -53,6 +53,37 @@ const optionalPreviewCommitSha = z.preprocess(
 // address are what Resend, Postmark, SendGrid and Mailgun all accept, so
 // packages/security keeps its "no vendor is chosen by this ticket"
 // position instead of taking a dependency on one provider's SDK.
+/**
+ * An absolute http(s) origin and nothing else: no path, query or fragment. A
+ * value like `https://app.example/redeem` would silently produce
+ * `https://app.example/redeem/auth/redeem?token=...`, so the shape is pinned
+ * here rather than trusted to the caller.
+ */
+const optionalOrigin = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z
+    .string()
+    .url()
+    .refine((value) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        return false;
+      }
+      return (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        (parsed.pathname === "" || parsed.pathname === "/") &&
+        parsed.search === "" &&
+        parsed.hash === "" &&
+        parsed.username === "" &&
+        parsed.password === ""
+      );
+    }, "PUBLIC_APP_ORIGIN must be a bare http(s) origin with no path, query, fragment or credentials")
+    .transform((value) => new URL(value).origin)
+    .optional()
+);
+
 const optionalUrl = z.preprocess(
   (value) => (value === "" ? undefined : value),
   z.string().url().optional()
@@ -89,6 +120,18 @@ const rawEnvironmentSchema = z
     WORKER_PORT: portValue,
     PREVIEW_ID: optionalPreviewId,
     PREVIEW_COMMIT_SHA: optionalPreviewCommitSha,
+    /**
+     * The canonical public origin this deployment is reached at, used to build
+     * links that are emailed to people.
+     *
+     * Not derived from the incoming request. Review (#83) found that building
+     * a magic-link URL from `new URL(request.url).origin` lets an
+     * unauthenticated caller choose the host: a request submitted for a victim
+     * with `Host: attacker.example` produces a real, signed link pointing at
+     * the attacker, and the victim clicking it hands over a redeemable bearer
+     * token. The request host is attacker-controlled input; this is not.
+     */
+    PUBLIC_APP_ORIGIN: optionalOrigin,
     MAGIC_LINK_EMAIL_ENDPOINT: optionalUrl,
     MAGIC_LINK_EMAIL_API_KEY: optionalSecret,
     MAGIC_LINK_EMAIL_FROM: optionalEmailAddress
@@ -122,6 +165,17 @@ const rawEnvironmentSchema = z
             message: `${field} is required for ${value.APP_ENV}; a hosted environment cannot deliver magic links through the local console sender`
           });
         }
+      }
+      // A hosted deployment must state its own public origin. Falling back to
+      // the request host is what made emailed links attacker-steerable, so
+      // there is deliberately no fallback here: the deployment fails to boot
+      // rather than sending a link to a host it was told at request time.
+      if (value.PUBLIC_APP_ORIGIN === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["PUBLIC_APP_ORIGIN"],
+          message: `PUBLIC_APP_ORIGIN is required for ${value.APP_ENV}; emailed links must come from a configured origin, never from the incoming request host`
+        });
       }
     }
     if (value.APP_ENV === "preview") {
@@ -171,6 +225,13 @@ export interface EnvironmentConfig {
     readonly web: number;
     readonly worker: number;
   };
+  /**
+   * The origin to use when building a link that leaves the system. Always
+   * present: configured explicitly for a hosted environment (enforced by the
+   * schema), and derived from the local web port for development and test.
+   * Never taken from an incoming request.
+   */
+  readonly publicAppOrigin: string;
   readonly preview?: {
     readonly id: string;
     readonly commitSha: string;
@@ -219,6 +280,10 @@ export function loadEnvironmentConfig(source: EnvironmentSource): EnvironmentCon
       web: value.WEB_PORT,
       worker: value.WORKER_PORT
     },
+    // Hosted environments must configure this; the schema refuses to load
+    // without it. Development and test fall back to the local web port, which
+    // is a fixed local value rather than anything a request can influence.
+    publicAppOrigin: value.PUBLIC_APP_ORIGIN ?? `http://localhost:${value.WEB_PORT}`,
     ...(value.PREVIEW_ID !== undefined && value.PREVIEW_COMMIT_SHA !== undefined
       ? {
           preview: {

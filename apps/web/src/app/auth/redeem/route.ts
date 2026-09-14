@@ -1,3 +1,4 @@
+import { loadEnvironmentConfig } from "@signal-audit/config";
 import { generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { SESSION_COOKIE_NAME } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
@@ -34,28 +35,33 @@ export async function GET(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const token = new URL(request.url).searchParams.get("token");
   const headers = withRequestId(undefined, requestId);
+  // Redirect targets are resolved against the configured origin rather than
+  // the request URL, for the same reason the emailed link is (review #83): the
+  // request host is caller-controlled. Reading the token from the request's
+  // own query string is fine, since that is the value being redeemed.
+  const origin = loadEnvironmentConfig(process.env).publicAppOrigin;
 
   if (token === null || token.length === 0) {
-    return NextResponse.redirect(new URL("/?auth=missing_token", request.url), { headers });
+    return NextResponse.redirect(new URL("/?auth=missing_token", origin), { headers });
   }
 
   try {
     const redemption = await redeemMagicLinkForSession(token);
     if (redemption.outcome === "invalid") {
-      return NextResponse.redirect(new URL("/?auth=invalid_link", request.url), { headers });
+      return NextResponse.redirect(new URL("/?auth=invalid_link", origin), { headers });
     }
     if (redemption.outcome === "no_account") {
-      return NextResponse.redirect(new URL("/?auth=no_account", request.url), { headers });
+      return NextResponse.redirect(new URL("/?auth=no_account", origin), { headers });
     }
     // 303 so the browser issues a GET for the destination and the consumed
     // token is not re-sent if the user reloads the landing page.
-    const response = NextResponse.redirect(new URL("/roles", request.url), { status: 303, headers });
+    const response = NextResponse.redirect(new URL("/roles", origin), { status: 303, headers });
     response.cookies.set(SESSION_COOKIE_NAME, redemption.sessionToken, SESSION_COOKIE_OPTIONS);
     return response;
   } catch (error) {
     // Never echo the failure to the caller: the same opaque destination for
     // any server-side fault, with the detail kept to the server log.
     console.error("magic-link redeem (email link) failed", error);
-    return NextResponse.redirect(new URL("/?auth=error", request.url), { headers });
+    return NextResponse.redirect(new URL("/?auth=error", origin), { headers });
   }
 }

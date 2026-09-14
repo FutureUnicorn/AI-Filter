@@ -136,9 +136,13 @@ test("a hosted environment with delivery settings loads and exposes them", () =>
       DEPLOYMENT_COMMIT_SHA: "abc1234",
       MAGIC_LINK_EMAIL_ENDPOINT: "https://mail.test/send",
       MAGIC_LINK_EMAIL_API_KEY: "preview-key",
-      MAGIC_LINK_EMAIL_FROM: "no-reply@acme.test"
+      MAGIC_LINK_EMAIL_FROM: "no-reply@acme.test",
+      // Also required for every hosted environment as of review #83: emailed
+      // links must come from a configured origin, never the request host.
+      PUBLIC_APP_ORIGIN: "https://pr-1.preview.acme.test"
     })
   );
+  assert.equal(config.publicAppOrigin, "https://pr-1.preview.acme.test");
   assert.deepEqual(config.magicLinkEmail, {
     endpoint: "https://mail.test/send",
     apiKey: "preview-key",

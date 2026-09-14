@@ -60,7 +60,17 @@ export async function POST(request: NextRequest): Promise<Response> {
         email,
         expiresAt: generated.expiresAt
       });
-      const link = `${new URL(request.url).origin}/auth/redeem?token=${generated.token}`;
+      // Built from configured state, never from the request.
+      //
+      // Review (#83), P1: this line read `new URL(request.url).origin`. The
+      // endpoint is unauthenticated and accepts an arbitrary `Host`, so an
+      // attacker could request a link for a victim while supplying
+      // `Host: attacker.example`; the victim received a genuine, signed link
+      // pointing at the attacker and handed over a redeemable bearer token by
+      // clicking it. The request host is attacker-controlled input. A hosted
+      // deployment now fails to boot without PUBLIC_APP_ORIGIN rather than
+      // falling back to anything a caller can set.
+      const link = `${config.publicAppOrigin}/auth/redeem?token=${generated.token}`;
       // The adapter is selected from validated environment configuration,
       // not hardcoded: passing config.appEnv is what makes the
       // hosted-environment guard live. The previous call passed no
