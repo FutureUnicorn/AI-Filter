@@ -2,7 +2,7 @@ import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/c
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { getFileIntakeById, getImportRowsForIntake, getMembershipsForUser } from "@signal-audit/db";
 import { ALLOWED_SNIFFED_MIME_TYPES, buildImportStatusSummary } from "@signal-audit/domain";
-import { fetchObjectBytes, parseCsvFile } from "@signal-audit/ingestion";
+import { fetchValidatedObjectBytes, parseCsvFile } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -21,6 +21,17 @@ interface RouteContext {
  * exist (finalize has committed at least once), those are authoritative
  * and the file is never re-read.
  */
+
+/** A validated intake always has a hash; its absence means the row is not in
+ * the state its status claims, which must fail loudly rather than skip the
+ * integrity check. */
+function requireValidatedHash(hash: string | undefined): string {
+  if (hash === undefined) {
+    throw new Error("intake is marked validated but has no recorded content hash");
+  }
+  return hash;
+}
+
 export async function GET(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, intakeId } = await context.params;
@@ -63,7 +74,16 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
 
     const rows = await getImportRowsForIntake(config.database.url, config.database.schema, intakeId);
     const totalRows =
-      rows.length > 0 ? rows.length : (await parseCsvFile(await fetchObjectBytes(config.storage, intake.storageKey))).rows.length;
+      rows.length > 0
+        ? rows.length
+        : // Same binding as the other post-validation reads (review #83): the
+          // presigned PUT outlives validation, so a re-fetch must be checked
+          // against the validated digest rather than trusted.
+          (
+            await parseCsvFile(
+              await fetchValidatedObjectBytes(config.storage, intake.storageKey, requireValidatedHash(intake.sha256Hash))
+            )
+          ).rows.length;
 
     return Response.json(buildImportStatusSummary(totalRows, rows), {
       status: 200,

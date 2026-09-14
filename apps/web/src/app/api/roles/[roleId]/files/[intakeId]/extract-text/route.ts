@@ -9,7 +9,7 @@ import {
 import {
   extractCanonicalTextFromDocx,
   extractCanonicalTextFromPdf,
-  fetchObjectBytes
+  fetchValidatedObjectBytes
 } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
@@ -66,7 +66,21 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const bytes = await fetchObjectBytes(config.storage, intake.storageKey);
+    // Bound to the bytes validation approved (review #83). Completing an
+    // intake does not revoke the presigned PUT, so the key stays writable for
+    // the rest of its TTL; without this, an overwrite after validation would
+    // be processed here as though it had passed MIME, size and quarantine
+    // checks. A validated intake always carries a hash, so its absence means
+    // the row is not in the state its status claims.
+    if (intake.sha256Hash === undefined) {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "This intake has no recorded content hash, so its bytes cannot be verified. Re-validate it."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
+    const bytes = await fetchValidatedObjectBytes(config.storage, intake.storageKey, intake.sha256Hash);
     const result =
       intake.sniffedMimeType === ALLOWED_SNIFFED_MIME_TYPES.pdf
         ? await extractCanonicalTextFromPdf(bytes)

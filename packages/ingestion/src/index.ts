@@ -129,6 +129,16 @@ export async function createPresignedUploadUrl(
  * type so a caller can turn it into a rejection rather than a 500: an
  * oversized upload is an expected outcome of an untrusted PUT, not a fault.
  */
+/**
+ * The two storage operations `fetchObjectBytes` performs, so a test can stand
+ * in for the bucket without reimplementing the read. Deliberately narrow: it
+ * cannot stub the verification, only the bytes it verifies.
+ */
+export interface TestObjectReader {
+  head(): { readonly ContentLength?: number | undefined };
+  get(): AsyncIterable<Uint8Array>;
+}
+
 export class ObjectTooLargeError extends Error {
   readonly key: string;
   readonly limitBytes: number;
@@ -169,6 +179,20 @@ export async function fetchObjectBytes(
   key: string,
   limitBytes: number = MAX_FILE_UPLOAD_BYTES
 ): Promise<Buffer> {
+  // Test seam, used only when a caller supplies it. CI runs no object store,
+  // so without this the size cap and the hash binding could only be tested
+  // by reimplementing them in the test, which proves nothing about the code
+  // that ships. Reading through the real function keeps the assertions on the
+  // real path. Production callers never set this field.
+  const reader = (options as StorageConnectionOptions & { readonly __testReader?: TestObjectReader }).__testReader;
+  if (reader !== undefined) {
+    const length = reader.head().ContentLength;
+    if (length !== undefined && length > limitBytes) {
+      throw new ObjectTooLargeError(key, limitBytes, length);
+    }
+    return await readCappedStream(reader.get(), limitBytes, key);
+  }
+
   const client = storageClient(options);
   try {
     // Gate 1: refuse before transferring anything, when the store tells us.
@@ -188,6 +212,62 @@ export async function fetchObjectBytes(
   } finally {
     client.destroy();
   }
+}
+
+/**
+ * Thrown when an object's bytes no longer match what validation approved.
+ * Its own type so callers answer "this intake is no longer usable" rather
+ * than 500: an overwrite is an attack outcome, not an internal fault.
+ */
+export class ObjectChangedError extends Error {
+  readonly key: string;
+  readonly expectedSha256: string;
+  readonly actualSha256: string;
+
+  constructor(key: string, expectedSha256: string, actualSha256: string) {
+    super(
+      `Object ${key} no longer matches the bytes that were validated ` +
+        `(expected sha256 ${expectedSha256}, found ${actualSha256}); refusing to process it`
+    );
+    this.name = "ObjectChangedError";
+    this.key = key;
+    this.expectedSha256 = expectedSha256;
+    this.actualSha256 = actualSha256;
+  }
+}
+
+/**
+ * Reads an object and refuses it unless its bytes still hash to what
+ * validation recorded.
+ *
+ * Review #83, P1: completing an intake does not revoke the presigned PUT.
+ * The URL stays writable for the rest of its 15-minute TTL, so its holder
+ * could upload benign bytes, let them validate, then overwrite the same key.
+ * Extract-text and finalize re-fetched the key and consumed the replacement
+ * without ever comparing it to `sha256_hash`, so MIME, size and quarantine
+ * validation were all bypassed by a second PUT.
+ *
+ * Every post-validation read is now bound to the validated digest. This
+ * detects the substitution rather than preventing the write: the overwrite
+ * still lands in the bucket, but nothing downstream will process it. True
+ * prevention needs bucket versioning with a pinned `VersionId`, which is
+ * infrastructure this change does not introduce, and which CI could not
+ * verify today since it runs no object store. Chosen deliberately, and
+ * recorded here so the weaker guarantee is not mistaken for the stronger
+ * one.
+ */
+export async function fetchValidatedObjectBytes(
+  options: StorageConnectionOptions,
+  key: string,
+  expectedSha256: string,
+  limitBytes: number = MAX_FILE_UPLOAD_BYTES
+): Promise<Buffer> {
+  const bytes = await fetchObjectBytes(options, key, limitBytes);
+  const actual = createHash("sha256").update(bytes).digest("hex");
+  if (actual !== expectedSha256) {
+    throw new ObjectChangedError(key, expectedSha256, actual);
+  }
+  return bytes;
 }
 
 /**
