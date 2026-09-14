@@ -826,6 +826,18 @@ export interface FileValidationInput {
    * packages/ingestion's central-directory scan) whenever the sniffed
    * type is ZIP-based, i.e. docx. */
   readonly zipUncompressedBytes?: number | undefined;
+  /**
+   * True when the sniffed type is ZIP-based but its central directory could
+   * not be read, so no uncompressed size is knowable.
+   *
+   * Review #83, P1: `zipUncompressedBytes` being absent used to mean two
+   * different things -- "not an archive" and "an archive we could not
+   * inspect" -- and this function read both as the former. A ZIP64 or
+   * malformed archive that still sniffed as a valid DOCX therefore skipped
+   * the bomb check entirely and validated. The two cases are now
+   * distinguishable, because only one of them is safe.
+   */
+  readonly archiveUninspectable?: boolean | undefined;
 }
 
 export type FileValidationOutcome =
@@ -841,6 +853,18 @@ export function evaluateFileValidation(input: FileValidationInput): FileValidati
   }
   if (input.sniffedMimeType === undefined) {
     return { outcome: "quarantined", reason: "Could not identify the file's real type from its contents." };
+  }
+  // An archive whose central directory cannot be read is quarantined, not
+  // validated. The bomb check below is the only thing standing between a
+  // 20 MiB DOCX and gigabytes of inflated output, and it cannot run without
+  // a declared uncompressed size. Treating "unknown" as "fine" is how a
+  // ZIP64 archive bypassed it: it sniffs as a perfectly valid DOCX.
+  if (input.archiveUninspectable === true) {
+    return {
+      outcome: "quarantined",
+      reason:
+        "File sniffed as a ZIP-based document but its central directory could not be read, so the expansion size is unknown and the archive-bomb check cannot run."
+    };
   }
   const allowedType = (Object.entries(ALLOWED_SNIFFED_MIME_TYPES) as [AllowedFileType, string][]).find(
     ([, mimeType]) => mimeType === input.sniffedMimeType

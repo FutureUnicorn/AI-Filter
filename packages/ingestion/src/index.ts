@@ -4,11 +4,12 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { ALLOWED_SNIFFED_MIME_TYPES, evaluateCanonicalTextQuality } from "@signal-audit/domain";
+import { ALLOWED_SNIFFED_MIME_TYPES, MAX_FILE_UPLOAD_BYTES, evaluateCanonicalTextQuality } from "@signal-audit/domain";
 import type { CanonicalTextPage } from "@signal-audit/domain";
 import { parse as parseCsv } from "csv-parse/sync";
 import { fileTypeFromBuffer } from "file-type";
@@ -123,18 +124,101 @@ export async function createPresignedUploadUrl(
 
 // ---- AF-29: file allowlist, MIME validation, hash and quarantine ----
 
-export async function fetchObjectBytes(options: StorageConnectionOptions, key: string): Promise<Buffer> {
+/**
+ * Thrown when an object is larger than the caller is willing to read. Its own
+ * type so a caller can turn it into a rejection rather than a 500: an
+ * oversized upload is an expected outcome of an untrusted PUT, not a fault.
+ */
+export class ObjectTooLargeError extends Error {
+  readonly key: string;
+  readonly limitBytes: number;
+  readonly observedBytes: number | undefined;
+
+  constructor(key: string, limitBytes: number, observedBytes: number | undefined) {
+    super(
+      `Object ${key} exceeds the ${limitBytes}-byte read limit` +
+        (observedBytes === undefined ? "" : ` (observed at least ${observedBytes} bytes)`)
+    );
+    this.name = "ObjectTooLargeError";
+    this.key = key;
+    this.limitBytes = limitBytes;
+    this.observedBytes = observedBytes;
+  }
+}
+
+/**
+ * Reads an object, refusing to buffer more than `limitBytes`.
+ *
+ * Review #83, P1: this used `transformToByteArray()`, which allocates the
+ * whole object before any validation sees `MAX_FILE_UPLOAD_BYTES`. The signed
+ * PUT carries no content-length constraint, so an attacker holding a valid
+ * upload URL could make every validator buffer an arbitrarily large object.
+ * The size limit was being enforced after the damage it exists to prevent.
+ *
+ * Two gates, because either alone is insufficient:
+ *
+ *  1. `HeadObject` first. Trusted metadata from the store, so an oversized
+ *     object is refused without transferring it at all. But `ContentLength`
+ *     can be absent, so this cannot be the only check.
+ *  2. Streaming accumulation with a hard stop. Counts what has actually
+ *     arrived and aborts the moment the limit is passed, which bounds memory
+ *     even when metadata was missing or wrong.
+ */
+export async function fetchObjectBytes(
+  options: StorageConnectionOptions,
+  key: string,
+  limitBytes: number = MAX_FILE_UPLOAD_BYTES
+): Promise<Buffer> {
   const client = storageClient(options);
   try {
+    // Gate 1: refuse before transferring anything, when the store tells us.
+    const head = await client.send(new HeadObjectCommand({ Bucket: options.bucket, Key: key }));
+    if (head.ContentLength !== undefined && head.ContentLength > limitBytes) {
+      throw new ObjectTooLargeError(key, limitBytes, head.ContentLength);
+    }
+
     const response = await client.send(new GetObjectCommand({ Bucket: options.bucket, Key: key }));
-    const bytes = await response.Body?.transformToByteArray();
-    if (bytes === undefined) {
+    const body = response.Body;
+    if (body === undefined) {
       throw new Error(`Object body was empty for key ${key}`);
     }
-    return Buffer.from(bytes);
+
+    // Gate 2: bound what is actually read, whatever the metadata claimed.
+    return await readCappedStream(body as AsyncIterable<Uint8Array>, limitBytes, key);
   } finally {
     client.destroy();
   }
+}
+
+/**
+ * Accumulates a stream, aborting the moment it passes `limitBytes`.
+ *
+ * Exported so the enforcement itself is directly testable. CI provides
+ * Postgres but no object store, so an end-to-end oversized-upload test
+ * against real storage cannot run there; this is the part that actually
+ * bounds memory, and it is tested against synthetic streams instead. The
+ * `HeadObject` pre-check above is a transfer-avoidance optimisation on top of
+ * it, not the guarantee.
+ *
+ * Aborts on the chunk that crosses the limit rather than after the loop, so
+ * peak memory stays within one chunk of the cap no matter how much the sender
+ * intended to deliver.
+ */
+export async function readCappedStream(
+  stream: AsyncIterable<Uint8Array>,
+  limitBytes: number,
+  key: string
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      throw new ObjectTooLargeError(key, limitBytes, total);
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 const ZIP_EOCD_SIGNATURE = 0x06054b50;
@@ -156,11 +240,17 @@ export interface ZipCentralDirectorySummary {
  * result would already be the attack succeeding.
  *
  * Returns undefined for anything that isn't a well-formed single-disk
- * ZIP (including a ZIP64 one, identified by the 0xFFFFFFFF sentinel in
- * the EOCD): AF-29's caller treats "couldn't read the central directory
- * of something that sniffed as a ZIP-based format" as quarantine-worthy
- * on its own, via evaluateFileValidation's undefined-sniffed-type path,
- * not as license to skip the bomb check.
+ * ZIP, including a ZIP64 one, identified by the 0xFFFFFFFF sentinel in
+ * the EOCD.
+ *
+ * This comment used to claim that case was already quarantined "via
+ * evaluateFileValidation's undefined-sniffed-type path". Review #83 showed
+ * that was false: such a file sniffs as a perfectly valid DOCX, so the
+ * sniffed type is defined and that path is never taken. The absent size was
+ * then read downstream as "not an archive", and the bomb check was skipped
+ * on exactly the files most likely to need it. `sniffUploadedFile` now sets
+ * `archiveUninspectable` so the two cases are distinguishable, and
+ * `evaluateFileValidation` quarantines this one explicitly.
  */
 export function inspectZipCentralDirectory(buffer: Buffer): ZipCentralDirectorySummary | undefined {
   const searchStart = Math.max(0, buffer.length - ZIP_EOCD_MIN_SIZE - ZIP_MAX_COMMENT_SIZE);
@@ -202,6 +292,10 @@ export interface SniffedFile {
   readonly sniffedMimeType: string | undefined;
   readonly sha256Hash: string;
   readonly zipUncompressedBytes?: number | undefined;
+  /** Set when the file is a ZIP-based format whose central directory could
+   * not be read, so no expansion size is knowable. Distinct from simply
+   * having no size, which is the ordinary non-archive case. */
+  readonly archiveUninspectable?: boolean | undefined;
 }
 
 /**
@@ -248,13 +342,19 @@ export async function sniffUploadedFile(options: StorageConnectionOptions, key: 
   const bytes = await fetchObjectBytes(options, key);
   const detected = await fileTypeFromBuffer(bytes);
   const sniffedMimeType = detected?.mime ?? (looksLikeCsvText(bytes) ? ALLOWED_SNIFFED_MIME_TYPES.csv : undefined);
-  const zipSummary =
-    detected?.mime === ALLOWED_SNIFFED_MIME_TYPES.docx ? inspectZipCentralDirectory(bytes) : undefined;
+  // Whether this file IS a ZIP-based format, kept separate from whether its
+  // directory could be read. Collapsing the two is what let a ZIP64 archive
+  // skip the bomb check: it sniffs as a valid DOCX, produced no summary, and
+  // the absent size was then read downstream as "not an archive".
+  const isArchiveFormat = detected?.mime === ALLOWED_SNIFFED_MIME_TYPES.docx;
+  const zipSummary = isArchiveFormat ? inspectZipCentralDirectory(bytes) : undefined;
+  const archiveUninspectable = isArchiveFormat && zipSummary === undefined;
   return {
     sizeBytes: bytes.length,
     sniffedMimeType,
     sha256Hash: createHash("sha256").update(bytes).digest("hex"),
-    ...(zipSummary === undefined ? {} : { zipUncompressedBytes: zipSummary.totalUncompressedBytes })
+    ...(zipSummary === undefined ? {} : { zipUncompressedBytes: zipSummary.totalUncompressedBytes }),
+    ...(archiveUninspectable ? { archiveUninspectable: true } : {})
   };
 }
 
