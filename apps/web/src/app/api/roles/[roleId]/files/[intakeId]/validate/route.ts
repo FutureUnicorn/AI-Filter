@@ -1,10 +1,6 @@
 import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import {
-  getFileIntakeById,
-  getMembershipsForUser,
-  recordFileValidationResult
-} from "@signal-audit/db";
+import { getFileIntakeById, getMembershipsForUser, recordFileValidationResult } from "@signal-audit/db";
 import { evaluateFileValidation } from "@signal-audit/domain";
 import { sniffUploadedFile } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
@@ -68,11 +64,19 @@ export async function POST(_request: NextRequest, context: RouteContext): Promis
     }
 
     const sniffed = await sniffUploadedFile(config.storage, intake.storageKey);
+
     const validation = evaluateFileValidation({
       declaredFilename: intake.declaredFilename,
       sniffedMimeType: sniffed.sniffedMimeType,
       sizeBytes: sniffed.sizeBytes,
-      zipUncompressedBytes: sniffed.zipUncompressedBytes
+      zipUncompressedBytes: sniffed.zipUncompressedBytes,
+      // Review #83, P1: omitting this made the entire uninspectable-archive
+      // fix dead code. The sniffer set the flag and the evaluator honoured it,
+      // but nothing carried it across, so a ZIP64 or malformed DOCX still
+      // arrived with a recognized DOCX MIME and no declared size and
+      // validated exactly as before. Unit-testing both ends of a wire that is
+      // not connected proves nothing about the path that ships.
+      archiveUninspectable: sniffed.archiveUninspectable
     });
 
     const outcome = await recordFileValidationResult(config.database.url, config.database.schema, intakeId, {
