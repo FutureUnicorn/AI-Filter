@@ -8,13 +8,10 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
-  claimIdempotentRequest,
-  completeIdempotentRequest,
   correctEvidenceOutcome,
   getApplicationById,
   getMembershipsForUser,
-  getRoleById,
-  releaseIdempotentRequest
+  getRoleById
 } from "@signal-audit/db";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../../../lib/session";
@@ -130,18 +127,36 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    // Claimed after authorization, and scoped by organization, so a key can
-    // neither be consumed nor probed across tenants.
-    const claim = await claimIdempotentRequest(config.database.url, config.database.schema, {
-      organizationId: role.organizationId,
-      endpoint: "evidence_corrections.record",
-      idempotencyKey,
-      payload: { applicationId: application.applicationId, criterionId, ...parsedBody }
-    });
-    if (claim.outcome === "replay") {
-      return Response.json(claim.body, { status: claim.status, headers: withRequestId(undefined, requestId) });
+    // Review #83, P1: the claim now travels into the writer and is committed
+    // in the same transaction as the correction, closing the window where a
+    // fault between "correction committed" and "response stored" left the key
+    // permanently in_flight. See the note in recordCandidateDecision's route
+    // for the full failure it removes.
+    //
+    // Still claimed after authorization and scoped by organization, so a key
+    // can neither be consumed nor probed across tenants.
+    const result = await correctEvidenceOutcome(
+      config.database.url,
+      config.database.schema,
+      {
+        organizationId: role.organizationId,
+        applicationId: application.applicationId,
+        criterionId,
+        outcome: parsedBody.outcome,
+        correctedByUserId: userId,
+        reason: parsedBody.reason
+      },
+      {
+        endpoint: "evidence_corrections.record",
+        key: idempotencyKey,
+        payload: { applicationId: application.applicationId, criterionId, ...parsedBody }
+      }
+    );
+
+    if (result.outcome === "replayed") {
+      return Response.json(result.body, { status: result.status, headers: withRequestId(undefined, requestId) });
     }
-    if (claim.outcome === "fingerprint_mismatch") {
+    if (result.outcome === "idempotency_mismatch") {
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -149,7 +164,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-    if (claim.outcome === "in_flight") {
+    if (result.outcome === "idempotency_in_flight") {
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -157,24 +172,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-
-    let result;
-    try {
-      result = await correctEvidenceOutcome(config.database.url, config.database.schema, {
-        organizationId: role.organizationId,
-        applicationId: application.applicationId,
-        criterionId,
-        outcome: parsedBody.outcome,
-        correctedByUserId: userId,
-        reason: parsedBody.reason
-      });
-    } catch (error) {
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
-      throw error;
-    }
-
     if (result.outcome === "nothing_to_correct") {
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -183,7 +181,6 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
     if (result.outcome === "superseded") {
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       // Losing the race is a 409 and says why: the reviewer's "before"
       // is no longer what they were looking at, so re-reading and
       // re-deciding is the correct next step, not a silent retry.
@@ -195,12 +192,13 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const body = {
-      evidenceOutcomeId: result.evidenceOutcomeId,
-      supersededEvidenceOutcomeId: result.supersededId
-    };
-    await completeIdempotentRequest(config.database.url, config.database.schema, claim.requestId, 201, body);
-    return Response.json(body, { status: 201, headers: withRequestId(undefined, requestId) });
+    return Response.json(
+      {
+        evidenceOutcomeId: result.evidenceOutcomeId,
+        supersededEvidenceOutcomeId: result.supersededId
+      },
+      { status: 201, headers: withRequestId(undefined, requestId) }
+    );
   } catch (error) {
     console.error("evidence correction failed", error);
     const apiError = buildApiError({

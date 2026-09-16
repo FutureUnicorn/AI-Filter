@@ -4162,7 +4162,8 @@ export interface RecordedEvidenceRevision {
 export async function correctEvidenceOutcome(
   databaseUrl: string,
   schema: string,
-  input: CorrectEvidenceOutcomeInput
+  input: CorrectEvidenceOutcomeInput,
+  idempotency?: IdempotencyContext
 ): Promise<EvidenceCorrectionResult> {
   assertSafeSchema(schema);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
@@ -4170,6 +4171,24 @@ export async function correctEvidenceOutcome(
     await client.connect();
     await client.query("BEGIN");
     try {
+      // Same fix as recordCandidateDecision (review #83, P1): the claim lives
+      // in the correction's own transaction, so a fault cannot leave a
+      // committed correction behind an idempotency key that never completed.
+      let claimId: string | undefined;
+      if (idempotency !== undefined) {
+        const claim = await claimOnClient(client, schema, input.organizationId, idempotency);
+        if (!("claimId" in claim)) {
+          await client.query("COMMIT");
+          if (claim.kind === "replay") {
+            return { outcome: "replayed", status: claim.status, body: claim.body };
+          }
+          return claim.kind === "fingerprint_mismatch"
+            ? { outcome: "idempotency_mismatch" }
+            : { outcome: "idempotency_in_flight" };
+        }
+        claimId = claim.claimId;
+      }
+
       // What is actually load-bearing here, measured rather than
       // asserted:
       //
@@ -4225,8 +4244,17 @@ export async function correctEvidenceOutcome(
       );
       const evidenceOutcomeId = inserted.rows[0]?.evidence_outcome_id;
       if (evidenceOutcomeId === undefined) {
+        // No correction recorded, so the claim rolls back with it.
         await client.query("ROLLBACK");
         return { outcome: "superseded" };
+      }
+      if (claimId !== undefined) {
+        // Stored in the route's response shape, not the writer's internal
+        // one, so a replay is byte-identical to the original 201.
+        await completeOnClient(client, schema, claimId, 201, {
+          evidenceOutcomeId,
+          supersededEvidenceOutcomeId: supersededId
+        });
       }
       await client.query("COMMIT");
       return { outcome: "recorded", evidenceOutcomeId, supersededId };
@@ -4546,7 +4574,12 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
 export type EvidenceCorrectionResult =
   | { readonly outcome: "recorded"; readonly evidenceOutcomeId: string; readonly supersededId: string }
   | { readonly outcome: "nothing_to_correct" }
-  | { readonly outcome: "superseded" };
+  | { readonly outcome: "superseded" }
+  /** See IdempotencyContext: these three come from the claim that now shares
+   * this function's transaction rather than from a separate pre-flight. */
+  | { readonly outcome: "replayed"; readonly status: number; readonly body: unknown }
+  | { readonly outcome: "idempotency_mismatch" }
+  | { readonly outcome: "idempotency_in_flight" };
 
 export interface RecordCandidateDecisionInput {
   readonly organizationId: string;
@@ -4794,6 +4827,11 @@ export async function releaseIdempotentRequest(
 
 export type CandidateDecisionResult =
   | { readonly outcome: "recorded"; readonly decisionId: string; readonly supersededId?: string }
+  /** The same key and payload already completed; the stored response is
+   * returned verbatim rather than a second decision being recorded. */
+  | { readonly outcome: "replayed"; readonly status: number; readonly body: unknown }
+  | { readonly outcome: "idempotency_mismatch" }
+  | { readonly outcome: "idempotency_in_flight" }
   | { readonly outcome: "superseded" }
   /** The application does not exist for this organization, so there is
    * nothing to decide on and no parent row to serialize against. Distinct
@@ -4812,10 +4850,98 @@ export type CandidateDecisionResult =
  * changed, so re-reading and re-deciding is the right next step, and a
  * UI has to be able to say so.
  */
+/**
+ * Idempotency context carried INTO an action's own transaction.
+ *
+ * Review #83, P1: claiming the key, performing the action and storing the
+ * response were three calls on three connections. A fault after the action
+ * committed but before the response was stored left the key at
+ * `response_status = NULL` forever -- every same-key retry got `in_flight`,
+ * while retrying with a fresh key recorded a second human decision. The
+ * protocol was not atomic with the thing it protects.
+ *
+ * Passing it in makes the claim, the action and the completion one
+ * transaction on one connection. A fault anywhere rolls back all three, so a
+ * retry re-claims cleanly instead of wedging, and no action is ever committed
+ * without its completed idempotency record.
+ */
+export interface IdempotencyContext {
+  readonly endpoint: string;
+  readonly key: string;
+  readonly payload: unknown;
+}
+
+export type IdempotentReplay =
+  | { readonly kind: "replay"; readonly status: number; readonly body: unknown }
+  | { readonly kind: "fingerprint_mismatch" }
+  | { readonly kind: "in_flight" };
+
+/** Claims the key on the caller's transaction, or reports what already
+ * happened under it. `FOR UPDATE` on the existing row serializes two
+ * concurrent retries so they cannot both read a NULL response. */
+async function claimOnClient(
+  client: Client,
+  schema: string,
+  organizationId: string,
+  idempotency: IdempotencyContext
+): Promise<{ readonly claimId: string } | IdempotentReplay> {
+  const fingerprint = createHash("sha256").update(JSON.stringify(idempotency.payload ?? null)).digest("hex");
+  const claimed = await client.query<{ idempotent_request_id: string }>(
+    `INSERT INTO "${schema}".idempotent_requests
+       (organization_id, endpoint, idempotency_key, request_fingerprint)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (organization_id, endpoint, idempotency_key) DO NOTHING
+     RETURNING idempotent_request_id`,
+    [organizationId, idempotency.endpoint, idempotency.key, fingerprint]
+  );
+  const claimId = claimed.rows[0]?.idempotent_request_id;
+  if (claimId !== undefined) {
+    return { claimId };
+  }
+  const existing = await client.query<{
+    request_fingerprint: string;
+    response_status: number | null;
+    response_body: unknown;
+  }>(
+    `SELECT request_fingerprint, response_status, response_body
+       FROM "${schema}".idempotent_requests
+      WHERE organization_id = $1 AND endpoint = $2 AND idempotency_key = $3
+      FOR UPDATE`,
+    [organizationId, idempotency.endpoint, idempotency.key]
+  );
+  const row = existing.rows[0];
+  if (row === undefined) {
+    throw new Error("idempotency record vanished between claim and read");
+  }
+  if (row.request_fingerprint !== fingerprint) {
+    return { kind: "fingerprint_mismatch" };
+  }
+  if (row.response_status === null) {
+    return { kind: "in_flight" };
+  }
+  return { kind: "replay", status: row.response_status, body: row.response_body };
+}
+
+async function completeOnClient(
+  client: Client,
+  schema: string,
+  claimId: string,
+  status: number,
+  body: unknown
+): Promise<void> {
+  await client.query(
+    `UPDATE "${schema}".idempotent_requests
+        SET response_status = $2, response_body = $3::jsonb, completed_at = clock_timestamp()
+      WHERE idempotent_request_id = $1`,
+    [claimId, status, JSON.stringify(body ?? null)]
+  );
+}
+
 export async function recordCandidateDecision(
   databaseUrl: string,
   schema: string,
-  input: RecordCandidateDecisionInput
+  input: RecordCandidateDecisionInput,
+  idempotency?: IdempotencyContext
 ): Promise<CandidateDecisionResult> {
   assertSafeSchema(schema);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
@@ -4823,6 +4949,25 @@ export async function recordCandidateDecision(
     await client.connect();
     await client.query("BEGIN");
     try {
+      // Claimed inside THIS transaction, not a separate one (review #83, P1).
+      // The claim, the insert below and the completion before COMMIT either
+      // all land or none do, so there is no window where a decision exists
+      // with an incomplete idempotency record.
+      let claimId: string | undefined;
+      if (idempotency !== undefined) {
+        const claim = await claimOnClient(client, schema, input.organizationId, idempotency);
+        if (!("claimId" in claim)) {
+          await client.query("COMMIT");
+          if (claim.kind === "replay") {
+            return { outcome: "replayed", status: claim.status, body: claim.body };
+          }
+          return claim.kind === "fingerprint_mismatch"
+            ? { outcome: "idempotency_mismatch" }
+            : { outcome: "idempotency_in_flight" };
+        }
+        claimId = claim.claimId;
+      }
+
       // Serialize on the PARENT application row, before reading the head.
       //
       // Review #83, P1: locking the head cannot serialize a candidate's first
@@ -4846,6 +4991,7 @@ export async function recordCandidateDecision(
         [input.organizationId, input.applicationId]
       );
       if (application.rows[0] === undefined) {
+        // Same reasoning: no action performed, so no claim should persist.
         await client.query("ROLLBACK");
         return { outcome: "no_such_application" };
       }
@@ -4883,13 +5029,26 @@ export async function recordCandidateDecision(
       );
       const decisionId = inserted.rows[0]?.decision_id;
       if (decisionId === undefined) {
+        // Nothing was recorded, so the claim must not survive either: the
+        // ROLLBACK discards it and the client may retry the same key.
         await client.query("ROLLBACK");
         return { outcome: "superseded" };
       }
+
+      const result: CandidateDecisionResult =
+        supersededId === undefined
+          ? { outcome: "recorded", decisionId }
+          : { outcome: "recorded", decisionId, supersededId };
+      if (claimId !== undefined) {
+        // In the same transaction as the insert above. This is the line whose
+        // absence from the transaction was the defect.
+        await completeOnClient(client, schema, claimId, 201, {
+          decisionId,
+          ...(supersededId === undefined ? {} : { supersededDecisionId: supersededId })
+        });
+      }
       await client.query("COMMIT");
-      return supersededId === undefined
-        ? { outcome: "recorded", decisionId }
-        : { outcome: "recorded", decisionId, supersededId };
+      return result;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
@@ -5075,6 +5234,319 @@ export async function assertConcurrentFirstDecisionHasOneRoot(
       rootCount: Number(roots.rows[0]?.count ?? "-1"),
       headCount: Number(heads.rows[0]?.count ?? "-1"),
       totalDecisions: Number(total.rows[0]?.count ?? "-1")
+    };
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface IdempotencyAtomicityObservations {
+  /** After a fault inside the writer's transaction. */
+  readonly faultedThrew: boolean;
+  readonly decisionsAfterFault: number;
+  readonly claimRowsAfterFault: number;
+  /** Retrying the SAME key once the fault is gone. */
+  readonly retryAfterFaultOutcome: string;
+  readonly decisionsAfterRetry: number;
+  readonly claimStatusAfterRetry: number | null;
+  /** Retrying once more, as a client would after losing the 201 in transit. */
+  readonly replayOutcome: string;
+  readonly replayStatus: number;
+  readonly replayBodyMatches: boolean;
+  readonly decisionsAfterReplay: number;
+  /**
+   * What a deferred constraint trigger, firing at COMMIT time, saw in
+   * idempotent_requests for this key. 201 means the completion was already
+   * inside the transaction; null means it was still to come afterwards.
+   */
+  readonly completionStatusAtCommit: number | null;
+  /** The old three-call shape, reproduced deliberately as a negative control. */
+  readonly legacyDecisionsAfterFault: number;
+  readonly legacySameKeyRetry: string;
+  readonly legacyDecisionsAfterNewKeyRetry: number;
+}
+
+/**
+ * Review #83, P1: the fault-in-the-window regression.
+ *
+ * The window was between "the decision committed" and "the idempotency
+ * response was stored", when those were two transactions on two connections.
+ * A process or database fault there left the key at response_status = NULL
+ * permanently: every same-key retry answered in_flight, and a client that
+ * gave up and retried with a fresh key recorded a SECOND human decision.
+ *
+ * The fault is injected with an AFTER INSERT trigger on candidate_decisions,
+ * which raises inside the writer's own transaction at exactly the point the
+ * old shape had already committed. That is the closest deterministic stand-in
+ * for the process dying there: same position in the sequence, same partial
+ * work in flight, and unlike killing the backend it lands in the same place
+ * on every run.
+ *
+ * What it proves, in order:
+ *   1. A fault in the window leaves NOTHING behind. No decision, and no
+ *      claim, because the claim is now in the same transaction as the insert.
+ *   2. A retry of the SAME key therefore records cleanly rather than being
+ *      told the key is still in progress by a request that no longer exists.
+ *   3. A further retry replays the stored 201 verbatim instead of recording
+ *      a second decision.
+ *   4. The legacy three-call shape, run against the same database, still
+ *      wedges and still duplicates. That is the negative control: it is what
+ *      this function measures the absence of, so a revert to the old shape
+ *      fails here rather than passing quietly.
+ */
+export async function assertIdempotencyIsAtomicWithTheAction(
+  databaseUrl: string
+): Promise<IdempotencyAtomicityObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `idem_atomic_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const endpoint = "candidate_decisions.record";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0013_file_intakes.sql",
+      "0016_applications_and_import_finalization.sql",
+      "0017_evidence_outcomes.sql",
+      "0018_evidence_corrections.sql",
+      "0019_correction_attribution.sql",
+      "0020_candidate_decisions.sql",
+      "0021_single_decision_root.sql",
+      "0022_idempotent_requests.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A')`, [organizationId]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Decider') RETURNING user_id`,
+      [`atomic_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [organizationId, roleId, `atomic/${suffix}.csv`, userId]
+    );
+    const intakeId = intake.rows[0]?.intake_id;
+
+    const createApplication = async (rowNumber: number, name: string): Promise<string> => {
+      const created = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING application_id`,
+        [organizationId, roleId, intakeId, rowNumber, name, `${name.toLowerCase()}_${suffix}@acme.test`]
+      );
+      const applicationId = created.rows[0]?.application_id;
+      if (applicationId === undefined) {
+        throw new Error("probe could not create an application");
+      }
+      return applicationId;
+    };
+
+    const countDecisions = async (applicationId: string): Promise<number> => {
+      const counted = await admin.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM "${schema}".candidate_decisions WHERE application_id = $1`,
+        [applicationId]
+      );
+      return Number(counted.rows[0]?.count ?? "-1");
+    };
+
+    // ---- 1 and 2: fault in the window, then retry the same key ----
+    const applicationId = await createApplication(1, "Casey");
+    const key = `atomic-${suffix}`;
+    const payload = { applicationId, decision: "advance" };
+    const idempotency: IdempotencyContext = { endpoint, key, payload };
+    const decide = (): Promise<CandidateDecisionResult> =>
+      recordCandidateDecision(
+        databaseUrl,
+        schema,
+        {
+          organizationId,
+          applicationId,
+          decision: "advance",
+          rationale: "atomicity probe",
+          decidedByUserId: userId
+        },
+        idempotency
+      );
+
+    await admin.query(
+      `CREATE FUNCTION "${schema}".inject_fault() RETURNS trigger LANGUAGE plpgsql AS $fn$
+         BEGIN RAISE EXCEPTION 'injected fault inside the idempotency window'; END
+       $fn$`
+    );
+    await admin.query(
+      `CREATE TRIGGER inject_fault_after_insert AFTER INSERT ON "${schema}".candidate_decisions
+         FOR EACH ROW EXECUTE FUNCTION "${schema}".inject_fault()`
+    );
+
+    let faultedThrew = false;
+    try {
+      await decide();
+    } catch {
+      faultedThrew = true;
+    }
+    const decisionsAfterFault = await countDecisions(applicationId);
+    const claimsAfterFault = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".idempotent_requests
+        WHERE organization_id = $1 AND endpoint = $2 AND idempotency_key = $3`,
+      [organizationId, endpoint, key]
+    );
+
+    await admin.query(`DROP TRIGGER inject_fault_after_insert ON "${schema}".candidate_decisions`);
+
+    const retry = await decide();
+    const decisionsAfterRetry = await countDecisions(applicationId);
+    const claimRow = await admin.query<{ response_status: number | null }>(
+      `SELECT response_status FROM "${schema}".idempotent_requests
+        WHERE organization_id = $1 AND endpoint = $2 AND idempotency_key = $3`,
+      [organizationId, endpoint, key]
+    );
+
+    // ---- 3: the client never saw the 201 and sends the same key again ----
+    const replay = await decide();
+    const decisionsAfterReplay = await countDecisions(applicationId);
+    const replayBodyMatches =
+      replay.outcome === "replayed" &&
+      retry.outcome === "recorded" &&
+      JSON.stringify(replay.body) === JSON.stringify({ decisionId: retry.decisionId });
+
+    // ---- 3.5: is the completion INSIDE the transaction, or merely near it? ----
+    //
+    // The trigger fault above rolls the whole transaction back, so it cannot
+    // tell a completion written before COMMIT from one written after: in both
+    // shapes nothing survives a fault at the insert. That distinction is the
+    // actual fix, so it needs an observation rather than an injected fault.
+    //
+    // A DEFERRABLE INITIALLY DEFERRED constraint trigger runs at COMMIT, after
+    // every statement in the transaction and before the commit completes. It
+    // therefore sees exactly the state the transaction is about to make
+    // durable. If the completion is in the transaction it reads 201; if the
+    // completion happens after COMMIT, as the old shape did, it reads NULL,
+    // and that NULL is the window.
+    const witnessApplicationId = await createApplication(3, "Avery");
+    const witnessKey = `witness-${suffix}`;
+    await admin.query(`CREATE TABLE "${schema}".commit_witness (observed_status integer)`);
+    await admin.query(
+      `CREATE FUNCTION "${schema}".witness_completion() RETURNS trigger LANGUAGE plpgsql AS $fn$
+         DECLARE seen integer;
+         BEGIN
+           SELECT response_status INTO seen FROM "${schema}".idempotent_requests
+            WHERE organization_id = NEW.organization_id
+              AND endpoint = '${endpoint}'
+              AND idempotency_key = '${witnessKey}';
+           INSERT INTO "${schema}".commit_witness (observed_status) VALUES (seen);
+           RETURN NULL;
+         END
+       $fn$`
+    );
+    await admin.query(
+      `CREATE CONSTRAINT TRIGGER witness_completion_at_commit
+         AFTER INSERT ON "${schema}".candidate_decisions
+         DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW EXECUTE FUNCTION "${schema}".witness_completion()`
+    );
+    await recordCandidateDecision(
+      databaseUrl,
+      schema,
+      {
+        organizationId,
+        applicationId: witnessApplicationId,
+        decision: "advance",
+        rationale: "commit-time witness",
+        decidedByUserId: userId
+      },
+      { endpoint, key: witnessKey, payload: { applicationId: witnessApplicationId, decision: "advance" } }
+    );
+    await admin.query(`DROP TRIGGER witness_completion_at_commit ON "${schema}".candidate_decisions`);
+    const witnessed = await admin.query<{ observed_status: number | null }>(
+      `SELECT observed_status FROM "${schema}".commit_witness`
+    );
+
+    // ---- 4: negative control, the old three-call shape ----
+    // Claim, act and complete on three separate connections, with the
+    // process "dying" before the third. This is what the code did before
+    // this fix, reproduced here so the difference is measured rather than
+    // asserted in a comment.
+    const legacyApplicationId = await createApplication(2, "Jordan");
+    const legacyKey = `legacy-${suffix}`;
+    const legacyPayload = { applicationId: legacyApplicationId, decision: "advance" };
+    const legacyClaim = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId,
+      endpoint,
+      idempotencyKey: legacyKey,
+      payload: legacyPayload
+    });
+    if (legacyClaim.outcome !== "claimed") {
+      throw new Error(`probe expected the legacy claim to succeed, got ${legacyClaim.outcome}`);
+    }
+    await recordCandidateDecision(databaseUrl, schema, {
+      organizationId,
+      applicationId: legacyApplicationId,
+      decision: "advance",
+      rationale: "legacy shape, decision commits on its own",
+      decidedByUserId: userId
+    });
+    // completeIdempotentRequest is deliberately NOT called: that is the fault.
+    const legacyDecisionsAfterFault = await countDecisions(legacyApplicationId);
+    const legacySameKeyRetry = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId,
+      endpoint,
+      idempotencyKey: legacyKey,
+      payload: legacyPayload
+    });
+    // Wedged on the original key, the client rotates to a fresh one.
+    const legacyNewKeyClaim = await claimIdempotentRequest(databaseUrl, schema, {
+      organizationId,
+      endpoint,
+      idempotencyKey: `legacy-rotated-${suffix}`,
+      payload: legacyPayload
+    });
+    if (legacyNewKeyClaim.outcome !== "claimed") {
+      throw new Error(`probe expected the rotated legacy key to claim, got ${legacyNewKeyClaim.outcome}`);
+    }
+    await recordCandidateDecision(databaseUrl, schema, {
+      organizationId,
+      applicationId: legacyApplicationId,
+      decision: "advance",
+      rationale: "legacy shape, the duplicate human decision",
+      decidedByUserId: userId
+    });
+    const legacyDecisionsAfterNewKeyRetry = await countDecisions(legacyApplicationId);
+
+    return {
+      faultedThrew,
+      decisionsAfterFault,
+      claimRowsAfterFault: Number(claimsAfterFault.rows[0]?.count ?? "-1"),
+      retryAfterFaultOutcome: retry.outcome,
+      decisionsAfterRetry,
+      claimStatusAfterRetry: claimRow.rows[0]?.response_status ?? null,
+      replayOutcome: replay.outcome,
+      replayStatus: replay.outcome === "replayed" ? replay.status : -1,
+      replayBodyMatches,
+      decisionsAfterReplay,
+      completionStatusAtCommit: witnessed.rows[0]?.observed_status ?? null,
+      legacyDecisionsAfterFault,
+      legacySameKeyRetry: legacySameKeyRetry.outcome,
+      legacyDecisionsAfterNewKeyRetry
     };
   } finally {
     await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);

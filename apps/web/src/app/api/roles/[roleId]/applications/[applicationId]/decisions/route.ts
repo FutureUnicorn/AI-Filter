@@ -8,14 +8,11 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
-  claimIdempotentRequest,
-  completeIdempotentRequest,
   getApplicationById,
   getMembershipsForUser,
   getRoleById,
   listCandidateDecisionsForApplication,
-  recordCandidateDecision,
-  releaseIdempotentRequest
+  recordCandidateDecision
 } from "@signal-audit/db";
 import { deriveCandidateWorkflowStatus } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
@@ -124,21 +121,48 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    // Claimed after authorization, so an unauthorized caller cannot consume
-    // or probe a key, and scoped by organization so one tenant's keys are
-    // invisible to another.
-    const claim = await claimIdempotentRequest(config.database.url, config.database.schema, {
-      organizationId: role.organizationId,
-      endpoint: "candidate_decisions.record",
-      idempotencyKey,
-      payload: { applicationId: application.applicationId, ...parsedBody }
-    });
-    if (claim.outcome === "replay") {
+    // Review #83, P1. This used to be three round trips on three connections:
+    // claim, record, complete. The recorded decision committed in the middle
+    // one, so a crash before the third left the key parked at
+    // response_status = NULL forever: every retry of the same key answered
+    // "still in progress", and a client that gave up and retried with a fresh
+    // key recorded a SECOND human decision. Releasing on the error path only
+    // covered faults this process lived to observe, which is precisely not
+    // the case that mattered.
+    //
+    // The context is now passed INTO the writer, which claims and completes
+    // on the same connection inside the same transaction as the insert. The
+    // three facts commit together or not at all, so the wedged state is no
+    // longer reachable and a retry either replays the stored response or
+    // re-claims a key that never took effect.
+    //
+    // Claimed after authorization still holds: this call is made only once
+    // the caller's `record_decision` capability has been checked, and the
+    // claim is scoped by organization, so one tenant's keys stay invisible to
+    // another and an unauthorized caller cannot consume or probe a key.
+    const result = await recordCandidateDecision(
+      config.database.url,
+      config.database.schema,
+      {
+        organizationId: role.organizationId,
+        applicationId: application.applicationId,
+        decision: parsedBody.decision,
+        rationale: parsedBody.rationale,
+        decidedByUserId: userId
+      },
+      {
+        endpoint: "candidate_decisions.record",
+        key: idempotencyKey,
+        payload: { applicationId: application.applicationId, ...parsedBody }
+      }
+    );
+
+    if (result.outcome === "replayed") {
       // The original response, verbatim. A fresh 201 here would be
       // indistinguishable from having recorded a second decision.
-      return Response.json(claim.body, { status: claim.status, headers: withRequestId(undefined, requestId) });
+      return Response.json(result.body, { status: result.status, headers: withRequestId(undefined, requestId) });
     }
-    if (claim.outcome === "fingerprint_mismatch") {
+    if (result.outcome === "idempotency_mismatch") {
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -146,7 +170,9 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-    if (claim.outcome === "in_flight") {
+    if (result.outcome === "idempotency_in_flight") {
+      // Now only reachable while a concurrent request genuinely holds the key
+      // in an open transaction, not after a crash.
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -154,25 +180,9 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-
-    let result;
-    try {
-      result = await recordCandidateDecision(config.database.url, config.database.schema, {
-        organizationId: role.organizationId,
-        applicationId: application.applicationId,
-        decision: parsedBody.decision,
-        rationale: parsedBody.rationale,
-        decidedByUserId: userId
-      });
-    } catch (error) {
-      // Release on failure so the client can retry the same key rather than
-      // being locked out permanently by a transient fault.
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
-      throw error;
-    }
-
     if (result.outcome === "superseded") {
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
+      // No release call needed any more: the writer rolled the claim back
+      // with the decision it declined to record.
       const error = buildApiError({
         requestId,
         code: "conflict",
@@ -188,7 +198,6 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     // the caller has no membership for, so this cannot be used to probe
     // whether an application id exists in another tenant.
     if (result.outcome === "no_such_application") {
-      await releaseIdempotentRequest(config.database.url, config.database.schema, claim.requestId);
       const error = buildApiError({
         requestId,
         code: "not_found",
@@ -197,12 +206,15 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const body = {
-      decisionId: result.decisionId,
-      ...(result.supersededId === undefined ? {} : { supersededDecisionId: result.supersededId })
-    };
-    await completeIdempotentRequest(config.database.url, config.database.schema, claim.requestId, 201, body);
-    return Response.json(body, { status: 201, headers: withRequestId(undefined, requestId) });
+    // Identical in shape to what the writer stored as the replay body, so a
+    // retry cannot be told apart from the original.
+    return Response.json(
+      {
+        decisionId: result.decisionId,
+        ...(result.supersededId === undefined ? {} : { supersededDecisionId: result.supersededId })
+      },
+      { status: 201, headers: withRequestId(undefined, requestId) }
+    );
   } catch (error) {
     console.error("recording a candidate decision failed", error);
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not record the decision." });
