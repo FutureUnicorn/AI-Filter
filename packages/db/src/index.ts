@@ -43,9 +43,166 @@ import {
   summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
-import { Client } from "pg";
+import { Client, Pool } from "pg";
+import type { ClientBase, PoolClient } from "pg";
 
 /** Persistence adapters will implement domain-owned ports in this package. */
+/**
+ * One pool per connection string, shared for the life of the process.
+ *
+ * Review #83: every function here used to open its own `Client`, so a single
+ * request that called getRoleById, getMembershipsForUser, getApplicationById
+ * and recordCandidateDecision paid four TCP, TLS and authentication handshakes
+ * in sequence and left four Postgres backends to be started and torn down.
+ * Correct, and needlessly expensive under any real concurrency.
+ *
+ * Keyed by connection string because tests and probes legitimately point at
+ * different databases in one process, and a single global pool would send
+ * their queries to whichever one happened to be first.
+ *
+ * `allowExitOnIdle` is what keeps this from being a trap: without it an idle
+ * pooled connection is an open handle, and `node --test` and every script in
+ * scripts/ would hang after finishing their work instead of exiting.
+ */
+const connectionPools = new Map<string, Pool>();
+
+function getPool(databaseUrl: string): Pool {
+  const existing = connectionPools.get(databaseUrl);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    connectionTimeoutMillis: 5_000,
+    idleTimeoutMillis: 10_000,
+    max: 10,
+    allowExitOnIdle: true
+  });
+  // Without a listener, an error raised on an idle pooled client (the server
+  // closing it, a network drop) reaches the process as an unhandled 'error'
+  // event and takes it down. The pool discards the client either way; this
+  // only stops that being fatal.
+  pool.on("error", () => undefined);
+  connectionPools.set(databaseUrl, pool);
+  return pool;
+}
+
+/**
+ * A pooled connection, released by the caller's `finally`.
+ *
+ * Deliberately not offered to the probe helpers below. They run
+ * `SET search_path`, `SET LOCAL ROLE` and CREATE/DROP SCHEMA, which are
+ * session state that would outlive the borrower and leak onto whoever got the
+ * connection next. Their own dedicated `Client` is not an oversight.
+ */
+async function acquireConnection(databaseUrl: string): Promise<PoolClient> {
+  return getPool(databaseUrl).connect();
+}
+
+/**
+ * Closes every pool. Not needed for process exit, which `allowExitOnIdle`
+ * already handles; this is for a caller that wants the connections gone at a
+ * known point, such as a graceful shutdown draining in-flight work first.
+ */
+export async function closeDatabasePools(): Promise<void> {
+  const pools = [...connectionPools.values()];
+  connectionPools.clear();
+  await Promise.all(pools.map(async (pool) => pool.end().catch(() => undefined)));
+}
+
+export interface ConnectionReuseObservations {
+  /** Distinct Postgres backend PIDs used across the sequence. */
+  readonly distinctBackends: number;
+  readonly calls: number;
+  /** Sessions Postgres itself counted as established during the sequence. */
+  readonly sessionsEstablished: number;
+  /** The health check, which is deliberately unpooled, must still open one. */
+  readonly healthCheckSessions: number;
+}
+
+/**
+ * Review #83: proves the pool is actually reused rather than merely present.
+ *
+ * Measured two independent ways, because each alone is weak. `pg_backend_pid()`
+ * says which backend served a query but could repeat by chance if a backend
+ * were recycled onto the same PID. `pg_stat_database.sessions` counts sessions
+ * Postgres established, which is exact but would be polluted by anything else
+ * connecting concurrently -- so this runs against its own database, created
+ * and dropped here, where nothing else does.
+ *
+ * Together they distinguish the fix from the defect. Before pooling, N
+ * sequential calls meant N backends and N sessions. After, one of each.
+ */
+export async function assertConnectionsAreReused(
+  adminDatabaseUrl: string,
+  calls = 6
+): Promise<ConnectionReuseObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const database = `reuse_probe_${suffix}`;
+  const admin = new Client({ connectionString: adminDatabaseUrl, connectionTimeoutMillis: 5_000 });
+  let probeUrl: string;
+  try {
+    await admin.connect();
+    // CREATE DATABASE cannot run inside a transaction block, which is why this
+    // is a bare query on a dedicated connection.
+    await admin.query(`CREATE DATABASE "${database}"`);
+    const target = new URL(adminDatabaseUrl);
+    target.pathname = `/${database}`;
+    probeUrl = target.toString();
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+
+  const observer = new Client({ connectionString: adminDatabaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await observer.connect();
+    const readSessions = async (): Promise<number> => {
+      const counted = await observer.query<{ sessions: string }>(
+        `SELECT sessions::text AS sessions FROM pg_stat_database WHERE datname = $1`,
+        [database]
+      );
+      return Number(counted.rows[0]?.sessions ?? "-1");
+    };
+
+    const backends = new Set<number>();
+    const before = await readSessions();
+    for (let index = 0; index < calls; index += 1) {
+      const client = await acquireConnection(probeUrl);
+      try {
+        const pid = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        const observed = pid.rows[0]?.pid;
+        if (observed === undefined) {
+          throw new Error("probe could not read a backend pid");
+        }
+        backends.add(observed);
+      } finally {
+        client.release();
+      }
+    }
+    const afterSequence = await readSessions();
+
+    // The unpooled health check, as a control in the same run: if the
+    // measurement could not see a new session it would report reuse for
+    // everything, including code that pools nothing.
+    await checkDatabaseConnection(probeUrl, "public");
+    const afterHealthCheck = await readSessions();
+
+    await closeDatabasePools();
+    return {
+      distinctBackends: backends.size,
+      calls,
+      sessionsEstablished: afterSequence - before,
+      healthCheckSessions: afterHealthCheck - afterSequence
+    };
+  } finally {
+    await closeDatabasePools().catch(() => undefined);
+    await observer.query(`DROP DATABASE IF EXISTS "${database}"`).catch(() => undefined);
+    await observer.end().catch(() => undefined);
+  }
+}
+
+
+
 export interface DatabaseAdapterBoundary {
   readonly domain: DomainPort;
 }
@@ -55,6 +212,16 @@ export interface DatabaseHealth {
   readonly schema: string;
 }
 
+/**
+ * Deliberately not pooled, unlike every other reader here.
+ *
+ * A liveness probe that borrows a warm pooled connection reports the pool's
+ * health, not the database's: it would answer healthy from a cached connection
+ * while a new one could not be established at all. Its own handshake is the
+ * thing being measured. The per-client statement and query timeouts below are
+ * the other reason -- they bound this check without bounding every other
+ * caller that would share a pooled connection.
+ */
 export async function checkDatabaseConnection(
   databaseUrl: string,
   expectedSchema: string
@@ -82,6 +249,15 @@ export async function checkDatabaseConnection(
   }
 }
 
+/**
+ * Everything below this point keeps its own dedicated `Client` on purpose.
+ *
+ * These probes and seed helpers run `SET search_path`, `SET LOCAL ROLE` and
+ * CREATE/DROP SCHEMA. That is session state, and on a pooled connection it
+ * would outlive the borrower and land on whoever got the connection next,
+ * which is a far worse bug than the handshake cost pooling saves. They also
+ * run once per test rather than once per request, so there is nothing to save.
+ */
 export async function verifySyntheticDatabaseFixture(
   databaseUrl: string,
   schema: string
@@ -162,7 +338,7 @@ export interface CreateMagicLinkTokenInput {
  * the entire user base behind an error that claims their account does
  * not exist.
  */
-async function assertMembershipLookupVisible(client: Client, schema: string): Promise<void> {
+async function assertMembershipLookupVisible(client: ClientBase, schema: string): Promise<void> {
   const rls = await client.query<{ active: boolean }>(
     `SELECT row_security_active('"${schema}".memberships'::regclass) AS active`
   );
@@ -176,7 +352,7 @@ async function assertMembershipLookupVisible(client: Client, schema: string): Pr
 }
 
 async function emailHasMembership(
-  client: Client,
+  client: ClientBase,
   schema: string,
   email: string
 ): Promise<boolean> {
@@ -193,7 +369,7 @@ async function emailHasMembership(
 }
 
 async function provisionInvitedMembership(
-  client: Client,
+  client: ClientBase,
   schema: string,
   email: string,
   organizationId: string,
@@ -265,9 +441,8 @@ export async function createMagicLinkToken(
 ): Promise<void> {
   assertSafeSchema(schema);
   const email = input.email.toLowerCase();
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     // A plain login token (no invite) is not a signup path: refuse to mint
     // one for an email that has no user+membership pair. Invite tokens are
     // the only way an unknown email becomes a member, and they name the
@@ -287,7 +462,7 @@ export async function createMagicLinkToken(
       ]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -308,9 +483,8 @@ export async function redeemMagicLinkToken(
   tokenHash: string
 ): Promise<MagicLinkRedemptionAttempt> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       const redeemed = await client.query<MagicLinkTokenRow>(
@@ -352,7 +526,7 @@ export async function redeemMagicLinkToken(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -403,12 +577,11 @@ export async function appendAuditEvent(
     return;
   }
 
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await insert(client);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -436,9 +609,8 @@ export async function recordEvidenceExtractionRun(
   input: RecordEvidenceExtractionRunInput
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `INSERT INTO "${schema}".evidence_extraction_runs
          (organization_id, entity_type, entity_id, provider, model, prompt_version,
@@ -457,7 +629,7 @@ export async function recordEvidenceExtractionRun(
       ]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -519,9 +691,8 @@ export async function recordInferenceUsage(
 ): Promise<void> {
   assertSafeSchema(schema);
   assertNonNegativeUsage(input);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `INSERT INTO "${schema}".inference_usage_ledger
          (organization_id, model, period_start, input_tokens, output_tokens)
@@ -533,7 +704,7 @@ export async function recordInferenceUsage(
       [input.organizationId, input.model, input.periodStart, input.inputTokens, input.outputTokens]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -550,9 +721,8 @@ export async function getInferenceUsage(
   input: GetInferenceUsageInput
 ): Promise<{ inputTokens: number; outputTokens: number }> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{ input_tokens: string; output_tokens: string }>(
       `SELECT input_tokens, output_tokens FROM "${schema}".inference_usage_ledger
         WHERE organization_id = $1 AND model = $2 AND period_start = $3`,
@@ -564,7 +734,7 @@ export async function getInferenceUsage(
       outputTokens: row === undefined ? 0 : bigintColumnToNumber(row.output_tokens, "output_tokens")
     };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -610,9 +780,8 @@ export async function setInferenceKillSwitch(
   input: SetInferenceKillSwitchInput
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       const result = await client.query(
@@ -664,7 +833,7 @@ export async function setInferenceKillSwitch(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -705,16 +874,15 @@ export async function getUserByEmail(
   email: string
 ): Promise<User | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<UserRow>(
       `SELECT user_id, email, display_name, created_at FROM "${schema}".users WHERE email = $1`,
       [email]
     );
     return result.rows[0] === undefined ? undefined : rowToUser(result.rows[0]);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -740,9 +908,8 @@ export async function getMembershipsForUser(
   userId: string
 ): Promise<readonly Membership[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<MembershipRow>(
       `SELECT membership_id, organization_id, user_id, role, created_at
          FROM "${schema}".memberships
@@ -758,7 +925,7 @@ export async function getMembershipsForUser(
       createdAt: row.created_at.toISOString()
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -984,9 +1151,8 @@ export async function createRole(
   input: CreateRoleInput
 ): Promise<Role> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<RoleRow>(
       `INSERT INTO "${schema}".roles (organization_id, title, created_by_user_id)
        VALUES ($1, $2, $3)
@@ -1007,7 +1173,7 @@ export async function createRole(
       createdAt: row.created_at.toISOString()
     };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1019,9 +1185,8 @@ export async function listRolesForOrganization(
   organizationId: string
 ): Promise<readonly Role[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<RoleRow>(
       `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
          FROM "${schema}".roles
@@ -1039,7 +1204,7 @@ export async function listRolesForOrganization(
       createdAt: row.created_at.toISOString()
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1052,9 +1217,8 @@ export async function getRoleById(
   roleId: string
 ): Promise<Role | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<RoleRow>(
       `SELECT role_id, organization_id, title, status, created_by_user_id, created_at
          FROM "${schema}".roles
@@ -1075,7 +1239,7 @@ export async function getRoleById(
       createdAt: row.created_at.toISOString()
     };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1140,9 +1304,8 @@ export async function reserveInferenceBudget(
         `reserving zero cannot be checked against a cap, got inputTokens=${input.inputTokens} outputTokens=${input.outputTokens}`
     );
   }
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const reserved = await client.query<{ reservation_id: string; total_tokens: string }>(
       `WITH updated_ledger AS (
          INSERT INTO "${schema}".inference_usage_ledger
@@ -1208,7 +1371,7 @@ export async function reserveInferenceBudget(
       maxTotalTokens: input.maxTotalTokens
     };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1258,9 +1421,8 @@ export async function settleInferenceReservation(
     }
   }
 
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       const reservation = await client.query<{
@@ -1311,7 +1473,7 @@ export async function settleInferenceReservation(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1354,9 +1516,8 @@ export async function getRubricForRole(
   roleId: string
 ): Promise<Rubric | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<RubricRow>(
       `SELECT ${RUBRIC_COLUMNS}
          FROM "${schema}".rubrics
@@ -1367,7 +1528,7 @@ export async function getRubricForRole(
     );
     return result.rows[0] === undefined ? undefined : rowToRubric(result.rows[0]);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1390,9 +1551,8 @@ export async function upsertDraftRubric(
   criteria: readonly RubricCriterion[]
 ): Promise<UpsertDraftRubricOutcome> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const criteriaJson = JSON.stringify(criteria);
     const updated = await client.query<RubricRow>(
       `UPDATE "${schema}".rubrics
@@ -1423,7 +1583,7 @@ export async function upsertDraftRubric(
     }
     return { outcome: "saved", rubric: rowToRubric(insertedRow) };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1450,9 +1610,8 @@ export async function publishRubric(
   approvedByUserId: string
 ): Promise<PublishRubricOutcome> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<RubricRow>(
       `UPDATE "${schema}".rubrics
           SET status = 'published', approved_by_user_id = $2, approved_at = CURRENT_TIMESTAMP,
@@ -1464,7 +1623,7 @@ export async function publishRubric(
     const row = result.rows[0];
     return row === undefined ? { outcome: "no_draft" } : { outcome: "published", rubric: rowToRubric(row) };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1523,9 +1682,8 @@ export async function createFileIntake(
   input: CreateFileIntakeInput
 ): Promise<FileIntake> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<FileIntakeRow>(
       `INSERT INTO "${schema}".file_intakes
          (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
@@ -1546,7 +1704,7 @@ export async function createFileIntake(
     }
     return rowToFileIntake(row);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1556,16 +1714,15 @@ export async function getFileIntakeById(
   intakeId: string
 ): Promise<FileIntake | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<FileIntakeRow>(
       `SELECT ${FILE_INTAKE_COLUMNS} FROM "${schema}".file_intakes WHERE intake_id = $1`,
       [intakeId]
     );
     return result.rows[0] === undefined ? undefined : rowToFileIntake(result.rows[0]);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1583,9 +1740,8 @@ export async function markFileIntakeUploaded(
   intakeId: string
 ): Promise<MarkFileIntakeUploadedOutcome> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<FileIntakeRow>(
       `UPDATE "${schema}".file_intakes
           SET status = 'uploaded'
@@ -1596,7 +1752,7 @@ export async function markFileIntakeUploaded(
     const row = result.rows[0];
     return row === undefined ? { outcome: "not_pending" } : { outcome: "uploaded", intake: rowToFileIntake(row) };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1639,9 +1795,8 @@ export async function invalidateChangedIntake(
   detail: { readonly expectedSha256: string; readonly actualSha256: string }
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `UPDATE "${schema}".file_intakes
           SET status = 'quarantined', rejection_reason = $2
@@ -1653,7 +1808,7 @@ export async function invalidateChangedIntake(
       ]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1664,9 +1819,8 @@ export async function recordFileValidationResult(
   input: RecordFileValidationInput
 ): Promise<RecordFileValidationOutcome> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const newStatus: FileIntakeStatus = input.validation.outcome === "validated" ? "validated" : "quarantined";
     const rejectionReason = input.validation.outcome === "validated" ? null : input.validation.reason;
     const result = await client.query<FileIntakeRow>(
@@ -1679,7 +1833,7 @@ export async function recordFileValidationResult(
     const row = result.rows[0];
     return row === undefined ? { outcome: "not_uploaded" } : { outcome: "recorded", intake: rowToFileIntake(row) };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1724,9 +1878,8 @@ export async function createCanonicalTextExtraction(
   input: CreateCanonicalTextExtractionInput
 ): Promise<CanonicalTextExtraction> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const pagesJson = JSON.stringify(input.pages);
     await client.query(
       `INSERT INTO "${schema}".canonical_text_extractions (intake_id, pages, total_pages, quality)
@@ -1744,7 +1897,7 @@ export async function createCanonicalTextExtraction(
     }
     return rowToCanonicalTextExtraction(row);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1754,16 +1907,15 @@ export async function getCanonicalTextExtractionByIntakeId(
   intakeId: string
 ): Promise<CanonicalTextExtraction | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<CanonicalTextExtractionRow>(
       `SELECT ${CANONICAL_TEXT_EXTRACTION_COLUMNS} FROM "${schema}".canonical_text_extractions WHERE intake_id = $1`,
       [intakeId]
     );
     return result.rows[0] === undefined ? undefined : rowToCanonicalTextExtraction(result.rows[0]);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1838,7 +1990,7 @@ function normalizedAppliedAt(raw: string | undefined): string | null {
 }
 
 async function insertImportRow(
-  client: Client,
+  client: ClientBase,
   schema: string,
   intakeId: string,
   rowNumber: number,
@@ -1866,9 +2018,8 @@ export async function finalizeCsvImport(
   input: FinalizeCsvImportInput
 ): Promise<FinalizeCsvImportOutcome> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       const existing = await client.query<{ idempotency_key: string; mapping: CsvColumnMapping[] }>(
@@ -1950,7 +2101,7 @@ export async function finalizeCsvImport(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -1960,16 +2111,15 @@ export async function getImportRowsForIntake(
   intakeId: string
 ): Promise<readonly ImportRow[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<ImportRowRow>(
       `SELECT ${IMPORT_ROW_COLUMNS} FROM "${schema}".import_rows WHERE intake_id = $1 ORDER BY row_number`,
       [intakeId]
     );
     return result.rows.map(rowToImportRow);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3159,9 +3309,8 @@ export async function listApplicationsForRole(
   roleId: string
 ): Promise<readonly Application[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<ApplicationRow>(
       `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
               candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
@@ -3172,7 +3321,7 @@ export async function listApplicationsForRole(
     );
     return result.rows.map(rowToApplication);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3197,9 +3346,8 @@ export async function listEvidenceExtractionRunsForEntities(
   if (entityIds.length === 0) {
     return [];
   }
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{ entity_type: string; entity_id: string; created_at: Date }>(
       `SELECT entity_type, entity_id, created_at
          FROM "${schema}".evidence_extraction_runs
@@ -3212,7 +3360,7 @@ export async function listEvidenceExtractionRunsForEntities(
       createdAt: row.created_at.toISOString()
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3562,9 +3710,8 @@ export async function getFailedDocumentRate(
   roleId: string
 ): Promise<FailedDocumentRate> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{
       uploaded: string;
       quarantined: string;
@@ -3608,7 +3755,7 @@ export async function getFailedDocumentRate(
       extractionSucceeded: toCount(row.extraction_succeeded, "extraction_succeeded")
     });
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3792,9 +3939,8 @@ export async function recordEvidenceOutcome(
   input: RecordEvidenceOutcomeInput
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `INSERT INTO "${schema}".evidence_outcomes
          (organization_id, application_id, criterion_id, kind, outcome, run_id)
@@ -3809,7 +3955,7 @@ export async function recordEvidenceOutcome(
       ]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3831,9 +3977,8 @@ export async function listCurrentEvidenceOutcomesForApplication(
   applicationId: string
 ): Promise<readonly RecordedEvidenceOutcome[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{ outcome: EvidenceOutcome; recorded_at: Date }>(
       `SELECT DISTINCT ON (criterion_id) outcome, recorded_at
          FROM "${schema}".evidence_outcomes
@@ -3846,7 +3991,7 @@ export async function listCurrentEvidenceOutcomesForApplication(
       recordedAt: row.recorded_at.toISOString()
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -3863,9 +4008,8 @@ export async function getApplicationById(
   applicationId: string
 ): Promise<Application | undefined> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<ApplicationRow>(
       `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
               candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
@@ -3876,7 +4020,7 @@ export async function getApplicationById(
     const row = result.rows[0];
     return row === undefined ? undefined : rowToApplication(row);
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4166,9 +4310,8 @@ export async function correctEvidenceOutcome(
   idempotency?: IdempotencyContext
 ): Promise<EvidenceCorrectionResult> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       // Same fix as recordCandidateDecision (review #83, P1): the claim lives
@@ -4263,7 +4406,7 @@ export async function correctEvidenceOutcome(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4283,9 +4426,8 @@ export async function listEvidenceRevisionsForApplication(
   applicationId: string
 ): Promise<readonly RecordedEvidenceRevision[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{
       evidence_outcome_id: string;
       outcome: EvidenceOutcome;
@@ -4312,7 +4454,7 @@ export async function listEvidenceRevisionsForApplication(
         : { supersedesEvidenceOutcomeId: row.supersedes_evidence_outcome_id })
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4738,9 +4880,8 @@ export async function claimIdempotentRequest(
 ): Promise<IdempotentRequestClaim> {
   assertSafeSchema(schema);
   const fingerprint = createHash("sha256").update(JSON.stringify(input.payload ?? null)).digest("hex");
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const claimed = await client.query<{ idempotent_request_id: string }>(
       `INSERT INTO "${schema}".idempotent_requests
          (organization_id, endpoint, idempotency_key, request_fingerprint)
@@ -4778,7 +4919,7 @@ export async function claimIdempotentRequest(
     }
     return { outcome: "replay", status: row.response_status, body: row.response_body };
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4791,9 +4932,8 @@ export async function completeIdempotentRequest(
   body: unknown
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `UPDATE "${schema}".idempotent_requests
           SET response_status = $2, response_body = $3::jsonb, completed_at = clock_timestamp()
@@ -4801,7 +4941,7 @@ export async function completeIdempotentRequest(
       [requestId, status, JSON.stringify(body ?? null)]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4813,15 +4953,14 @@ export async function releaseIdempotentRequest(
   requestId: string
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query(
       `DELETE FROM "${schema}".idempotent_requests WHERE idempotent_request_id = $1 AND response_status IS NULL`,
       [requestId]
     );
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -4880,7 +5019,7 @@ export type IdempotentReplay =
  * happened under it. `FOR UPDATE` on the existing row serializes two
  * concurrent retries so they cannot both read a NULL response. */
 async function claimOnClient(
-  client: Client,
+  client: ClientBase,
   schema: string,
   organizationId: string,
   idempotency: IdempotencyContext
@@ -4923,7 +5062,7 @@ async function claimOnClient(
 }
 
 async function completeOnClient(
-  client: Client,
+  client: ClientBase,
   schema: string,
   claimId: string,
   status: number,
@@ -4944,9 +5083,8 @@ export async function recordCandidateDecision(
   idempotency?: IdempotencyContext
 ): Promise<CandidateDecisionResult> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     await client.query("BEGIN");
     try {
       // Claimed inside THIS transaction, not a separate one (review #83, P1).
@@ -5054,7 +5192,7 @@ export async function recordCandidateDecision(
       throw error;
     }
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
@@ -5066,9 +5204,8 @@ export async function listCandidateDecisionsForApplication(
   applicationId: string
 ): Promise<readonly CandidateDecision[]> {
   assertSafeSchema(schema);
-  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const client = await acquireConnection(databaseUrl);
   try {
-    await client.connect();
     const result = await client.query<{
       decision_id: string;
       organization_id: string;
@@ -5098,7 +5235,7 @@ export async function listCandidateDecisionsForApplication(
       decidedAt: row.decided_at.toISOString()
     }));
   } finally {
-    await client.end().catch(() => undefined);
+    client.release();
   }
 }
 
