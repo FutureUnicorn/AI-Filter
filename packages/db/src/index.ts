@@ -360,7 +360,7 @@ export async function redeemMagicLinkToken(
 //
 // Insert only. There is deliberately no update or delete function here,
 // on top of the database trigger that rejects them outright (migration
-// 0005): immutability is enforced twice, not assumed from one layer.
+// 0005_immutable_audit_events.sql): immutability is enforced twice, not assumed from one layer.
 
 export interface AppendAuditEventInput {
   readonly organizationId: string;
@@ -415,7 +415,7 @@ export async function appendAuditEvent(
 // ---- AF-40: persist model/prompt/schema/rubric versions ----
 //
 // Insert only, same as appendAuditEvent: immutability is enforced by
-// the database trigger (migration 0006), and there is deliberately no
+// the database trigger (0006_audit_events_delete_and_membership_fixes.sql), and there is deliberately no
 // update/delete function here either.
 
 export interface RecordEvidenceExtractionRunInput {
@@ -593,7 +593,7 @@ export interface SetInferenceKillSwitchInput {
 }
 
 /**
- * The database CHECK constraint (migration 0008) is the real enforcement:
+ * The database CHECK constraint (0008_inference_kill_switch.sql) is the real enforcement:
  * engaging without a reason is rejected there, and the actor comes from
  * the audited actorUserId rather than a second field
  * regardless of what this function is called with, matching this
@@ -1379,7 +1379,7 @@ export type UpsertDraftRubricOutcome =
  * Creates the role's first draft, or overwrites the existing one --
  * never both in the same call, and never touches a published version.
  * The role_id foreign key plus the one-draft-per-role partial unique
- * index (migration 0010) are what make this safe under concurrent
+ * index (0011_rubrics.sql) are what make this safe under concurrent
  * calls: a race to create the first draft fails one caller with a
  * unique-violation rather than silently producing two drafts.
  */
@@ -1439,8 +1439,8 @@ export type PublishRubricOutcome =
  * can't both succeed, and once the first one wins, migration
  * 0012_immutable_published_rubrics.sql's trigger makes the resulting row
  * permanently unreachable to any future UPDATE, this function included.
- * (That migration was authored as 0011 on the original branch; 0011 was
- * already taken by the rubrics table itself on the reconstruction
+ * (That migration was authored as `0011` on the original branch; `0011`
+ * was already taken by the rubrics table itself on the reconstruction
  * baseline, so it was renumbered and this reference follows it.)
  */
 export async function publishRubric(
@@ -1978,7 +1978,7 @@ export async function getImportRowsForIntake(
 const MIGRATIONS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
 
 /**
- * Creates a throwaway schema, applies the real 0002/0004 migrations, and
+ * Creates a throwaway schema, applies the real 0002_organizations_users_memberships.sql and 0004_tenant_scoped_rls.sql migrations, and
  * proves a non-superuser role cannot read or write another organization's
  * memberships, including when app.current_org_id is the empty string.
  */
@@ -2024,7 +2024,7 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
       [userA, userB]
     );
     // Seeding memberships needs the same tenant scope the policy demands.
-    // 0004 uses FORCE ROW LEVEL SECURITY, so the table OWNER is subject to
+    // 0004_tenant_scoped_rls.sql uses FORCE ROW LEVEL SECURITY, so the table OWNER is subject to
     // the policy too -- only a superuser bypasses it. Inserting both rows
     // unscoped therefore fails with "new row violates row-level security
     // policy" for any non-superuser, which is the second reason this probe
@@ -2827,7 +2827,7 @@ export interface PublishedRubricImmutabilityObservations {
   readonly publishSucceeded: boolean;
   /** A second publish of the same row must not find a draft to publish. */
   readonly republishOutcome: string;
-  /** Raised by migration 0012's trigger on UPDATE of a published row. */
+  /** Raised by 0012_immutable_published_rubrics.sql's trigger on UPDATE of a published row. */
   readonly updateRejection: string;
   /** And on DELETE, which a BEFORE UPDATE-only trigger would have missed. */
   readonly deleteRejection: string;
@@ -3777,7 +3777,7 @@ export interface RecordedEvidenceOutcome {
 
 /**
  * Insert only. evidence_outcomes is append-only at the database level
- * (0016's trigger), so there is deliberately no update or delete
+ * (0017_evidence_outcomes.sql's trigger), so there is deliberately no update or delete
  * function here either -- same shape as appendAuditEvent and
  * recordEvidenceExtractionRun.
  *
@@ -4080,7 +4080,7 @@ export async function assertEvidenceOutcomePersistence(databaseUrl: string): Pro
     //    CASCADE the cascade issued a DELETE and this table's append-only
     //    trigger rejected it, so the operator saw
     //    "evidence_outcomes is append-only" for a table they never named.
-    //    0006 hit the same thing on audit_events.
+    //    0006_audit_events_delete_and_membership_fixes.sql hit the same thing on audit_events.
     for (const [label, statement, params] of [
       ["application", `DELETE FROM applications WHERE application_id = $1`, [appA]],
       ["organization", `DELETE FROM organizations WHERE organization_id = $1`, [orgA]]
@@ -4498,7 +4498,7 @@ export async function assertEvidenceCorrectionsAppendOnly(databaseUrl: string): 
     // "the before state" ambiguous for whichever survives.
     //
     // Stated honestly: this particular assertion cannot fail while the
-    // schema is intact, and dropping 0017's unique index to prove it
+    // schema is intact, and dropping 0018_evidence_corrections.sql's unique index to prove it
     // does not isolate the behaviour -- the INSERT fails earlier with
     // "there is no unique or exclusion constraint matching the ON
     // CONFLICT specification". It is kept as a statement of the
@@ -4589,7 +4589,7 @@ export interface RecordCandidateDecisionInput {
   /**
    * Always required, never defaulted. There is no signature of this
    * function that records a decision without a named person, which is
-   * the code-level half of what 0019's NOT NULL enforces.
+   * the code-level half of what 0020_candidate_decisions.sql's NOT NULL enforces.
    */
   readonly decidedByUserId: string;
 }
@@ -4973,7 +4973,7 @@ export async function recordCandidateDecision(
       // Review #83, P1: locking the head cannot serialize a candidate's first
       // decision, because there is no head row yet and `FOR UPDATE` cannot
       // lock a row that does not exist. Two first-time transactions both read
-      // no head, both inserted a NULL predecessor, and 0020's partial unique
+      // no head, both inserted a NULL predecessor, and 0020_candidate_decisions.sql's partial unique
       // index excludes NULLs by its own predicate, so both committed. The
       // result was two roots and two current states, with a later read
       // arbitrarily picking one by timestamp.
@@ -5125,7 +5125,7 @@ export interface ConcurrentFirstDecisionObservations {
  *
  * With no decisions yet there is no head row, and `FOR UPDATE` cannot lock a
  * row that does not exist. Two first-time transactions both read no head,
- * both insert a NULL predecessor, and 0020's partial unique index excludes
+ * both insert a NULL predecessor, and 0020_candidate_decisions.sql's partial unique index excludes
  * NULLs by its own predicate, so both commit: two roots, two current states,
  * and a later read that picks one by timestamp while the other sits
  * unchained.
@@ -5147,8 +5147,8 @@ export async function assertConcurrentFirstDecisionHasOneRoot(
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    // Same list the integrity probe loads, plus 0021. Trimming it is not
-    // safe: 0020's composite foreign key onto applications needs the unique
+    // Same list the integrity probe loads, plus 0021_single_decision_root.sql. Trimming it is not
+    // safe: 0020_candidate_decisions.sql's composite foreign key onto applications needs the unique
     // constraint a later migration adds, and omitting it fails at CREATE
     // TABLE with "no unique constraint matching given keys".
     for (const migration of [
@@ -5814,7 +5814,7 @@ export async function assertCandidateDecisionIntegrity(databaseUrl: string): Pro
       .map((decision) => decision.supersedesDecisionId)
       .filter((id): id is string => id !== undefined);
     // Stated honestly, because it was measured: this assertion cannot
-    // fail while the schema is intact, and dropping 0019's unique index
+    // fail while the schema is intact, and dropping 0020_candidate_decisions.sql's unique index
     // to prove otherwise does not isolate it -- the INSERT fails earlier
     // with "there is no unique or exclusion constraint matching the ON
     // CONFLICT specification". The same is true of AF-49's equivalent.

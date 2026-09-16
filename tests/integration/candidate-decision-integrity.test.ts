@@ -27,7 +27,7 @@ test("candidate decisions are the only status, always named, and never forked", 
 // recordCandidateDecision serialized by taking FOR UPDATE on the current
 // head. A candidate with no decisions has no head row, and FOR UPDATE cannot
 // lock a row that does not exist, so two first-time transactions both read no
-// head and both inserted a NULL predecessor. 0020's partial unique index
+// head and both inserted a NULL predecessor. 0020_candidate_decisions.sql's partial unique index
 // excludes NULLs by its own predicate, so both committed: two roots, two
 // current states, one of them silently unchained.
 //

@@ -55,7 +55,7 @@ test("the current revision is the one nothing supersedes, not the newest timesta
 });
 
 test("a correction recorded with an EARLIER timestamp than what it replaced still wins", () => {
-  // Chain order is a stored fact (0017's supersedes link), not an
+  // Chain order is a stored fact (0018_evidence_corrections.sql's supersedes link), not an
   // inference from clocks. Two rows written in the same microsecond, or
   // any clock skew, must not be able to invert the history.
   const backdated: EvidenceRevision = { ...correction, recordedAt: "2026-08-29T09:00:00.000Z" };
@@ -89,7 +89,7 @@ test("an uncorrected card has no correction field at all, rather than an empty o
 
 test("a correction whose predecessor is missing does not claim a before it cannot show", () => {
   // Reporting "corrected" without the before state would show the card as
-  // satisfying AF-49 while quietly failing it. 0016 makes deletion
+  // satisfying AF-49 while quietly failing it. 0017_evidence_outcomes.sql makes deletion
   // impossible, so this can only mean an incomplete read.
   const card = buildCorrectedEvidenceCard([correction], correction);
   assert.equal(card.correction, undefined);

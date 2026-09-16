@@ -155,3 +155,141 @@ test("every migration filename hard-coded in source exists on disk", () => {
     `source references migrations that do not exist:\n${[...new Set(offenders)].join("\n")}`
   );
 });
+
+const SOURCE_ROOTS = ["packages", "apps", "scripts", "tests"] as const;
+
+/**
+ * The one file whose comments deliberately name migrations that no longer
+ * exist, because its whole subject is what they used to be called.
+ *
+ * Scoped to a single path rather than a pattern, so a second file cannot start
+ * quietly accumulating stale names under the same excuse, and asserted below
+ * to actually still contain such a reference so the exemption cannot rot.
+ */
+const MIGRATION_HISTORY_FILE = path.join("tests", "architecture", "migration-ordering.test.ts");
+
+interface CommentLine {
+  readonly relative: string;
+  readonly number: number;
+  readonly text: string;
+}
+
+function commentLines(): readonly CommentLine[] {
+  const collected: CommentLine[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === "dist" || entry.name === ".next") {
+          continue;
+        }
+        walk(full);
+        continue;
+      }
+      if (!/\.(ts|tsx|mjs|js)$/u.test(entry.name)) {
+        continue;
+      }
+      const relative = path.relative(repositoryRoot, full);
+      fs.readFileSync(full, "utf8")
+        .split("\n")
+        .forEach((text, index) => {
+          const trimmed = text.trim();
+          if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+            collected.push({ relative, number: index + 1, text });
+          }
+        });
+    }
+  };
+  for (const root of SOURCE_ROOTS) {
+    const full = path.join(repositoryRoot, root);
+    if (fs.existsSync(full)) {
+      walk(full);
+    }
+  }
+  return collected;
+}
+
+function namedMigrationFiles(text: string): readonly string[] {
+  return [...text.matchAll(/\b(\d{4}_[a-z0-9_]+\.sql)\b/gu)]
+    .map((match) => match[1])
+    .filter((name): name is string => name !== undefined);
+}
+
+/**
+ * PR #83 review: `deriveCandidateWorkflowStatus` attributed the single-head
+ * invariant to prefix `0019`, which is correction_attribution and has nothing to
+ * do with decisions. Eighteen further references turned out to be wrong the
+ * same way once swept for, all from one cause: the reconstruction renumbered
+ * nine migrations and the remapper only rewrote path-qualified references, so
+ * every bare number silently came to point at whatever now occupies it.
+ *
+ * The check above skips comments, on the grounds that prose is not a
+ * dependency the code resolves. True, and beside the point: a wrong reference
+ * sends whoever is debugging that invariant to a file that does not contain
+ * it, which is the cost the reviewer actually named.
+ *
+ * So comments are held to the same standard, and the convention that makes
+ * that possible is: name the file, not the number. A filename breaks visibly
+ * when it stops existing. A bare prefix just starts meaning something else.
+ */
+test("every migration filename named in a comment exists on disk", () => {
+  const onDisk = new Set(migrationFilenames());
+  const offenders = commentLines()
+    .filter((line) => line.relative !== MIGRATION_HISTORY_FILE)
+    .flatMap((line) =>
+      namedMigrationFiles(line.text)
+        .filter((name) => !onDisk.has(name))
+        .map((name) => `${line.relative}:${line.number} names ${name}`)
+    );
+
+  assert.deepEqual(
+    [...new Set(offenders)],
+    [],
+    `comments name migrations that do not exist:\n${[...new Set(offenders)].join("\n")}`
+  );
+});
+
+test("the migration-history exemption still covers a real historical reference", () => {
+  const onDisk = new Set(migrationFilenames());
+  const historical = commentLines()
+    .filter((line) => line.relative === MIGRATION_HISTORY_FILE)
+    .flatMap((line) => namedMigrationFiles(line.text))
+    .filter((name) => !onDisk.has(name));
+
+  assert.ok(
+    historical.length > 0,
+    `${MIGRATION_HISTORY_FILE} no longer names any renamed migration, so its exemption is dead weight; remove it`
+  );
+});
+
+/**
+ * The other half of "name the file, not the number". A bare prefix in prose is
+ * unbindable: nothing can check it, and a renumber cannot break it visibly.
+ *
+ * Backticks are the escape hatch, for prose genuinely discussing a number as a
+ * number -- which prefix a migration was authored under before renumbering, or
+ * which prefixes collide. Substituting a filename there would say something
+ * different, so those are exempt by how they are written rather than by being
+ * listed somewhere this test would have to keep in sync.
+ */
+test("comments reference migrations by filename, never by bare number", () => {
+  const prefixes = new Set(migrationPrefixes());
+  const offenders = commentLines().flatMap((line) => {
+    // Filenames and backticked spans are removed first, so neither
+    // 0011_rubrics.sql nor `0011` still looks like a bare number.
+    const stripped = line.text.replace(/\d{4}_[a-z0-9_]+\.sql/gu, "").replace(/`[^`]*`/gu, "");
+    return [...stripped.matchAll(/\b(\d{4})\b/gu)]
+      .map((match) => match[1])
+      .filter((prefix): prefix is string => prefix !== undefined && prefixes.has(prefix))
+      .map((prefix) => `${line.relative}:${line.number} says ${prefix} -- ${line.text.trim()}`);
+  });
+
+  assert.deepEqual(
+    [...new Set(offenders)],
+    [],
+    "these comments reference a migration by bare number, which cannot be checked and does not survive a " +
+      `renumber. Name the file, or backtick the number if the numbering itself is the point:\n${[
+        ...new Set(offenders)
+      ].join("\n")}`
+  );
+});

@@ -70,7 +70,7 @@ test("a revision supersedes the earlier decision and is counted", () => {
 });
 
 test("a revision recorded with an EARLIER timestamp than what it replaced still stands", () => {
-  // The chain is a stored fact (0019's supersedes link), not an
+  // The chain is a stored fact (0020_candidate_decisions.sql's supersedes link), not an
   // inference from clocks -- so skew or two rows in the same microsecond
   // cannot invert which decision is current.
   const status = deriveCandidateWorkflowStatus([

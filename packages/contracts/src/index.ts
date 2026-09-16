@@ -943,7 +943,7 @@ export const failedDocumentRateSchema = z.strictObject({
 }) satisfies z.ZodType<FailedDocumentRate>;
 
 /**
- * Mirrors 0018's CHECK exactly: a reason must contain at least one
+ * Mirrors 0018_evidence_corrections.sql's CHECK exactly: a reason must contain at least one
  * character that is not whitespace.
  *
  * Deliberately not `.min(1)`, which accepts "   ", and deliberately not

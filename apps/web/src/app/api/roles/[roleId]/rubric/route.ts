@@ -21,7 +21,7 @@ interface RouteContext {
 
 /**
  * AF-25: rubric draft/edit, scoped through the role it belongs to. A
- * rubric has no organization_id of its own (migration 0010) -- the role
+ * rubric has no organization_id of its own (0011_rubrics.sql) -- the role
  * is the tenant boundary, so authorization always resolves roleId ->
  * the role's organizationId first, the same "never trust a client-
  * supplied id alone" rule AF-19 established for every other resource.

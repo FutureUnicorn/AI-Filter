@@ -1773,8 +1773,8 @@ export function buildEvidenceCardSet(
 // "Recruiter corrections never overwrite the original AI output --
 // before/after state is preserved for every correction."
 //
-// The append-only half is the database's (0016 rejects UPDATE, DELETE
-// and TRUNCATE; 0017 makes every correction name what it replaced).
+// The append-only half is the database's (0017_evidence_outcomes.sql rejects UPDATE, DELETE
+// and TRUNCATE; 0018_evidence_corrections.sql makes every correction name what it replaced).
 // What belongs here is the reading: turning a chain of revisions into a
 // current card that carries its own before/after, so a recruiter looking
 // at a corrected criterion can see it was corrected without going to
@@ -1795,7 +1795,7 @@ export interface EvidenceRevision {
  * produced it (if any) resolved against the revision it replaced.
  *
  * The head is found by following supersedes links, not by taking the
- * newest timestamp: 0017 makes the chain a stored fact precisely so this
+ * newest timestamp: 0018_evidence_corrections.sql makes the chain a stored fact precisely so this
  * does not have to be an inference. The head is the one revision no
  * other revision supersedes. Timestamps break the tie only among
  * criterion chains that are genuinely independent.
@@ -1816,7 +1816,7 @@ export function resolveCurrentEvidenceRevisions(
     const criterionId = revision.outcome.criterionId;
     const existing = heads.get(criterionId);
     // A criterion should have exactly one unsuperseded revision. If a
-    // history somehow forked despite 0017's unique index, take the newest
+    // history somehow forked despite 0018_evidence_corrections.sql's unique index, take the newest
     // rather than an arbitrary one, so the view is at least deterministic.
     if (existing === undefined || revision.recordedAt > existing.recordedAt) {
       heads.set(criterionId, revision);
@@ -1831,7 +1831,7 @@ export function buildCorrectedEvidenceCard(
 ): EvidenceCard {
   const card = buildEvidenceCard(head.outcome, head.recordedAt);
   // AF-50: all three of who, why and what-it-replaced, or this is not
-  // reported as a correction at all. 0017 and 0018 make a partial one
+  // reported as a correction at all. 0018_evidence_corrections.sql and 0019_correction_attribution.sql make a partial one
   // unrepresentable in the database, so reaching here means an
   // incomplete read -- and a card that says "corrected" while unable to
   // say by whom or why is exactly the unanswerable audit answer those
@@ -1852,7 +1852,7 @@ export function buildCorrectedEvidenceCard(
     // The predecessor is missing from what we were given. Reporting the
     // correction without its "before" would be worse than not claiming
     // one: it would show a card as corrected while quietly failing the
-    // requirement the correction exists to satisfy. 0016 makes deletion
+    // requirement the correction exists to satisfy. 0017_evidence_outcomes.sql makes deletion
     // impossible, so this means an incomplete read, not lost data.
     return card;
   }
@@ -2065,7 +2065,7 @@ export interface CandidateDecision extends VersionedRecord {
   readonly decision: CandidateDecisionKind;
   /** Why. Never optional: an unexplained decision is not reviewable. */
   readonly rationale: string;
-  /** Who. Never optional and never a service account -- see 0019. */
+  /** Who. Never optional and never a service account -- see 0020_candidate_decisions.sql. */
   readonly decidedByUserId: string;
   readonly supersedesDecisionId?: string | undefined;
   readonly decidedAt: string;
@@ -2090,10 +2090,11 @@ export type CandidateWorkflowStatus =
 
 /**
  * The current decision is the one nothing supersedes, found by following
- * the supersedes links rather than by taking the newest timestamp. 0019
- * stores that link precisely so this is a lookup and not an inference:
- * two decisions recorded in the same microsecond, or any clock skew,
- * must not be able to invert which one stands.
+ * the supersedes links rather than by taking the newest timestamp.
+ * 0020_candidate_decisions.sql stores that link precisely so this is a
+ * lookup and not an inference: two decisions recorded in the same
+ * microsecond, or any clock skew, must not be able to invert which one
+ * stands.
  */
 export function deriveCandidateWorkflowStatus(
   decisions: readonly CandidateDecision[]
@@ -2105,9 +2106,18 @@ export function deriveCandidateWorkflowStatus(
     decisions.map((decision) => decision.supersedesDecisionId).filter((id): id is string => id !== undefined)
   );
   const heads = decisions.filter((decision) => !superseded.has(decision.decisionId));
-  // 0019's partial unique index makes more than one head impossible.
-  // If one somehow appears, take the newest so the view is at least
-  // deterministic rather than dependent on row order.
+  // Two indexes together make more than one head impossible, and it takes
+  // both: 0020_candidate_decisions.sql's partial unique index on
+  // supersedes_decision_id stops two decisions claiming the same
+  // predecessor, but excludes NULLs by its own predicate, so it says
+  // nothing about first decisions. 0021_single_decision_root.sql covers
+  // that case with a unique index on (organization_id, application_id)
+  // WHERE supersedes_decision_id IS NULL. Before 0021_single_decision_root.sql existed this
+  // comment named one index and claimed a guarantee that did not hold:
+  // two concurrent first decisions really did produce two heads.
+  //
+  // If one somehow appears anyway, take the newest so the view is at
+  // least deterministic rather than dependent on row order.
   const current = heads.reduce<CandidateDecision | undefined>(
     (latest, decision) =>
       latest === undefined || decision.decidedAt > latest.decidedAt ? decision : latest,

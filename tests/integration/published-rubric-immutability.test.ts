@@ -4,7 +4,7 @@ import test from "node:test";
 import { assertPublishedRubricImmutability } from "../../packages/db/src/index.ts";
 
 /**
- * AF-27 (#36) shipped migration 0012's published-rubric immutability trigger
+ * AF-27 (#36) shipped 0012_immutable_published_rubrics.sql's published-rubric immutability trigger
  * and the publishRubric helper with no test of either. That is the specific
  * hazard the stacked-PR chain kept producing: a feature-to-feature PR never
  * triggered the CI workflow, so an integrity control could ship unexercised

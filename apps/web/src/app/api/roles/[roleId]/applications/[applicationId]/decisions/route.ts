@@ -46,7 +46,7 @@ interface RouteContext {
  *      route to the recorder either, not merely no reason to use it.
  *
  * There is deliberately no PATCH or PUT. A decision is appended and the
- * previous one is superseded, never edited -- 0019's trigger rejects
+ * previous one is superseded, never edited -- 0020_candidate_decisions.sql's trigger rejects
  * UPDATE outright -- so "change the status" and "record a new decision"
  * are the same operation, which is what makes the log the only source.
  */

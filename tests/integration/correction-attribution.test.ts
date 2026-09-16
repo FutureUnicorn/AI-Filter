@@ -60,7 +60,7 @@ test("a reason with any real content is accepted, including one that is merely s
 
 test("the contract and the database ask the same question, so neither is the looser layer", () => {
   // Tripwire, not a substitute for running the SQL: if someone relaxes
-  // 0018 back toward length(trim(...)) the two layers silently diverge
+  // 0019_correction_attribution.sql back toward length(trim(...)) the two layers silently diverge
   // and the database becomes the weaker one.
   const migration = readFileSync(MIGRATION, "utf8");
   assert.ok(

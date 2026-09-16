@@ -40,11 +40,11 @@ interface RouteContext {
  * introduce a shape the pipeline itself could not have produced -- a
  * hand-written outcome is still an outcome.
  *
- * AF-50: the reason is checked with the same predicate 0018 enforces,
+ * AF-50: the reason is checked with the same predicate 0018_evidence_corrections.sql enforces,
  * so "   " is a 400 here rather than a constraint violation surfacing as
  * a 500 later. The actor is never taken from the request at all -- it is
  * the session's own userId, so a caller cannot attribute a correction to
- * someone else, and 0018's membership foreign key means that user must
+ * someone else, and 0019_correction_attribution.sql's membership foreign key means that user must
  * actually belong to the organization whose evidence they are changing.
  */
 export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
