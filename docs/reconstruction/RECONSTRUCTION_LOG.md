@@ -373,12 +373,25 @@ in production.
 to `test:integration`. The existing `test-registration` architecture guard
 caught the omission before CI did.
 
-**Observation, not fixed, out of scope:** `packages/ai` exports three error
+**Same shape, found by sweeping for it:** `packages/ai` exports three error
 classes (`InferenceKillSwitchEngagedError`, `AiUsageUnavailableError`,
-`AiStructuredCallParseError`) that nothing in the repository catches. This is
-not a live defect on this branch, because no app imports `@signal-audit/ai`
-yet. It is the same shape as the P2 finding above and should be checked when the
-consumer lands.
+`AiStructuredCallParseError`) that nothing catches. Not a live defect, because
+nothing imports `@signal-audit/ai` on this branch, so there is no caller to add
+a handler to. Adding one would mean inventing the consumer.
+
+What was actually wrong was that this class of bug depended on a reviewer
+noticing it, twice in one round. `tests/architecture/typed-error-handling.test.ts`
+now asserts every exported `Error` subclass is narrowed by some caller outside
+its own module, with the three `packages/ai` classes recorded as exemptions.
+
+The exemptions are written to expire on their own: each names the package whose
+absent consumer is its entire justification, and a third check reads the
+workspace dependency graph and fails the moment anything depends on that
+package. So the handlers become required exactly when someone is in a position
+to decide what they should do, rather than sitting on a list of permanent
+excuses nobody re-reads. Verified with three controls: a new unexempted error
+class, an exemption for a class that is in fact handled, and adding
+`@signal-audit/ai` to `apps/worker`'s dependencies.
 
 **Result:** full `pnpm check` exit 0 locally; CI green 7/7 on `6ed0500`. All 10
 review threads on PR #83 replied to and resolved.
