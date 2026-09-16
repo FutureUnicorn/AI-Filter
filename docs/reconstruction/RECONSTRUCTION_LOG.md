@@ -332,3 +332,53 @@ itself, so the fixes live on this branch and are logged as extra bug fixes, not 
 | Result | exit 0 — 157 unit, 343 integration, 21 architecture, 27 Python, zero failures. |
 | Product check | Records a **named human's** advance/hold/decline with a rationale, and derives status by following supersedes links rather than by timestamp. This is the human-decision path the product requires; no automatic decision, score or ranking. |
 
+
+## PR #83 review, round 2
+
+Three findings from Sai, all on code this branch introduced in round 1. Two of
+them were the same mistake twice, so it is recorded as one lesson rather than
+two entries: **a fix asserted at both ends of a boundary, with nothing tested
+across it.**
+
+| | |
+|---|---|
+| Finding (P1) | `archiveUninspectable` never reached `evaluateFileValidation`. The sniffer set it, the evaluator honoured it, both had passing unit tests, and the validate route omitted the field. A ZIP64 or malformed DOCX validated exactly as before. |
+| Fix | `7bec118` — one field added to the evaluation input. |
+| Why it survived round 1 | The only coverage was a unit test either side of the wire. Neither could observe the wire. |
+
+| | |
+|---|---|
+| Finding (P2) | `ObjectTooLargeError` and `ObjectChangedError` were created so callers could respond, and no caller was changed. Both reached the generic catch and answered 500, leaving an oversized object `uploaded` and retryable forever and a substituted one `validated` and failing opaquely. |
+| Fix | `e20cbc0` — validate quarantines and answers 413 on an oversized read; the four post-validation readers answer 409 (quarantining via `invalidateChangedIntake`) on a hash mismatch and 413 on an oversized read, the latter deliberately leaving status alone because a size refusal says nothing about whether the bytes are the approved ones. |
+| Contract change | `payload_too_large` added to `API_ERROR_CODES`, mapped to 413. |
+| Schema-adjacent change | `RecordFileValidationInput.sha256Hash` is now optional, so a rejection occurring before any bytes are read can still be recorded. No migration. |
+| Extra defect found | The `extract-text` route's import block had been corrupted by a round-1 edit, leaving the file syntactically invalid. `typecheck:tests` does not cover `apps/web`, so nothing caught it; only writing a test that imports the route did. Repaired in the same commit. |
+
+| | |
+|---|---|
+| Finding (P1) | The idempotency protocol was not atomic with the action. Claim, action and completion were three calls on three connections; a fault after the action committed left the key at `response_status = NULL` permanently, wedging same-key retries at `in_flight` and driving clients to rotate the key, which recorded a second human decision. |
+| Fix | `6c5cc45` — `recordCandidateDecision` and `correctEvidenceOutcome` take an optional `IdempotencyContext` and claim and complete on their own connection inside their own transaction. Routes make one call. Outcomes that record nothing roll the claim back with the action. `releaseIdempotentRequest` is gone from both routes: it only covered faults the process lived to observe. |
+| Test mistake caught by its own control | The first regression injected a fault with an `AFTER INSERT` trigger and asserted nothing survived. It passed **with the completion moved back after `COMMIT`**, i.e. against the exact defect being fixed, because a fault at the insert rolls everything back in both shapes. Replaced by a `DEFERRABLE INITIALLY DEFERRED` constraint trigger that fires at `COMMIT` and reads what the transaction is about to make durable: 201 when the completion is inside, NULL when it is not. |
+| Negative controls run | Four, all failing with the fix reverted: claim split into its own transaction; decision completion moved after `COMMIT`; correction completion moved after `COMMIT`; and the legacy three-call shape, reproduced inside the probe, which still commits the action alone, wedges the key and duplicates the decision on key rotation. |
+| Coverage of the second route | `6ed0500` — the finding named both routes and the first fix commit proved only one, which is the same pattern as the dead wire above. The correction writer now has the same commit-time witness and a same-key replay check. |
+
+**New test infrastructure:** `tests/support/ingestion-storage-stub.ts` redirects
+`@signal-audit/ingestion` for route tests. Only object storage is faked, because
+CI provides Postgres and no object store. The errors are the real classes
+re-exported from the real module, so the `instanceof` checks under test are the
+ones that run in production; a hand-rolled look-alike would pass here and fail
+in production.
+
+**Registration:** `tests/integration/file-intake-route-errors.test.ts` was added
+to `test:integration`. The existing `test-registration` architecture guard
+caught the omission before CI did.
+
+**Observation, not fixed, out of scope:** `packages/ai` exports three error
+classes (`InferenceKillSwitchEngagedError`, `AiUsageUnavailableError`,
+`AiStructuredCallParseError`) that nothing in the repository catches. This is
+not a live defect on this branch, because no app imports `@signal-audit/ai`
+yet. It is the same shape as the P2 finding above and should be checked when the
+consumer lands.
+
+**Result:** full `pnpm check` exit 0 locally; CI green 7/7 on `6ed0500`. All 10
+review threads on PR #83 replied to and resolved.
