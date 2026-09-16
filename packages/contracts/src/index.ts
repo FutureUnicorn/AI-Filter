@@ -376,6 +376,10 @@ export const API_ERROR_CODES = [
   "forbidden",
   "not_found",
   "conflict",
+  // Review #83: an oversized upload is a client-content outcome with its own
+  // HTTP meaning. Without this the route had to answer 400 or 500 for a file
+  // it had correctly refused, and 500 is what it actually did.
+  "payload_too_large",
   "rate_limited",
   "internal_error",
   "service_unavailable"
@@ -391,6 +395,7 @@ export const API_ERROR_STATUS: Readonly<Record<ApiErrorCode, number>> = {
   forbidden: 403,
   not_found: 404,
   conflict: 409,
+  payload_too_large: 413,
   rate_limited: 429,
   internal_error: 500,
   service_unavailable: 503

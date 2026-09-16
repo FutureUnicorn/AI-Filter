@@ -4,9 +4,12 @@ import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
   createCanonicalTextExtraction,
   getFileIntakeById,
-  getMembershipsForUser
+  getMembershipsForUser,
+  invalidateChangedIntake
 } from "@signal-audit/db";
 import {
+  ObjectChangedError,
+  ObjectTooLargeError,
   extractCanonicalTextFromDocx,
   extractCanonicalTextFromPdf,
   fetchValidatedObjectBytes
@@ -80,7 +83,36 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-    const bytes = await fetchValidatedObjectBytes(config.storage, intake.storageKey, intake.sha256Hash);
+    let bytes;
+    try {
+      bytes = await fetchValidatedObjectBytes(config.storage, intake.storageKey, intake.sha256Hash);
+    } catch (readError) {
+      // Review #83: these typed errors were falling into the generic catch and
+      // returning 500, so an overwritten object left the intake `validated`
+      // and every later call failed the same opaque way. They exist to mark an
+      // expected rejection: invalidate the intake so it cannot be reprocessed,
+      // and tell the caller what happened.
+      if (readError instanceof ObjectChangedError) {
+        await invalidateChangedIntake(config.database.url, config.database.schema, intakeId, readError);
+        const error = buildApiError({
+          requestId,
+          code: "conflict",
+          message:
+            "The stored file no longer matches the bytes that were validated, so it has been quarantined. Upload it again."
+        });
+        return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+      }
+      if (readError instanceof ObjectTooLargeError) {
+        const error = buildApiError({
+          requestId,
+          code: "payload_too_large",
+          message: `This file is larger than the ${readError.limitBytes}-byte limit.`
+        });
+        return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+      }
+      throw readError;
+    }
+
     const result =
       intake.sniffedMimeType === ALLOWED_SNIFFED_MIME_TYPES.pdf
         ? await extractCanonicalTextFromPdf(bytes)

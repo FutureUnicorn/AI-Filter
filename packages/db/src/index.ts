@@ -806,6 +806,106 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
   return schema;
 }
 
+export interface FileIntakeRouteProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly roleId: string;
+  readonly intakeId: string;
+  readonly storageKey: string;
+}
+
+/**
+ * Review #83 round 2: the file-intake routes had no route-level coverage at
+ * all, which is how a fix that was unit-tested at both ends could ship with
+ * nothing wiring the two together, and how typed errors created for callers
+ * to handle reached a generic 500 instead.
+ *
+ * Provisions a schema with the intake migrations and seeds the whole chain a
+ * request needs, so a test can call the real handlers rather than a helper
+ * they happen to share.
+ */
+export async function provisionFileIntakeRouteSchema(
+  databaseUrl: string,
+  options: {
+    readonly declaredFilename: string;
+    readonly declaredMimeType: string;
+    readonly status?: FileIntakeStatus;
+    readonly sniffedMimeType?: string;
+    readonly sha256Hash?: string;
+    readonly sizeBytes?: number;
+  }
+): Promise<FileIntakeRouteProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `intake_route_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const storageKey = `intake-route/${suffix}/${options.declaredFilename}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0013_file_intakes.sql",
+      "0014_file_intake_validation.sql",
+      "0015_canonical_text_extractions.sql",
+      "0016_applications_and_import_finalization.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Route Probe Org')`, [
+      organizationId
+    ]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Route Probe') RETURNING user_id`,
+      [`intake_route_${suffix}@acme.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("provisionFileIntakeRouteSchema did not produce a user row");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Route Probe Role', $2)
+       RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id,
+          status, sniffed_mime_type, sha256_hash, size_bytes)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'uploaded'), $8, $9, $10)
+       RETURNING intake_id`,
+      [
+        organizationId,
+        roleId,
+        storageKey,
+        options.declaredFilename,
+        options.declaredMimeType,
+        userId,
+        options.status ?? null,
+        options.sniffedMimeType ?? null,
+        options.sha256Hash ?? null,
+        options.sizeBytes ?? null
+      ]
+    );
+    const intakeId = intake.rows[0]?.intake_id;
+    if (intakeId === undefined || roleId === undefined) {
+      throw new Error("provisionFileIntakeRouteSchema did not produce a role and intake");
+    }
+    return { schema, organizationId, userId, roleId, intakeId, storageKey };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
 /** Best-effort teardown for provisionRouteProbeSchema; each run is unique. */
 export async function dropProbeSchema(databaseUrl: string, schema: string): Promise<void> {
   assertSafeSchema(schema);
@@ -1503,7 +1603,10 @@ export async function markFileIntakeUploaded(
 export interface RecordFileValidationInput {
   readonly sniffedMimeType: string | undefined;
   readonly sizeBytes: number;
-  readonly sha256Hash: string;
+  /** Absent when the object was refused before it could be read, such as an
+   * oversized upload the streaming cap rejected: there are no bytes to hash.
+   * Such an intake is quarantined, so no later step looks for one. */
+  readonly sha256Hash?: string | undefined;
   readonly validation: { readonly outcome: "validated" } | { readonly outcome: "quarantined"; readonly reason: string };
 }
 
@@ -1516,6 +1619,44 @@ export type RecordFileValidationOutcome =
  * freshly-uploaded object, never re-run against something already
  * validated/quarantined/rejected (which would let a second, more
  * lenient pass override a real quarantine finding). */
+/**
+ * Quarantines an intake whose stored bytes no longer match the validated
+ * digest.
+ *
+ * Review #83: without this an overwrite left the intake `validated` forever,
+ * so every preview, extract and finalize call returned the same opaque 500
+ * and nothing recorded why. Moving it to `quarantined` makes the state match
+ * reality and stops the row being reprocessed.
+ *
+ * Deliberately does not clear the recorded hash: that digest is the evidence
+ * of what was approved, and losing it would destroy the only means of showing
+ * later that a substitution happened.
+ */
+export async function invalidateChangedIntake(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string,
+  detail: { readonly expectedSha256: string; readonly actualSha256: string }
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `UPDATE "${schema}".file_intakes
+          SET status = 'quarantined', rejection_reason = $2
+        WHERE intake_id = $1 AND status <> 'quarantined'`,
+      [
+        intakeId,
+        `Stored object no longer matches the validated content hash (validated ${detail.expectedSha256}, ` +
+          `found ${detail.actualSha256}); the upload was replaced after validation.`
+      ]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 export async function recordFileValidationResult(
   databaseUrl: string,
   schema: string,
@@ -1533,7 +1674,7 @@ export async function recordFileValidationResult(
           SET status = $2, sniffed_mime_type = $3, size_bytes = $4, sha256_hash = $5, rejection_reason = $6
         WHERE intake_id = $1 AND status = 'uploaded'
         RETURNING ${FILE_INTAKE_COLUMNS}`,
-      [intakeId, newStatus, input.sniffedMimeType ?? null, input.sizeBytes, input.sha256Hash, rejectionReason]
+      [intakeId, newStatus, input.sniffedMimeType ?? null, input.sizeBytes, input.sha256Hash ?? null, rejectionReason]
     );
     const row = result.rows[0];
     return row === undefined ? { outcome: "not_uploaded" } : { outcome: "recorded", intake: rowToFileIntake(row) };

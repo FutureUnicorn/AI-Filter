@@ -1,8 +1,18 @@
 import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getFileIntakeById, getImportRowsForIntake, getMembershipsForUser } from "@signal-audit/db";
+import {
+  getFileIntakeById,
+  getImportRowsForIntake,
+  getMembershipsForUser,
+  invalidateChangedIntake
+} from "@signal-audit/db";
 import { ALLOWED_SNIFFED_MIME_TYPES, buildImportStatusSummary } from "@signal-audit/domain";
-import { fetchValidatedObjectBytes, parseCsvFile } from "@signal-audit/ingestion";
+import {
+  ObjectChangedError,
+  ObjectTooLargeError,
+  fetchValidatedObjectBytes,
+  parseCsvFile
+} from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -73,17 +83,43 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     }
 
     const rows = await getImportRowsForIntake(config.database.url, config.database.schema, intakeId);
-    const totalRows =
-      rows.length > 0
-        ? rows.length
-        : // Same binding as the other post-validation reads (review #83): the
-          // presigned PUT outlives validation, so a re-fetch must be checked
-          // against the validated digest rather than trusted.
-          (
-            await parseCsvFile(
-              await fetchValidatedObjectBytes(config.storage, intake.storageKey, requireValidatedHash(intake.sha256Hash))
-            )
-          ).rows.length;
+    let totalRows = rows.length;
+    if (rows.length === 0) {
+      // Same binding as the other post-validation reads (review #83): the
+      // presigned PUT outlives validation, so a re-fetch must be checked
+      // against the validated digest rather than trusted.
+      try {
+        const bytes = await fetchValidatedObjectBytes(
+          config.storage,
+          intake.storageKey,
+          requireValidatedHash(intake.sha256Hash)
+        );
+        totalRows = (await parseCsvFile(bytes)).rows.length;
+      } catch (readError) {
+        // Handled rather than left to the generic catch, for the same reason
+        // as the other readers: a substituted object is an expected rejection
+        // and must invalidate the intake, not answer 500 forever.
+        if (readError instanceof ObjectChangedError) {
+          await invalidateChangedIntake(config.database.url, config.database.schema, intakeId, readError);
+          const error = buildApiError({
+            requestId,
+            code: "conflict",
+            message:
+              "The stored file no longer matches the bytes that were validated, so it has been quarantined. Upload it again."
+          });
+          return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+        }
+        if (readError instanceof ObjectTooLargeError) {
+          const error = buildApiError({
+            requestId,
+            code: "payload_too_large",
+            message: `This file is larger than the ${readError.limitBytes}-byte limit.`
+          });
+          return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+        }
+        throw readError;
+      }
+    }
 
     return Response.json(buildImportStatusSummary(totalRows, rows), {
       status: 200,

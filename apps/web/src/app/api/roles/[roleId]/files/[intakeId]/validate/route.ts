@@ -1,8 +1,15 @@
 import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getFileIntakeById, getMembershipsForUser, recordFileValidationResult } from "@signal-audit/db";
-import { evaluateFileValidation } from "@signal-audit/domain";
-import { sniffUploadedFile } from "@signal-audit/ingestion";
+import {
+  getFileIntakeById,
+  getMembershipsForUser,
+  recordFileValidationResult
+} from "@signal-audit/db";
+import { MAX_FILE_UPLOAD_BYTES, evaluateFileValidation } from "@signal-audit/domain";
+import {
+  ObjectTooLargeError,
+  sniffUploadedFile
+} from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -63,7 +70,33 @@ export async function POST(_request: NextRequest, context: RouteContext): Promis
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
 
-    const sniffed = await sniffUploadedFile(config.storage, intake.storageKey);
+    let sniffed;
+    try {
+      sniffed = await sniffUploadedFile(config.storage, intake.storageKey);
+    } catch (sniffError) {
+      // Review #83: ObjectTooLargeError was reaching the generic catch below,
+      // so an oversized object answered 500 and the intake stayed `uploaded` --
+      // retryable forever, with no record of why. The typed error exists
+      // precisely because this is an expected outcome of an untrusted PUT, so
+      // it quarantines the intake and answers 413.
+      if (sniffError instanceof ObjectTooLargeError) {
+        await recordFileValidationResult(config.database.url, config.database.schema, intakeId, {
+          sniffedMimeType: undefined,
+          sizeBytes: sniffError.observedBytes ?? MAX_FILE_UPLOAD_BYTES + 1,
+          validation: {
+            outcome: "quarantined",
+            reason: `Object exceeds the ${sniffError.limitBytes}-byte read limit and was refused without being buffered.`
+          }
+        });
+        const error = buildApiError({
+          requestId,
+          code: "payload_too_large",
+          message: `This file is larger than the ${sniffError.limitBytes}-byte limit and has been quarantined.`
+        });
+        return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+      }
+      throw sniffError;
+    }
 
     const validation = evaluateFileValidation({
       declaredFilename: intake.declaredFilename,

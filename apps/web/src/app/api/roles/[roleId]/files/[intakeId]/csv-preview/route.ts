@@ -1,8 +1,17 @@
 import { buildApiError, csvPreviewInputSchema, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getFileIntakeById, getMembershipsForUser } from "@signal-audit/db";
+import {
+  getFileIntakeById,
+  getMembershipsForUser,
+  invalidateChangedIntake
+} from "@signal-audit/db";
 import { ALLOWED_SNIFFED_MIME_TYPES, buildCsvPreview, validateCsvColumnMapping } from "@signal-audit/domain";
-import { fetchValidatedObjectBytes, parseCsvFile } from "@signal-audit/ingestion";
+import {
+  ObjectChangedError,
+  ObjectTooLargeError,
+  fetchValidatedObjectBytes,
+  parseCsvFile
+} from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
 import type { NextRequest } from "next/server";
@@ -92,7 +101,36 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
-    const bytes = await fetchValidatedObjectBytes(config.storage, intake.storageKey, intake.sha256Hash);
+    let bytes;
+    try {
+      bytes = await fetchValidatedObjectBytes(config.storage, intake.storageKey, intake.sha256Hash);
+    } catch (readError) {
+      // Review #83: these typed errors were falling into the generic catch and
+      // returning 500, so an overwritten object left the intake `validated`
+      // and every later call failed the same opaque way. They exist to mark an
+      // expected rejection: invalidate the intake so it cannot be reprocessed,
+      // and tell the caller what happened.
+      if (readError instanceof ObjectChangedError) {
+        await invalidateChangedIntake(config.database.url, config.database.schema, intakeId, readError);
+        const error = buildApiError({
+          requestId,
+          code: "conflict",
+          message:
+            "The stored file no longer matches the bytes that were validated, so it has been quarantined. Upload it again."
+        });
+        return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+      }
+      if (readError instanceof ObjectTooLargeError) {
+        const error = buildApiError({
+          requestId,
+          code: "payload_too_large",
+          message: `This file is larger than the ${readError.limitBytes}-byte limit.`
+        });
+        return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+      }
+      throw readError;
+    }
+
     const { headers, rows } = parseCsvFile(bytes);
     if (headers.length === 0) {
       const error = buildApiError({ requestId, code: "invalid_request", message: "CSV file has no header row." });
