@@ -119,6 +119,21 @@ test("a fault in the idempotency window leaves nothing behind and the retry repl
     "the idempotency response must already be written when the action's transaction commits"
   );
 
+  // The correction writer, which the finding named alongside the decision
+  // writer. Proving one and assuming the other is how the first round's dead
+  // wire happened.
+  assert.equal(
+    observed.correctionCompletionStatusAtCommit,
+    201,
+    "a correction must commit with its idempotency response already written"
+  );
+  assert.equal(observed.correctionReplayOutcome, "replayed");
+  assert.equal(
+    observed.correctionRevisions,
+    2,
+    "the retry must replay, leaving the original and one correction rather than two corrections"
+  );
+
   // Negative control. The old three-call shape, run against the same database
   // in the same probe, still exhibits both halves of the defect: the action
   // committed alone, and the key is now permanently in_flight.

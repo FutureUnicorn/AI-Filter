@@ -5261,6 +5261,14 @@ export interface IdempotencyAtomicityObservations {
    * inside the transaction; null means it was still to come afterwards.
    */
   readonly completionStatusAtCommit: number | null;
+  /**
+   * The same commit-time observation for correctEvidenceOutcome. Both routes
+   * were named in the finding, and a fix proven on only one of them is the
+   * pattern this whole round exists to stop repeating.
+   */
+  readonly correctionCompletionStatusAtCommit: number | null;
+  readonly correctionReplayOutcome: string;
+  readonly correctionRevisions: number;
   /** The old three-call shape, reproduced deliberately as a negative control. */
   readonly legacyDecisionsAfterFault: number;
   readonly legacySameKeyRetry: string;
@@ -5481,6 +5489,74 @@ export async function assertIdempotencyIsAtomicWithTheAction(
       `SELECT observed_status FROM "${schema}".commit_witness`
     );
 
+    // ---- 3.6: the same guarantee on the correction writer ----
+    const correctionApplicationId = await createApplication(4, "Rowan");
+    const criterionId = "postgres";
+    const attribution = {
+      organizationId,
+      candidateId: "44444444-4444-4444-8444-444444444444",
+      schemaVersion: CONTRACT_SCHEMA_VERSION
+    } as const;
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId,
+      applicationId: correctionApplicationId,
+      outcome: {
+        ...attribution,
+        kind: "supported",
+        criterionId,
+        citation: { document: "resume.pdf", pageOrSection: "Experience", offset: 4, quote: "Ran Postgres." }
+      }
+    });
+    const correctionOutcome: EvidenceOutcome = { ...attribution, kind: "not_found", criterionId };
+    const correctionKey = `correction-${suffix}`;
+    const correctionEndpoint = "evidence_corrections.record";
+    await admin.query(`CREATE TABLE "${schema}".correction_commit_witness (observed_status integer)`);
+    await admin.query(
+      `CREATE FUNCTION "${schema}".witness_correction_completion() RETURNS trigger LANGUAGE plpgsql AS $fn$
+         DECLARE seen integer;
+         BEGIN
+           SELECT response_status INTO seen FROM "${schema}".idempotent_requests
+            WHERE organization_id = NEW.organization_id
+              AND endpoint = '${correctionEndpoint}'
+              AND idempotency_key = '${correctionKey}';
+           INSERT INTO "${schema}".correction_commit_witness (observed_status) VALUES (seen);
+           RETURN NULL;
+         END
+       $fn$`
+    );
+    await admin.query(
+      `CREATE CONSTRAINT TRIGGER witness_correction_at_commit
+         AFTER INSERT ON "${schema}".evidence_outcomes
+         DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW EXECUTE FUNCTION "${schema}".witness_correction_completion()`
+    );
+    const correctionIdempotency: IdempotencyContext = {
+      endpoint: correctionEndpoint,
+      key: correctionKey,
+      payload: { applicationId: correctionApplicationId, criterionId, outcome: correctionOutcome }
+    };
+    const correctionInput: CorrectEvidenceOutcomeInput = {
+      organizationId,
+      applicationId: correctionApplicationId,
+      criterionId,
+      outcome: correctionOutcome,
+      correctedByUserId: userId,
+      reason: "the quote belongs to a different candidate"
+    };
+    await correctEvidenceOutcome(databaseUrl, schema, correctionInput, correctionIdempotency);
+    await admin.query(`DROP TRIGGER witness_correction_at_commit ON "${schema}".evidence_outcomes`);
+    const correctionWitnessed = await admin.query<{ observed_status: number | null }>(
+      `SELECT observed_status FROM "${schema}".correction_commit_witness
+        WHERE observed_status IS NOT NULL OR true ORDER BY observed_status NULLS FIRST LIMIT 1`
+    );
+    // Retrying the same key must replay rather than append a second
+    // correction on top of the first.
+    const correctionReplay = await correctEvidenceOutcome(databaseUrl, schema, correctionInput, correctionIdempotency);
+    const correctionRevisions = await admin.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schema}".evidence_outcomes WHERE application_id = $1`,
+      [correctionApplicationId]
+    );
+
     // ---- 4: negative control, the old three-call shape ----
     // Claim, act and complete on three separate connections, with the
     // process "dying" before the third. This is what the code did before
@@ -5544,6 +5620,9 @@ export async function assertIdempotencyIsAtomicWithTheAction(
       replayBodyMatches,
       decisionsAfterReplay,
       completionStatusAtCommit: witnessed.rows[0]?.observed_status ?? null,
+      correctionCompletionStatusAtCommit: correctionWitnessed.rows[0]?.observed_status ?? null,
+      correctionReplayOutcome: correctionReplay.outcome,
+      correctionRevisions: Number(correctionRevisions.rows[0]?.count ?? "-1"),
       legacyDecisionsAfterFault,
       legacySameKeyRetry: legacySameKeyRetry.outcome,
       legacyDecisionsAfterNewKeyRetry
