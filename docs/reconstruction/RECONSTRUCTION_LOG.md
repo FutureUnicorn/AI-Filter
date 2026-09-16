@@ -395,3 +395,28 @@ class, an exemption for a class that is in fact handled, and adding
 
 **Result:** full `pnpm check` exit 0 locally; CI green 7/7 on `6ed0500`. All 10
 review threads on PR #83 replied to and resolved.
+
+## PR #83 review, round 3
+
+Two findings, both from a review by Pradeep0111, neither a correctness bug.
+
+| | |
+|---|---|
+| Finding (doc accuracy) | `deriveCandidateWorkflowStatus` attributed the single-head invariant to prefix `0019`, which is correction_attribution and unrelated to decisions. |
+| Swept | Eighteen more references were wrong the same way. One cause: the reconstruction renumbered nine migrations and `remap_migrations.py` only rewrote path-qualified references, so every bare number silently came to point at whatever now occupies it. |
+| Verified against the defining migration | evidence_outcomes' append-only trigger is 0017, not 0016 (0016 has no triggers at all); `supersedes_evidence_outcome_id` and its unique index are 0018, not 0017; the corrector membership FK and non-blank reason CHECK are 0019, not 0018; everything about candidate_decisions is 0020, not 0019; the rubrics table and its one-draft-per-role index are 0011, not 0010. |
+| Wrong twice over | The reviewer's line also claimed a guarantee that did not hold. 0020's partial unique index excludes NULLs by its own predicate, so it says nothing about first decisions: two concurrent first decisions really did produce two heads until 0021 added the single-root index. The comment now names both indexes and which case each covers. |
+| Fix | `088031b` — all nineteen corrected, every remaining bare reference converted to the filename form, and `migration-ordering.test.ts` extended to check comments rather than only string literals. The old version skipped comments because prose is not a dependency the code resolves, which is true and beside the point: a wrong reference sends whoever is debugging that invariant to a file that does not contain it. Bare numbers in comments are now rejected outright, with backticks as the escape hatch for prose about numbering itself. |
+| Controls | Restoring the reviewer's exact original line fails the new check, as does naming a nonexistent migration file, as does making the history exemption stop covering anything. The guard also caught its own docstring on first run. |
+
+| | |
+|---|---|
+| Finding (efficiency) | ~48 sites opened a dedicated `pg.Client` per call, so one `POST .../decisions` paid four TCP, TLS and auth handshakes in sequence. Measured before the fix: six sequential calls, six backends, six sessions. |
+| Fix | `c6d122c` — one `Pool` per connection string for the 39 request-path functions. Keyed per connection string because tests and probes legitimately target different databases in one process. `allowExitOnIdle` is load-bearing: without it an idle pooled connection is an open handle and `node --test` would hang. |
+| Deliberately not pooled | `checkDatabaseConnection`, because a liveness probe answering from a warm pooled connection reports the pool's health and not the database's; and the `assert*`/`provision*` probes, because they run `SET search_path`, `SET LOCAL ROLE` and CREATE/DROP SCHEMA, which on a shared connection would leak onto the next borrower. A leaked `search_path` would send a later query to another tenant's schema, which is worse than the latency pooling removes. |
+| Proof | A pool that exists but is not reused behaves exactly like the defect while looking correct at the call site, so reuse is measured rather than inspected: `pg_backend_pid()` and `pg_stat_database.sessions`, against a database the probe creates and drops so parallel tests cannot pollute the count. The unpooled health check runs in the same probe as a control, so a measurement blind to new connections fails instead of reporting reuse for everything. |
+| Second guard | `tests/architecture/pooled-connection-safety.test.ts` covers the hazard pooling introduces rather than the one it fixes: no pooled function may issue a statement outliving its transaction, every pooled function must release, and the pooled/dedicated split must stay real so neither check goes vacuous. Its first regex flagged every `UPDATE ... SET` in the file; tightened to statement-initial `SET`. |
+| Controls | Making `acquireConnection` build a per-call pool fails the reuse test with 6 backends for 6 calls. Adding `SET search_path` to a pooled function, dropping a `release()`, and unpooling the exempted probe each fail exactly one architecture check. |
+
+**Result:** full `pnpm check` exit 0 locally, 162 unit, 364 integration, 34
+architecture, zero failures.
