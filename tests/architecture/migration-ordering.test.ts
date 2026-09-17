@@ -19,12 +19,25 @@ const MIGRATIONS_DIR = path.join(repositoryRoot, "packages", "db", "migrations")
  * would have caught that; the replay only caught it because the collision
  * was inspected by hand.
  *
- * Grandfathering rather than renaming: `0006` and `0009` were already
- * duplicated on the baseline. Renumbering a migration that may already have
- * been applied somewhere rewrites history for those deployments, so the
- * existing pairs are recorded as known exceptions and everything new is held
- * to the invariant. Shrinking this list is safe; growing it is the thing this
- * test exists to prevent.
+ * Two exemptions, with different histories, corrected after the PR #83 review
+ * pointed out this comment was wrong:
+ *
+ *   - `0006` was already duplicated on the reconstruction baseline. `git
+ *     ls-tree` on the merge base shows both `0006` files on develop.
+ *   - `0009` was NOT. The baseline had one `0009` file; 0009_roles.sql arrives
+ *     with this reconstruction, so this branch creates that collision and then
+ *     exempts it, which is the thing the paragraph below says to prevent.
+ *
+ * It is kept rather than renumbered because there is no free integer between
+ * `0009` and `0011`: roles has to be applied before 0011_rubrics.sql, which
+ * references it, so moving it means renumbering the whole tail. That is what
+ * produced nineteen wrong migration references the last time, and the exemption
+ * is only tolerable because the check below proves this particular collision
+ * cannot break anything.
+ *
+ * Renumbering a migration that may already have been applied somewhere also
+ * rewrites history for those deployments. Shrinking this list is safe; growing
+ * it needs the same proof.
  */
 const GRANDFATHERED_DUPLICATE_PREFIXES: ReadonlySet<string> = new Set(["0006", "0009"]);
 
@@ -291,5 +304,77 @@ test("comments reference migrations by filename, never by bare number", () => {
       `renumber. Name the file, or backtick the number if the numbering itself is the point:\n${[
         ...new Set(offenders)
       ].join("\n")}`
+  );
+});
+
+/**
+ * The exemptions above are only safe if the colliding files can be applied in
+ * either order, and until now that was a claim in a comment rather than a
+ * checked property.
+ *
+ * Two migrations sharing a prefix are order-independent when they touch
+ * disjoint sets of tables: filename sort decides which runs first, and neither
+ * can care. When they touch the same table, the sort order becomes
+ * load-bearing and nothing pins it. That is exactly the shape of the real
+ * hazard this reconstruction hit, where `0013_file_intake_validation.sql` and
+ * `0013_file_intakes.sql` both touched file_intakes and `_` sorting before `s`
+ * put the ALTER TABLE ahead of the CREATE TABLE. This check would have caught
+ * it; the prose claim did not.
+ */
+function tablesTouched(sql: string): ReadonlySet<string> {
+  const patterns = [
+    /CREATE TABLE(?: IF NOT EXISTS)?\s+"?([a-z_][a-z0-9_]*)"?/giu,
+    /ALTER TABLE\s+"?([a-z_][a-z0-9_]*)"?/giu,
+    /CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)?\s+\S+\s+ON\s+"?([a-z_][a-z0-9_]*)"?/giu,
+    /CREATE (?:CONSTRAINT )?TRIGGER\s+\S+\s+(?:BEFORE|AFTER|INSTEAD OF)[\s\S]*?\bON\s+"?([a-z_][a-z0-9_]*)"?/giu
+  ];
+  const found = new Set<string>();
+  for (const pattern of patterns) {
+    for (const match of sql.matchAll(pattern)) {
+      const name = match[1];
+      if (name !== undefined) {
+        found.add(name.toLowerCase());
+      }
+    }
+  }
+  return found;
+}
+
+test("migrations sharing a prefix touch disjoint tables, so their order cannot matter", () => {
+  const byPrefix = new Map<string, string[]>();
+  for (const name of migrationFilenames()) {
+    const prefix = /^(\d+)_/u.exec(name)?.[1];
+    assert.ok(prefix !== undefined, `migration ${name} must start with a numeric prefix`);
+    byPrefix.set(prefix, [...(byPrefix.get(prefix) ?? []), name]);
+  }
+
+  const duplicated = [...byPrefix.entries()].filter(([, names]) => names.length > 1);
+  // If this ever reaches zero the duplicates were resolved and both this test
+  // and the exemption list should go, rather than sitting here passing
+  // vacuously.
+  assert.ok(duplicated.length > 0, "no duplicated prefixes remain; remove this test and the exemption list");
+
+  const offenders: string[] = [];
+  for (const [prefix, names] of duplicated) {
+    const touched = names.map(
+      (name) => [name, tablesTouched(fs.readFileSync(path.join(MIGRATIONS_DIR, name), "utf8"))] as const
+    );
+    for (let i = 0; i < touched.length; i += 1) {
+      for (let j = i + 1; j < touched.length; j += 1) {
+        const [nameA, tablesA] = touched[i] ?? ["", new Set<string>()];
+        const [nameB, tablesB] = touched[j] ?? ["", new Set<string>()];
+        const shared = [...tablesA].filter((table) => tablesB.has(table));
+        if (shared.length > 0) {
+          offenders.push(`${prefix}: ${nameA} and ${nameB} both touch ${shared.join(", ")}`);
+        }
+      }
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    "these same-prefix migrations touch the same tables, so which one runs first is decided by the rest of the " +
+      `filename and nothing pins it:\n${offenders.join("\n")}`
   );
 });
