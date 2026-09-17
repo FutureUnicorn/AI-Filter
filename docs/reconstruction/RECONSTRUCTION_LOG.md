@@ -430,7 +430,7 @@ independently before fixing; one of the proposed fixes was wrong.
 | | |
 |---|---|
 | Finding (REV-001, raised to HIGH after live repro) | `normalizeAppliedAt` compared the parsed instant's UTC fields against the literal date parts, so any offset crossing midnight read as a calendar error. `2026-01-31T23:00:00-05:00` is 1 February in UTC; `2026-01-01T00:00:00+05:30` is 31 December of the previous year. Both were returned to the operator as "not a valid date". The regex admits `[+-]HH:MM`, so this was a broken accepted format. A live three-row import dropped two candidates. |
-| **The suggested fix was wrong** | Scoping the year and month checks to the date-only branch, as the day check already was, would accept `2026-02-30T00:00:00Z`: `new Date` returns 2026-03-02 for it, not NaN. That trades a false rejection for silent corruption, storing a date nobody wrote. Verified empirically across 18 cases before choosing an approach. |
+| **The suggested fix was wrong** | Scoping the year and month checks to the date-only branch, as the day check already was, would accept `2026-02-30T00:00:00Z`: `new Date` returns 2026-03-02 for it, not NaN. That trades a false rejection for silent corruption, storing a date nobody wrote. The cases that settled it are not a claim in this log: they are encoded in the two tests `tests/unit/csv-import-finalization.test.ts` adds, which between them assert every accepted offset and every rejected impossible date, and which fail against the original code and the suggested fix respectively. |
 | Fix | `b82cf88` — the calendar question is asked of the literal date parts via `Date.UTC`, independent of any offset; the instant is used only for the stored value. |
 | Controls | The original code fails the offset test; the suggested fix fails the impossible-date test. Both run. |
 
@@ -457,7 +457,16 @@ independently before fixing; one of the proposed fixes was wrong.
 | Fix | `a83675d` — the comment is corrected, and the exemption is earned mechanically: same-prefix migrations must touch disjoint tables, so filename sort order cannot matter. Both current pairs are disjoint. |
 | Control | The real hazard this reconstruction hit was not disjoint: renaming `0014_file_intake_validation.sql` back to `0013_` reproduces it and the new check fails. The prose claim never would have. |
 
-**Answered rather than fixed:** the bootstrap gap. Verified against live Jira that
+**Sai's separate blocker, resolved before this round:** `pnpm dev:infra` could
+not start because `infra/compose/runtime.yml` pinned `minio/minio` on Docker Hub,
+whose manifest was unavailable. Fixed by Sai's own `0e12a0b`, which repoints both
+MinIO images at Quay. Re-verified here against the live registry:
+`quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`,
+`quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z` and
+`postgres:17.10-alpine3.23` all resolve.
+
+**Answered rather than fixed:** the product-entry bootstrap gap, which is a
+different thing from the compose blocker above. Verified against live Jira that
 no ticket covered it, then filed **AF-97** under EPIC 2. A fresh deployment has
 no organization, user or membership and no way to create the first of any; every
 `INSERT INTO organizations` is a test fixture, and the AF-16 invite machinery has
