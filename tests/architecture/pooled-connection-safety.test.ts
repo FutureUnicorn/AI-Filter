@@ -126,6 +126,14 @@ test("the pooled and dedicated-client split is real, so neither check is vacuous
   // And the probes must be the dedicated ones, because they are the functions
   // that legitimately need session state.
   //
+  // This leans on a naming convention, so state it: in packages/db, `assert*`
+  // and `provision*` are integration probes that own their connection.
+  // A runtime precondition that runs on the request path is named `require*`
+  // or `ensure*` instead, and may pool. Review #83 hit this when a new
+  // request-path guard was called assertMembershipLookupVisibleOnce and was
+  // flagged here; it was renamed rather than exempted, because the name was
+  // the thing that was wrong.
+  //
   // One exception, named rather than pattern-matched: the probe whose subject
   // IS the pool has to borrow from it to measure anything. It sets no session
   // state, which the first test in this file checks independently, so the

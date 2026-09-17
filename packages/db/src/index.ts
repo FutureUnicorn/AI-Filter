@@ -338,16 +338,54 @@ export interface CreateMagicLinkTokenInput {
  * the entire user base behind an error that claims their account does
  * not exist.
  */
-async function assertMembershipLookupVisible(client: ClientBase, schema: string): Promise<void> {
+async function requireMembershipLookupVisible(client: ClientBase, schema: string, caller: string): Promise<void> {
   const rls = await client.query<{ active: boolean }>(
     `SELECT row_security_active('"${schema}".memberships'::regclass) AS active`
   );
   if (rls.rows[0]?.active === true) {
     throw new Error(
-      `cannot verify membership for a login magic link: row-level security is active on "${schema}".memberships ` +
-        `for the current database role, so the cross-organization lookup a login token requires can never match. ` +
+      `${caller} cannot read memberships: row-level security is active on "${schema}".memberships for the ` +
+        `current database role, so a cross-organization lookup by user_id alone can never match. ` +
         `Grant this role BYPASSRLS, or move the lookup into a SECURITY DEFINER function owned by the table owner.`
     );
+  }
+}
+
+/**
+ * Per connection string and schema, because whether RLS applies is a property
+ * of the table and the role, not of the request. Checking on every call would
+ * add a round trip to every authenticated request for an answer that cannot
+ * change while the process is running; a restart re-checks it.
+ */
+const membershipVisibilityChecked = new Map<string, Promise<void>>();
+
+async function requireMembershipLookupVisibleOnce(
+  databaseUrl: string,
+  schema: string,
+  caller: string
+): Promise<void> {
+  const key = `${databaseUrl}\u0000${schema}`;
+  const existing = membershipVisibilityChecked.get(key);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const check = (async (): Promise<void> => {
+    const client = await acquireConnection(databaseUrl);
+    try {
+      await requireMembershipLookupVisible(client, schema, caller);
+    } finally {
+      client.release();
+    }
+  })();
+  // Cached before awaiting so concurrent first requests share one check, and
+  // removed on failure so a fixed deployment does not keep serving the error
+  // from cache.
+  membershipVisibilityChecked.set(key, check);
+  try {
+    await check;
+  } catch (error) {
+    membershipVisibilityChecked.delete(key);
+    throw error;
   }
 }
 
@@ -356,7 +394,7 @@ async function emailHasMembership(
   schema: string,
   email: string
 ): Promise<boolean> {
-  await assertMembershipLookupVisible(client, schema);
+  await requireMembershipLookupVisible(client, schema, "a login magic link");
   const found = await client.query(
     `SELECT 1
        FROM "${schema}".users u
@@ -908,6 +946,19 @@ export async function getMembershipsForUser(
   userId: string
 ): Promise<readonly Membership[]> {
   assertSafeSchema(schema);
+  // Review #83, REV-002: this is the same cross-organization lookup the login
+  // path makes, keyed on user_id with no organization filter, and it was the
+  // only one of the two without the visibility guard.
+  //
+  // 0004_tenant_scoped_rls.sql puts FORCE ROW LEVEL SECURITY on memberships
+  // with a policy on app.current_org_id, which nothing sets here. That is inert
+  // today only because the application role happens to be the Postgres image's
+  // bootstrap superuser. Under any role RLS applies to, this query returns zero
+  // rows, every authenticated caller looks like it holds no memberships, and
+  // all 16 API routes answer not_found. Silently, and identically to a genuine
+  // permission denial, which is the worst possible way for it to fail: the
+  // login path at least refuses loudly with an actionable message.
+  await requireMembershipLookupVisibleOnce(databaseUrl, schema, "reading a user's memberships");
   const client = await acquireConnection(databaseUrl);
   try {
     const result = await client.query<MembershipRow>(
@@ -2285,6 +2336,118 @@ export async function assertMembershipsTenantIsolation(databaseUrl: string): Pro
  * with a random suffix so concurrent runs cannot collide, and both
  * dropped in `finally`.
  */
+export interface MembershipReadUnderRlsObservations {
+  /** As the bootstrap superuser, which is what the app runs as today. */
+  readonly asSuperuserMembershipCount: number;
+  /** As a role RLS actually applies to, before this fix: zero rows, no error. */
+  readonly asRestrictedRoleRowCount: number;
+  /** After the fix: the failure mode is a thrown, actionable error. */
+  readonly asRestrictedRoleThrew: boolean;
+  readonly errorMentionsRowLevelSecurity: boolean;
+  readonly errorMentionsRemedy: boolean;
+}
+
+/**
+ * Review #83, REV-002. getMembershipsForUser makes the same
+ * cross-organization lookup the login path does, and was the only one of the
+ * two without the visibility guard.
+ *
+ * Why silence is the dangerous part: under a role RLS applies to, the query
+ * returns zero rows rather than failing. Every authenticated caller then looks
+ * like it holds no memberships, and all 16 API routes answer not_found, which
+ * is indistinguishable from a genuine permission denial. The whole product
+ * would appear to work and deny everyone, with nothing in the logs.
+ *
+ * Measured against a real NOSUPERUSER NOBYPASSRLS role, because that is the
+ * only way to observe it: as the Postgres image's bootstrap superuser, RLS is
+ * bypassed and the defect is invisible.
+ */
+export async function assertMembershipReadFailsLoudlyUnderRls(
+  databaseUrl: string
+): Promise<MembershipReadUnderRlsObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `mread_probe_${suffix}`;
+  const role = `mread_app_${suffix}`;
+  const password = randomBytes(16).toString("hex");
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const email = `mread_${suffix}@acme.test`;
+
+  const probeUrl = new URL(databaseUrl);
+  probeUrl.username = role;
+  probeUrl.password = password;
+  const probeDatabaseUrl = probeUrl.toString();
+
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of ["0002_organizations_users_memberships.sql", "0004_tenant_scoped_rls.sql"]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Org A')`, [organizationId]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Member') RETURNING user_id`,
+      [email]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) {
+      throw new Error("probe could not create a user");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+
+    // Control: as the superuser the membership is visible, so a later failure
+    // is attributable to RLS rather than to the fixture being wrong.
+    const asSuperuser = await getMembershipsForUser(databaseUrl, schema, userId);
+
+    // What the raw query does under the restricted role, with no guard in the
+    // way. This is the defect itself, measured rather than described.
+    const restricted = new Client({ connectionString: probeDatabaseUrl, connectionTimeoutMillis: 5_000 });
+    let rowCount = -1;
+    try {
+      await restricted.connect();
+      const rows = await restricted.query(
+        `SELECT membership_id FROM "${schema}".memberships WHERE user_id = $1`,
+        [userId]
+      );
+      rowCount = rows.rowCount ?? -1;
+    } finally {
+      await restricted.end().catch(() => undefined);
+    }
+
+    // And what the guarded function now does with the same role.
+    let threw = false;
+    let message = "";
+    try {
+      await getMembershipsForUser(probeDatabaseUrl, schema, userId);
+    } catch (error) {
+      threw = true;
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    return {
+      asSuperuserMembershipCount: asSuperuser.length,
+      asRestrictedRoleRowCount: rowCount,
+      asRestrictedRoleThrew: threw,
+      errorMentionsRowLevelSecurity: /row-level security/iu.test(message),
+      errorMentionsRemedy: /BYPASSRLS|SECURITY DEFINER/u.test(message)
+    };
+  } finally {
+    await closeDatabasePools().catch(() => undefined);
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.query(`REASSIGN OWNED BY ${role} TO CURRENT_USER`).catch(() => undefined);
+    await admin.query(`DROP OWNED BY ${role}`).catch(() => undefined);
+    await admin.query(`DROP ROLE IF EXISTS ${role}`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
 export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<void> {
   const suffix = randomBytes(4).toString("hex");
   const schema = `mlrls_probe_${suffix}`;
