@@ -1162,12 +1162,31 @@ export function normalizeAppliedAt(
     return { outcome: "invalid" };
   }
   // Catches values the pattern admits but the calendar does not, such as
-  // 2026-02-30, which Date would otherwise roll forward into March.
+  // 2026-02-30, which Date rolls forward into March rather than refusing.
+  //
+  // Checked against the literal date parts, NOT against the parsed instant.
+  // Review #83: comparing `parsed`'s UTC fields to the literal ones conflates
+  // two different things, because a legitimate offset shifts the instant into
+  // an adjacent day, month or year. `2026-01-31T23:00:00-05:00` is 1 February
+  // in UTC and `2026-01-01T00:00:00+05:30` is 31 December of the previous
+  // year, so both were reported as invalid dates back to the operator who
+  // supplied them. Any ATS export carrying local offsets lost every candidate
+  // dated on the first or last day of a month.
+  //
+  // Scoping the year and month checks to the date-only branch, as the day
+  // check already was, does not fix it: `2026-02-30T00:00:00Z` parses to
+  // 2026-03-02 rather than NaN, so that would start silently accepting
+  // impossible dates and storing them as the day they rolled into. The
+  // calendar question and the offset question have to be asked separately.
   const [year, month, day] = trimmed.slice(0, 10).split("-").map(Number);
+  if (year === undefined || month === undefined || day === undefined) {
+    return { outcome: "invalid" };
+  }
+  const calendarDay = new Date(Date.UTC(year, month - 1, day));
   if (
-    parsed.getUTCFullYear() !== year ||
-    parsed.getUTCMonth() + 1 !== month ||
-    (trimmed.length === 10 && parsed.getUTCDate() !== day)
+    calendarDay.getUTCFullYear() !== year ||
+    calendarDay.getUTCMonth() + 1 !== month ||
+    calendarDay.getUTCDate() !== day
   ) {
     return { outcome: "invalid" };
   }

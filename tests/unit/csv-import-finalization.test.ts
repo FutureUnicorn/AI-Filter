@@ -134,3 +134,81 @@ test("appliedAt normalization is strict about what it accepts", () => {
   const normalized = normalizeAppliedAt("2026-03-04");
   assert.equal(normalized.outcome === "normalized" ? normalized.value : "", "2026-03-04T00:00:00.000Z");
 });
+
+/**
+ * PR #83 review, REV-001. Every zoned value above uses `Z`, which never shifts
+ * the instant, so nothing here exercised the format the regex actually admits:
+ * `[+-]HH:MM`. Under a real local offset the check compared the parsed instant's
+ * UTC fields against the literal date parts, and any offset that crosses
+ * midnight moves the instant into an adjacent day, month or year.
+ *
+ * The effect was not a rejected edge case. An ATS export carrying local
+ * timestamps lost every candidate dated on the first or last day of a month,
+ * and the failure told the operator their valid timestamp was not a valid date.
+ */
+test("a valid offset that shifts the UTC date is accepted, not called invalid", () => {
+  // Crosses backwards over a year boundary: 2025-12-31T18:30:00Z.
+  const backwards = normalizeAppliedAt("2026-01-01T00:00:00+05:30");
+  assert.equal(backwards.outcome, "normalized", "an offset crossing into the previous year is still a real date");
+  assert.equal(
+    backwards.outcome === "normalized" ? backwards.value : "",
+    "2025-12-31T18:30:00.000Z",
+    "the stored value is the instant, so the offset is preserved rather than discarded"
+  );
+
+  // Crosses forwards over a month boundary: 2026-02-01T04:00:00Z.
+  const forwards = normalizeAppliedAt("2026-01-31T23:00:00-05:00");
+  assert.equal(forwards.outcome, "normalized", "an offset crossing into the next month is still a real date");
+  assert.equal(forwards.outcome === "normalized" ? forwards.value : "", "2026-02-01T04:00:00.000Z");
+
+  // The extremes of the offset range the pattern admits, and the colonless form.
+  for (const value of ["2026-12-31T23:59:59+14:00", "2026-01-01T00:00:00-12:00", "2026-06-15T10:00:00+0530"]) {
+    assert.equal(normalizeAppliedAt(value).outcome, "normalized", `${value} should be accepted`);
+  }
+
+  // And the row-level effect, which is what the operator actually saw.
+  const complete = {
+    candidateFullName: "Casey Jones",
+    candidateEmail: "casey@example.test",
+    externalReferenceId: undefined,
+    appliedAt: "2026-01-31T23:00:00-05:00"
+  } as const;
+  assert.equal(
+    classifyCsvImportRow(complete).outcome,
+    "processed",
+    "a candidate with a local-offset timestamp must not be dropped from the import"
+  );
+});
+
+/**
+ * The control for the fix above, and the reason the obvious fix is wrong.
+ *
+ * Scoping the year and month checks to the date-only branch, the way the day
+ * check already was, would accept these: `new Date("2026-02-30T00:00:00Z")`
+ * does not return NaN, it returns 2026-03-02. So that version of the fix trades
+ * a false rejection for a silent corruption, storing a date the operator never
+ * wrote. Both properties have to hold at once.
+ */
+test("an impossible calendar date is still refused, with or without a time and zone", () => {
+  for (const value of [
+    "2026-02-30",
+    "2026-02-30T00:00:00Z",
+    "2026-02-30T12:00:00+05:30",
+    "2026-02-29",
+    "2026-04-31T10:00:00-07:00",
+    "2026-13-01T00:00:00Z",
+    "2026-00-10",
+    "2026-01-00"
+  ]) {
+    assert.equal(
+      normalizeAppliedAt(value).outcome,
+      "invalid",
+      `${value} is not a real date and must not be rolled forward into one`
+    );
+  }
+
+  // 2024 is a leap year and 2026 is not, so the day check is a real calendar
+  // check rather than a fixed month-length table.
+  assert.equal(normalizeAppliedAt("2024-02-29").outcome, "normalized");
+  assert.equal(normalizeAppliedAt("2026-02-28").outcome, "normalized");
+});
