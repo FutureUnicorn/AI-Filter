@@ -420,3 +420,47 @@ Two findings, both from a review by Pradeep0111, neither a correctness bug.
 
 **Result:** full `pnpm check` exit 0 locally, 162 unit, 364 integration, 34
 architecture, zero failures.
+
+## PR #83 review, round 4
+
+Four findings from an end-to-end review that drove the real user journey against
+live Postgres and MinIO rather than reading code. All four verified
+independently before fixing; one of the proposed fixes was wrong.
+
+| | |
+|---|---|
+| Finding (REV-001, raised to HIGH after live repro) | `normalizeAppliedAt` compared the parsed instant's UTC fields against the literal date parts, so any offset crossing midnight read as a calendar error. `2026-01-31T23:00:00-05:00` is 1 February in UTC; `2026-01-01T00:00:00+05:30` is 31 December of the previous year. Both were returned to the operator as "not a valid date". The regex admits `[+-]HH:MM`, so this was a broken accepted format. A live three-row import dropped two candidates. |
+| **The suggested fix was wrong** | Scoping the year and month checks to the date-only branch, as the day check already was, would accept `2026-02-30T00:00:00Z`: `new Date` returns 2026-03-02 for it, not NaN. That trades a false rejection for silent corruption, storing a date nobody wrote. Verified empirically across 18 cases before choosing an approach. |
+| Fix | `b82cf88` — the calendar question is asked of the literal date parts via `Date.UTC`, independent of any offset; the instant is used only for the stored value. |
+| Controls | The original code fails the offset test; the suggested fix fails the impossible-date test. Both run. |
+
+| | |
+|---|---|
+| Finding (REV-002) | `getMembershipsForUser` makes the same cross-organization lookup the login path makes and was the only one of the two without the RLS visibility guard. Under a role RLS applies to it returns zero rows rather than failing, so every authenticated caller looks like it holds no memberships and all 16 routes answer `not_found`: the product denies everyone while appearing to enforce permissions, with nothing in the logs. |
+| Fix | `afbefdc` — guarded, checked once per connection string and schema since RLS applicability cannot change while the process runs. Cached before awaiting so concurrent first requests share one check, evicted on failure so a fixed deployment is not served a cached error. |
+| Sweep | The other two live `memberships` queries: `emailHasMembership` is the login path and was already guarded. This was the only gap. |
+| Proof | A real `NOSUPERUSER NOBYPASSRLS` role, which is the only way to observe it. The superuser read is a control so a failure is attributable to RLS, and the raw zero-row result is asserted so the test cannot pass vacuously. |
+| Side effect | The pooling guard flagged the new `assertMembershipLookupVisibleOnce` as a probe. Renamed to `require*` rather than exempted: in packages/db, `assert*`/`provision*` means a probe that owns its connection and `require*` means a request-path precondition that may pool. That convention is now stated in the guard. |
+
+| | |
+|---|---|
+| Finding (REV-003) | `SESSION_SECRET` was absent from every env template and read at request time, so a deployment following `.env.example` booted, passed the environment health check, and then threw on every authenticated request with no request id and nothing in the log stream. Four further hosted vars were also undocumented. |
+| Fix | `14f3dde` — `apps/web/src/instrumentation.ts`. Next.js calls `register()` once and waits for it before serving, so throwing there makes absence a boot failure. Verified against the Next docs rather than assumed. |
+| Deliberately not | Adding `SESSION_SECRET` to `packages/config`'s shared schema. `apps/worker` loads the same schema and signs no sessions, so that would make the worker fail to boot over a secret it never reads. |
+| Guard | Reads the variable names out of the config schema and out of the web app's direct `process.env` reads instead of keeping a list, because a hand-kept list is exactly what drifted. `PREVIEW_*` excluded as pipeline-injected. |
+| Controls | Removing either variable fails the template check; downgrading the boot assertion to a warning fails the other. |
+
+| | |
+|---|---|
+| Finding (REV-004) | The exemption list claimed `0006` and `0009` "were already duplicated on the baseline". `git ls-tree` on the merge base shows both `0006` files on develop but only one `0009`: `0009_roles.sql` arrives with this reconstruction, so the branch creates that collision and then exempts it, which the docstring says the test exists to prevent. |
+| Kept, not renumbered | There is no free integer between `0009` and `0011`, since roles must precede `0011_rubrics.sql` which references it. Moving it means renumbering the whole tail, which is what produced nineteen wrong references last round. |
+| Fix | `a83675d` — the comment is corrected, and the exemption is earned mechanically: same-prefix migrations must touch disjoint tables, so filename sort order cannot matter. Both current pairs are disjoint. |
+| Control | The real hazard this reconstruction hit was not disjoint: renaming `0014_file_intake_validation.sql` back to `0013_` reproduces it and the new check fails. The prose claim never would have. |
+
+**Answered rather than fixed:** the bootstrap gap. Verified against live Jira that
+no ticket covered it, then filed **AF-97** under EPIC 2. A fresh deployment has
+no organization, user or membership and no way to create the first of any; every
+`INSERT INTO organizations` is a test fixture, and the AF-16 invite machinery has
+no HTTP route. AF-73 (recruiter workflow E2E) cannot pass until it exists.
+
+**Result:** full `pnpm check` exit 0 — 164 unit, 367 integration, 35 architecture.
