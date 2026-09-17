@@ -80,3 +80,64 @@ test("staging and production deploy only exact green revisions", () => {
   assert.match(production, /git rev-parse HEAD/u);
   assert.doesNotMatch(production, /workflow_dispatch/u);
 });
+
+/**
+ * PR #83 review, REV-003. Five variables the code requires were absent from
+ * .env.example: SESSION_SECRET, PUBLIC_APP_ORIGIN and the three
+ * MAGIC_LINK_EMAIL_* values. A developer copying the template got a server
+ * that booted, passed the environment health check, and then threw on every
+ * authenticated request.
+ *
+ * Reading the names out of the source rather than keeping a list here is the
+ * point: a hand-kept list is exactly what drifted. Any variable a future
+ * ticket adds to the config schema, or reads from process.env in the web app's
+ * own library code, has to appear in the template or this fails.
+ */
+test("every environment variable the code requires appears in .env.example", () => {
+  const template = new Set(
+    read(".env.example")
+      .split("\n")
+      .map((line) => /^([A-Z][A-Z0-9_]*)=/u.exec(line.trim())?.[1])
+      .filter((name): name is string => name !== undefined)
+  );
+
+  // Keys of the config schema's z.object, which is what loadEnvironmentConfig
+  // parses and therefore what every service needs.
+  const configSource = read("packages/config/src/index.ts");
+  const schemaKeys = [...configSource.matchAll(/^ {4}([A-Z][A-Z0-9_]*):/gmu)]
+    .map((match) => match[1])
+    .filter((name): name is string => name !== undefined);
+
+  // Plus anything the web app reads straight from process.env, which is how
+  // SESSION_SECRET escaped the schema in the first place.
+  const webSecrets = [...read("apps/web/src/lib/session.ts").matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/gu)]
+    .map((match) => match[1])
+    .filter((name): name is string => name !== undefined);
+
+  // PREVIEW_* are injected by the preview pipeline per deployment, not copied
+  // from a template, so a placeholder would be misleading rather than helpful.
+  const pipelineInjected = new Set(["PREVIEW_ID", "PREVIEW_COMMIT_SHA"]);
+
+  const required = [...new Set([...schemaKeys, ...webSecrets])].filter((name) => !pipelineInjected.has(name)).sort();
+  assert.ok(required.length > 10, `expected to discover the real variable list, found ${required.length}`);
+
+  const missing = required.filter((name) => !template.has(name));
+  assert.deepEqual(
+    missing,
+    [],
+    `these variables are required by the code but absent from .env.example, so a developer following it gets a ` +
+      `server that starts and then fails:\n${missing.join("\n")}`
+  );
+});
+
+test("the web server refuses to start without a session secret", () => {
+  // REV-003's other half. Documenting SESSION_SECRET is not enough on its own:
+  // read at request time, its absence is a 500 per request rather than a
+  // failure to boot, and the health check reports healthy throughout. Next.js
+  // calls register() once and waits for it before serving, so throwing there
+  // is what makes absence a startup failure.
+  const instrumentation = read("apps/web/src/instrumentation.ts");
+  assert.match(instrumentation, /export function register\(/u, "Next.js only calls a function named register");
+  assert.match(instrumentation, /SESSION_SECRET/u);
+  assert.match(instrumentation, /throw new Error/u, "it has to throw; logging a warning still serves requests");
+});
