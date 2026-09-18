@@ -262,7 +262,22 @@ test("an object replaced after validation makes a reader answer 409 and quaranti
   }
 });
 
-test("an oversized read from a post-validation reader answers 413 rather than 500", async () => {
+/**
+ * PR #83 review round 5, REV-014. Previously left `validated` on the theory
+ * that an oversized read says nothing about whether the stored bytes are the
+ * approved ones. That theory didn't hold: the approved bytes already passed
+ * this same limit during validation (evaluateFileValidation, review #83
+ * P1), so bytes that now exceed it cannot be those bytes -- the object was
+ * replaced after validation, exactly like a hash mismatch. Leaving the
+ * intake `validated` stranded it forever: every reader kept answering 413
+ * with no quarantine/re-upload path back.
+ *
+ * csv-preview is driven here because it is the route the finding cited, but
+ * extract-text, finalize and import-status hit the identical branch and all
+ * four call the same invalidateOversizedIntake, so this proves the shared
+ * fix rather than a per-route patch.
+ */
+test("an oversized read from a post-validation reader answers 413 and quarantines the intake", async () => {
   const databaseUrl = requireDatabase();
   const probe = await provisionFileIntakeRouteSchema(databaseUrl, {
     declaredFilename: "candidates.csv",
@@ -287,11 +302,12 @@ test("an oversized read from a post-validation reader answers 413 rather than 50
     );
     assert.equal(response.status, 413, await response.clone().text());
 
-    // Not quarantined: unlike a hash mismatch, an oversized read says nothing
-    // about whether the stored bytes are the approved ones, so destroying the
-    // intake here would punish a caller for a limit the route enforces.
     const stored = await getFileIntakeById(databaseUrl, probe.schema, probe.intakeId);
-    assert.equal(stored?.status, "validated");
+    assert.equal(stored?.status, "quarantined", "an oversized post-validation read must not leave the intake reprocessable forever");
+
+    // The validated digest is deliberately kept, same as the hash-mismatch
+    // case: it is the evidence of what was actually approved.
+    assert.equal(stored?.sha256Hash, REAL_HASH, "the validated hash must survive the quarantine");
   } finally {
     await dropProbeSchema(databaseUrl, probe.schema);
   }

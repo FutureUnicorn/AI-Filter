@@ -5,7 +5,8 @@ import {
   createCanonicalTextExtraction,
   getFileIntakeById,
   getMembershipsForUser,
-  invalidateChangedIntake
+  invalidateChangedIntake,
+  invalidateOversizedIntake
 } from "@signal-audit/db";
 import {
   ObjectChangedError,
@@ -103,10 +104,16 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
         return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
       }
       if (readError instanceof ObjectTooLargeError) {
+        // The bytes validation approved already passed this same limit, so an
+        // object that now exceeds it cannot be those bytes: it was replaced
+        // after validation, same as a hash mismatch (review #83, REV-014).
+        await invalidateOversizedIntake(config.database.url, config.database.schema, intakeId, readError);
         const error = buildApiError({
           requestId,
           code: "payload_too_large",
-          message: `This file is larger than the ${readError.limitBytes}-byte limit.`
+          message:
+            `This file is larger than the ${readError.limitBytes}-byte limit, so it no longer matches what was ` +
+            `validated and has been quarantined. Upload it again.`
         });
         return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
       }

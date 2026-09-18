@@ -130,6 +130,55 @@ test("every environment variable the code requires appears in .env.example", () 
   );
 });
 
+/**
+ * PR #83 review, REV-013. Compose's shared x-runtime-environment carried
+ * neither SESSION_SECRET nor PUBLIC_APP_ORIGIN/MAGIC_LINK_EMAIL_*, so
+ * `docker compose up` started a web container that instrumentation.ts (REV-003)
+ * then killed before it could accept a request, and a hosted deployment
+ * (APP_ENV=staging/production) failed packages/config's loadEnvironmentConfig
+ * for the same reason .env.example was once missing them.
+ *
+ * SESSION_SECRET belongs to the web service specifically, not the shared
+ * block: apps/worker loads the same config schema and never signs a session,
+ * so requiring the secret there would fail worker boot over a value it never
+ * reads (see instrumentation.ts).
+ */
+test("compose passes the web service its session secret and the shared hosted config vars", () => {
+  const compose = read("infra/compose/runtime.yml");
+
+  const runtimeEnvironmentBlock = /x-runtime-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  assert.ok(runtimeEnvironmentBlock, "expected an x-runtime-environment anchor block");
+  for (const name of [
+    "PUBLIC_APP_ORIGIN",
+    "MAGIC_LINK_EMAIL_ENDPOINT",
+    "MAGIC_LINK_EMAIL_API_KEY",
+    "MAGIC_LINK_EMAIL_FROM"
+  ]) {
+    assert.match(
+      runtimeEnvironmentBlock!,
+      new RegExp(`${name}: \\$\\{${name}:-\\}`, "u"),
+      `${name} must be in the shared runtime environment so hosted web and worker config can load`
+    );
+  }
+  assert.doesNotMatch(
+    runtimeEnvironmentBlock!,
+    /SESSION_SECRET/u,
+    "SESSION_SECRET must not be shared with the worker, which never signs a session"
+  );
+
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(webService, "expected a web service block");
+  assert.match(
+    webService!,
+    /SESSION_SECRET: \$\{SESSION_SECRET:\?SESSION_SECRET is required\}/u,
+    "the web service must receive a required SESSION_SECRET"
+  );
+
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(workerService, "expected a worker service block");
+  assert.doesNotMatch(workerService!, /SESSION_SECRET/u, "the worker must not require a session secret it never reads");
+});
+
 test("the web server refuses to start without a session secret", () => {
   // REV-003's other half. Documenting SESSION_SECRET is not enough on its own:
   // read at request time, its absence is a 500 per request rather than a

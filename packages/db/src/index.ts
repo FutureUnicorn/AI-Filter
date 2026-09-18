@@ -1863,6 +1863,46 @@ export async function invalidateChangedIntake(
   }
 }
 
+/**
+ * Quarantines an intake whose post-validation read exceeded the same byte
+ * limit validation itself enforces.
+ *
+ * Review #83, REV-014: this case was left `validated` on the theory that an
+ * oversized read says nothing about whether the stored bytes are the
+ * approved ones. That theory doesn't hold: the approved bytes already passed
+ * this exact limit during validation, so bytes that now exceed it cannot be
+ * those bytes -- the object was replaced (or the limit tightened) after
+ * validation, same as a hash mismatch. Leaving it `validated` stranded the
+ * intake forever, since every reader keeps rejecting it with no path back to
+ * quarantined/re-upload.
+ *
+ * Deliberately does not clear the recorded hash, for the same reason
+ * invalidateChangedIntake doesn't: it is the evidence of what was approved.
+ */
+export async function invalidateOversizedIntake(
+  databaseUrl: string,
+  schema: string,
+  intakeId: string,
+  detail: { readonly limitBytes: number }
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `UPDATE "${schema}".file_intakes
+          SET status = 'quarantined', rejection_reason = $2
+        WHERE intake_id = $1 AND status <> 'quarantined'`,
+      [
+        intakeId,
+        `Stored object now exceeds the ${detail.limitBytes}-byte validated read limit; the upload was replaced ` +
+          `after validation.`
+      ]
+    );
+  } finally {
+    client.release();
+  }
+}
+
 export async function recordFileValidationResult(
   databaseUrl: string,
   schema: string,

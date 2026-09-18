@@ -473,3 +473,38 @@ no organization, user or membership and no way to create the first of any; every
 no HTTP route. AF-73 (recruiter workflow E2E) cannot pass until it exists.
 
 **Result:** full `pnpm check` exit 0 — 164 unit, 367 integration, 35 architecture.
+
+## PR #83 review, round 5
+
+Two findings raised against the head that fixed Sai's compose blocker, both
+resolvable inline threads (REV-013, REV-014).
+
+| | |
+|---|---|
+| Finding (REV-013, P1) | `x-runtime-environment` never passed `SESSION_SECRET`, so `docker compose up` built a web container that `instrumentation.ts` (REV-003) then killed before it could accept a request. The shared block also omitted `PUBLIC_APP_ORIGIN` and the three `MAGIC_LINK_EMAIL_*` values, so a hosted `APP_ENV` (staging/production) would fail `loadEnvironmentConfig`'s own validation for the same reason `.env.example` once did. |
+| Fix | `SESSION_SECRET` added to the `web` service only, not the shared block: `apps/worker` loads the same config schema and signs no session, so requiring the secret there would fail worker boot over a value it never reads (already the stated reasoning for keeping it out of `packages/config`, REV-003). `PUBLIC_APP_ORIGIN` and `MAGIC_LINK_EMAIL_*` added to the shared block, defaulted to empty so `development`/`test` compose runs behave exactly as before and a hosted `APP_ENV` fails at config load if left unset, rather than at request time. |
+| Regression | `tests/integration/environment-policy.test.ts` reads the compose file's `x-runtime-environment` block and its `web`/`worker` service blocks directly, asserting the four hosted vars are in the shared block, `SESSION_SECRET` is present only on `web`, and absent from both the shared block and `worker`. |
+| Control | Reverted to the pre-fix file: fails exactly as expected (missing vars, missing per-service secret). |
+
+| | |
+|---|---|
+| Finding (REV-014, P2) | `csv-preview` answered 413 on `ObjectTooLargeError` from a post-validation read but left the intake `validated`, on the theory that a size refusal says nothing about whether the stored bytes are the approved ones. That theory doesn't hold: validation itself enforces the identical limit (`evaluateFileValidation`, REV-P1 round 1), so bytes that now exceed it during a later read cannot be the bytes that were approved -- the object was replaced after validation, exactly like the hash-mismatch case `ObjectChangedError` already handles. Left `validated`, the intake was permanently stuck: every later read kept failing the same way with no quarantine/re-upload path. The same branch exists in `extract-text`, `finalize` and `import-status`. |
+| Fix | `invalidateOversizedIntake` added to `packages/db`, mirroring `invalidateChangedIntake`: quarantines, records a reason naming the limit, and deliberately does not clear the recorded hash (the evidence of what was approved). All four post-validation readers now call it from their `ObjectTooLargeError` branch, the same one-line pattern each already used for `ObjectChangedError`. |
+| Regression | `tests/integration/file-intake-route-errors.test.ts`'s existing oversized-post-validation-read test (previously asserting `validated`, documenting the theory this finding disproved) now asserts `quarantined` and that the hash survives. Driven through `csv-preview`, the route the finding named; the other three call the identical new function so this is the shared fix, not a per-route patch. |
+| Control | Reverted `csv-preview` and the new function: the updated test fails, `actual: 'validated'` vs `expected: 'quarantined'`. |
+
+**On verifying this round for real.** No Docker daemon was available in this
+environment, so `pnpm dev:infra` could not be used. Postgres 16's own binaries
+were on the image; a scratch cluster was initialized directly
+(`initdb`/`pg_ctl`, throwaway data directory, discarded after), the 24
+migrations replayed against it, and the full suite run against it rather than
+skipped: `pnpm run test:unit:ts` (164), `pnpm run test:integration` against
+that real database (368, including the DB-dependent file-intake-route-errors
+and connection-pooling suites), `pnpm run check:architecture` (35), full
+workspace `pnpm run typecheck`, `pnpm run lint`, and `pnpm run build`. All
+clean. Object storage was not stood up (no MinIO), so nothing in this round
+touched that boundary; both findings here are compose configuration and a
+database-only code path.
+
+**Result:** full `pnpm check` exit 0 — 164 unit, 368 integration, 35
+architecture, against a real (scratch) Postgres.
