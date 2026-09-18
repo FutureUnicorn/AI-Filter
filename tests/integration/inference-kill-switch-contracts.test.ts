@@ -23,7 +23,7 @@ test("engaging with no reason at all is refused by the table", async () => {
   // The failure mode being prevented, shown rather than described.
   // `reason ~ '[^[:space:]]'` against NULL is NULL, not false, so the whole
   // CHECK evaluated to NULL and Postgres accepts true OR NULL. The switch
-  // could be engaged with no reason, undoing the invariant 0008 and 0009
+  // could be engaged with no reason, undoing the invariant 0008_inference_kill_switch.sql and 0009_inference_kill_switch_nonblank_reason.sql
   // exist to establish.
   assert.equal(
     observed.nullReasonAcceptedByOldConstraint,

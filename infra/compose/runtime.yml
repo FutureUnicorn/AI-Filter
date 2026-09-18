@@ -13,6 +13,10 @@ x-runtime-environment: &runtime-environment
   WORKER_PORT: "3001"
   PREVIEW_ID: ${PREVIEW_ID:-}
   PREVIEW_COMMIT_SHA: ${PREVIEW_COMMIT_SHA:-}
+  PUBLIC_APP_ORIGIN: ${PUBLIC_APP_ORIGIN:-}
+  MAGIC_LINK_EMAIL_ENDPOINT: ${MAGIC_LINK_EMAIL_ENDPOINT:-}
+  MAGIC_LINK_EMAIL_API_KEY: ${MAGIC_LINK_EMAIL_API_KEY:-}
+  MAGIC_LINK_EMAIL_FROM: ${MAGIC_LINK_EMAIL_FROM:-}
 
 services:
   postgres:
@@ -35,7 +39,7 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   storage:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -49,7 +53,7 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   storage-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     restart: "no"
     depends_on:
       storage:
@@ -133,6 +137,7 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *runtime-environment
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
     ports:
       - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_HOST_PORT:-3000}:3000"
     healthcheck:

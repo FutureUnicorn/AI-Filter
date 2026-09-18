@@ -5,6 +5,7 @@ import {
   LOG_EVENT_NAMES,
   buildLogEntry,
   createConsoleMagicLinkEmailSender,
+  createMagicLinkEmailSender,
   logStructured,
   redactPii
 } from "../../packages/security/src/index.ts";
@@ -178,7 +179,16 @@ test("redactPii keeps several adjacent correlation identifiers intact", () => {
   assert.equal(redactPii(value), value);
 });
 
-test("the development magic-link sender keeps local dev output non-sensitive", async (t) => {
+// This test previously asserted the OPPOSITE of what it now asserts, and
+// that inversion is the point. It required the token to be redacted from
+// stderr as well as from the log stream, which left no channel at all
+// yielding a usable link: the request stored a valid token, returned 202,
+// and the redeem endpoint was unreachable without hand-editing the
+// database. The real boundary is between the two channels, not "redact
+// everywhere" -- logStructured output is retained and searchable, so a
+// credential must never enter it, while stderr in a local environment is
+// the deliberate local-only delivery channel.
+test("the development magic-link sender delivers a usable link on stderr and nothing sensitive to the log stream", async (t) => {
   const stderrMock = t.mock.method(process.stderr, "write", () => true);
   const logMock = t.mock.method(console, "log", () => undefined);
   const link = "http://localhost:3000/auth/redeem?token=abc123";
@@ -188,21 +198,81 @@ test("the development magic-link sender keeps local dev output non-sensitive", a
     link
   });
 
+  // stderr: the local developer must be able to complete a sign-in.
   const written = stderrMock.mock.calls.map((call) => String(call.arguments[0])).join("");
-  assert.equal(written.includes(link), false, "the raw magic link must stay out of terminal output");
-  assert.equal(written.includes("dev@example.test"), false);
-  assert.equal(written.includes("token=abc123"), false);
-  assert.equal(written.includes("token=[REDACTED]"), true, "the sender should still emit a redacted link hint");
+  assert.equal(written.includes(link), true, "a local developer must be able to obtain the real link");
+  assert.equal(written.includes("token=abc123"), true, "a redacted token cannot be redeemed");
 
-  // The structured log records delivery but must not carry the credential.
+  // The retained structured log must still carry neither the credential
+  // nor the recipient. This half is unchanged and must stay true.
   const logged = logMock.mock.calls.map((call) => String(call.arguments[0])).join("");
-  assert.equal(logged.includes(link), false);
-  assert.equal(logged.includes("dev@example.test"), false);
+  assert.equal(logged.includes(link), false, "the retained log stream must not carry the bearer credential");
+  assert.equal(logged.includes("dev@example.test"), false, "the retained log stream must not carry the recipient");
   assert.equal(logged.includes("abc123"), false);
+  assert.match(logged, /magic_link\.queued/, "delivery is still recorded as a non-PII event");
 });
 
 test("the development magic-link sender refuses to run in a hosted environment", () => {
   for (const appEnv of ["staging", "production"]) {
-    assert.throws(() => createConsoleMagicLinkEmailSender(appEnv), /local-development only/);
+    assert.throws(() => createConsoleMagicLinkEmailSender(appEnv), /hosted environment/);
   }
+});
+
+// The guard above was unreachable in practice until this round: the route
+// called createConsoleMagicLinkEmailSender() with no argument, so appEnv
+// defaulted to "development" no matter where the code was deployed.
+test("hosted selection fails closed instead of degrading to the console sender", () => {
+  // `preview` is in this list because review (#28) found it missing. It is a
+  // hosted per-PR/per-SHA deployment, not a developer terminal, so falling
+  // through to the console sender wrote the raw recipient address and bearer
+  // link to the stderr of a hosted process and delivered the link to nobody.
+  for (const appEnv of ["preview", "staging", "production"]) {
+    assert.throws(
+      () => createMagicLinkEmailSender({ appEnv }),
+      /refusing to fall back to the local console sender/,
+      `${appEnv} without delivery configuration must not silently use the console sender`
+    );
+  }
+});
+
+test("the console sender itself refuses every hosted environment, not just staging and production", () => {
+  // Second boundary: even a caller that bypasses createMagicLinkEmailSender
+  // and constructs the console sender directly cannot get it in a hosted
+  // environment. Belt and braces on purpose -- the selector is the intended
+  // door, but this is the function that actually holds the credential.
+  for (const appEnv of ["preview", "staging", "production"]) {
+    assert.throws(
+      () => createConsoleMagicLinkEmailSender(appEnv),
+      /hosted environment/,
+      `${appEnv} must not be able to construct the console sender`
+    );
+  }
+  for (const appEnv of ["development", "test"]) {
+    assert.doesNotThrow(() => createConsoleMagicLinkEmailSender(appEnv));
+  }
+});
+
+test("a hosted preview with delivery configured is served by the real adapter", () => {
+  // The fix must not make preview unusable, only honest: configured
+  // delivery is accepted exactly as staging and production are.
+  assert.doesNotThrow(() =>
+    createMagicLinkEmailSender({
+      appEnv: "preview",
+      delivery: { endpoint: "https://mail.test/send", apiKey: "k", from: "no-reply@acme.test" }
+    })
+  );
+});
+
+test("local selection uses the console sender, and honours configured delivery when present", () => {
+  // No delivery configured: the console sender, which is what makes a
+  // local sign-in completable at all.
+  assert.doesNotThrow(() => createMagicLinkEmailSender({ appEnv: "development" }));
+  // Delivery configured locally (a mail catcher, say) is honoured rather
+  // than overridden.
+  assert.doesNotThrow(() =>
+    createMagicLinkEmailSender({
+      appEnv: "development",
+      delivery: { endpoint: "https://mail.test/send", apiKey: "k", from: "no-reply@acme.test" }
+    })
+  );
 });
