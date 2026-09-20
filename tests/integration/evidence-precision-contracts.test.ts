@@ -69,8 +69,16 @@ test("what the metric counts as corrected is what the reviewer's card shows as c
   const cardsShowingCorrection = cards.cards.filter((card) => card.correction !== undefined).length;
 
   const precision = summarizeEvidencePrecision([
-    { itemId: "o-python", revisions: revisions.filter((r) => r.outcome.criterionId === "python_production"), reviewed: true },
-    { itemId: "o-aws", revisions: revisions.filter((r) => r.outcome.criterionId === "aws_certification"), reviewed: true }
+    {
+      itemId: "o-python",
+      revisions: revisions.filter((r) => r.outcome.criterionId === "python_production"),
+      examinedVia: "item_correction"
+    },
+    {
+      itemId: "o-aws",
+      revisions: revisions.filter((r) => r.outcome.criterionId === "aws_certification"),
+      examinedVia: "candidate_decision"
+    }
   ]);
 
   assert.equal(cardsShowingCorrection, 1);
@@ -87,17 +95,24 @@ test("a chain of two corrections is one corrected card and one imprecise item", 
   const cards = buildCorrectedEvidenceCardSet(APPLICATION, ["python_production"], revisions);
   assert.equal(cards.cards.filter((card) => card.correction !== undefined).length, 1);
 
-  const precision = summarizeEvidencePrecision([{ itemId: "o", revisions, reviewed: true }]);
+  const precision = summarizeEvidencePrecision([{ itemId: "o", revisions, examinedVia: "item_correction" }]);
   assert.equal(precision.correctedItems, 1);
   assert.equal(precision.correctionEvents, 2, "the card shows one correction; the metric still knows there were two");
 });
 
 test("a precision sample validates as a MetricSample for either dataset", () => {
-  const precision = summarizeEvidencePrecision([
-    { itemId: "a", revisions: [original("a", "c1")], reviewed: true }
-  ]);
+  // Built per dataset, because each has its own record of what a human
+  // examined and a sample cannot be moved from one to the other.
+  const byDataset = {
+    live_pilot: summarizeEvidencePrecision([
+      { itemId: "a", revisions: [original("a", "c1")], examinedVia: "candidate_decision" }
+    ]),
+    locked_offline_eval: summarizeEvidencePrecision([
+      { itemId: "a", revisions: [original("a", "c1")], examinedVia: "offline_annotation" }
+    ])
+  } as const;
   for (const dataset of ["live_pilot", "locked_offline_eval"] as const) {
-    const sample = describeEvidencePrecision(precision, dataset, 1);
+    const sample = describeEvidencePrecision(byDataset[dataset], dataset, 1);
     metricSampleSchema.parse(sample);
     assert.equal(sample.metric, `evidence_precision_${dataset}`);
   }
@@ -105,7 +120,7 @@ test("a precision sample validates as a MetricSample for either dataset", () => 
 
 test("a suppressed precision figure cannot smuggle a value past the contract", () => {
   const precision = summarizeEvidencePrecision([
-    { itemId: "a", revisions: [original("a", "c1")], reviewed: true }
+    { itemId: "a", revisions: [original("a", "c1")], examinedVia: "candidate_decision" }
   ]);
   const suppressed = describeEvidencePrecision(precision, "live_pilot", 50);
   assert.equal(suppressed.value, null);
@@ -117,10 +132,80 @@ test("the two datasets stay distinguishable after crossing the contract boundary
   // If both serialised to the same metric name, a dashboard would pool
   // them -- which is the exact failure the separate targets exist to
   // prevent.
-  const precision = summarizeEvidencePrecision([
-    { itemId: "a", revisions: [original("a", "c1")], reviewed: true }
-  ]);
-  const live = metricSampleSchema.parse(describeEvidencePrecision(precision, "live_pilot", 1));
-  const offline = metricSampleSchema.parse(describeEvidencePrecision(precision, "locked_offline_eval", 1));
+  const live = metricSampleSchema.parse(
+    describeEvidencePrecision(
+      summarizeEvidencePrecision([
+        { itemId: "a", revisions: [original("a", "c1")], examinedVia: "candidate_decision" }
+      ]),
+      "live_pilot",
+      1
+    )
+  );
+  const offline = metricSampleSchema.parse(
+    describeEvidencePrecision(
+      summarizeEvidencePrecision([
+        { itemId: "a", revisions: [original("a", "c1")], examinedVia: "offline_annotation" }
+      ]),
+      "locked_offline_eval",
+      1
+    )
+  );
   assert.notEqual(live.metric, offline.metric);
+});
+
+test("only the items the reviewer's card shows as corrected can claim item-level examination", () => {
+  // The provenance half of the same cross-module claim. AF-49's card set
+  // is what a recruiter actually saw; the metric's denominator is what it
+  // says they examined. An item whose card shows no correction has no
+  // item-level record of being read, so claiming one has to fail here
+  // rather than quietly firming up the denominator.
+  const revisions = [
+    original("o-python", "python_production"),
+    correction("c-python", "python_production", "o-python"),
+    original("o-aws", "aws_certification")
+  ];
+  const cards = buildCorrectedEvidenceCardSet(APPLICATION, ["python_production", "aws_certification"], revisions);
+  const correctedCriteria = new Set(
+    cards.cards.filter((card) => card.correction !== undefined).map((card) => card.criterionId)
+  );
+
+  for (const criterionId of ["python_production", "aws_certification"]) {
+    const history = {
+      itemId: criterionId,
+      revisions: revisions.filter((r) => r.outcome.criterionId === criterionId),
+      examinedVia: "item_correction"
+    } as const;
+    if (correctedCriteria.has(criterionId)) {
+      assert.equal(summarizeEvidencePrecision([history]).correctedItems, 1);
+    } else {
+      assert.throws(
+        () => summarizeEvidencePrecision([history]),
+        /claims examinedVia item_correction but none of its revisions supersedes another/,
+        `${criterionId} has no correction on its card and must not be able to claim one`
+      );
+    }
+  }
+});
+
+test("the inference caveat survives the contract boundary as a code, not prose", () => {
+  // A limitation a dashboard cannot branch on is a limitation nobody
+  // applies. If examination_inferred were not in the closed set the
+  // contract validates, this sample would be rejected outright rather
+  // than arriving with the caveat attached.
+  const precision = summarizeEvidencePrecision([
+    { itemId: "a", revisions: [original("a", "c1")], examinedVia: "candidate_decision" },
+    { itemId: "b", revisions: [original("b", "c2")], examinedVia: "candidate_decision" }
+  ]);
+  const sample = metricSampleSchema.parse(describeEvidencePrecision(precision, "live_pilot", 1));
+  const inferred = sample.limitations.find((limitation) => limitation.code === "examination_inferred");
+  assert.ok(inferred, "a denominator built from candidate-level decisions must say so in a code");
+  assert.match(inferred.detail, /2 of 2 item\(s\)/);
+  assert.equal(
+    metricSampleSchema.safeParse({
+      ...sample,
+      limitations: [{ code: "examination_probably_fine", detail: "invented" }]
+    }).success,
+    false,
+    "the code set is closed, so the caveat cannot be renamed into something softer"
+  );
 });

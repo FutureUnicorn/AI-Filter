@@ -2202,7 +2202,16 @@ export const METRIC_LIMITATION_CODES = [
    * says the two sides were measured differently, this one says some of
    * the reference side was thrown away as unusable.
    */
-  "adjudication_not_independent"
+  "adjudication_not_independent",
+  /**
+   * AF-57. Part of the denominator counts as examined on the strength of
+   * a record about the candidate rather than about the item being
+   * counted. Like the two codes above, this is about the KIND of data
+   * and not the amount: the examination fact is at a coarser grain than
+   * the unit of the metric, so a larger sample does not make it any more
+   * certain that any single item was read.
+   */
+  "examination_inferred"
 ] as const;
 
 export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
@@ -2339,8 +2348,66 @@ export function describeFailedDocumentRate(
 // can be grown cheaply. There is deliberately no function here that
 // accepts both at once; the dataset is a required argument, and it
 // selects the metric name.
+//
+// **An item enters the denominator only by naming what proves a human
+// examined it.** The first version of this took a bare
+// `reviewed: boolean`, which asks the caller to assert the single fact
+// the metric cannot check and this stack does not record. Nothing
+// records it: evidence_outcomes (0016_evidence_outcomes.sql) stores what
+// was produced and what was corrected, candidate_decisions
+// (0019_candidate_decisions.sql), audit_sample_members
+// (0020_audit_samples.sql) and review_timing_spans
+// (0021_review_timing.sql) are all per application, and AF-53's focused
+// card index never leaves the browser. A bare boolean lets a caller
+// count items nobody opened and inflate precision, with the emitted
+// sample saying nothing about it.
+//
+// Narrowing the denominator to item-level proof is not the way out: a
+// correction is the only item-level record there is, so a denominator
+// made only of proven examinations is a denominator of corrected items,
+// and the metric would report 0 for ever. So the flag is replaced by the
+// fact behind it, and the weakest fact in the denominator is carried out
+// with the number. A correction proves the item it lands on was
+// examined. A locked-eval annotation proves it too, because every case
+// in evals/datasets/gold-set-v1.json carries an expected kind per
+// criterion, so each item was adjudicated one at a time. A decision
+// recorded on the candidate proves only that the candidate was handled:
+// it covers every item on that candidate at once, and it is all that is
+// available for the common case of an item a reviewer read and left
+// alone. Those still count -- excluding them is the always-0 metric
+// above -- but they attach `examination_inferred`, so what the
+// denominator rests on is machine-readable rather than a doc comment
+// nobody reads. Expect that code on every live-pilot sample until
+// something records per-item examination. That is the honest state of
+// the data, not noise.
 
 export type EvidencePrecisionDataset = "live_pilot" | "locked_offline_eval";
+
+export const EVIDENCE_EXAMINATION_SOURCES = [
+  /** Nobody is known to have looked at this item. It stays out of the denominator. */
+  "not_examined",
+  /**
+   * The item's own revision chain carries a human correction
+   * (0017_evidence_corrections.sql). Item-level proof, and the only kind
+   * a live pilot produces today.
+   */
+  "item_correction",
+  /**
+   * A locked-eval annotator labelled this item. Item-level proof, since
+   * an expected kind is recorded per criterion rather than per case, and
+   * it exists only for the offline dataset.
+   */
+  "offline_annotation",
+  /**
+   * A decision was recorded on the candidate (0019_candidate_decisions.sql).
+   * That the candidate was handled, not that this item was read: one
+   * decision covers every item on the candidate at once. An inference,
+   * counted but declared.
+   */
+  "candidate_decision"
+] as const;
+
+export type EvidenceExaminationSource = (typeof EVIDENCE_EXAMINATION_SOURCES)[number];
 
 export interface EvidenceItemHistory {
   /** Stable identity across corrections: the root of the revision chain. */
@@ -2348,25 +2415,37 @@ export interface EvidenceItemHistory {
   /** Every revision of this one item, in any order. */
   readonly revisions: readonly EvidenceRevision[];
   /**
-   * Whether a human examined this item -- a decision was recorded on the
-   * candidate, or the item itself was corrected. Not derivable from the
-   * revisions alone, because the common case is an item a reviewer read
-   * and left alone, which leaves no trace on the item.
+   * What establishes that a human examined this item. Deliberately not a
+   * boolean: examination is asserted by the caller and cannot be checked
+   * here, so the assertion has to name the record it rests on and carry
+   * that record's weakness into the reported sample.
    */
-  readonly reviewed: boolean;
+  readonly examinedVia: EvidenceExaminationSource;
 }
 
 export interface EvidencePrecision {
-  /** 1 - (corrected / reviewed). null when nothing has been reviewed. */
+  /** 1 - (corrected / examined). null when nothing has been examined. */
   readonly precision: number | null;
   /** Items a human examined: the denominator. */
-  readonly reviewedItems: number;
-  /** Reviewed items that needed at least one correction. */
+  readonly examinedItems: number;
+  /** Examined items that needed at least one correction. */
   readonly correctedItems: number;
-  /** Items produced, reviewed or not: the population. */
+  /** Items produced, examined or not: the population. */
   readonly producedItems: number;
   /**
-   * Corrections applied across reviewed items, counting repeats. Reported
+   * Denominator items counted as examined because a decision was
+   * recorded on the candidate, with nothing recorded against the item.
+   * Drives `examination_inferred`.
+   */
+  readonly inferredExaminations: number;
+  /**
+   * Denominator items examined by a locked-eval annotator. Tracked
+   * separately from the inferred count because it is proof rather than
+   * inference, and because it belongs to exactly one dataset.
+   */
+  readonly annotatedExaminations: number;
+  /**
+   * Corrections applied across examined items, counting repeats. Reported
    * beside correctedItems rather than folded into it: an item corrected
    * three times is one imprecise item for this metric, but three
    * corrections is a different and worse story than one, and only the
@@ -2381,14 +2460,25 @@ export interface EvidencePrecision {
  * Counting correction events instead would let a single stubborn item
  * push the rate below any target on its own, and the number would stop
  * meaning "share of items" while still being named that.
+ *
+ * `examinedVia` has to agree with the revisions in both directions. A
+ * correction is a human act, so an item carrying one was examined by
+ * definition and cannot be attributed to anything weaker; and an item
+ * with no correction cannot claim `item_correction`, which is the only
+ * way a caller could otherwise assert item-level proof for an item no
+ * record covers. Both are contradictory input rather than edge cases:
+ * each hides a bug in whatever built the histories, and that bug moves
+ * the denominator.
  */
 export function summarizeEvidencePrecision(
   items: readonly EvidenceItemHistory[]
 ): EvidencePrecision {
   const seen = new Set<string>();
-  let reviewedItems = 0;
+  let examinedItems = 0;
   let correctedItems = 0;
   let correctionEvents = 0;
+  let inferredExaminations = 0;
+  let annotatedExaminations = 0;
 
   for (const item of items) {
     if (seen.has(item.itemId)) {
@@ -2403,22 +2493,31 @@ export function summarizeEvidencePrecision(
       (revision) => revision.supersedesEvidenceOutcomeId !== undefined
     ).length;
 
-    if (corrections > 0 && !item.reviewed) {
-      // Contradictory input rather than an edge case: a correction is a
-      // human act, so the item was examined by definition. Silently
-      // flipping the flag would hide a bug in whatever computed it, and
-      // that bug moves the denominator.
+    if (corrections > 0 && item.examinedVia !== "item_correction") {
       throw new Error(
-        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s) but is marked unreviewed`
+        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s), ` +
+          `which is item-level proof of examination, but claims examinedVia ${item.examinedVia}`
       );
     }
-    if (!item.reviewed) {
+    if (corrections === 0 && item.examinedVia === "item_correction") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia item_correction ` +
+          "but none of its revisions supersedes another"
+      );
+    }
+    if (item.examinedVia === "not_examined") {
       continue;
     }
-    reviewedItems += 1;
+    examinedItems += 1;
     correctionEvents += corrections;
     if (corrections > 0) {
       correctedItems += 1;
+    }
+    if (item.examinedVia === "candidate_decision") {
+      inferredExaminations += 1;
+    }
+    if (item.examinedVia === "offline_annotation") {
+      annotatedExaminations += 1;
     }
   }
 
@@ -2426,10 +2525,12 @@ export function summarizeEvidencePrecision(
     // null, never 1. Perfect precision over an empty denominator is what
     // a pilot that has not started yet would report, and it is the single
     // most quotable wrong number this metric could produce.
-    precision: reviewedItems === 0 ? null : (reviewedItems - correctedItems) / reviewedItems,
-    reviewedItems,
+    precision: examinedItems === 0 ? null : (examinedItems - correctedItems) / examinedItems,
+    examinedItems,
     correctedItems,
     producedItems: items.length,
+    inferredExaminations,
+    annotatedExaminations,
     correctionEvents
   };
 }
@@ -2438,21 +2539,67 @@ export function summarizeEvidencePrecision(
  * Precision as a reportable metric, for one dataset at a time.
  *
  * `population` is every item produced and `sampleSize` is only those
- * reviewed, so an unread backlog surfaces as population_incomplete
+ * examined, so an unread backlog surfaces as population_incomplete
  * without anyone having to remember to mention it.
+ *
+ * A denominator resting on candidate-level decisions is reported, with
+ * `examination_inferred` attached. Suppressing the number instead would
+ * suppress every live-pilot figure this product can currently produce,
+ * and a metric nobody can compute is not a safer metric: it is the same
+ * claim made in a slide deck with nothing attached to it at all.
  */
 export function describeEvidencePrecision(
   precision: EvidencePrecision,
   dataset: EvidencePrecisionDataset,
   minimumSampleSize: number
 ): MetricSample {
-  return summarizeMetric({
+  // Each dataset has exactly one examination record of its own, so a
+  // denominator built from the other one's is a pooled sample wearing a
+  // single name. That is the failure the two targets exist to prevent,
+  // arriving by a different route than a shared metric name -- which is
+  // the only route the dataset argument closes on its own.
+  if (dataset === "live_pilot" && precision.annotatedExaminations > 0) {
+    throw new Error(
+      `describeEvidencePrecision: ${precision.annotatedExaminations} item(s) examined by a locked-eval ` +
+        "annotator cannot be reported as live_pilot precision"
+    );
+  }
+  if (dataset === "locked_offline_eval" && precision.inferredExaminations > 0) {
+    throw new Error(
+      `describeEvidencePrecision: ${precision.inferredExaminations} item(s) examined only via a candidate ` +
+        "decision cannot be reported as locked_offline_eval precision; the locked eval has no recruiters"
+    );
+  }
+
+  const sample = summarizeMetric({
     metric: `evidence_precision_${dataset}`,
     value: precision.precision,
-    sampleSize: precision.reviewedItems,
+    sampleSize: precision.examinedItems,
     population: precision.producedItems,
     minimumSampleSize
   });
+
+  if (precision.inferredExaminations === 0) {
+    return sample;
+  }
+  // Attached even when the value is suppressed, for the reason AF-55
+  // gives: this describes how the denominator was built, not how large
+  // it is, and a caveat that appeared and vanished with sample size
+  // would read as being about sample size.
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "examination_inferred",
+        detail:
+          `${precision.inferredExaminations} of ${precision.examinedItems} item(s) in the denominator ` +
+          "count as examined because a decision was recorded on the candidate, not because anything " +
+          "records that this item was read; nothing in this system captures per-item examination, so an " +
+          "item a reviewer scrolled past is indistinguishable here from one they checked and accepted"
+      }
+    ]
+  };
 }
 
 // ---- AF-56: qualified-candidate preservation ----
