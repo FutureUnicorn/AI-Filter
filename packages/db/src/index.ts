@@ -1179,6 +1179,224 @@ export async function seedOrganizationMembership(
   }
 }
 
+// ---- AF-100: the database half of the shared HTTP route harness ----
+//
+// provisionRouteProbeSchema and provisionFileIntakeRouteSchema above are each
+// scoped to one feature's migrations and one seeded actor, which is why every
+// route ticket that wanted request-level coverage had to add a third. This one
+// is deliberately general: it applies the whole chain a session-gated write
+// endpoint needs and seeds one member per role, so a test picks the capability
+// it is exercising instead of provisioning for it.
+//
+// It lives in packages/db for the same reason the two above do -- `pg` is a
+// dependency of this package and tests do not import it directly.
+
+export interface ApiRouteProbeMember {
+  readonly userId: string;
+  readonly email: string;
+}
+
+export interface ApiRouteProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly intakeId: string;
+  readonly applicationId: string;
+  /** The criterion the seeded pipeline evidence was filed under. */
+  readonly criterionId: string;
+  /** One member per role, so a test names the capability rather than the user. */
+  readonly members: Readonly<Record<MembershipRole, ApiRouteProbeMember>>;
+  /**
+   * A real, session-capable user who belongs to a DIFFERENT organization.
+   *
+   * Seeded by default because "authenticated but not a member here" is the
+   * case a route test most often has to distinguish from "not signed in", and
+   * a test that has to provision a second tenant itself usually does not.
+   */
+  readonly outsider: ApiRouteProbeMember;
+  readonly outsiderOrganizationId: string;
+}
+
+/**
+ * The full set, in dependency order.
+ *
+ * Trimming it is not safe in either direction: 0020_candidate_decisions.sql's
+ * composite foreign key onto applications needs the unique constraint
+ * 0016_applications_and_import_finalization.sql adds, and that one needs
+ * 0013_file_intakes.sql. The first-decision probe's comment records the same
+ * finding. 0022_idempotent_requests.sql is here because every mutating
+ * endpoint this harness drives requires an Idempotency-Key, so a schema
+ * without it fails at the first POST.
+ */
+const API_ROUTE_MIGRATIONS = [
+  "0002_organizations_users_memberships.sql",
+  "0006_evidence_extraction_runs.sql",
+  "0009_roles.sql",
+  "0013_file_intakes.sql",
+  "0016_applications_and_import_finalization.sql",
+  "0017_evidence_outcomes.sql",
+  "0018_evidence_corrections.sql",
+  "0019_correction_attribution.sql",
+  "0020_candidate_decisions.sql",
+  "0021_single_decision_root.sql",
+  "0022_idempotent_requests.sql"
+] as const;
+
+export async function provisionApiRouteSchema(
+  databaseUrl: string,
+  options: { readonly criterionId?: string } = {}
+): Promise<ApiRouteProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `api_route_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const outsiderOrganizationId = "22222222-2222-4222-8222-222222222222";
+  const criterionId = options.criterionId ?? "postgres";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of API_ROUTE_MIGRATIONS) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Route Harness Org')`, [
+      organizationId
+    ]);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Other Tenant')`, [
+      outsiderOrganizationId
+    ]);
+
+    const seedMember = async (
+      organization: string,
+      role: MembershipRole,
+      label: string
+    ): Promise<ApiRouteProbeMember> => {
+      const email = `${label}_${suffix}@acme.test`;
+      const inserted = await admin.query<{ user_id: string }>(
+        `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING user_id`,
+        [email, `Route Harness ${role}`]
+      );
+      const userId = inserted.rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error(`provisionApiRouteSchema did not produce a user row for ${role}`);
+      }
+      await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, $3)`, [
+        organization,
+        userId,
+        role
+      ]);
+      return { userId, email };
+    };
+
+    const members = {
+      owner: await seedMember(organizationId, "owner", "owner"),
+      admin: await seedMember(organizationId, "admin", "admin"),
+      recruiter: await seedMember(organizationId, "recruiter", "recruiter"),
+      auditor: await seedMember(organizationId, "auditor", "auditor")
+    } as const;
+    const outsider = await seedMember(outsiderOrganizationId, "recruiter", "outsider");
+
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Route Harness Role', $2)
+       RETURNING role_id`,
+      [organizationId, members.owner.userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'candidates.csv', 'text/csv', $4)
+       RETURNING intake_id`,
+      [organizationId, roleId, `api-route/${suffix}/candidates.csv`, members.recruiter.userId]
+    );
+    const intakeId = intake.rows[0]?.intake_id;
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications
+         (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Casey Harness', $4)
+       RETURNING application_id`,
+      [organizationId, roleId, intakeId, `casey_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (roleId === undefined || intakeId === undefined || applicationId === undefined) {
+      throw new Error("provisionApiRouteSchema did not produce a role, intake and application");
+    }
+
+    // One pipeline-authored outcome, so a correction has something to
+    // supersede. Written here rather than through recordEvidenceOutcome
+    // because that opens a pooled connection against the schema this
+    // function is still building.
+    const outcome = {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      kind: "supported",
+      organizationId,
+      candidateId: applicationId,
+      criterionId,
+      citation: {
+        document: "candidates.csv",
+        pageOrSection: "Experience",
+        offset: 0,
+        quote: "Ran Postgres in production for four years."
+      }
+    };
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [organizationId, applicationId, criterionId, "supported", JSON.stringify(outcome)]
+    );
+
+    return {
+      schema,
+      organizationId,
+      roleId,
+      intakeId,
+      applicationId,
+      criterionId,
+      members,
+      outsider,
+      outsiderOrganizationId
+    };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Read rows straight out of a probe schema.
+ *
+ * The harness's whole point is to check what a real request left behind, and
+ * the package's own readers answer only the questions their features needed --
+ * `listCandidateDecisionsForApplication` returns the derived history, not the
+ * `decided_by_user_id` column a test wants to compare against the session
+ * user. Rather than add a bespoke reader per assertion, tests get this.
+ *
+ * Reads only. The guard is not about untrusted input (callers are test files)
+ * but about what this export can become: a general writer here would be a way
+ * to put rows in the database without going through the writers whose
+ * constraints and transactions are the thing under test.
+ */
+export async function readProbeRows<TRow extends Record<string, unknown>>(
+  databaseUrl: string,
+  schema: string,
+  sql: string,
+  parameters: readonly unknown[] = []
+): Promise<readonly TRow[]> {
+  assertSafeSchema(schema);
+  if (!/^\s*select\s/iu.test(sql)) {
+    throw new Error("readProbeRows runs SELECT statements only; use the package's writers to change rows");
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(`SET search_path TO "${schema}"`);
+    const result = await client.query<TRow>(sql, [...parameters]);
+    return result.rows;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-23: role creation ----
 
 export interface CreateRoleInput {

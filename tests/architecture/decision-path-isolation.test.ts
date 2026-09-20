@@ -10,6 +10,22 @@ import { fileURLToPath } from "node:url";
 // dependency rule already forbids packages/ai -> packages/db, which is
 // the structural half; these assert the parts that rule does not cover
 // and that a future refactor could quietly undo.
+//
+// AF-100 moved two assertions out of this file, because a real request
+// answers them better than a source-text match can:
+//
+//   * "the endpoint takes its actor from the session, never from the request
+//     body" matched the strings `readSessionUserId(request)` and
+//     `decidedByUserId: userId`. Both survive in a handler that reads the
+//     session and then prefers an `x-acting-user` header -- confirmed by
+//     writing that handler and watching this file stay green.
+//   * the verb inventory was a regex over `export async function ([A-Z]+)(`,
+//     which counts a match inside a comment or a string.
+//
+// Both now live in tests/integration/api-route-harness.test.ts, which signs a
+// request as one member, supplies another member's id down every channel a
+// handler could read, and checks the row. What stays here is what no request
+// can reach: whether another layer can name the recorder at all.
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -44,22 +60,13 @@ test("the decision recorder always requires a named human, with no defaulted act
   );
 });
 
-test("the decision endpoint takes its actor from the session, never from the request body", () => {
-  const route = readFileSync(
-    join(
-      repositoryRoot,
-      "apps/web/src/app/api/roles/[roleId]/applications/[applicationId]/decisions/route.ts"
-    ),
-    "utf8"
-  );
-  assert.ok(route.includes("readSessionUserId(request)"), "the actor must come from the session");
-  assert.ok(
-    route.includes("decidedByUserId: userId"),
-    "the recorded actor must be the session user, not a value from the payload"
-  );
-  // A strictObject input schema is what turns "we ignore a decidedByUserId
-  // in the body" into "we reject it", which is the difference between a
-  // convention and a boundary.
+test("the input contract offers no way to name a decider", () => {
+  // The other half of "the actor comes from the session" is that a body
+  // field naming one is rejected rather than ignored -- the difference
+  // between a convention and a boundary. That rejection is exercised as a
+  // 400 in api-route-harness.test.ts; what is checked here is the property
+  // no single request can show, that the schema admits no such field under
+  // any name the endpoint would accept.
   const contracts = readFileSync(join(repositoryRoot, "packages/contracts/src/index.ts"), "utf8");
   const schema = contracts.slice(contracts.indexOf("recordCandidateDecisionInputSchema"));
   const declaration = schema.slice(0, schema.indexOf("});"));
@@ -68,18 +75,4 @@ test("the decision endpoint takes its actor from the session, never from the req
     !declaration.includes("decidedByUserId"),
     "the input schema must offer no way to name a decider"
   );
-});
-
-test("no HTTP verb other than POST and GET exists on the decision endpoint", () => {
-  // A PATCH or PUT would be a second way to change a status, and the
-  // ticket's first clause is that there is only one.
-  const route = readFileSync(
-    join(
-      repositoryRoot,
-      "apps/web/src/app/api/roles/[roleId]/applications/[applicationId]/decisions/route.ts"
-    ),
-    "utf8"
-  );
-  const handlers = [...route.matchAll(/export async function ([A-Z]+)\(/gu)].map((match) => match[1]);
-  assert.deepEqual([...handlers].sort(), ["GET", "POST"]);
 });
