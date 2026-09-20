@@ -172,6 +172,24 @@ test("an end-to-end report still carries no candidate identifier", () => {
   }
 });
 
+test("the corrections line and the precision line are two readings of one denominator", () => {
+  // buildRoleAuditReport now refuses a report whose corrections and
+  // evidence_precision_live_pilot disagree on how many items a human
+  // reviewed. This asserts that constraint is the one the real producers
+  // already satisfy rather than a rule invented at the report boundary:
+  // describeEvidencePrecision takes sampleSize straight from the same
+  // EvidencePrecision the corrections are read off.
+  const { report, precision, metrics } = assembled();
+  assert.equal(report.corrections?.reviewedItems, precision.reviewedItems);
+  assert.equal(metrics.evidence_precision_live_pilot?.sampleSize, precision.reviewedItems);
+
+  const rendered = renderRoleAuditReport(report);
+  // The reader can divide one line and land on the other: 1 of 3
+  // corrected is the 66.7% printed above it.
+  assert.match(rendered, /Evidence precision\n {2}66\.7% \(from 3 of 4\)/);
+  assert.match(rendered, /1 of 3 reviewed evidence items were corrected, across 1 correction\(s\)\./);
+});
+
 test("a metric that was never computed is visible as not measured, end to end", () => {
   const { report } = assembled();
   assert.equal(report.metrics.failed_document_rate, null);

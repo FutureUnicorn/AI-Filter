@@ -38,7 +38,7 @@ function report(overrides: Record<string, unknown> = {}) {
     roleId: ROLE,
     generatedAt: "2026-08-29T18:00:00.000Z",
     metrics: metrics(),
-    corrections: { reviewedItems: 200, correctedItems: 3, correctionEvents: 4 },
+    corrections: { reviewedItems: 40, correctedItems: 3, correctionEvents: 4 },
     auditSample: { seed: "pilot-1", eligibleCount: 60, sampledCount: 10 },
     ...overrides
   });
@@ -147,9 +147,112 @@ test("more corrected items than reviewed items is rejected", () => {
   );
 });
 
+// REV-001. correctedItems > reviewedItems was the only correction
+// invariant checked, and it is a comparison, so every input that is not a
+// count at all slipped past it: -1 > 40 is false, NaN > 40 is false. The
+// remaining cases below are the same defect, not extra polish -- each one
+// prints a specific impossible sentence into a document read without a
+// login and without anyone present to question it.
+
+test("a negative corrected count is rejected rather than printed as a correction", () => {
+  // -1 > reviewedItems is false, so the old comparison waved this through
+  // and the report printed "-1 of 40 reviewed evidence items".
+  assert.throws(
+    () => report({ corrections: { reviewedItems: 40, correctedItems: -1, correctionEvents: 0 } }),
+    /corrections requires a non-negative integer correctedItems, got: -1/
+  );
+});
+
+test("a correction count that is not a number at all is rejected", () => {
+  // Every comparison against NaN is false, so NaN was the one value that
+  // passed the old check by construction and rendered as "NaN of 40".
+  assert.throws(
+    () => report({ corrections: { reviewedItems: 40, correctedItems: Number.NaN, correctionEvents: 4 } }),
+    /corrections requires a non-negative integer correctedItems, got: NaN/
+  );
+});
+
+test("a fractional reviewed count is rejected", () => {
+  // Items are counted, not measured. A fraction means whatever produced
+  // it was not counting items.
+  assert.throws(
+    () => report({ corrections: { reviewedItems: 40.5, correctedItems: 3, correctionEvents: 4 } }),
+    /corrections requires a non-negative integer reviewedItems, got: 40\.5/
+  );
+});
+
+test("fewer correction events than corrected items is rejected", () => {
+  // Correcting an item is what produces an event, so events below
+  // corrected items means one of the two numbers is counting something
+  // other than what the report says it is.
+  assert.throws(
+    () => report({ corrections: { reviewedItems: 40, correctedItems: 3, correctionEvents: 2 } }),
+    /2 correction event\(s\) cannot account for 3 corrected item\(s\)/
+  );
+});
+
+test("corrections and the precision metric cannot disagree on how many items were reviewed", () => {
+  // Both are AF-57's, over one set of reviewed items, and the report
+  // prints both denominators. Two different ones let a reader divide the
+  // corrections line and get a precision other than the one printed
+  // directly above it.
+  assert.throws(
+    () => report({ corrections: { reviewedItems: 41, correctedItems: 3, correctionEvents: 4 } }),
+    /corrections cover 41 reviewed item\(s\) but evidence_precision_live_pilot was computed over 40/
+  );
+});
+
+test("an audit sample larger than the set it was drawn from is rejected", () => {
+  // The report states that re-running the selection with this seed
+  // reproduces this sample. A draw of 10 from 5 eligible candidates
+  // cannot be reproduced by anyone, so the report would be inviting a
+  // check guaranteed to fail and calling the result provenance.
+  assert.throws(
+    () => report({ auditSample: { seed: "pilot-1", eligibleCount: 5, sampledCount: 10 } }),
+    /claims 10 of 5 eligible candidates; a draw cannot exceed what it was drawn from/
+  );
+});
+
+test("a blank audit sample seed is rejected", () => {
+  // Printed the same as a real one, and explains nothing. audit_samples
+  // CHECKs seed ~ '[^[:space:]]' for this reason; the report accepted
+  // what its own store rejects.
+  assert.throws(
+    () => report({ auditSample: { seed: "   ", eligibleCount: 60, sampledCount: 10 } }),
+    /seed cannot be blank/
+  );
+});
+
+test("a negative eligible count is rejected", () => {
+  assert.throws(
+    () => report({ auditSample: { seed: "pilot-1", eligibleCount: -1, sampledCount: 0 } }),
+    /auditSample requires a non-negative integer eligibleCount, got: -1/
+  );
+});
+
+test("a selection that repeats a candidate is rejected while the ids are still there to prove it", () => {
+  // describeAuditSampleProvenance is the last place the ids exist. A
+  // repeated id counts one candidate twice, so the published sampledCount
+  // stops matching anything a reproducer can reach -- and every stage
+  // after this one has thrown away the evidence needed to notice.
+  assert.throws(
+    () =>
+      describeAuditSampleProvenance({
+        seed: "pilot-1",
+        eligibleCount: 4,
+        sampledApplicationIds: [
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        ]
+      }),
+    /repeats an application id, so sampledCount would overstate the draw/
+  );
+});
+
 test("corrections report items and events separately", () => {
   const rendered = renderRoleAuditReport(report());
-  assert.match(rendered, /3 of 200 reviewed evidence items were corrected, across 4 correction\(s\)\./);
+  assert.match(rendered, /3 of 40 reviewed evidence items were corrected, across 4 correction\(s\)\./);
 });
 
 test("the audit sample tells the employer how to reproduce it", () => {

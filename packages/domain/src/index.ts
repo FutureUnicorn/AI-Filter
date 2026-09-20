@@ -2379,10 +2379,23 @@ export interface AuditSampleProvenance {
 }
 
 export function describeAuditSampleProvenance(selection: AuditSampleSelection): AuditSampleProvenance {
+  const distinct = new Set(selection.sampledApplicationIds);
+  if (distinct.size !== selection.sampledApplicationIds.length) {
+    // This is the last place the ids exist. sampledCount is published
+    // beside a claim that re-running the draw reproduces the sample, and
+    // a repeated id counts one candidate twice -- so the published count
+    // no longer matches anything a reproducer can arrive at, and every
+    // stage after this one has lost the evidence needed to notice. The
+    // store rejects it too: audit_sample_members is UNIQUE on
+    // (audit_sample_id, application_id).
+    throw new Error(
+      "describeAuditSampleProvenance: the selection repeats an application id, so sampledCount would overstate the draw"
+    );
+  }
   return {
     seed: selection.seed,
     eligibleCount: selection.eligibleCount,
-    sampledCount: selection.sampledApplicationIds.length
+    sampledCount: distinct.size
   };
 }
 
@@ -2412,6 +2425,27 @@ export interface BuildRoleAuditReportInput {
   readonly auditSample: AuditSampleProvenance | null;
 }
 
+/**
+ * Every figure this report prints has to survive a reader with no one
+ * present to explain it, so each one is checked here before it can be
+ * published.
+ *
+ * The metrics do not need it: summarizeMetric is a real constructor and
+ * refuses a non-integer count, a sampleSize above its population and a
+ * non-finite value, so the only thing left for this boundary to check is
+ * the one fact the constructor cannot know, which key the sample was
+ * filed under. CorrectionSummary and AuditSampleProvenance had no such
+ * constructor -- they are bare interfaces assembled at the call site --
+ * and so reached the renderer with nothing checked at all.
+ */
+function assertPublishableCounts(context: string, counts: Readonly<Record<string, number>>): void {
+  for (const [name, value] of Object.entries(counts)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${context} requires a non-negative integer ${name}, got: ${value}`);
+    }
+  }
+}
+
 export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = input.metrics[metric];
@@ -2424,11 +2458,72 @@ export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAudi
       );
     }
   }
-  if (input.corrections !== null && input.corrections.correctedItems > input.corrections.reviewedItems) {
-    throw new Error(
-      "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
-    );
+
+  const corrections = input.corrections;
+  if (corrections !== null) {
+    assertPublishableCounts("buildRoleAuditReport: corrections", {
+      reviewedItems: corrections.reviewedItems,
+      correctedItems: corrections.correctedItems,
+      correctionEvents: corrections.correctionEvents
+    });
+    if (corrections.correctedItems > corrections.reviewedItems) {
+      throw new Error(
+        "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
+      );
+    }
+    if (corrections.correctionEvents < corrections.correctedItems) {
+      // Correcting an item is what produces a correction event, so events
+      // below corrected items is not a small discrepancy: one of the two
+      // numbers is measuring something other than what the report says it
+      // is, and the reader has no way to tell which.
+      throw new Error(
+        `buildRoleAuditReport: ${corrections.correctionEvents} correction event(s) cannot account for ` +
+          `${corrections.correctedItems} corrected item(s); correcting an item takes at least one event`
+      );
+    }
+    const precision = input.metrics.evidence_precision_live_pilot;
+    if (precision !== null && precision.sampleSize !== corrections.reviewedItems) {
+      // Both figures are AF-57's, over one set of reviewed items, and the
+      // report prints both: "(from N of M)" under Evidence precision and
+      // "x of N reviewed evidence items" under Corrections. Two different
+      // N's is a document that contradicts itself, and a reader who
+      // divides the corrections line gets a precision that is not the one
+      // printed above it.
+      throw new Error(
+        `buildRoleAuditReport: corrections cover ${corrections.reviewedItems} reviewed item(s) but ` +
+          `evidence_precision_live_pilot was computed over ${precision.sampleSize}; the report would print ` +
+          "two different denominators for the same set"
+      );
+    }
   }
+
+  const auditSample = input.auditSample;
+  if (auditSample !== null) {
+    assertPublishableCounts("buildRoleAuditReport: auditSample", {
+      eligibleCount: auditSample.eligibleCount,
+      sampledCount: auditSample.sampledCount
+    });
+    if (auditSample.seed.trim().length === 0) {
+      // The report prints the seed as the thing that makes the draw
+      // checkable. A blank one is printed just the same and explains
+      // nothing, which is why audit_samples CHECKs it in the store.
+      throw new Error(
+        "buildRoleAuditReport: the audit sample seed cannot be blank; it is what makes the draw reproducible"
+      );
+    }
+    if (auditSample.sampledCount > auditSample.eligibleCount) {
+      // The report tells the reader that re-running the selection with
+      // this seed reproduces this sample. A draw larger than the set it
+      // came from cannot be reproduced by anyone, so the report would be
+      // inviting a check that is guaranteed to fail and calling that
+      // provenance.
+      throw new Error(
+        `buildRoleAuditReport: the audit sample claims ${auditSample.sampledCount} of ` +
+          `${auditSample.eligibleCount} eligible candidates; a draw cannot exceed what it was drawn from`
+      );
+    }
+  }
+
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     organizationId: input.organizationId,
