@@ -79,9 +79,16 @@ domain.
 ## Preview lifecycle
 
 Preview deployment is triggered by a completed successful `CI` workflow for a
-same-repository pull request. The workflow checks out
-`workflow_run.head_sha`, verifies the checked-out SHA, and deploys through a
-runner labelled `signal-audit-preview`.
+same-repository pull request based on `develop` or `main`. The workflow checks
+out `workflow_run.head_sha`, verifies the checked-out SHA, and deploys through
+a runner labelled `signal-audit-preview`.
+
+AF-93: deploy and cleanup must agree on this scope, or a PR gets a preview
+created that nothing ever reclaims except the 72-hour TTL sweep. Every
+checkout in this workflow (deploy, cleanup, and sweep) also sets
+`clean: false` -- `actions/checkout` defaults to wiping every gitignored file,
+and `.runtime/previews/` (the record of which previews exist) is gitignored,
+so the default checkout destroyed that record before each job could read it.
 
 Each preview receives:
 

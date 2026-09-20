@@ -5,7 +5,7 @@ on:
     workflows: ["CI"]
     types: [completed]
   pull_request_target:
-    branches: [develop]
+    branches: [develop, main]
     types: [closed]
   schedule:
     - cron: "17 3 * * *"
@@ -30,6 +30,10 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.pull_requests[0] != null &&
+      (
+        github.event.workflow_run.pull_requests[0].base.ref == 'develop' ||
+        github.event.workflow_run.pull_requests[0].base.ref == 'main'
+      ) &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: [self-hosted, linux, x64, signal-audit-preview]
     timeout-minutes: 30
@@ -42,6 +46,7 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
+          clean: false
       - name: Verify and deploy isolated preview
         env:
           PREVIEW_BASE_DOMAIN: ${{ vars.PREVIEW_BASE_DOMAIN }}
@@ -65,6 +70,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+          clean: false
       - name: Remove the closed PR environment
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -83,6 +89,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+          clean: false
       - name: Remove orphaned preview environments
         env:
           PREVIEW_TTL_HOURS: ${{ vars.PREVIEW_TTL_HOURS || '72' }}

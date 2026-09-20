@@ -69,6 +69,40 @@ test("preview lifecycle is green-SHA scoped with close and TTL cleanup", () => {
   assert.match(workflow, /preview sweep/u);
 });
 
+/**
+ * AF-93, finding 1. `actions/checkout` defaults to `clean: true`, which runs
+ * `git clean -ffdx` -- the `-x` includes gitignored files. `.runtime/previews/`
+ * is gitignored (it holds generated per-preview credentials), so the default
+ * checkout at the start of every job destroyed the one record deploy, cleanup,
+ * and sweep all need to find an existing preview before they can replace or
+ * remove it. `clean: false` is required on every checkout in this workflow, not
+ * just one, since all three jobs read that same state.
+ */
+test("preview jobs never wipe the gitignored runtime state they depend on", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  const checkoutSteps = [...workflow.matchAll(/uses: actions\/checkout@[^\n]+\n([\s\S]*?)(?=\n {6}- name:|\n {4}\S|$)/gu)];
+  assert.ok(checkoutSteps.length >= 3, `expected at least 3 checkout steps, found ${checkoutSteps.length}`);
+  for (const [, withBlock] of checkoutSteps) {
+    assert.match(withBlock ?? "", /clean: false/u, `every checkout in this workflow must set clean: false:\n${withBlock}`);
+  }
+});
+
+/**
+ * AF-93, finding 2. Deploy and cleanup used to disagree about which PRs get a
+ * preview: deploy was unrestricted (any base branch), cleanup only fired for
+ * PRs based on develop. A PR based on anywhere else got a preview created and
+ * never reclaimed except by the 72-hour TTL sweep. Restricting deploy to the
+ * same develop/main bases cleanup already covers also matters now that AF-92
+ * runs CI on feature/** PRs too -- without this, every stacked feature PR
+ * would try to stand up a full preview stack on the one preview host.
+ */
+test("preview creation and preview cleanup agree on which PRs are in scope", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  assert.match(workflow, /pull_requests\[0\]\.base\.ref == 'develop'/u);
+  assert.match(workflow, /pull_requests\[0\]\.base\.ref == 'main'/u);
+  assert.match(workflow, /pull_request_target:\s*\n\s+branches: \[develop, main\]/u);
+});
+
 test("staging and production deploy only exact green revisions", () => {
   const staging = read(".github/workflows/staging-environment.yml");
   const production = read(".github/workflows/production-gate.yml");
