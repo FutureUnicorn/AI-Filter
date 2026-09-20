@@ -2011,12 +2011,24 @@ export interface ReviewTimingSummary {
    * is the specific way this metric could flatter the product.
    */
   readonly medianActiveMs: number | null;
-  /** Applications with at least one usable span. The denominator. */
+  /** Applications whose review time is FULLY observed. The denominator. */
   readonly sampleSize: number;
   /** Applications in scope, whether or not they were ever opened. */
   readonly population: number;
   /** Spans excluded because an idle cutoff ended them. */
   readonly truncatedSpanCount: number;
+  /**
+   * Applications kept out of the denominator because at least one of
+   * their spans hit an idle cutoff, so their total is a lower bound
+   * rather than a measurement.
+   *
+   * Reported at application grain because truncatedSpanCount cannot
+   * answer the question that matters to a reader: how much of the scope
+   * was dropped. sampleSize + partiallyObservedCount accounts for every
+   * application that was opened at all, and the remainder of population
+   * is the set nobody has reviewed yet.
+   */
+  readonly partiallyObservedCount: number;
 }
 
 /**
@@ -2035,16 +2047,38 @@ export interface ReviewTimingSummary {
  * bias the baseline downward -- again in the direction that flatters a
  * later improvement -- and excluding it silently would hide how much
  * data was dropped, which is why the count is reported.
+ *
+ * The whole APPLICATION leaves the denominator, not just the span.
+ * Dropping the span alone keeps an application whose real total is
+ * unknown in the sample carrying only the part we happened to see: one
+ * five-minute visit followed by an idle-truncated one is counted as a
+ * five-minute review. That understates the median, and if every
+ * application has that shape then sampleSize still equals population,
+ * so the result carries no limitation at all and reads as a complete
+ * measurement. Understating the assisted median overstates the
+ * reduction, which is the one direction this metric must never fail in.
+ *
+ * What remains and cannot be fixed here: a long review is likelier to be
+ * interrupted than a short one, so the applications this drops are not a
+ * random subset, and the surviving median still leans short. That is why
+ * the count is published rather than only the exclusion -- a reader who
+ * sees most of the scope dropped should not treat the remainder as the
+ * role's review time.
  */
 export function summarizeReviewTiming(
   spans: readonly ReviewTimingSpan[],
   population: number
 ): ReviewTimingSummary {
   const truncatedSpanCount = spans.filter((span) => span.truncatedByIdle).length;
-  const usable = spans.filter((span) => !span.truncatedByIdle);
+  const partiallyObserved = new Set(
+    spans.filter((span) => span.truncatedByIdle).map((span) => span.applicationId)
+  );
 
   const totalByApplication = new Map<string, number>();
-  for (const span of usable) {
+  for (const span of spans) {
+    if (partiallyObserved.has(span.applicationId)) {
+      continue;
+    }
     totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
   }
 
@@ -2057,7 +2091,8 @@ export function summarizeReviewTiming(
     medianActiveMs: sampleSize === 0 ? null : median(totals),
     sampleSize,
     population,
-    truncatedSpanCount
+    truncatedSpanCount,
+    partiallyObservedCount: partiallyObserved.size
   };
 }
 
@@ -2356,6 +2391,23 @@ export interface ReviewTimeBaseline {
 }
 
 /**
+ * The sample this metric refuses to report below, fixed here rather than
+ * taken from the caller.
+ *
+ * describeReviewTimeReduction still takes a minimum as an argument so
+ * tests can drive the suppression boundary directly, but the reporting
+ * path must not: a threshold a request can choose is not a threshold. An
+ * endpoint that accepted `minimumSampleSize=1` would hand anyone who
+ * wanted a number the means to get one out of a single review.
+ *
+ * Ten, because this is a median. Below roughly that, one interrupted
+ * review moves the middle value by minutes, and docs/VALIDATION_STATUS.md
+ * sizes the POC at about a hundred applications per role, so ten is the
+ * order of a tenth of a role rather than a number chosen to be reachable.
+ */
+export const REVIEW_TIME_REDUCTION_MINIMUM_SAMPLE_SIZE = 10;
+
+/**
  * Assisted review time against a baseline, as a reportable metric.
  *
  * The value is the fraction of baseline time removed: 0.5 means half the
@@ -2366,11 +2418,12 @@ export interface ReviewTimeBaseline {
  * ever say, and a floor at zero would render it as "no improvement" and
  * lose it.
  *
- * The denominator handed to summarizeMetric is applications with usable
- * timing, not spans. AF-54 drops idle-truncated spans, so an application
- * whose only visit was truncated never reaches the sample -- which shows
- * up as `population_incomplete` rather than quietly shrinking the base
- * the median was drawn from.
+ * The denominator handed to summarizeMetric is applications whose review
+ * time is fully observed, not spans and not applications. AF-54 drops
+ * any application with an idle-truncated span, so a partially observed
+ * review shows up as `population_incomplete` rather than as a short
+ * complete one -- see summarizeReviewTiming for why the alternative
+ * silently overstates this metric.
  */
 export function describeReviewTimeReduction(
   assisted: ReviewTimingSummary,

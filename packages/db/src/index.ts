@@ -2026,6 +2026,45 @@ export async function listApplicationsForRole(
 }
 
 /**
+ * The population a role-level metric is measured against.
+ *
+ * Separate from listApplicationsForRole rather than `.length` on it: the
+ * only caller is a metric, and reading every candidate's name and email
+ * into memory to arrive at an integer puts PII somewhere it has no
+ * business being. Scoped by organization as well as role for the same
+ * IDOR reason listApplicationsForRole is.
+ */
+export async function countApplicationsForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<number> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ population: string }>(
+      `SELECT count(*) AS population
+         FROM "${schema}".applications
+        WHERE organization_id = $1 AND role_id = $2`,
+      [organizationId, roleId]
+    );
+    const raw = result.rows[0]?.population;
+    // count(*) is bigint, which node-postgres returns as a string. An
+    // unchecked Number() would turn a malformed value into NaN and hand
+    // summarizeMetric a population it would reject far from here.
+    const population = raw === undefined ? Number.NaN : Number(raw);
+    if (!Number.isSafeInteger(population) || population < 0) {
+      throw new Error(`countApplicationsForRole: population is not a safe non-negative integer, got: ${raw}`);
+    }
+    return population;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
  * One query for the whole page of applications rather than one per
  * application: a role with a thousand imported candidates would
  * otherwise open a thousand connections to render a single screen.
@@ -4246,6 +4285,219 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-55: review-time reduction ----
+
+/** Handle on a seeded schema, returned by createReviewTimeMetricFixture. */
+export interface ReviewTimeMetricFixture {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly otherOrganizationId: string;
+  /** 12 applications: 11 fully observed, 1 with a truncated span. */
+  readonly roleId: string;
+  /** 2 applications, both fully observed: below any sane minimum sample. */
+  readonly sparseRoleId: string;
+  /** A role belonging to the other tenant entirely. */
+  readonly otherOrganizationRoleId: string;
+  /** Holds view_audit_reports in organizationId. */
+  readonly auditorUserId: string;
+  /** Reviews candidates in organizationId; must NOT see the metric. */
+  readonly recruiterUserId: string;
+  /** Authenticated, but a member of nothing. */
+  readonly outsiderUserId: string;
+  drop(): Promise<void>;
+}
+
+/**
+ * Seeds a throwaway schema the AF-55 endpoint can be exercised against.
+ *
+ * This lives in packages/db rather than in tests/ because the migration
+ * directory and the postgres client are both internal to this package,
+ * and every other probe here is built the same way. What it deliberately
+ * does NOT do is assert anything: the claim under test is how the route
+ * behaves, so the checking belongs next to the route, not here.
+ *
+ * The shape is chosen so the interesting cases are reachable without
+ * reseeding: a role whose sample clears the minimum but whose population
+ * does not (one application is partially observed, so the reduction
+ * comes back with population_incomplete attached), a role too small to
+ * report at all, and a second tenant to point the same request at.
+ */
+export async function createReviewTimeMetricFixture(databaseUrl: string): Promise<ReviewTimeMetricFixture> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `af55_route_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const otherOrganizationId = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const drop = async (): Promise<void> => {
+    const cleaner = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await cleaner.connect();
+      await cleaner.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } finally {
+      await cleaner.end().catch(() => undefined);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [
+      organizationId,
+      otherOrganizationId
+    ]);
+
+    const createUser = async (label: string): Promise<string> => {
+      const created = await admin.query<{ user_id: string }>(
+        `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING user_id`,
+        [`${label}_${suffix}@acme.test`, label]
+      );
+      const userId = created.rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error(`fixture could not create the ${label} user`);
+      }
+      return userId;
+    };
+    const auditorUserId = await createUser("auditor");
+    const recruiterUserId = await createUser("recruiter");
+    const outsiderUserId = await createUser("outsider");
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role)
+       VALUES ($1, $2, 'auditor'), ($1, $3, 'recruiter')`,
+      [organizationId, auditorUserId, recruiterUserId]
+    );
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`, [
+      otherOrganizationId,
+      outsiderUserId
+    ]);
+
+    const createRole = async (ownerOrganizationId: string, title: string, createdBy: string): Promise<string> => {
+      const created = await admin.query<{ role_id: string }>(
+        `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, $2, $3) RETURNING role_id`,
+        [ownerOrganizationId, title, createdBy]
+      );
+      const roleId = created.rows[0]?.role_id;
+      if (roleId === undefined) {
+        throw new Error(`fixture could not create the ${title} role`);
+      }
+      return roleId;
+    };
+    const roleId = await createRole(organizationId, "Measured", recruiterUserId);
+    const sparseRoleId = await createRole(organizationId, "Sparse", recruiterUserId);
+    const otherOrganizationRoleId = await createRole(otherOrganizationId, "Other tenant", outsiderUserId);
+
+    const createIntake = async (ownerOrganizationId: string, ownerRoleId: string, key: string): Promise<string> => {
+      const created = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+        [
+          ownerOrganizationId,
+          ownerRoleId,
+          key,
+          ownerOrganizationId === organizationId ? recruiterUserId : outsiderUserId
+        ]
+      );
+      const intakeId = created.rows[0]?.intake_id;
+      if (intakeId === undefined) {
+        throw new Error("fixture could not create a file intake");
+      }
+      return intakeId;
+    };
+    const intakeId = await createIntake(organizationId, roleId, `af55/${suffix}-measured.csv`);
+    const sparseIntakeId = await createIntake(organizationId, sparseRoleId, `af55/${suffix}-sparse.csv`);
+
+    const createApplication = async (ownerRoleId: string, intake: string, row: number): Promise<string> => {
+      const created = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications
+           (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING application_id`,
+        [organizationId, ownerRoleId, intake, row, `Candidate ${row}`, `c${row}_${suffix}@acme.test`]
+      );
+      const applicationId = created.rows[0]?.application_id;
+      if (applicationId === undefined) {
+        throw new Error("fixture could not create an application");
+      }
+      return applicationId;
+    };
+
+    // Eleven applications reviewed start to finish at five minutes each,
+    // then a twelfth that was interrupted. The twelfth is the case the
+    // metric used to count as a five-minute review.
+    const measured: string[] = [];
+    for (let row = 1; row <= 12; row += 1) {
+      measured.push(await createApplication(roleId, intakeId, row));
+    }
+    let hour = 9;
+    const recordSpan = async (
+      applicationId: string,
+      activeMs: number,
+      truncatedByIdle: boolean
+    ): Promise<void> => {
+      const startedAt = new Date(Date.UTC(2026, 7, 29, hour, 0, 0));
+      const endedAt = new Date(startedAt.getTime() + activeMs + 1_000);
+      hour = hour === 20 ? 9 : hour + 1;
+      await recordReviewTimingSpan(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        reviewerUserId: recruiterUserId,
+        startedAt,
+        endedAt,
+        activeMs,
+        truncatedByIdle
+      });
+    };
+    for (const applicationId of measured.slice(0, 11)) {
+      await recordSpan(applicationId, 300_000, false);
+    }
+    const interrupted = measured[11];
+    if (interrupted === undefined) {
+      throw new Error("fixture expected twelve applications");
+    }
+    await recordSpan(interrupted, 300_000, false);
+    await recordSpan(interrupted, 400_000, true);
+
+    for (let row = 1; row <= 2; row += 1) {
+      await recordSpan(await createApplication(sparseRoleId, sparseIntakeId, row), 300_000, false);
+    }
+
+    return {
+      schema,
+      organizationId,
+      otherOrganizationId,
+      roleId,
+      sparseRoleId,
+      otherOrganizationRoleId,
+      auditorUserId,
+      recruiterUserId,
+      outsiderUserId,
+      drop
+    };
+  } catch (error) {
+    await drop().catch(() => undefined);
+    throw error;
+  } finally {
     await admin.end().catch(() => undefined);
   }
 }

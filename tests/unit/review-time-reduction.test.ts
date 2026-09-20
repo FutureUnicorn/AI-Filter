@@ -11,7 +11,7 @@ const MEASURED: ReviewTimeBaseline = { source: "measured_preassist", medianActiv
 const REPORTED: ReviewTimeBaseline = { source: "employer_reported", medianActiveMs: 600_000 };
 
 function assisted(medianActiveMs: number | null, sampleSize: number, population = sampleSize) {
-  return { medianActiveMs, sampleSize, population, truncatedSpanCount: 0 };
+  return { medianActiveMs, sampleSize, population, truncatedSpanCount: 0, partiallyObservedCount: 0 };
 }
 
 function codes(sample: MetricSample): readonly string[] {
@@ -102,6 +102,44 @@ test("applications whose only visit was idle-truncated show up as an incomplete 
   const sample = describeReviewTimeReduction(timing, MEASURED, 2);
   assert.equal(sample.value, 0.5);
   assert.ok(codes(sample).includes("population_incomplete"));
+});
+
+test("a role where every application was interrupted reports nothing, not a 50% reduction", () => {
+  // The exact shape that used to produce an unqualified headline number:
+  // every application has one five-minute span and one idle-truncated
+  // one, so dropping only the span left sampleSize equal to population
+  // and the result carried no limitation at all. Each of these
+  // candidates took AT LEAST 700,000ms against a 600,000ms baseline, so
+  // the truthful reading is "possibly slower"; the metric reported 0.5.
+  const spans: readonly ReviewTimingSpan[] = ["a", "b", "c"].flatMap((applicationId) => [
+    { applicationId, activeMs: 300_000, truncatedByIdle: false },
+    { applicationId, activeMs: 400_000, truncatedByIdle: true }
+  ]);
+  const timing = summarizeReviewTiming(spans, 3);
+  const sample = describeReviewTimeReduction(timing, MEASURED, 3);
+  assert.equal(sample.value, null, "a partially observed role must not produce a reduction");
+  assert.deepEqual(codes(sample), ["no_sample", "population_incomplete"]);
+});
+
+test("one interrupted application among many shrinks the denominator and says so", () => {
+  // Reported, because eleven complete reviews support a number. Flagged,
+  // because the twelfth is not "not yet reviewed", it is reviewed and
+  // unmeasurable, and a reader comparing 11 against 12 can see the gap.
+  const spans: readonly ReviewTimingSpan[] = [
+    ...Array.from({ length: 11 }, (_, index) => ({
+      applicationId: `full-${index}`,
+      activeMs: 300_000,
+      truncatedByIdle: false
+    })),
+    { applicationId: "interrupted", activeMs: 300_000, truncatedByIdle: false },
+    { applicationId: "interrupted", activeMs: 400_000, truncatedByIdle: true }
+  ];
+  const timing = summarizeReviewTiming(spans, 12);
+  assert.equal(timing.sampleSize, 11);
+  assert.equal(timing.partiallyObservedCount, 1);
+  const sample = describeReviewTimeReduction(timing, MEASURED, 10);
+  assert.equal(sample.value, 0.5);
+  assert.deepEqual(codes(sample), ["population_incomplete"]);
 });
 
 test("end to end from spans: time is summed per application before the median", () => {
