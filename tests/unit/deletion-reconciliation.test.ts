@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { planRetention, reconcileRetention } from "../../packages/domain/src/index.ts";
+import { RETENTION_SURFACES, planRetention, reconcileRetention } from "../../packages/domain/src/index.ts";
 import type { RetentionResidue } from "../../packages/domain/src/index.ts";
 
 // AF-63: "Scheduled job confirms every store that should be empty
@@ -26,8 +26,20 @@ const CLASSIFIED_TABLES = [
   "roles"
 ];
 
+// The default is "this run measured every surface", so the tests below
+// exercise the classification rules rather than the observation gap. The
+// gap gets its own tests, which subtract from this list on purpose.
 function residue(overrides: Partial<RetentionResidue> = {}): RetentionResidue {
-  return { rowsPastCutoffBySurface: {}, observedTables: CLASSIFIED_TABLES, ...overrides };
+  return {
+    rowsPastCutoffBySurface: {},
+    observedSurfaces: [...RETENTION_SURFACES],
+    observedTables: CLASSIFIED_TABLES,
+    ...overrides
+  };
+}
+
+function measuredExcept(...unmeasured: readonly string[]): readonly string[] {
+  return RETENTION_SURFACES.filter((surface) => !unmeasured.includes(surface));
 }
 
 function kinds(report: ReturnType<typeof reconcileRetention>): readonly string[] {
@@ -130,4 +142,97 @@ test("the report carries the cutoff it was reconciled against", () => {
   const report = reconcileRetention(PLAN, residue());
   assert.equal(report.cutoff, PLAN.cutoff);
   assert.equal(report.organizationId, ORG);
+});
+
+// ---- REV-001: a surface nobody measured must not read as empty ----
+//
+// An absent count and a measured zero are the same number. Before
+// observedSurfaces, object_storage_documents -- the only surface the plan
+// calls purgeable, and the one surface that does not live in Postgres --
+// was never counted by anything, so `rows ?? 0` fired the `rows === 0`
+// early continue every time, residue_present was unreachable against a
+// live database, and a tenant whose CVs were still in blob storage
+// reconciled clean: true.
+
+test("a surface this run did not measure is reported, not assumed empty", () => {
+  const report = reconcileRetention(
+    PLAN,
+    residue({ observedSurfaces: measuredExcept("object_storage_documents") })
+  );
+  const finding = report.findings.find((f) => f.kind === "not_observed");
+  assert.equal(finding?.surface, "object_storage_documents");
+  assert.equal(report.clean, false, "not looking is not the same as looking and finding nothing");
+});
+
+test("an unmeasured surface reports no row count rather than zero rows", () => {
+  // Reporting 0 would be the same lie in a different field: a reader
+  // would take it for a measurement.
+  const report = reconcileRetention(
+    PLAN,
+    residue({ observedSurfaces: measuredExcept("object_storage_documents") })
+  );
+  const finding = report.findings.find((f) => f.kind === "not_observed");
+  assert.equal(finding?.rowsPastCutoff, undefined);
+  assert.match(finding?.detail ?? "", /did not measure object_storage_documents/);
+  assert.match(finding?.detail ?? "", /the uploaded document itself/);
+});
+
+test("the statement names the unmeasured surfaces, so the sentence cannot read as clean", () => {
+  const report = reconcileRetention(
+    PLAN,
+    residue({ observedSurfaces: measuredExcept("object_storage_documents", "candidate_decisions") })
+  );
+  assert.match(report.statement, /were not measured by this run/);
+  assert.match(report.statement, /object_storage_documents/);
+  assert.match(report.statement, /candidate_decisions/);
+});
+
+test("every plan surface unmeasured is every plan surface reported, none skipped", () => {
+  // A guard that only covered object storage would leave the same hole
+  // open for any Postgres surface whose table is missing from the schema.
+  const report = reconcileRetention(PLAN, residue({ observedSurfaces: [] }));
+  const unmeasured = new Set(report.findings.filter((f) => f.kind === "not_observed").map((f) => f.surface));
+  const expected = new Set(RETENTION_SURFACES.filter((surface) => surface !== "audit_events"));
+  assert.deepEqual(unmeasured, expected);
+  assert.equal(report.clean, false);
+});
+
+test("a no_candidate_data surface is not reported as unmeasured, because a count would say nothing", () => {
+  // audit_events holds nothing candidate-derived by construction, and
+  // reconcileRetention discards its count even when it has one. Demanding
+  // a measurement that is then thrown away would be noise on every run,
+  // and noise is what makes a report get skimmed.
+  const report = reconcileRetention(PLAN, residue({ observedSurfaces: measuredExcept("audit_events") }));
+  assert.deepEqual(report.findings, []);
+  assert.equal(report.clean, true);
+});
+
+test("residue in an unmeasured purgeable surface cannot be masked by a stale count", () => {
+  // A count left in the map for a surface this run did not measure is
+  // last run's number, not this one's. It must not suppress the finding.
+  const report = reconcileRetention(
+    PLAN,
+    residue({
+      observedSurfaces: measuredExcept("object_storage_documents"),
+      rowsPastCutoffBySurface: { object_storage_documents: 40 }
+    })
+  );
+  assert.deepEqual(
+    report.findings.map((f) => f.kind),
+    ["not_observed"]
+  );
+  assert.equal(report.findings[0]?.rowsPastCutoff, undefined);
+});
+
+test("an unclassified table nobody counted reports no row count rather than zero", () => {
+  // The observer cannot tenant-scope a count on a table it does not know
+  // the shape of, so it does not count one at all. The finding still
+  // stands on the table's existence; what must not appear is "0 rows".
+  const report = reconcileRetention(
+    PLAN,
+    residue({ observedTables: [...CLASSIFIED_TABLES, "candidate_notes"] })
+  );
+  const finding = report.findings.find((f) => f.kind === "unclassified_surface");
+  assert.equal(finding?.surface, "candidate_notes");
+  assert.equal(finding?.rowsPastCutoff, undefined);
 });

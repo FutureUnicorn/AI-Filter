@@ -26,6 +26,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  RetentionResidue,
   ReviewTimingSpan,
   Role,
   RoleStatus,
@@ -4393,13 +4394,29 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
  * their own, so they are scoped through file_intakes rather than counted
  * globally -- counting them across tenants would make one noisy tenant
  * look like everyone's problem.
+ *
+ * `observedSurfaces` names what this call actually measured, and it is
+ * the reason the result cannot quietly overstate itself. Two surfaces
+ * would otherwise come back as an implicit zero: object_storage_documents,
+ * which is not in Postgres at all and is the only surface the plan calls
+ * purgeable, and any surface whose table is missing from this schema.
+ * Both are now absent from observedSurfaces instead, and reconcileRetention
+ * turns that into a not_observed finding rather than a clean bill of health.
+ *
+ * `externalCounts` is how a surface outside Postgres gets measured: a
+ * caller that lists blob storage for this tenant passes
+ * `{ object_storage_documents: n }` and the residue_present branch becomes
+ * reachable for real. A count is only accepted for a surface this
+ * function cannot see itself, so a caller cannot paper over a table that
+ * is right there to be counted.
  */
 export async function observeRetentionResidue(
   databaseUrl: string,
   schema: string,
   organizationId: string,
-  cutoff: string
-): Promise<{ rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] }> {
+  cutoff: string,
+  externalCounts: Readonly<Record<string, number>> = {}
+): Promise<RetentionResidue> {
   assertSafeSchema(schema);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
@@ -4418,6 +4435,7 @@ export async function observeRetentionResidue(
     // missing table there is not residue.
     const present = new Set(observedTables);
     const counts: Record<string, number> = {};
+    const observedSurfaces: string[] = [];
     const scoped: ReadonlyArray<readonly [string, string]> = [
       ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
       [
@@ -4445,6 +4463,9 @@ export async function observeRetentionResidue(
 
     for (const [surface, sql] of scoped) {
       if (!present.has(surface)) {
+        // Not an error: probe schemas apply a subset of migrations. But
+        // it is also not a zero. Leaving the surface out of
+        // observedSurfaces is what keeps it from reading as measured.
         continue;
       }
       const result = await client.query<{ count: string }>(sql, [organizationId, cutoff]);
@@ -4456,9 +4477,41 @@ export async function observeRetentionResidue(
         throw new Error(`observeRetentionResidue: ${surface} count is not a safe integer, got: ${raw}`);
       }
       counts[surface] = parsed;
+      observedSurfaces.push(surface);
     }
 
-    return { rowsPastCutoffBySurface: counts, observedTables };
+    const selfCounted = new Set(scoped.map(([surface]) => surface));
+    for (const [surface, count] of Object.entries(externalCounts)) {
+      // A caller-supplied number for something the database can answer
+      // would replace a real measurement with an asserted one, which is
+      // the same "trust me" this whole change exists to remove. Refused
+      // rather than merged, because a silent overwrite would make the
+      // report look measured while saying whatever the caller wanted.
+      if (selfCounted.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which this ` +
+            `function counts from the database itself`
+        );
+      }
+      if (present.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which is a table ` +
+            `in schema "${schema}". External counts are for surfaces that do not live in Postgres.`
+        );
+      }
+      if (!Number.isSafeInteger(count) || count < 0) {
+        // Same reasoning as the bigint parse above: a NaN here would land
+        // in the map, mark the surface observed, and read as "no residue".
+        throw new Error(
+          `observeRetentionResidue: external count for "${surface}" must be a non-negative safe ` +
+            `integer, got: ${String(count)}`
+        );
+      }
+      counts[surface] = count;
+      observedSurfaces.push(surface);
+    }
+
+    return { rowsPastCutoffBySurface: counts, observedSurfaces, observedTables };
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -4477,13 +4530,25 @@ export async function observeRetentionResidue(
  * plan's back. If observeRetentionResidue read a hand-maintained list
  * rather than information_schema, that table would be invisible and the
  * job would report all clear while candidate text sat in it.
+ *
+ * It also returns the observations either side of the object-storage
+ * question, because that surface is the one the job cannot reach on its
+ * own: `residue` is what a caller with no storage listing gets,
+ * `residueWithPurgedObjectStorage` and `residueWithObjectStorageResidue`
+ * are what the same tenant looks like once someone actually counted the
+ * objects. Without all three, "clean" and "residue_present" are each
+ * only reachable through a hand-built residue object, which would prove
+ * nothing about the live path.
  */
 export async function probeRetentionReconciliation(
   databaseUrl: string,
   cutoff: string
 ): Promise<{
-  residue: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
-  residueBeforeAnyData: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  residue: RetentionResidue;
+  residueWithObjectStorageResidue: RetentionResidue;
+  residueWithPurgedObjectStorage: RetentionResidue;
+  residueBeforeAnyData: RetentionResidue;
+  residueMissingSurfaceTable: RetentionResidue;
   organizationId: string;
 }> {
   const suffix = randomBytes(4).toString("hex");
@@ -4524,9 +4589,28 @@ export async function probeRetentionReconciliation(
        VALUES ($1,$2,'Eng',$5), ($3,$4,'B role',$5)`,
       [roleA, orgA, roleB, orgB, userId]
     );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter'), ($3,$2,'recruiter')`,
+      [orgA, userId, orgB]
+    );
 
-    // Baseline: the plan's surfaces exist but hold nothing for tenant A.
-    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
+    // Taken while candidate_decisions does not exist yet, which is not a
+    // contrivance: this is what any schema behind on migrations looks
+    // like, and before observedSurfaces the absent table produced no
+    // count, the count defaulted to 0, and the surface read as verified
+    // empty. Captured here so the reconciliation can be held to saying
+    // "not measured" instead.
+    const residueMissingSurfaceTable = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0019_candidate_decisions.sql"), "utf8"));
+
+    // Baseline: every surface the plan covers exists, was measured, and
+    // holds nothing for tenant A -- including object storage, which is
+    // measured only because the caller supplied the listing.
+    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
 
     // Tenant A's undeleted candidate data.
     await admin.query(
@@ -4551,6 +4635,11 @@ export async function probeRetentionReconciliation(
        VALUES ('66666666-6666-4666-8666-666666666666',$1,$2,'python','supported',
          '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe"}}'::jsonb)`,
       [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (organization_id, application_id, decision, rationale, decided_by_user_id)
+       VALUES ($1,$2,'hold','Revisit after the panel',$3)`,
+      [orgA, applicationId, userId]
     );
 
     // Tenant B's data, which must not be counted against tenant A --
@@ -4577,8 +4666,106 @@ export async function probeRetentionReconciliation(
     );
     await admin.query(`INSERT INTO "${schema}".recruiter_scratch_notes (candidate_note) VALUES ('Jane seemed strong')`);
 
+    // Three views of the same tenant, differing only in whether anyone
+    // counted the objects in blob storage:
+    //   residue                        - nobody did, which is every caller today
+    //   residueWithPurgedObjectStorage - someone did, and it was empty
+    //   residueWithObjectStorageResidue- someone did, and two CVs are still there
+    // The middle one is why `clean` has to stay reachable, and the last
+    // one is the only way residue_present is reached without a test
+    // hand-building the residue it is supposed to be proving.
     const residue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
-    return { residue, residueBeforeAnyData, organizationId: orgA };
+    const residueWithPurgedObjectStorage = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    const residueWithObjectStorageResidue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 2
+    });
+    return {
+      residue,
+      residueWithObjectStorageResidue,
+      residueWithPurgedObjectStorage,
+      residueBeforeAnyData,
+      residueMissingSurfaceTable,
+      organizationId: orgA
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Exercises the guards on caller-supplied counts against a live schema.
+ *
+ * An external count is the one number in the residue that nothing in the
+ * database corroborates, so the guards around it are load-bearing: a NaN
+ * that got through would mark the surface observed and read as "no
+ * residue", which is the exact green-because-nobody-looked failure the
+ * observedSurfaces field exists to close.
+ *
+ * Each case returns the thrown message, or null when the call was
+ * accepted. A test asserting a message therefore cannot be satisfied by
+ * a typo, a connection failure or any other incidental error -- those
+ * propagate out of here rather than being reported as a refusal.
+ */
+export async function probeRetentionExternalCountGuards(
+  databaseUrl: string,
+  cutoff: string
+): Promise<{
+  acceptedUnobservableSurface: RetentionResidue;
+  refusedSelfCountedSurface: string | null;
+  refusedExistingTable: string | null;
+  refusedNonInteger: string | null;
+  refusedNegative: string | null;
+}> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_guard_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  async function refusal(externalCounts: Readonly<Record<string, number>>): Promise<string | null> {
+    try {
+      await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, externalCounts);
+      return null;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("observeRetentionResidue:")) {
+        // Anything that is not this function's own refusal is a real
+        // failure and must not be reported to the caller as a guard
+        // firing.
+        throw error;
+      }
+      return error.message;
+    }
+  }
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [orgA]);
+
+    return {
+      acceptedUnobservableSurface: await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+        object_storage_documents: 7
+      }),
+      refusedSelfCountedSurface: await refusal({ file_intakes: 0 }),
+      refusedExistingTable: await refusal({ roles: 0 }),
+      refusedNonInteger: await refusal({ object_storage_documents: Number.NaN }),
+      refusedNegative: await refusal({ object_storage_documents: -1 })
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

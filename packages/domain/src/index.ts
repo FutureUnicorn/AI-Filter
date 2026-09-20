@@ -2339,6 +2339,26 @@ export function describeFailedDocumentRate(
 // not classify as its own finding. An unclassified surface is not
 // automatically a leak; it is automatically unreviewed, which is the
 // thing that must not be silent.
+//
+// **The second way this job could lie is by not measuring a surface at
+// all.** An absent count and a measured zero are the same number, so a
+// surface nothing looked at reads exactly like a surface that was looked
+// at and found empty. object_storage_documents is the live case: it is
+// the only surface the plan calls purgeable, it does not live in
+// Postgres, and nothing counts blob objects, so a tenant whose uploaded
+// CVs are still sitting in storage past the window reconciles
+// `clean: true` -- green because the report never looked, which is the
+// failure this ticket exists to prevent. The same hole opens for any
+// Postgres surface whose table is absent from the schema the observer
+// read.
+//
+// So a measurement is something a residue has to claim explicitly, via
+// `observedSurfaces`, and anything a run did not measure becomes a
+// `not_observed` finding that keeps the report off green. That makes the
+// honest answer representable rather than deferring it: `clean` again
+// means "every surface was looked at, and was empty", and it stays
+// reachable, because a caller that really does list blob storage can
+// supply that count and earn it.
 
 export type ReconciliationFindingKind =
   /** A surface the plan says should be emptied still holds rows past the cutoff. */
@@ -2346,18 +2366,36 @@ export type ReconciliationFindingKind =
   /** A surface the plan already admits it cannot purge. Expected, still reported. */
   | "blocked_as_planned"
   /** A table exists in the schema that the retention plan does not classify at all. */
-  | "unclassified_surface";
+  | "unclassified_surface"
+  /** The plan covers this surface, but this run never measured it, so nothing is known about it. */
+  | "not_observed";
 
 export interface ReconciliationFinding {
   readonly kind: ReconciliationFindingKind;
   readonly surface: string;
-  readonly rowsPastCutoff: number;
+  /**
+   * Rows past the cutoff, or `undefined` when this run did not measure
+   * the surface. Never 0 standing in for "not measured": that
+   * substitution is the whole defect this field's shape guards against.
+   */
+  readonly rowsPastCutoff: number | undefined;
   readonly detail: string;
 }
 
 export interface RetentionResidue {
   /** Rows older than the cutoff still present, per surface name. */
   readonly rowsPastCutoffBySurface: Readonly<Record<string, number>>;
+  /**
+   * The plan surfaces this run actually measured, whether or not it
+   * found anything. Stated separately rather than inferred from the keys
+   * of `rowsPastCutoffBySurface`, so an observer that can only reach some
+   * of the surfaces has to say which ones, instead of an omission
+   * quietly reading as a zero.
+   *
+   * A surface may be measured from outside Postgres: an object-storage
+   * listing belongs here exactly as much as a `count(*)` does.
+   */
+  readonly observedSurfaces: readonly string[];
   /** Every table observed in the live schema, however named. */
   readonly observedTables: readonly string[];
 }
@@ -2366,7 +2404,12 @@ export interface ReconciliationReport {
   readonly organizationId: string;
   readonly cutoff: string;
   readonly findings: readonly ReconciliationFinding[];
-  /** True when nothing at all needs a human: no residue and no unclassified table. */
+  /**
+   * True when nothing at all needs a human: every surface the plan covers
+   * was measured, none held anything past the cutoff, and no table is
+   * unclassified. A surface this run could not measure keeps `clean`
+   * false, because "we did not look" is not "it was empty".
+   */
   readonly clean: boolean;
   readonly statement: string;
 }
@@ -2400,8 +2443,34 @@ export function reconcileRetention(
 ): ReconciliationReport {
   const findings: ReconciliationFinding[] = [];
   const planned = new Map(plan.surfaces.map((surface) => [String(surface.surface), surface]));
+  const observed = new Set(residue.observedSurfaces);
 
   for (const surface of plan.surfaces) {
+    if (surface.disposition === "no_candidate_data") {
+      // Deliberately exempt from the not_observed check below, not an
+      // oversight. The plan's claim here is not "this is empty past the
+      // cutoff", it is "nothing candidate-derived is ever written here,
+      // by construction". A row count neither confirms nor refutes that,
+      // so counting the surface would not make the report any truer, and
+      // reporting it unmeasured every single run would be noise that
+      // trains a reader to skim past the findings that matter. Changing
+      // a surface to this disposition is an explicit edit to
+      // RETENTION_PLAN, so the silence is still someone's recorded
+      // decision rather than an omission.
+      continue;
+    }
+    if (!observed.has(surface.surface)) {
+      findings.push({
+        kind: "not_observed",
+        surface: surface.surface,
+        rowsPastCutoff: undefined,
+        detail:
+          `This run did not measure ${surface.surface}, so the report cannot say whether it is ` +
+          `empty past the cutoff. It holds ${surface.holds}, and that may still be there. ` +
+          `Supply a count for it before reading this report as a clean bill of health.`
+      });
+      continue;
+    }
     const rows = residue.rowsPastCutoffBySurface[surface.surface] ?? 0;
     if (rows === 0) {
       continue;
@@ -2415,9 +2484,6 @@ export function reconcileRetention(
           `${rows} row(s) older than the cutoff remain in a surface the plan says is purgeable. ` +
           `Either the purge did not run or it did not cover this surface.`
       });
-      continue;
-    }
-    if (surface.disposition === "no_candidate_data") {
       continue;
     }
     findings.push({
@@ -2435,7 +2501,13 @@ export function reconcileRetention(
     findings.push({
       kind: "unclassified_surface",
       surface: table,
-      rowsPastCutoff: residue.rowsPastCutoffBySurface[table] ?? 0,
+      // Undefined rather than 0 when nothing counted it. An unclassified
+      // table has no known tenant column, so the observer cannot scope a
+      // count to one organization, and an unscoped count would be a
+      // cross-tenant read in a report handed to one customer. The finding
+      // stands on the table's existence either way; what must not happen
+      // is a never-measured table reporting "0 rows" as if someone looked.
+      rowsPastCutoff: residue.rowsPastCutoffBySurface[table],
       detail:
         `Table "${table}" exists in the schema but the retention plan does not classify it. ` +
         `It may hold candidate data that nothing is accounting for. Classify it in ` +
@@ -2466,10 +2538,21 @@ function buildReconciliationStatement(
   const parts: string[] = [];
   const unclassified = needsAttention.filter((finding) => finding.kind === "unclassified_surface");
   const residue = needsAttention.filter((finding) => finding.kind === "residue_present");
+  const unmeasured = needsAttention.filter((finding) => finding.kind === "not_observed");
   if (residue.length > 0) {
     parts.push(
       `${residue.length} surface(s) that should have been purged still hold data: ` +
         residue.map((finding) => finding.surface).join(", ")
+    );
+  }
+  // Named before the blocked surfaces, and in the sentence rather than
+  // only in the findings array, because this is the one category a
+  // reader could otherwise mistake for a clean result.
+  if (unmeasured.length > 0) {
+    parts.push(
+      `${unmeasured.length} surface(s) were not measured by this run, so nothing here says whether ` +
+        `they are empty: ` +
+        unmeasured.map((finding) => finding.surface).join(", ")
     );
   }
   if (unclassified.length > 0) {
@@ -2485,7 +2568,10 @@ function buildReconciliationStatement(
     );
   }
   if (parts.length === 0) {
-    return "Every surface the retention plan covers is empty past the cutoff, and no table is unclassified.";
+    return (
+      "Every surface the retention plan covers was measured and is empty past the cutoff, " +
+      "and no table is unclassified."
+    );
   }
   return parts.join(". ") + ".";
 }
