@@ -2070,3 +2070,151 @@ function median(sortedValues: readonly number[]): number {
   const upper = sortedValues[middle] ?? 0;
   return (lower + upper) / 2;
 }
+
+// ---- AF-54: the capture half ----
+//
+// summarizeReviewTiming above consumes spans. Nothing produced one until
+// this existed: the table, the recorder and the summary were all in
+// place and no recruiter action created a row, so the baseline the
+// ticket asks for was always going to be empty.
+//
+// The split is the one AF-53 drew, for the same reason. This repository
+// has no jsdom, so anything decided inside a React effect cannot be
+// tested. Every rule about what counts as review time lives in these
+// functions, which are pure and clock-free -- the caller passes the time
+// in -- and apps/web/src/lib/review-timing.ts does only the parts that
+// genuinely need a browser: subscribing to events, reading the clock,
+// and sending the result.
+
+/**
+ * Two minutes without an interaction and the reviewer is no longer
+ * reviewing, whatever the tab still says.
+ *
+ * The exact number is a judgement, so what matters is which way it errs.
+ * Too long and a coffee break lands in the baseline, inflating the
+ * "before" and flattering any later improvement; too short and a
+ * reviewer who reads carefully before touching anything gets chopped
+ * into truncated fragments. Truncated spans are excluded from the median
+ * and counted in the open, so erring short costs sample size visibly
+ * while erring long corrupts the number silently. Two minutes is the
+ * short side of that trade on purpose.
+ */
+export const REVIEW_IDLE_CUTOFF_MS = 120_000;
+
+/**
+ * One visit in progress.
+ *
+ * `countedUntilMs` is the last instant that counts as review, and it is
+ * the only place duration is held. There is no separate accumulator,
+ * because a span never pauses: it starts when the page becomes visible
+ * and ends when it stops being visible, so active time within one span
+ * is exactly `countedUntilMs - startedAtMs` and a second field holding
+ * the same fact could only ever disagree with it.
+ *
+ * `lastActivityAtMs` is the last instant the reviewer proved they were
+ * there, which is a different thing and is why both are kept.
+ */
+export interface ReviewTimingState {
+  readonly startedAtMs: number;
+  readonly countedUntilMs: number;
+  readonly lastActivityAtMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** Exactly the fields the recorder needs, and no reviewer among them. */
+export interface ReviewTimingSpanDraft {
+  readonly startedAtMs: number;
+  readonly endedAtMs: number;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** A settled state and, when one just ended, the span it produced. */
+export interface ReviewTimingTransition {
+  readonly state: ReviewTimingState;
+  readonly completed: ReviewTimingSpanDraft | undefined;
+}
+
+export function beginReviewTiming(atMs: number): ReviewTimingState {
+  return { startedAtMs: atMs, countedUntilMs: atMs, lastActivityAtMs: atMs, truncatedByIdle: false };
+}
+
+/**
+ * Advance the span to `atMs`, or conclude the reviewer had already left.
+ *
+ * The idle cutoff is applied here rather than by a timer, so the answer
+ * does not depend on whether a tick happened to fire. A reviewer who
+ * walked away an hour ago and whose tab is only now closing gets the
+ * same span either way.
+ *
+ * When the cutoff has passed, time is counted only up to the last
+ * interaction -- the grace window itself is not counted. That is the
+ * difference between a truncated span being a lower bound on the review,
+ * which is what it is described as and what makes it safe to exclude,
+ * and it being the review plus up to two minutes of absence.
+ */
+export function settleReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingState {
+  if (state.truncatedByIdle) {
+    return state;
+  }
+  if (atMs <= state.lastActivityAtMs + REVIEW_IDLE_CUTOFF_MS) {
+    // Math.max, not assignment: a clock that jumps backwards must not
+    // un-count time already counted.
+    return { ...state, countedUntilMs: Math.max(state.countedUntilMs, atMs) };
+  }
+  return { ...state, countedUntilMs: state.lastActivityAtMs, truncatedByIdle: true };
+}
+
+/**
+ * The reviewer did something at `atMs`.
+ *
+ * If the cutoff had already passed, that span is finished and this
+ * interaction opens a new one. Handing the finished span back rather
+ * than resuming it is what stops a reviewer returning from lunch from
+ * having the lunch counted, and stops the opposite failure: a span that
+ * truncated once and then silently measures nothing for the rest of the
+ * visit.
+ */
+export function recordReviewActivity(state: ReviewTimingState, atMs: number): ReviewTimingTransition {
+  const settled = settleReviewTiming(state, atMs);
+  if (!settled.truncatedByIdle) {
+    return {
+      state: { ...settled, lastActivityAtMs: Math.max(settled.lastActivityAtMs, atMs) },
+      completed: undefined
+    };
+  }
+  return { state: beginReviewTiming(atMs), completed: toSpanDraft(settled) };
+}
+
+/**
+ * Close the span at `atMs`, or report that there is nothing to send.
+ *
+ * `undefined` for a span that measured no time, and that is not merely
+ * an optimization. An application whose only spans were empty would
+ * still enter summarizeReviewTiming's denominator carrying a total of
+ * zero, pulling the median toward "reviews take no time" -- the exact
+ * number that function refuses to report. Dropping them at the source is
+ * what keeps the sample made of measurements.
+ */
+export function sealReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingSpanDraft | undefined {
+  const draft = toSpanDraft(settleReviewTiming(state, atMs));
+  return draft.activeMs > 0 ? draft : undefined;
+}
+
+/**
+ * `endedAtMs` is the counted frontier, never the caller's clock, and
+ * `activeMs` is measured against the same instant.
+ *
+ * That is what makes `activeMs <= endedAtMs - startedAtMs` true by
+ * construction rather than by hope. Migration 0021 asserts the same
+ * bound as a CHECK, and a producer that can only emit conforming spans
+ * is worth more than one that is merely rejected when it does not.
+ */
+function toSpanDraft(state: ReviewTimingState): ReviewTimingSpanDraft {
+  return {
+    startedAtMs: state.startedAtMs,
+    endedAtMs: state.countedUntilMs,
+    activeMs: state.countedUntilMs - state.startedAtMs,
+    truncatedByIdle: state.truncatedByIdle
+  };
+}

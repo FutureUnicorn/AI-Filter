@@ -734,3 +734,44 @@ export const recordCandidateDecisionInputSchema = z.strictObject({
   decision: z.enum(CANDIDATE_DECISION_KINDS),
   rationale: correctionReasonSchema
 });
+
+// ---- AF-54: capture recruiter review timing ----
+
+/**
+ * What a client may send for one review span.
+ *
+ * As with a decision, the actor is absent: no reviewerUserId, and a
+ * strictObject so sending one is a 400 rather than an ignored extra.
+ * That matters more here than it looks. A timing row names a person and
+ * how long they took, so a caller able to choose the name could attach
+ * someone else's working rate to their own reading -- and the table this
+ * feeds is one GROUP BY away from being a performance record.
+ *
+ * Both cross-field rules mirror CHECK constraints in migration 0021.
+ * The database is the boundary that actually holds; these exist so a
+ * miscomputed client gets `invalid_request` and a message, rather than a
+ * constraint violation surfacing as a 500 that reads like a server bug.
+ */
+export const recordReviewTimingSpanInputSchema = z
+  .strictObject({
+    startedAt: z.iso.datetime(),
+    endedAt: z.iso.datetime(),
+    /**
+     * Focused, interacting time -- NOT endedAt - startedAt, which is why
+     * it is sent rather than derived. A tab left open overnight would
+     * otherwise record eight hours of "review".
+     */
+    activeMs: z.int().nonnegative(),
+    truncatedByIdle: z.boolean()
+  })
+  .refine((input) => Date.parse(input.endedAt) >= Date.parse(input.startedAt), {
+    error: "endedAt must not precede startedAt",
+    path: ["endedAt"]
+  })
+  .refine((input) => input.activeMs <= Date.parse(input.endedAt) - Date.parse(input.startedAt) + 1_000, {
+    // The same one-second tolerance the database allows, for clock
+    // granularity at the edges. Anything beyond it is a duration the
+    // client did not measure.
+    error: "activeMs cannot exceed the wall-clock span it sits inside",
+    path: ["activeMs"]
+  });
