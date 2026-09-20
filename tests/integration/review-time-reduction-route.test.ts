@@ -57,7 +57,7 @@ interface CallOptions {
 }
 
 async function call(options: CallOptions): Promise<{ status: number; body: Record<string, unknown> }> {
-  const query = options.query ?? "baselineSource=measured_preassist&baselineMedianActiveMs=600000";
+  const query = options.query ?? "employerReportedMedianActiveMs=600000";
   const token = options.userId === undefined ? undefined : createSessionToken(options.userId, SESSION_SECRET);
   const response = await GET(
     requestFor(`http://localhost:3000/api/roles/${options.roleId}/metrics/review-time-reduction?${query}`, token),
@@ -110,17 +110,60 @@ test("the review-time reduction is reachable through an authenticated endpoint",
   await t.test("the twelfth, interrupted application is reported as an incomplete population", async () => {
     const { body } = await call({ roleId: fixture.roleId, userId: fixture.auditorUserId });
     const codes = (body.limitations as Array<{ code: string }>).map((limitation) => limitation.code);
-    assert.deepEqual(codes, ["population_incomplete"]);
+    // Exhaustive, not `includes`: baseline_self_reported is now on every
+    // response this route can produce, and an assertion that tolerated
+    // extra codes would stop noticing if it disappeared.
+    assert.deepEqual(codes, ["population_incomplete", "baseline_self_reported"]);
   });
 
-  await t.test("an employer-reported baseline arrives labelled as an estimate", async () => {
-    const { body } = await call({
-      roleId: fixture.roleId,
-      userId: fixture.auditorUserId,
-      query: "baselineSource=employer_reported&baselineMedianActiveMs=600000"
-    });
+  await t.test("every reportable baseline arrives labelled as the employer's own estimate", async () => {
+    const { body } = await call({ roleId: fixture.roleId, userId: fixture.auditorUserId });
     const codes = (body.limitations as Array<{ code: string }>).map((limitation) => limitation.code);
     assert.ok(codes.includes("baseline_self_reported"), "the provenance of the baseline must survive the boundary");
+  });
+
+  await t.test("no request can obtain an unqualified metric by naming its own baseline source", async () => {
+    // REV-002. The route used to read `source` from the query string, so
+    // `baselineSource=measured_preassist` removed baseline_self_reported
+    // and the reader lost the fact that the two sides of the comparison
+    // were not measured the same way. Every spelling of that attempt is
+    // swept here rather than the one that was reported, since the point
+    // is that no query shape reaches an unlabelled value.
+    for (const spoof of [
+      "baselineSource=measured_preassist&employerReportedMedianActiveMs=600000",
+      "baselineSource=employer_reported&employerReportedMedianActiveMs=600000",
+      "baselineSource=MEASURED_PREASSIST&employerReportedMedianActiveMs=600000",
+      "baselineSource=&employerReportedMedianActiveMs=600000",
+      "employerReportedMedianActiveMs=600000&baselineSource=measured_preassist",
+      "baselineSource=measured_preassist&baselineSource=employer_reported&employerReportedMedianActiveMs=600000",
+      "baselineMedianActiveMs=600000&baselineSource=measured_preassist"
+    ]) {
+      const { status, body } = await call({ roleId: fixture.roleId, userId: fixture.auditorUserId, query: spoof });
+      assert.equal(status, 400, `naming a baseline source must be refused, not honoured: "${spoof}"`);
+      assert.equal((body.error as { code: string }).code, "invalid_request");
+    }
+  });
+
+  await t.test("there is no query shape that yields a value without the self-reported caveat", async () => {
+    // The property behind the sweep above: whatever a caller sends, a
+    // reported value carries the caveat or there is no reported value.
+    for (const query of [
+      "employerReportedMedianActiveMs=600000",
+      "employerReportedMedianActiveMs=600000&baselineSource=measured_preassist",
+      "employerReportedMedianActiveMs=600000&source=measured_preassist",
+      "employerReportedMedianActiveMs=600000&minimumSampleSize=1",
+      "employerReportedMedianActiveMs=1"
+    ]) {
+      const { status, body } = await call({ roleId: fixture.roleId, userId: fixture.auditorUserId, query });
+      if (status !== 200) {
+        continue;
+      }
+      const codes = (body.limitations as Array<{ code: string }>).map((limitation) => limitation.code);
+      assert.ok(
+        body.value === null || codes.includes("baseline_self_reported"),
+        `a value crossed the boundary unqualified for "${query}": ${JSON.stringify(body)}`
+      );
+    }
   });
 
   await t.test("a role below the minimum sample returns no value over the wire", async () => {
@@ -136,7 +179,7 @@ test("the review-time reduction is reachable through an authenticated endpoint",
     const { body } = await call({
       roleId: fixture.sparseRoleId,
       userId: fixture.auditorUserId,
-      query: "baselineSource=measured_preassist&baselineMedianActiveMs=600000&minimumSampleSize=1"
+      query: "employerReportedMedianActiveMs=600000&minimumSampleSize=1"
     });
     assert.equal(body.minimumSampleSize, REVIEW_TIME_REDUCTION_MINIMUM_SAMPLE_SIZE);
     assert.equal(body.value, null);
@@ -184,12 +227,11 @@ test("the review-time reduction is reachable through an authenticated endpoint",
     // error that surfaces as an internal error is unactionable.
     for (const query of [
       "",
-      "baselineSource=measured_preassist",
-      "baselineMedianActiveMs=600000",
-      "baselineSource=measured_preassist&baselineMedianActiveMs=0",
-      "baselineSource=measured_preassist&baselineMedianActiveMs=-600000",
-      "baselineSource=measured_preassist&baselineMedianActiveMs=fifteen%20minutes",
-      "baselineSource=guessed&baselineMedianActiveMs=600000"
+      "employerReportedMedianActiveMs=",
+      "employerReportedMedianActiveMs=0",
+      "employerReportedMedianActiveMs=-600000",
+      "employerReportedMedianActiveMs=fifteen%20minutes",
+      "baselineMedianActiveMs=600000"
     ]) {
       const { status, body } = await call({ roleId: fixture.roleId, userId: fixture.auditorUserId, query });
       assert.equal(status, 400, `expected 400 for "${query}"`);

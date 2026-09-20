@@ -47,11 +47,25 @@ interface RouteContext {
  *    review, and suppression that the reader can switch off is not
  *    suppression.
  *
- * 3. The baseline is validated by reviewTimeBaselineSchema before it
- *    reaches the domain. It is the one number here that does not
- *    originate inside the system, and a zero would otherwise reach
- *    describeReviewTimeReduction's throw and surface as a 500 rather
- *    than as the caller error it is.
+ * 3. The baseline's AMOUNT comes from the request. Its PROVENANCE does
+ *    not. `source` is fixed to `employer_reported` here and
+ *    `baselineSource` is rejected outright. An earlier version read the
+ *    source from the query string, so a caller could send
+ *    `measured_preassist` and describeReviewTimeReduction would omit
+ *    `baseline_self_reported`: the caller could delete the one
+ *    limitation that says the two sides were not measured the same way.
+ *    A baseline arriving in a request is an estimate by construction,
+ *    whatever it calls itself.
+ *
+ *    A genuine measured_preassist baseline needs two things that do not
+ *    exist yet: timing spans recorded while assistance was off, and a
+ *    persisted per-role record of when it was switched on to tell those
+ *    spans from the assisted ones. Until both exist no route can
+ *    honestly produce that source, so none may accept it.
+ *
+ *    The amount is still validated by reviewTimeBaselineSchema before it
+ *    reaches the domain, so a zero is a 400 rather than
+ *    describeReviewTimeReduction's throw surfacing as a 500.
  *
  * 4. The response is the MetricSample and nothing else. No target, no
  *    pass/fail against the 50% goal, and no candidate-level anything:
@@ -69,9 +83,28 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
 
-  const rawMedianActiveMs = request.nextUrl.searchParams.get("baselineMedianActiveMs");
+  // Rejected rather than ignored. A caller who sent this was told a
+  // source would be honoured, and silently relabelling their baseline
+  // would leave them believing the opposite of what the response says.
+  if (request.nextUrl.searchParams.has("baselineSource")) {
+    const error = buildApiError({
+      requestId,
+      code: "invalid_request",
+      message:
+        "baselineSource is not accepted. A baseline that arrives with a request is the employer's own " +
+        "estimate by definition and is labelled as one. A measured pre-assist baseline can only come from " +
+        "timing this system recorded before assistance was enabled, which nothing persists yet."
+    });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+  }
+
+  const rawMedianActiveMs = request.nextUrl.searchParams.get("employerReportedMedianActiveMs");
   const parsedBaseline = reviewTimeBaselineSchema.safeParse({
-    source: request.nextUrl.searchParams.get("baselineSource"),
+    // Fixed here, never read from the request. This is the whole of the
+    // fix for REV-002: `source` decides whether the reader is told the
+    // two sides were measured differently, so a caller able to set it is
+    // a caller able to delete that warning.
+    source: "employer_reported",
     // Number("") is 0 and Number(null) is 0, both of which the schema's
     // .positive() rejects; NaN is rejected by .finite(). Coercing here
     // and validating there keeps one definition of a usable baseline.
@@ -82,9 +115,8 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       requestId,
       code: "invalid_request",
       message:
-        "baselineSource must be employer_reported or measured_preassist, and baselineMedianActiveMs must be a " +
-        "positive number of milliseconds. There is no default: a baseline of unknown provenance is the one " +
-        "fact this comparison cannot lose."
+        "employerReportedMedianActiveMs must be a positive number of milliseconds. There is no default: a " +
+        "baseline of unknown provenance is the one fact this comparison cannot lose."
     });
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }

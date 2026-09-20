@@ -50,8 +50,15 @@ function filesUnder(directory: string): readonly string[] {
 
 const applicationSources = filesUnder(join(repositoryRoot, "apps")).map((path) => readFileSync(path, "utf8"));
 
+/**
+ * A CALL, not a mention. `source.includes(name)` would be satisfied by
+ * the import statement alone, so a route that imported the function and
+ * never called it would pass the guard whose entire purpose is to catch
+ * exactly that. An import is what "declared but unwired" looks like.
+ */
 function isReachable(name: string): boolean {
-  return applicationSources.some((source) => source.includes(name));
+  const called = new RegExp(String.raw`\b${name}\s*\(`, "u");
+  return applicationSources.some((source) => called.test(source));
 }
 
 test("the metric functions this suite guards are actually found in the domain", () => {
@@ -70,6 +77,34 @@ test("every metric the domain can produce is reachable from a shipped applicatio
     [],
     `computed but unreachable, so no customer or report can ever see it: ${unreachable.join(", ")}`
   );
+});
+
+test("no shipped surface lets a caller name the provenance of a review-time baseline", () => {
+  // REV-002. `source` decides whether the reader is told the two sides
+  // of the comparison were not measured the same way, so a request that
+  // can set it is a request that can delete that warning.
+  //
+  // Asserted as "the property is a string literal" rather than as "the
+  // file does not contain measured_preassist", because the defect this
+  // guards never contained that string: it read
+  // searchParams.get("baselineSource") and passed it straight through.
+  // A guard matching the literal would have been green throughout.
+  const baselineBuilders = filesUnder(join(repositoryRoot, "apps"))
+    .map((path) => [path, readFileSync(path, "utf8")] as const)
+    .filter(([, source]) => source.includes("reviewTimeBaselineSchema") || source.includes("ReviewTimeBaseline"));
+
+  assert.ok(baselineBuilders.length > 0, "expected at least one app surface to build a review-time baseline");
+  for (const [path, source] of baselineBuilders) {
+    const assignments = [...source.matchAll(/\bsource:\s*(.{0,40})/gu)].map((match) => match[1] ?? "");
+    assert.ok(assignments.length > 0, `${path} builds a baseline but never sets source`);
+    for (const assignment of assignments) {
+      assert.match(
+        assignment,
+        /^"(?:employer_reported)"/u,
+        `${path} must fix the baseline source to a literal the server owns, got: source: ${assignment}`
+      );
+    }
+  }
 });
 
 test("an exemption that is no longer needed fails, so the list cannot outlive the gap", () => {

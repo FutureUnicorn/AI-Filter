@@ -2382,6 +2382,14 @@ export const REVIEW_TIME_BASELINE_SOURCES = [
   /**
    * Timing spans this system recorded before assisted review was turned
    * on for the role. Measured the same way as the assisted side.
+   *
+   * No route may accept this from a caller, and none does: a source a
+   * request can name is a caveat a request can delete. It is reachable
+   * only from a server-owned measurement, which needs spans recorded
+   * while assistance was off plus a persisted per-role record of when it
+   * was enabled, to tell those spans from the assisted ones. Neither
+   * exists yet, so today this value has no honest producer.
+   * tests/architecture/metric-exposure.test.ts holds that line.
    */
   "measured_preassist"
 ] as const;
