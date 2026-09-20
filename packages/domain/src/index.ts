@@ -322,6 +322,23 @@ export interface Membership extends VersionedRecord {
   readonly createdAt: string;
 }
 
+/**
+ * AF-97: one organization the caller belongs to, with the role they hold
+ * in it -- the shape an organization switcher needs.
+ *
+ * Deliberately not `Organization & { role }`: it carries the
+ * organization's name, which is only ever disclosed to somebody who has
+ * a membership row for it, and the role, which is the caller's own, not
+ * a property of the organization. Keeping it a distinct record makes it
+ * impossible to hand this to code that expects a plain Organization and
+ * have it treat a per-caller field as tenant data.
+ */
+export interface CallerOrganization extends VersionedRecord {
+  readonly organizationId: string;
+  readonly name: string;
+  readonly role: MembershipRole;
+}
+
 // ---- AF-16: invite-only magic-link authentication ----
 //
 // These are internal persistence-layer shapes shared between

@@ -9,6 +9,7 @@ import type {
   CandidateDecision,
   CandidateDecisionKind,
   CanonicalTextExtraction,
+  CallerOrganization,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
@@ -504,6 +505,80 @@ export async function createMagicLinkToken(
   }
 }
 
+export interface CreateInviteMagicLinkTokenInput {
+  readonly tokenHash: string;
+  readonly email: string;
+  readonly invite: MagicLinkInvite;
+  readonly expiresAt: Date;
+  /**
+   * Not optional, and not a second call the caller could forget to make.
+   * An invite grants a named role in an organization to whoever redeems
+   * it, which is exactly the consequential `admin_action` AF-20 requires
+   * to be attributable -- and redemption itself records nothing, because
+   * the person redeeming is not the person who decided to grant it.
+   * Making this a field means an invite that is not attributable cannot
+   * be expressed, rather than merely discouraged.
+   */
+  readonly audit: {
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
+}
+
+/**
+ * Mints an invite token and its audit row in one transaction.
+ *
+ * Separate from createMagicLinkToken rather than an optional argument on
+ * it: a login link re-sends access somebody already has, an invite
+ * creates it, and only the second is an administrative act with an
+ * actor to record.
+ *
+ * The audit row's entity_id is the token hash, not the invited email.
+ * audit_events is append-only by trigger and has no delete path, so an
+ * address written there could never be removed; the token hash points at
+ * the magic_link_tokens row, which holds the email, organization and
+ * role together and can be deleted. The audit trail keeps the fact and
+ * its actor, and the joinable row keeps the detail.
+ */
+export async function createInviteMagicLinkToken(
+  databaseUrl: string,
+  schema: string,
+  input: CreateInviteMagicLinkTokenInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [input.tokenHash, email, input.invite.organizationId, input.invite.role, input.expiresAt]
+      );
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.invite.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "membership_invite",
+          entityId: input.tokenHash,
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Atomic single-use redemption: the UPDATE only ever matches a row once,
  * so two concurrent redemption attempts on the same token cannot both
@@ -980,6 +1055,226 @@ export async function getMembershipsForUser(
   }
 }
 
+// ---- AF-97: entering a deployment ----
+
+interface CallerOrganizationRow {
+  readonly organization_id: string;
+  readonly name: string;
+  readonly role: MembershipRole;
+}
+
+/**
+ * The organizations a signed-in caller may act in, with the role they
+ * hold in each.
+ *
+ * Every other route takes an organizationId it does not produce, so
+ * before this existed a user had exactly one way to learn their own:
+ * be told it out of band and paste it into a query string. This is the
+ * one query that turns a session into a set of places to act in, which
+ * is what an organization switcher renders.
+ *
+ * The organization name is only reachable through the caller's own
+ * membership rows -- the join, not a filter applied afterwards -- so an
+ * organizationId the caller has no membership for cannot be resolved to
+ * a name here, and the list cannot become an organization directory.
+ */
+export async function listOrganizationsForUser(
+  databaseUrl: string,
+  schema: string,
+  userId: string
+): Promise<readonly CallerOrganization[]> {
+  assertSafeSchema(schema);
+  // Same cross-organization lookup as getMembershipsForUser, and the same
+  // reason it must fail loudly: under a role RLS applies to, this returns
+  // zero rows for every caller, and an organization switcher that renders
+  // "you belong to no organizations" is indistinguishable from the truth.
+  await requireMembershipLookupVisibleOnce(databaseUrl, schema, "listing a user's organizations");
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<CallerOrganizationRow>(
+      `SELECT o.organization_id, o.name, m.role
+         FROM "${schema}".memberships m
+         INNER JOIN "${schema}".organizations o ON o.organization_id = m.organization_id
+        WHERE m.user_id = $1
+        ORDER BY o.name ASC, o.organization_id ASC`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      organizationId: row.organization_id,
+      name: row.name,
+      role: row.role
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+export interface BootstrapOrganizationOwnerInput {
+  readonly organizationName: string;
+  readonly email: string;
+  readonly displayName: string;
+}
+
+export interface BootstrapOrganizationOwnerResult {
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly organizationCreated: boolean;
+  readonly userCreated: boolean;
+  /** `promoted` means the user already belonged to this organization in a
+   * non-owner role and now owns it -- reported rather than silent, because
+   * it is the one privilege change this command can make to existing data. */
+  readonly membership: "created" | "promoted" | "unchanged";
+}
+
+/**
+ * Creates the first organization, user and owner membership of a
+ * deployment, atomically.
+ *
+ * A fresh deployment has none of the three, and no code path creates
+ * any: `POST /api/auth/magic-link/request` only mails a link to an email
+ * that already holds a membership, and an invite can only be issued by
+ * somebody who already owns an organization. That is a deliberate
+ * invite-only design (AF-16) with one missing step -- the first invite
+ * has nobody to come from -- so every route in the app was unreachable
+ * without hand-editing the database.
+ *
+ * This is the missing step, and it is deliberately NOT an HTTP route.
+ * Whatever creates the first owner cannot itself be behind
+ * authentication, so as a route it would be an unauthenticated
+ * privilege-granting endpoint that must be disabled after first use,
+ * and "we remembered to disable it" is not a security control. Requiring
+ * the operator to already hold database credentials moves the
+ * authorization to something the deployment already has to protect.
+ *
+ * Idempotent, so an interrupted or repeated run converges instead of
+ * creating a second organization with the same name: an existing
+ * organization of that name is reused, the user is matched by email, and
+ * the owner membership is upserted. See BootstrapOrganizationOwnerResult
+ * for what a repeat run reports.
+ */
+export async function bootstrapOrganizationOwner(
+  databaseUrl: string,
+  schema: string,
+  input: BootstrapOrganizationOwnerInput
+): Promise<BootstrapOrganizationOwnerResult> {
+  assertSafeSchema(schema);
+  const organizationName = input.organizationName.trim();
+  const displayName = input.displayName.trim();
+  const email = input.email.trim().toLowerCase();
+  // Checked here rather than left to the table's CHECK constraints: an
+  // operator running this by hand should get the reason, not a raw
+  // constraint-violation stack.
+  if (organizationName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty organization name");
+  }
+  if (displayName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty display name");
+  }
+  if (email.indexOf("@") < 1) {
+    throw new Error("bootstrapOrganizationOwner requires an email address");
+  }
+
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // One transaction for all three rows: a crash between them would
+      // otherwise leave an organization nobody owns or a user with no
+      // membership, and the second is exactly the "half-onboarded account"
+      // the login path reports as no_account.
+      //
+      // organizations.name carries no unique constraint -- two real
+      // employers may share a name -- so "insert unless one exists" is a
+      // check-then-write that two concurrent runs could both pass,
+      // producing the duplicate organization the idempotency below exists
+      // to prevent. A transaction-scoped advisory lock on the name makes
+      // the pair atomic without constraining the table, and is released by
+      // COMMIT or ROLLBACK either way.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationName]);
+      const insertedOrganization = await client.query<{ organization_id: string }>(
+        `INSERT INTO "${schema}".organizations (name)
+         SELECT $1
+          WHERE NOT EXISTS (SELECT 1 FROM "${schema}".organizations WHERE name = $1)
+         RETURNING organization_id`,
+        [organizationName]
+      );
+      const organizationCreated = insertedOrganization.rows[0] !== undefined;
+      const organizationId =
+        insertedOrganization.rows[0]?.organization_id ??
+        (
+          await client.query<{ organization_id: string }>(
+            `SELECT organization_id FROM "${schema}".organizations
+              WHERE name = $1
+              ORDER BY created_at ASC, organization_id ASC
+              LIMIT 1`,
+            [organizationName]
+          )
+        ).rows[0]?.organization_id;
+      if (organizationId === undefined) {
+        throw new Error("bootstrap did not resolve an organization");
+      }
+
+      const insertedUser = await client.query<{ user_id: string }>(
+        `INSERT INTO "${schema}".users (email, display_name)
+         VALUES ($1, $2)
+         ON CONFLICT (email) DO NOTHING
+         RETURNING user_id`,
+        [email, displayName]
+      );
+      const userCreated = insertedUser.rows[0] !== undefined;
+      // Deliberately does not overwrite an existing display name: this
+      // command exists to grant access, and silently renaming a person
+      // because an operator typed their name differently is not that.
+      const userId =
+        insertedUser.rows[0]?.user_id ??
+        (
+          await client.query<{ user_id: string }>(
+            `SELECT user_id FROM "${schema}".users WHERE email = $1`,
+            [email]
+          )
+        ).rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error("bootstrap did not resolve a user");
+      }
+
+      // AF-18's memberships policy requires this for both the SELECT and
+      // the INSERT below under any role RLS applies to; is_local = true
+      // ties it to this transaction, so it cannot leak onto a later query
+      // sharing the pooled connection. Same reasoning as
+      // provisionInvitedMembership.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const existing = await client.query<{ role: MembershipRole }>(
+        `SELECT role FROM "${schema}".memberships
+          WHERE organization_id = $1 AND user_id = $2
+          FOR UPDATE`,
+        [organizationId, userId]
+      );
+      const existingRole = existing.rows[0]?.role;
+      await client.query(
+        `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
+         VALUES ($1, $2, 'owner')
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'owner'`,
+        [organizationId, userId]
+      );
+      await client.query("COMMIT");
+      return {
+        organizationId,
+        userId,
+        organizationCreated,
+        userCreated,
+        membership:
+          existingRole === undefined ? "created" : existingRole === "owner" ? "unchanged" : "promoted"
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Seeds one organization + user + membership and returns the user id.
  *
@@ -996,8 +1291,8 @@ export async function getMembershipsForUser(
  * invoke it.
  */
 /**
- * Provision a throwaway schema with only the migrations the magic-link
- * routes touch, and return its name.
+ * Provision a throwaway schema with the migrations the authentication and
+ * entry-point routes touch, and return its name.
  *
  * Lives here rather than in the test because `pg` is a packages/db
  * dependency and tests do not import it directly (the same reason
@@ -1007,6 +1302,13 @@ export async function getMembershipsForUser(
  * workstation after `pnpm dev:infra`, false in the Integration CI job, which
  * starts a bare postgres service with no migrations applied. All three route
  * tests passed locally and failed in CI.
+ *
+ * AF-97 widened it from the two magic-link migrations to the five the way
+ * INTO a deployment now spans: audit_events, because an invite writes its
+ * `admin_action` row in the same transaction as the token, and roles,
+ * because "a recruiter can reach a role" is the thing entering a deployment
+ * is for. One fixture rather than a near-identical second one, so the two
+ * cannot drift about what a route-level probe contains.
  */
 export async function provisionRouteProbeSchema(databaseUrl: string): Promise<string> {
   const schema = `route_probe_${randomBytes(4).toString("hex")}`;
@@ -1014,7 +1316,17 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
-    for (const file of ["0002_organizations_users_memberships.sql", "0003_magic_link_tokens.sql"]) {
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0003_magic_link_tokens.sql",
+      "0005_immutable_audit_events.sql",
+      // 0005_immutable_audit_events.sql leaves audit_events with an
+      // ON DELETE CASCADE that fights its own append-only trigger, and the
+      // file below is the fix; applying the first without the second would
+      // give the probe a shape no real database has ever had.
+      "0006_audit_events_delete_and_membership_fixes.sql",
+      "0009_roles.sql"
+    ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }

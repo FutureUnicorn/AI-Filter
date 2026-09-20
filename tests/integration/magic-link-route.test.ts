@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import moduleHooks from "node:module";
 import test from "node:test";
 
 import {
@@ -8,6 +7,7 @@ import {
   seedOrganizationMembership
 } from "../../packages/db/src/index.ts";
 import { SESSION_COOKIE_NAME, verifySessionToken } from "../../packages/security/src/index.ts";
+import { loadWebRoute } from "../support/web-route-loader.ts";
 
 /**
  * The route-level redeemability gate.
@@ -112,44 +112,6 @@ function jsonRequest(url: string, body: unknown, idempotencyKey: string): Reques
   });
 }
 
-/**
- * apps/web source imports sibling modules extensionless (the redeem
- * route does `from "../../../../../lib/session"`), which Next's bundler
- * resolves and plain Node ESM does not. This hook adds the `.ts`
- * extension only when the bare specifier fails to resolve, so the real
- * route files load unmodified: the alternative was rewriting production
- * import specifiers to satisfy a test, which would change how Next
- * builds the app.
- */
-function registerExtensionlessTsResolution(): void {
-  moduleHooks.registerHooks({
-    resolve(specifier, context, nextResolve) {
-      try {
-        return nextResolve(specifier, context);
-      } catch (error) {
-        if (/\.[cm]?[jt]sx?$/u.test(specifier)) {
-          throw error;
-        }
-        // `.ts` covers apps/web's own extensionless relative imports
-        // (lib/session); `.js` covers package subpaths that Next resolves
-        // through its bundler, such as `next/server`. Tried in that order
-        // and only after the plain specifier has already failed, so this
-        // never shadows a specifier Node could resolve on its own.
-        for (const extension of [".ts", ".js"]) {
-          try {
-            return nextResolve(`${specifier}${extension}`, context);
-          } catch {
-            continue;
-          }
-        }
-        throw error;
-      }
-    }
-  });
-}
-
-let resolutionRegistered = false;
-
 interface RouteModule {
   POST(request: Request): Promise<Response>;
 }
@@ -158,36 +120,15 @@ interface GetRouteModule {
   GET(request: Request): Promise<Response>;
 }
 
-/**
- * Loaded through a runtime-built specifier rather than a static import.
- *
- * A static `import ".../route.ts"` would pull apps/web into
- * tests/tsconfig.json, which typechecks with module NodeNext; apps/web
- * has no `"type": "module"`, so every route file is then read as
- * CommonJS and its ESM syntax fails with TS1295. Next.js compiles those
- * files with its own tsconfig, and giving apps/web a `type` field to
- * satisfy this test would change how the app itself is built.
- *
- * Node still executes the genuine handler here, so this remains a
- * route-level test: the request and redeem handlers that ship are the
- * ones being driven.
- */
+/** The extension-retry hook and the runtime-built specifier both live in
+ * tests/support/web-route-loader.ts; see that file for why each is needed
+ * before a shipped route handler can be imported here. */
 async function loadRoute(relativePath: string): Promise<RouteModule> {
-  if (!resolutionRegistered) {
-    registerExtensionlessTsResolution();
-    resolutionRegistered = true;
-  }
-  const specifier = new URL(relativePath, import.meta.url).href;
-  return (await import(specifier)) as RouteModule;
+  return loadWebRoute<RouteModule>(import.meta.url, relativePath);
 }
 
 async function loadGetRoute(relativePath: string): Promise<GetRouteModule> {
-  if (!resolutionRegistered) {
-    registerExtensionlessTsResolution();
-    resolutionRegistered = true;
-  }
-  const specifier = new URL(relativePath, import.meta.url).href;
-  return (await import(specifier)) as GetRouteModule;
+  return loadWebRoute<GetRouteModule>(import.meta.url, relativePath);
 }
 
 const REQUEST_ROUTE = "../../apps/web/src/app/api/auth/magic-link/request/route.ts";

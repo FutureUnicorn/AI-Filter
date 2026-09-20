@@ -23,6 +23,7 @@ import type {
   Application,
   ApplicationQueueEntry,
   AuditEvent,
+  CallerOrganization,
   CandidateDecision,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -616,6 +617,23 @@ export const createInviteInputSchema = z.strictObject({
   organizationId: z.uuid(),
   role: z.enum(MEMBERSHIP_ROLES)
 });
+
+export type CreateInviteInput = z.infer<typeof createInviteInputSchema>;
+
+// ---- AF-97: the organizations the caller can act in ----
+//
+// The response shape behind the organization switcher. It is a contract
+// because a signed-in user's first request is now this one: everything
+// else in the app needs an organizationId, and until AF-97 the only way
+// to obtain one was to be told it out of band and paste it into a query
+// string.
+
+export const callerOrganizationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  organizationId: z.uuid(),
+  name: z.string().min(1),
+  role: z.enum(MEMBERSHIP_ROLES)
+}) satisfies z.ZodType<CallerOrganization>;
 
 // ---- AF-20: immutable audit events ----
 
