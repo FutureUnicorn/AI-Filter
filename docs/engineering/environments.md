@@ -83,9 +83,18 @@ same-repository pull request based on `develop` or `main`. The workflow checks
 out `workflow_run.head_sha`, verifies the checked-out SHA, and deploys through
 a runner labelled `signal-audit-preview`.
 
-AF-93: deploy and cleanup must agree on this scope, or a PR gets a preview
-created that nothing ever reclaims except the 72-hour TTL sweep. Every
-checkout in this workflow (deploy, cleanup, and sweep) also sets
+AF-93: deploy is scoped this way so an unbounded number of stacked PRs cannot
+each try to stand up a full preview stack on the one preview host. Cleanup is
+deliberately NOT scoped the same way -- it runs for every closed PR regardless
+of base branch, since a PR's base can be retargeted after its preview was
+created, and `preview down` already no-ops safely when there is nothing to
+remove. Gating cleanup on a mutable property is what created the leak in the
+first place. Deploy also verifies the source pull request is still open
+(a live API check, not the `workflow_run` event's snapshot) immediately before
+calling `preview up`, since a CI run that started before the PR closed can
+complete after it, which the event payload alone cannot distinguish.
+
+Every checkout in this workflow (deploy, cleanup, and sweep) also sets
 `clean: false` -- `actions/checkout` defaults to wiping every gitignored file,
 and `.runtime/previews/` (the record of which previews exist) is gitignored,
 so the default checkout destroyed that record before each job could read it.

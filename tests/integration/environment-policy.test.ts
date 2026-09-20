@@ -91,16 +91,56 @@ test("preview jobs never wipe the gitignored runtime state they depend on", () =
  * AF-93, finding 2. Deploy and cleanup used to disagree about which PRs get a
  * preview: deploy was unrestricted (any base branch), cleanup only fired for
  * PRs based on develop. A PR based on anywhere else got a preview created and
- * never reclaimed except by the 72-hour TTL sweep. Restricting deploy to the
- * same develop/main bases cleanup already covers also matters now that AF-92
- * runs CI on feature/** PRs too -- without this, every stacked feature PR
- * would try to stand up a full preview stack on the one preview host.
+ * never reclaimed except by the 72-hour TTL sweep. Restricting deploy scope
+ * also matters now that AF-92 runs CI on feature/** PRs too -- without this,
+ * every stacked feature PR would try to stand up a full preview stack on the
+ * one preview host.
  */
-test("preview creation and preview cleanup agree on which PRs are in scope", () => {
+test("preview creation is scoped to develop/main base PRs", () => {
   const workflow = read(".github/workflows/preview-environment.yml");
   assert.match(workflow, /pull_requests\[0\]\.base\.ref == 'develop'/u);
   assert.match(workflow, /pull_requests\[0\]\.base\.ref == 'main'/u);
-  assert.match(workflow, /pull_request_target:\s*\n\s+branches: \[develop, main\]/u);
+});
+
+/**
+ * AF-93 PR #85 review (Copilot). The first cut of this fix narrowed the
+ * cleanup trigger to `branches: [develop, main]` to match deploy -- but
+ * cleanup filters on the PR's CURRENT base branch at close time, which can
+ * change after the preview was created (GitHub allows retargeting a PR's
+ * base without closing it). A preview created while based on develop, then
+ * retargeted elsewhere before closing, would never be cleaned up except by
+ * the 72-hour sweep. `preview down` already no-ops when no state exists
+ * (scripts/environment/cli.mjs downPreview), so cleanup is safe to run
+ * unconditionally for every closed PR rather than gating on a mutable
+ * property -- unlike creation, which must stay scoped to bound how many
+ * preview stacks run on the one host at once.
+ */
+test("preview cleanup runs for every closed PR regardless of base branch", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  assert.match(workflow, /pull_request_target:\s*\n\s+types: \[closed\]/u);
+  assert.doesNotMatch(
+    workflow,
+    /pull_request_target:\s*\n\s+branches:/u,
+    "cleanup must not filter on base branch: it can change after the preview was created, and preview down " +
+      "already no-ops safely when nothing exists"
+  );
+});
+
+/**
+ * AF-93 PR #85 review (Copilot). `workflow_run` fires on CI completion, which
+ * can happen after the source PR has already closed -- the event's
+ * pull_requests[0] entry is a snapshot from when CI was triggered and does
+ * not reflect that. Without a live check, a CI run that started before close
+ * and finished after it could still pass the deploy job's `if` condition and
+ * recreate an environment for a PR that close-triggered cleanup already
+ * (correctly) tore down, with no later cleanup event to catch it.
+ */
+test("deploy verifies the source pull request is still open before creating a preview", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  assert.match(workflow, /id: pr-state/u);
+  assert.match(workflow, /api\.github\.com\/repos\/\$\{\{ github\.repository \}\}\/pulls\/\$PR_NUMBER/u);
+  assert.match(workflow, /echo "state=\$state" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(workflow, /if: steps\.pr-state\.outputs\.state == 'open'/u);
 });
 
 test("staging and production deploy only exact green revisions", () => {
