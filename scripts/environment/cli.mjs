@@ -5,8 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertDestructiveEnvironmentAllowed,
+  buildAlterRolePasswordStatement,
+  buildDatabaseUrl,
   derivePreviewEnvironment,
   requireHostedControls,
+  requireRotationControls,
   validateCommitSha,
   validatePullRequestNumber
 } from "./model.mjs";
@@ -51,6 +54,11 @@ function localEnvironment() {
       POSTGRES_DB: "signal_audit_local",
       POSTGRES_USER: "signal_audit_local",
       POSTGRES_PASSWORD: "local-only-password",
+      DATABASE_URL: buildDatabaseUrl({
+        user: "signal_audit_local",
+        password: "local-only-password",
+        database: "signal_audit_local"
+      }),
       DATABASE_SCHEMA: "public",
       STORAGE_REGION: "us-east-1",
       STORAGE_BUCKET: "signal-audit-development",
@@ -63,19 +71,83 @@ function localEnvironment() {
 function hostedEnvironment(appEnv) {
   requireHostedControls(appEnv, process.env);
   const sha = validateCommitSha(option("--sha") ?? process.env.DEPLOYMENT_COMMIT_SHA);
+  const database = `signal_audit_${appEnv}`;
   return {
     project: `signal-audit-${appEnv}`,
     variables: {
       ...process.env,
       APP_ENV: appEnv,
       DEPLOYMENT_COMMIT_SHA: sha,
-      POSTGRES_DB: `signal_audit_${appEnv}`,
+      POSTGRES_DB: database,
+      DATABASE_URL: buildDatabaseUrl({
+        user: process.env.POSTGRES_USER,
+        password: process.env.POSTGRES_PASSWORD,
+        database
+      }),
       DATABASE_SCHEMA: "public",
       STORAGE_REGION: process.env.STORAGE_REGION ?? "us-east-1",
       STORAGE_BUCKET: `signal-audit-${appEnv}`,
       WEB_BIND_ADDRESS: process.env.WEB_BIND_ADDRESS ?? "127.0.0.1"
     }
   };
+}
+
+/**
+ * AF-94: rotating POSTGRES_PASSWORD alone never reaches the database --
+ * Postgres only applies it while initialising an empty data directory, and
+ * staging/production keep a persistent volume. This authenticates with the
+ * outgoing password (POSTGRES_PASSWORD_PREVIOUS) against the already-running
+ * `postgres` service and issues the ALTER ROLE that makes the role's actual
+ * password match the secret being rotated in. Run it, then redeploy with
+ * `up` so migrate/web/worker pick up the new value.
+ *
+ * The statement is sent on psql's stdin, and the outgoing password is
+ * forwarded to the container via a bare `-e PGPASSWORD` (Docker reads the
+ * value from this process's own environment) rather than a flag value, so
+ * neither password is ever written into a process's argv.
+ */
+function rotatePassword(appEnv) {
+  requireHostedControls(appEnv, process.env);
+  const { previousPassword, nextPassword } = requireRotationControls(process.env);
+  const user = process.env.POSTGRES_USER;
+  const database = `signal_audit_${appEnv}`;
+  const project = `signal-audit-${appEnv}`;
+  const statement = buildAlterRolePasswordStatement(user, nextPassword);
+  const result = spawnSync(
+    "docker",
+    [
+      "compose",
+      "-f",
+      composeFile,
+      "--project-name",
+      project,
+      "exec",
+      "-T",
+      "-e",
+      "PGPASSWORD",
+      "postgres",
+      "psql",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-U",
+      user,
+      "-d",
+      database
+    ],
+    {
+      cwd: repositoryRoot,
+      env: { ...process.env, PGPASSWORD: previousPassword },
+      input: statement,
+      stdio: ["pipe", "inherit", "inherit"]
+    }
+  );
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`password rotation for ${appEnv} failed with status ${result.status}`);
+  }
+  console.log(
+    `Rotated ${user}@${appEnv} to the password in POSTGRES_PASSWORD. Run 'up' to redeploy migrate/web/worker with it, then drop POSTGRES_PASSWORD_PREVIOUS from the secret store.`
+  );
 }
 
 function startEnvironment(environment, { local = false, seed = false } = {}) {
@@ -170,8 +242,9 @@ if (scope === "local") {
   else if (action === "sweep") sweepPreviews();
   else throw new Error("Expected preview up|down|sweep");
 } else if (scope === "staging" || scope === "production") {
-  if (action !== "up") throw new Error("Hosted environments support only controlled up");
-  deployEnvironment(hostedEnvironment(scope), scope === "staging");
+  if (action === "up") deployEnvironment(hostedEnvironment(scope), scope === "staging");
+  else if (action === "rotate-password") rotatePassword(scope);
+  else throw new Error("Expected staging or production up|rotate-password");
 } else {
   throw new Error("Expected local, preview, staging, or production command scope");
 }

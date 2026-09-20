@@ -179,6 +179,38 @@ Staging and production environment variables:
 Do not copy values between environments. Secret values must never appear in Git,
 Jira, screenshots, workflow output, or shell history.
 
+## Credential rotation
+
+The official Postgres image applies `POSTGRES_USER`/`POSTGRES_PASSWORD` only
+while initialising an empty data directory. Staging and production keep a
+persistent `postgres-data` volume, so replacing `POSTGRES_PASSWORD` in the
+secret store and redeploying changes what `migrate`, `web`, and `worker`
+*send* without changing what the database role *accepts* -- every hosted
+service then fails authentication against a role whose password never moved.
+
+Rotate the database password like this:
+
+1. In the environment's secret store, add `POSTGRES_PASSWORD_PREVIOUS` set to
+   the currently active password, then replace `POSTGRES_PASSWORD` with the
+   new one.
+2. Run `node scripts/environment/cli.mjs <staging|production> rotate-password`.
+   It authenticates against the already-running `postgres` service with
+   `POSTGRES_PASSWORD_PREVIOUS` and issues `ALTER ROLE ... WITH PASSWORD`, so
+   the role's actual password matches the secret being rotated in. It refuses
+   to run if `POSTGRES_PASSWORD_PREVIOUS` is absent or equal to
+   `POSTGRES_PASSWORD` (nothing to rotate).
+3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
+   redeploy with the new password, which the role now accepts.
+4. Remove `POSTGRES_PASSWORD_PREVIOUS` from the secret store. It is only read
+   during step 2, and leaving the outgoing password in the store afterward
+   is exposure with no remaining purpose.
+
+Storage credentials (`STORAGE_ACCESS_KEY_ID`/`STORAGE_SECRET_ACCESS_KEY`) are
+MinIO's root user, which MinIO re-reads from the environment on every start
+rather than only at initialisation -- confirm this against the deployed MinIO
+version before relying on it, but it does not need the ALTER-ROLE-style
+rotation step Postgres does.
+
 ## Spend controls
 
 The repository supplies defense in depth through per-service CPU/memory limits,
@@ -242,5 +274,8 @@ Do not mark AF-11 Done if any external provider evidence in steps 4-9 is absent.
   target before removing it.
 - Hosted control missing: configure the named GitHub environment variable or
   secret. Do not bypass `requireHostedControls`.
+- Hosted database authentication fails right after a `POSTGRES_PASSWORD`
+  change: rotation was skipped. See "Credential rotation" above; do not
+  reset the volume to force it, which destroys the environment's state.
 - Production health failure: stop rollout and investigate; never seed or reset
   production to make the check pass.
