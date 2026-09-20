@@ -2346,8 +2346,22 @@ export function describeFailedDocumentRate(
 // are two populations. Pooling them lets a large, clean offline eval
 // mask live-pilot errors -- and the offline set is exactly the one that
 // can be grown cheaply. There is deliberately no function here that
-// accepts both at once; the dataset is a required argument, and it
-// selects the metric name.
+// accepts both at once.
+//
+// Which dataset an item came from is a property of the item, not an
+// argument supplied at the end. The first version of this took the
+// dataset only where the metric name was chosen, and checked it against
+// the examination source: `candidate_decision` belongs to a live pilot,
+// `offline_annotation` to the locked eval. That catches nothing for the
+// source that matters, because `item_correction` is the one examination
+// record both worlds produce -- a recruiter correcting a card and an
+// annotator marking an item wrong leave the same shape of revision
+// chain. So a batch of live-pilot corrections could be reported under
+// the offline name, and the inverse too: precisely the pooling the two
+// targets exist to prevent, with the number carrying no trace of it.
+// Every history now names its dataset, every item in a batch has to
+// agree with it, and the sample takes its name from that rather than
+// from a second argument nothing cross-checks.
 //
 // **An item enters the denominator only by naming what proves a human
 // examined it.** The first version of this took a bare
@@ -2389,7 +2403,9 @@ export const EVIDENCE_EXAMINATION_SOURCES = [
   /**
    * The item's own revision chain carries a human correction
    * (0017_evidence_corrections.sql). Item-level proof, and the only kind
-   * a live pilot produces today.
+   * a live pilot produces today. It says nothing about which dataset the
+   * item came from: both worlds correct items, and the chains are
+   * indistinguishable. That is why the dataset is carried separately.
    */
   "item_correction",
   /**
@@ -2412,6 +2428,14 @@ export type EvidenceExaminationSource = (typeof EVIDENCE_EXAMINATION_SOURCES)[nu
 export interface EvidenceItemHistory {
   /** Stable identity across corrections: the root of the revision chain. */
   readonly itemId: string;
+  /**
+   * Which population this item belongs to. Caller-asserted like
+   * `examinedVia`, and for the same reason: nothing in a revision chain
+   * distinguishes a pilot correction from an eval one. Stating it per
+   * item is what makes a mixed batch detectable at all, since a single
+   * dataset argument agrees with itself no matter what it is handed.
+   */
+  readonly dataset: EvidencePrecisionDataset;
   /** Every revision of this one item, in any order. */
   readonly revisions: readonly EvidenceRevision[];
   /**
@@ -2424,6 +2448,12 @@ export interface EvidenceItemHistory {
 }
 
 export interface EvidencePrecision {
+  /**
+   * The one population these items came from. Carried through rather
+   * than restated at reporting time, so the metric name cannot disagree
+   * with the data it was computed over.
+   */
+  readonly dataset: EvidencePrecisionDataset;
   /** 1 - (corrected / examined). null when nothing has been examined. */
   readonly precision: number | null;
   /** Items a human examined: the denominator. */
@@ -2438,12 +2468,6 @@ export interface EvidencePrecision {
    * Drives `examination_inferred`.
    */
   readonly inferredExaminations: number;
-  /**
-   * Denominator items examined by a locked-eval annotator. Tracked
-   * separately from the inferred count because it is proof rather than
-   * inference, and because it belongs to exactly one dataset.
-   */
-  readonly annotatedExaminations: number;
   /**
    * Corrections applied across examined items, counting repeats. Reported
    * beside correctedItems rather than folded into it: an item corrected
@@ -2469,18 +2493,44 @@ export interface EvidencePrecision {
  * record covers. Both are contradictory input rather than edge cases:
  * each hides a bug in whatever built the histories, and that bug moves
  * the denominator.
+ *
+ * `dataset` is required and every item must match it. Pooling is caught
+ * here, where the items are, rather than at reporting time, where all
+ * that is left of them is a count: by then a live-pilot correction and
+ * an offline one are the same integer.
  */
 export function summarizeEvidencePrecision(
-  items: readonly EvidenceItemHistory[]
+  items: readonly EvidenceItemHistory[],
+  dataset: EvidencePrecisionDataset
 ): EvidencePrecision {
   const seen = new Set<string>();
   let examinedItems = 0;
   let correctedItems = 0;
   let correctionEvents = 0;
   let inferredExaminations = 0;
-  let annotatedExaminations = 0;
 
   for (const item of items) {
+    if (item.dataset !== dataset) {
+      // The live pilot and the locked eval answer to different targets,
+      // so an item counted into the wrong one is not a mislabelled row:
+      // it is the pooling this metric is split in two to prevent.
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} belongs to ${item.dataset} ` +
+          `and cannot be counted into a ${dataset} sample`
+      );
+    }
+    if (item.examinedVia === "offline_annotation" && dataset !== "locked_offline_eval") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia offline_annotation ` +
+          `in a ${dataset} sample; only the locked eval has annotators`
+      );
+    }
+    if (item.examinedVia === "candidate_decision" && dataset !== "live_pilot") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia candidate_decision ` +
+          `in a ${dataset} sample; only a live pilot has recruiters deciding on candidates`
+      );
+    }
     if (seen.has(item.itemId)) {
       // Two histories for one item would double-count it in both
       // numerator and denominator -- not cancelling out, because only one
@@ -2516,12 +2566,10 @@ export function summarizeEvidencePrecision(
     if (item.examinedVia === "candidate_decision") {
       inferredExaminations += 1;
     }
-    if (item.examinedVia === "offline_annotation") {
-      annotatedExaminations += 1;
-    }
   }
 
   return {
+    dataset,
     // null, never 1. Perfect precision over an empty denominator is what
     // a pilot that has not started yet would report, and it is the single
     // most quotable wrong number this metric could produce.
@@ -2530,7 +2578,6 @@ export function summarizeEvidencePrecision(
     correctedItems,
     producedItems: items.length,
     inferredExaminations,
-    annotatedExaminations,
     correctionEvents
   };
 }
@@ -2547,32 +2594,21 @@ export function summarizeEvidencePrecision(
  * suppress every live-pilot figure this product can currently produce,
  * and a metric nobody can compute is not a safer metric: it is the same
  * claim made in a slide deck with nothing attached to it at all.
+ *
+ * There is deliberately no dataset argument. The dataset arrived with
+ * the items and was checked against every one of them; taking it again
+ * here would create a second place to state it and therefore a way for
+ * the two to disagree, which is the same reasoning that keeps a
+ * candidate's workflow status out of a column on applications
+ * (0019_candidate_decisions.sql). A sample reported under the wrong name
+ * is not rejected here because it cannot be constructed.
  */
 export function describeEvidencePrecision(
   precision: EvidencePrecision,
-  dataset: EvidencePrecisionDataset,
   minimumSampleSize: number
 ): MetricSample {
-  // Each dataset has exactly one examination record of its own, so a
-  // denominator built from the other one's is a pooled sample wearing a
-  // single name. That is the failure the two targets exist to prevent,
-  // arriving by a different route than a shared metric name -- which is
-  // the only route the dataset argument closes on its own.
-  if (dataset === "live_pilot" && precision.annotatedExaminations > 0) {
-    throw new Error(
-      `describeEvidencePrecision: ${precision.annotatedExaminations} item(s) examined by a locked-eval ` +
-        "annotator cannot be reported as live_pilot precision"
-    );
-  }
-  if (dataset === "locked_offline_eval" && precision.inferredExaminations > 0) {
-    throw new Error(
-      `describeEvidencePrecision: ${precision.inferredExaminations} item(s) examined only via a candidate ` +
-        "decision cannot be reported as locked_offline_eval precision; the locked eval has no recruiters"
-    );
-  }
-
   const sample = summarizeMetric({
-    metric: `evidence_precision_${dataset}`,
+    metric: `evidence_precision_${precision.dataset}`,
     value: precision.precision,
     sampleSize: precision.examinedItems,
     population: precision.producedItems,
