@@ -56,12 +56,26 @@ jobs:
       name: preview/pr-${{ github.event.workflow_run.pull_requests[0].number }}
       url: https://pr-${{ github.event.workflow_run.pull_requests[0].number }}.${{ vars.PREVIEW_BASE_DOMAIN }}
     steps:
-      - name: Check out the exact revision that passed CI
+      # AF-93 PR #85 review (Copilot), high severity: cli.mjs previously ran
+      # from the same, untrusted checkout it was building -- so a PR could
+      # modify cli.mjs itself to read PREVIEW_STATE_DIRECTORY and exfiltrate
+      # every OTHER preview's credentials, or run arbitrary commands as the
+      # runner user. Orchestration now runs from THIS checkout (trusted,
+      # default-branch code); the untrusted PR's own revision is checked out
+      # below into pr-source and used ONLY as the Docker build context, never
+      # executed directly.
+      - name: Check out trusted orchestration code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          clean: false
+      - name: Check out the exact revision that passed CI (build context only)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          path: pr-source
           persist-credentials: false
-          clean: false
       - name: Check whether the source pull request is still open
         id: pr-state
         env:
@@ -77,8 +91,12 @@ jobs:
           PREVIEW_BASE_DOMAIN: ${{ vars.PREVIEW_BASE_DOMAIN }}
           TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          # Read by infra/compose/runtime.yml (web/worker build.context, and
+          # the migrate/seed bind mounts, which must still run the PR's own
+          # migrations for correctness) -- never by cli.mjs's own logic.
+          DEPLOY_SOURCE_DIRECTORY: ${{ github.workspace }}/pr-source
         run: |
-          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          test "$(git -C pr-source rev-parse HEAD)" = "$TESTED_SHA"
           node scripts/environment/cli.mjs preview up --pr "$PR_NUMBER" --sha "$TESTED_SHA"
 
   cleanup:

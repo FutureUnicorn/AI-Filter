@@ -104,14 +104,35 @@ Preview state -- one JSON file per PR carrying its generated database and
 storage credentials -- lives at `PREVIEW_STATE_DIRECTORY`
 (`scripts/environment/cli.mjs`), a fixed, runner-persistent path OUTSIDE
 every job's git checkout, set once at the workflow level so deploy, cleanup,
-and sweep all agree on it. This is deliberate, not incidental: the deploy job
-checks out the PR's own untrusted head SHA (it has to, to build that
-revision's Dockerfile), and `clean: false` combined with state living INSIDE
-that checkout would have handed the untrusted checkout read access to every
-OTHER preview's already-generated credentials the moment `cli.mjs` ran --
-`.gitignore` itself would have documented exactly where to look. Falling back
-to an in-repo `.runtime/` when the variable is unset keeps local, manual
-`pnpm preview:*` usage on a developer's own machine unchanged.
+and sweep all agree on it. Falling back to an in-repo `.runtime/` when the
+variable is unset keeps local, manual `pnpm preview:*` usage on a
+developer's own machine unchanged.
+
+That alone is not enough, and the deploy job is structured around the
+reason: `scripts/environment/cli.mjs` -- the orchestration script that reads
+`PREVIEW_STATE_DIRECTORY` and shells out to Docker -- must never itself be
+code the PR under test controls. Running it from the PR's own checkout would
+let a modified `cli.mjs` read that variable directly and exfiltrate every
+OTHER preview's credentials (or run arbitrary commands as the runner user),
+regardless of where the credential files live. So deploy checks out TWO
+revisions: the default branch (trusted, where `cli.mjs` and this workflow's
+own commands run from) into the job's main workspace, and the PR's own
+tested SHA into a `pr-source` subdirectory that is never executed directly
+-- only consumed as `DEPLOY_SOURCE_DIRECTORY`, the Docker build context for
+`infra/compose/runtime.yml`'s `web`/`worker` services, and the mount source
+for the `migrate`/`seed` bind mounts (which must still run that PR's own
+migrations for correctness). Every other caller of that compose file --
+local development, staging, production, manual `pnpm preview:*` -- leaves
+`DEPLOY_SOURCE_DIRECTORY` unset and gets the previous, single-checkout
+behavior unchanged.
+
+This closes the orchestration-script attack surface Copilot's review
+identified. It does not, on its own, sandbox the `docker build` step itself
+-- a PR's own Dockerfile still executes build instructions on the shared
+runner host during that build, which is the same underlying question as
+finding 3 below (untrusted code on a persistent, reused runner) and needs
+the same kind of infrastructure decision (ephemeral build runners, or
+tighter Docker daemon sandboxing) to close fully.
 
 Each preview receives:
 

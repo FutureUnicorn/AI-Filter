@@ -71,19 +71,32 @@ test("preview lifecycle is green-SHA scoped with close and TTL cleanup", () => {
 
 /**
  * AF-93, finding 1. `actions/checkout` defaults to `clean: true`, which runs
- * `git clean -ffdx` -- the `-x` includes gitignored files. `.runtime/previews/`
- * is gitignored (it holds generated per-preview credentials), so the default
- * checkout at the start of every job destroyed the one record deploy, cleanup,
- * and sweep all need to find an existing preview before they can replace or
- * remove it. `clean: false` is required on every checkout in this workflow, not
- * just one, since all three jobs read that same state.
+ * `git clean -ffdx` -- the `-x` includes gitignored files. Preview credential
+ * state used to be gitignored inside each checkout, so the default checkout
+ * at the start of every job destroyed the one record deploy, cleanup, and
+ * sweep all needed to find an existing preview before they could replace or
+ * remove it. `clean: false` is required on every checkout that runs
+ * orchestration code (cli.mjs) from -- deploy's trusted default-branch
+ * checkout, and cleanup's and sweep's.
+ *
+ * The one exception is deploy's SECOND checkout, `pr-source` (the untrusted
+ * PR revision, added in a later review round): it is never executed and
+ * carries no state of its own, only Docker build input that is meant to be
+ * exactly the tested SHA's tree on every run -- so `clean: true` there is
+ * correct, not an oversight.
  */
 test("preview jobs never wipe the gitignored runtime state they depend on", () => {
   const workflow = read(".github/workflows/preview-environment.yml");
   const checkoutSteps = [...workflow.matchAll(/uses: actions\/checkout@[^\n]+\n([\s\S]*?)(?=\n {6}- name:|\n {4}\S|$)/gu)];
-  assert.ok(checkoutSteps.length >= 3, `expected at least 3 checkout steps, found ${checkoutSteps.length}`);
-  for (const [, withBlock] of checkoutSteps) {
-    assert.match(withBlock ?? "", /clean: false/u, `every checkout in this workflow must set clean: false:\n${withBlock}`);
+  assert.ok(checkoutSteps.length >= 4, `expected at least 4 checkout steps, found ${checkoutSteps.length}`);
+  const orchestrationCheckouts = checkoutSteps.filter(([, withBlock]) => !(withBlock ?? "").includes("path: pr-source"));
+  assert.ok(orchestrationCheckouts.length >= 3, "expected at least 3 checkouts that orchestration code runs from");
+  for (const [, withBlock] of orchestrationCheckouts) {
+    assert.match(
+      withBlock ?? "",
+      /clean: false/u,
+      `every checkout that orchestration code runs from must set clean: false:\n${withBlock}`
+    );
   }
 });
 
@@ -188,6 +201,51 @@ test("preview credential state lives outside every job's checkout", () => {
     /process\.env\.PREVIEW_STATE_DIRECTORY/u,
     "cli.mjs must read the runner-provided state location rather than always deriving one inside the checkout"
   );
+});
+
+/**
+ * AF-93 PR #85 review (Copilot), high severity follow-up. Moving credential
+ * state outside the checkout (previous test) stops the untrusted checkout
+ * from stumbling onto OTHER previews' secrets via .gitignore, but the deploy
+ * job still ran cli.mjs itself FROM that same untrusted checkout -- so a
+ * modified cli.mjs could simply read process.env.PREVIEW_STATE_DIRECTORY and
+ * exfiltrate every pr-*.json it finds, or run arbitrary commands as the
+ * runner user. cli.mjs and this workflow now run from a TRUSTED
+ * default-branch checkout; the untrusted PR's own revision is checked out
+ * separately into pr-source and used ONLY as the Docker build context
+ * (infra/compose/runtime.yml's web/worker build.context and the migrate/seed
+ * bind mounts, via DEPLOY_SOURCE_DIRECTORY) -- never executed as a script.
+ */
+test("deploy runs orchestration from a trusted checkout and treats the PR checkout as build input only", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  const deployJob = /^ {2}deploy:[\s\S]*?(?=\n {2}\S)/mu.exec(workflow)?.[0];
+  assert.ok(deployJob, "expected a deploy job block");
+
+  assert.match(
+    deployJob!,
+    /ref: \$\{\{ github\.event\.repository\.default_branch \}\}[\s\S]*?clean: false/u,
+    "the checkout that cli.mjs runs from must be the trusted default branch"
+  );
+  assert.match(
+    deployJob!,
+    /ref: \$\{\{ github\.event\.workflow_run\.head_sha \}\}\s*\n\s+path: pr-source/u,
+    "the untrusted PR revision must be checked out into its own subdirectory, not the job's main workspace"
+  );
+  assert.match(
+    deployJob!,
+    /DEPLOY_SOURCE_DIRECTORY: \$\{\{ github\.workspace \}\}\/pr-source/u,
+    "only the build context should point at the untrusted checkout"
+  );
+  assert.match(
+    deployJob!,
+    /test "\$\(git -C pr-source rev-parse HEAD\)" = "\$TESTED_SHA"/u,
+    "the tested-SHA verification must check pr-source's HEAD now that cli.mjs no longer runs from that checkout"
+  );
+
+  const compose = read("infra/compose/runtime.yml");
+  assert.match(compose, /context: \$\{DEPLOY_SOURCE_DIRECTORY:-\.\.\/\.\.\}/u);
+  assert.match(compose, /\$\{DEPLOY_SOURCE_DIRECTORY:-\.\.\/\.\.\}\/packages\/db\/migrations:\/migrations:ro/u);
+  assert.match(compose, /\$\{DEPLOY_SOURCE_DIRECTORY:-\.\.\/\.\.\}\/tests\/fixtures\/environment:\/fixtures:ro/u);
 });
 
 test("staging and production deploy only exact green revisions", () => {
