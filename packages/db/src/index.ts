@@ -2086,6 +2086,7 @@ export async function assertApplicantOrderingPreserved(databaseUrl: string): Pro
       throw new Error("probe could not create a role");
     }
 
+
     // Two intakes, three rows each, inserted in a deliberately jumbled
     // sequence so a missing ORDER BY would show up as insertion order.
     const intakeIds: string[] = [];
@@ -3494,6 +3495,20 @@ export async function recordAuditSample(
           [auditSampleId, input.organizationId, applicationId]
         );
       }
+      // Review REV-003. The deferred constraint trigger in 0020 is what
+      // actually guarantees this, and it fires on COMMIT for every writer
+      // including psql. Checking here as well buys a legible error at the
+      // call site instead of a check_violation surfacing from a COMMIT
+      // that names no application code, which is a materially worse thing
+      // to debug at 3am.
+      const expected = Math.min(input.requestedSize, input.eligibleCount);
+      if (input.sampledApplicationIds.length !== expected) {
+        throw new Error(
+          `an audit sample must record exactly ${expected} member(s), the lesser of requestedSize ` +
+            `${input.requestedSize} and eligibleCount ${input.eligibleCount}, but ` +
+            `${input.sampledApplicationIds.length} were supplied`
+        );
+      }
       await client.query("COMMIT");
       return auditSampleId;
     } catch (error) {
@@ -3530,7 +3545,9 @@ export async function listAuditSamplesForRole(
               array_agg(m.application_id ORDER BY m.application_id)
                 FILTER (WHERE m.application_id IS NOT NULL) AS application_ids
          FROM "${schema}".audit_samples s
-         LEFT JOIN "${schema}".audit_sample_members m ON m.audit_sample_id = s.audit_sample_id
+         LEFT JOIN "${schema}".audit_sample_members m
+                ON m.audit_sample_id = s.audit_sample_id
+               AND m.organization_id = s.organization_id
         WHERE s.organization_id = $1 AND s.role_id = $2
         GROUP BY s.audit_sample_id
         ORDER BY s.drawn_at DESC, s.audit_sample_id DESC`,
@@ -3629,6 +3646,35 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     if (roleId === undefined) {
       throw new Error("probe could not create a role");
     }
+    // A REAL org B application. The probe previously had none, which is
+    // why its cross-tenant check passed while the hole was open: with
+    // only org A applications to hand, the (application_id,
+    // organization_id) reference fired first and was mistaken for the
+    // sample reference doing the work. The reviewer's repro used an org B
+    // application precisely because that satisfies the applications key
+    // and leaves the sample key as the only thing standing.
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'auditor')`, [
+      orgB,
+      memberId
+    ]);
+    const roleB = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'RB', $2) RETURNING role_id`,
+      [orgB, memberId]
+    );
+    const intakeB = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'b.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgB, roleB.rows[0]?.role_id, `probe/${suffix}-b.csv`, memberId]
+    );
+    const applicationB = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'CB', $4) RETURNING application_id`,
+      [orgB, roleB.rows[0]?.role_id, intakeB.rows[0]?.intake_id, `cb_${suffix}@acme.test`]
+    );
+    const applicationBId = applicationB.rows[0]?.application_id;
+    if (applicationBId === undefined) {
+      throw new Error("probe could not create an org B application");
+    }
 
     // 1. A draw records with its membership, atomically.
     const sampleId = await recordAuditSample(databaseUrl, schema, {
@@ -3716,6 +3762,80 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       throw new Error("a draw must not be able to claim another tenant's application");
     }
 
+    // 4b. The real cross-tenant case: org B's application, carrying org
+    //     B's organization_id, inserted into org A's draw. This is the
+    //     row the reviewer executed successfully. The applications
+    //     reference is satisfied, so only the composite sample reference
+    //     can refuse it.
+    //
+    //     The exact-membership trigger is disabled for this one check and
+    //     the SQLSTATE is asserted, because otherwise this passes for the
+    //     wrong reason: adding a third member to a two-member draw is
+    //     refused by the count trigger whether or not the tenant
+    //     constraint exists, and the test would report the hole closed
+    //     while it was open. Measured: with the composite key reverted
+    //     and no SQLSTATE assertion, this check still passed.
+    await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER audit_sample_members_exact_membership`);
+    let foreignMemberSqlState = "";
+    try {
+      await admin.query(
+        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
+        [sampleId, orgB, applicationBId]
+      );
+    } catch (error) {
+      foreignMemberSqlState = (error as { code?: string }).code ?? "";
+    } finally {
+      await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_exact_membership`);
+    }
+    if (foreignMemberSqlState !== "23503") {
+      throw new Error(
+        "org A's draw must refuse org B's application with a foreign-key violation, got " +
+          `${foreignMemberSqlState === "" ? "no error at all" : `SQLSTATE ${foreignMemberSqlState}`}. ` +
+          "sampledCount is published in AF-59's report, so a foreign member inflates a customer-facing number " +
+          "and breaks the promise that the draw can be reproduced from the seed."
+      );
+    }
+
+    // 4c. The read path filters by tenant on its own, independently of
+    //     the constraint. Proven by dropping the constraint, inserting the
+    //     row it would have refused, and checking the read still excludes
+    //     it. Without this the JOIN predicate is untested belief: the two
+    //     live in different files, and a later migration relaxing the key
+    //     would silently reopen the read.
+    const foreignKeyName = await admin.query<{ conname: string }>(
+      `SELECT conname FROM pg_constraint
+        WHERE conrelid = '"${schema}".audit_sample_members'::regclass
+          AND contype = 'f' AND confrelid = '"${schema}".audit_samples'::regclass`
+    );
+    const constraintName = foreignKeyName.rows[0]?.conname;
+    if (constraintName === undefined) {
+      throw new Error("the composite reference from members to draws is missing entirely");
+    }
+    await admin.query(`ALTER TABLE audit_sample_members DROP CONSTRAINT "${constraintName}"`);
+    await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER audit_sample_members_exact_membership`);
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
+      [sampleId, orgB, applicationBId]
+    );
+    const withForeignRow = await listAuditSamplesForRole(databaseUrl, schema, orgA, roleId);
+    if (withForeignRow[0]?.sampledApplicationIds.length !== 2) {
+      throw new Error(
+        `the read path must exclude a foreign member even when the constraint is gone; got ${withForeignRow[0]?.sampledApplicationIds.length} members`
+      );
+    }
+    // Restore the schema exactly, so the steps below test what they say
+    // they test rather than a weakened table. The append-only trigger has
+    // to come off to remove the row it is designed to protect.
+    await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER audit_sample_members_append_only`);
+    await admin.query(`DELETE FROM audit_sample_members WHERE organization_id = $1`, [orgB]);
+    await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_append_only`);
+    await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_exact_membership`);
+    await admin.query(
+      `ALTER TABLE audit_sample_members
+         ADD CONSTRAINT "${constraintName}" FOREIGN KEY (audit_sample_id, organization_id)
+         REFERENCES audit_samples (audit_sample_id, organization_id)`
+    );
+
     // 5. Nothing edits, extends by rewriting, or erases a recorded draw.
     for (const statement of [
       `UPDATE audit_samples SET seed = 'rerolled'`,
@@ -3733,6 +3853,85 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       if (!rejected) {
         throw new Error(`a recorded draw must be immutable; permitted: ${statement}`);
       }
+    }
+
+    // 6. Review REV-003: the draw must record exactly what it drew.
+    //    Both directions matter and they lie differently. Too few reads
+    //    as "we sampled and found nobody"; too many reads as "we sampled
+    //    everybody". Neither required the seed to decide anything.
+    for (const [label, size, eligible, ids] of [
+      ["no members at all", 2, 3, [] as string[]],
+      ["fewer members than it drew", 2, 3, [applicationIds[0] as string]],
+      ["more members than it drew", 2, 3, applicationIds.slice(0, 3)]
+    ] as const) {
+      let rejected = false;
+      try {
+        await recordAuditSample(databaseUrl, schema, {
+          organizationId: orgA,
+          roleId,
+          seed: `exact-${label}-${suffix}`,
+          requestedSize: size,
+          eligibleCount: eligible,
+          drawnByUserId: memberId,
+          sampledApplicationIds: ids
+        });
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) {
+        throw new Error(`a draw recording ${label} must not commit`);
+      }
+    }
+
+    // A draw over an empty eligible population legitimately records
+    // nothing, and must still be allowed. This is why the constraint
+    // trigger is attached to audit_samples as well: with no member rows
+    // ever inserted, a trigger living only on the member table would
+    // never fire to check it.
+    await recordAuditSample(databaseUrl, schema, {
+      organizationId: orgA,
+      roleId,
+      seed: `empty-${suffix}`,
+      requestedSize: 5,
+      eligibleCount: 0,
+      drawnByUserId: memberId,
+      sampledApplicationIds: []
+    });
+
+    // 7. The database enforces it too, not just the writer. A caller
+    //    going around recordAuditSample gets the same answer.
+    let rawUnderfilledRejected = false;
+    try {
+      await admin.query("BEGIN");
+      await admin.query(
+        `INSERT INTO audit_samples
+           (audit_sample_id, organization_id, role_id, seed, requested_size, eligible_count, drawn_by_user_id)
+         VALUES ($1, $2, $3, $4, 2, 3, $5)`,
+        ["c0000001-4444-4444-8444-444444444444", orgA, roleId, `raw-${suffix}`, memberId]
+      );
+      await admin.query("COMMIT");
+    } catch {
+      rawUnderfilledRejected = true;
+      await admin.query("ROLLBACK").catch(() => undefined);
+    }
+    if (!rawUnderfilledRejected) {
+      throw new Error("a draw inserted directly with no members must be refused at commit, not only by the writer");
+    }
+
+    // 8. And a committed draw cannot be extended afterwards. The
+    //    append-only triggers reject UPDATE and DELETE and say nothing
+    //    about INSERT, which is how a finished draw could grow a member.
+    let extensionRejected = false;
+    try {
+      await admin.query(
+        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
+        [sampleId, orgA, applicationIds[2]]
+      );
+    } catch {
+      extensionRejected = true;
+    }
+    if (!extensionRejected) {
+      throw new Error("a committed draw must not accept a further member");
     }
   } finally {
     try {
