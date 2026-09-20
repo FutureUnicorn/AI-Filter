@@ -6,8 +6,19 @@ on:
     types: [completed]
     branches: [main]
 
+# AF-95: the group is deliberately a constant, not keyed on head_sha. Two
+# pushes to main produce two different SHAs, so a SHA-keyed group puts them in
+# two different groups and serialises nothing -- both deploys could run at once
+# against the same signal-audit-production Compose project, the same persistent
+# volume, and the same database, replaying migrations concurrently. A single
+# self-hosted production runner happens to prevent that today, but that is an
+# infrastructure fact this repository does not control and would lose the moment
+# a second production runner is added for capacity. A constant group states the
+# guarantee here instead of inheriting it. cancel-in-progress stays false so a
+# queued revision waits for the in-flight deployment rather than killing it
+# part-way through a migration.
 concurrency:
-  group: production-${{ github.event.workflow_run.head_sha }}
+  group: production
   cancel-in-progress: false
 
 permissions:

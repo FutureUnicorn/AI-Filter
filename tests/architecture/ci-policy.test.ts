@@ -92,3 +92,22 @@ test("production eligibility is success-only and tied to the tested main SHA", (
   assert.match(productionGate, /environment:\s+name: production/u);
   assert.match(productionGate, /secrets\.POSTGRES_PASSWORD/u);
 });
+
+test("production deployments are serialised across revisions, not per revision", () => {
+  // AF-95. Every production run must land in one concurrency group whatever
+  // revision triggered it, so two green pushes to main queue instead of
+  // deploying at once against the same volume and replaying migrations
+  // concurrently. Keying the group on head_sha gives each push its own group
+  // and serialises nothing; that the single signal-audit-production runner
+  // currently hides this is infrastructure, not a property of this repository.
+  const concurrency = /\nconcurrency:\n((?:[ \t]+\S.*\n)+)/u.exec(productionGate)?.[1];
+  assert.notEqual(concurrency, undefined, "production gate must declare a concurrency block");
+  assert.match(concurrency ?? "", /^\s+group: production\s*$/mu);
+  assert.doesNotMatch(
+    concurrency ?? "",
+    /\$\{\{/u,
+    "the group must be a constant: an expression makes it per-revision, which serialises nothing"
+  );
+  // False would let a newer revision cancel a deployment mid-migration.
+  assert.match(concurrency ?? "", /^\s+cancel-in-progress: false\s*$/mu);
+});

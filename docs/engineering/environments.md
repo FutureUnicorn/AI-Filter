@@ -139,6 +139,15 @@ The `production` GitHub environment must:
 - record deployment approvals and runs in GitHub; and
 - link to the hosting provider's audit log for host/console administration.
 
+Production deployments are serialised across revisions by a constant
+`production` concurrency group with `cancel-in-progress: false`: a second green
+`main` revision queues behind the in-flight deployment instead of running beside
+it against the same Compose project, volume, and database. Do not key that group
+on the revision — that gives each push its own group and serialises nothing,
+leaving the guarantee to rest on there being exactly one
+`signal-audit-production` runner. Adding a second production runner for capacity
+is then safe on this axis.
+
 Production does not run the synthetic seed command. Reset, seed, and destructive
 local commands reject `APP_ENV=production`.
 
