@@ -20,6 +20,14 @@ defaults:
   run:
     shell: bash
 
+env:
+  # AF-93 PR #85 review (Copilot): a fixed, runner-persistent location
+  # outside every job's checkout, so preview credentials are never part of
+  # what an untrusted PR checkout contains (see scripts/environment/cli.mjs).
+  # Shared across deploy, cleanup, and sweep so all three agree on where
+  # state lives.
+  PREVIEW_STATE_DIRECTORY: ${{ github.workspace }}/../preview-state
+
 jobs:
   deploy:
     name: Preview / Deploy
@@ -36,6 +44,14 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: [self-hosted, linux, x64, signal-audit-preview]
     timeout-minutes: 30
+    permissions:
+      contents: read
+      # AF-93 PR #85 review (Copilot): job-level permissions replace, not
+      # merge with, the workflow-level block above, so contents: read is
+      # restated here. pull-requests: read authenticates the live PR-state
+      # check below; without it the unauthenticated call works only for a
+      # public repository and is subject to the unauthenticated rate limit.
+      pull-requests: read
     environment:
       name: preview/pr-${{ github.event.workflow_run.pull_requests[0].number }}
       url: https://pr-${{ github.event.workflow_run.pull_requests[0].number }}.${{ vars.PREVIEW_BASE_DOMAIN }}
@@ -50,8 +66,10 @@ jobs:
         id: pr-state
         env:
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          state=$(curl -fsSL "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER" | jq -r '.state')
+          state=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER" | jq -r '.state')
           echo "state=$state" >> "$GITHUB_OUTPUT"
       - name: Verify and deploy isolated preview
         if: steps.pr-state.outputs.state == 'open'

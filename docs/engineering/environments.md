@@ -96,8 +96,22 @@ complete after it, which the event payload alone cannot distinguish.
 
 Every checkout in this workflow (deploy, cleanup, and sweep) also sets
 `clean: false` -- `actions/checkout` defaults to wiping every gitignored file,
-and `.runtime/previews/` (the record of which previews exist) is gitignored,
-so the default checkout destroyed that record before each job could read it.
+and the preview state directory (the record of which previews exist) is
+gitignored, so the default checkout destroyed that record before each job
+could read it.
+
+Preview state -- one JSON file per PR carrying its generated database and
+storage credentials -- lives at `PREVIEW_STATE_DIRECTORY`
+(`scripts/environment/cli.mjs`), a fixed, runner-persistent path OUTSIDE
+every job's git checkout, set once at the workflow level so deploy, cleanup,
+and sweep all agree on it. This is deliberate, not incidental: the deploy job
+checks out the PR's own untrusted head SHA (it has to, to build that
+revision's Dockerfile), and `clean: false` combined with state living INSIDE
+that checkout would have handed the untrusted checkout read access to every
+OTHER preview's already-generated credentials the moment `cli.mjs` ran --
+`.gitignore` itself would have documented exactly where to look. Falling back
+to an in-repo `.runtime/` when the variable is unset keeps local, manual
+`pnpm preview:*` usage on a developer's own machine unchanged.
 
 Each preview receives:
 
@@ -105,8 +119,9 @@ Each preview receives:
 - database schema: `pr_<PR>_<SHA>` inside its own disposable Postgres instance;
 - bucket: `signal-audit-preview-pr-<PR>-<SHA>` inside its own disposable MinIO instance;
 - randomly generated database and storage credentials;
-- a state file under ignored `.runtime/previews/` with mode `0600` where the
-  operating system supports POSIX permissions;
+- a state file under `PREVIEW_STATE_DIRECTORY` (or ignored `.runtime/previews/`
+  locally) with mode `0600` where the operating system supports POSIX
+  permissions;
 - a deployment URL associated with GitHub's PR-specific environment.
 
 Manual validation commands are:

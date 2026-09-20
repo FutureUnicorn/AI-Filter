@@ -143,6 +143,53 @@ test("deploy verifies the source pull request is still open before creating a pr
   assert.match(workflow, /if: steps\.pr-state\.outputs\.state == 'open'/u);
 });
 
+/**
+ * AF-93 PR #85 review (Copilot). The live PR-state check calls the GitHub
+ * API; without an Authorization header it works only for a public repository
+ * and is subject to the unauthenticated rate limit, so an eligible preview
+ * deployment could fail closed once that limit is exhausted (or always, for
+ * a private repository). The deploy job needs its own pull-requests: read
+ * grant because job-level permissions replace, not merge with, the
+ * workflow-level contents: read block.
+ */
+test("the live pull-request-state check is authenticated", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  const deployJob = /^ {2}deploy:[\s\S]*?(?=\n {2}\S)/mu.exec(workflow)?.[0];
+  assert.ok(deployJob, "expected a deploy job block");
+  const permissionsBlock = /permissions:\n([\s\S]*?)(?=\n {4}\S)/u.exec(deployJob!)?.[1];
+  assert.ok(permissionsBlock, "expected a job-level permissions block on deploy");
+  assert.match(permissionsBlock!, /contents: read/u);
+  assert.match(permissionsBlock!, /pull-requests: read/u);
+  assert.match(deployJob!, /Authorization: Bearer \$GITHUB_TOKEN/u);
+  assert.match(deployJob!, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/u);
+});
+
+/**
+ * AF-93 PR #85 review (Copilot), high severity. The deploy job's checkout of
+ * the PR's own untrusted head SHA must keep clean: false (finding 1), which
+ * means anything left inside that checkout survives into it. Preview state
+ * used to live at repositoryRoot/.runtime, i.e. INSIDE the git working tree
+ * that checkout populates -- so the untrusted checkout gained read access to
+ * every other preview's already-generated database and storage credentials
+ * the moment cli.mjs ran, and .gitignore itself documented exactly where to
+ * find them. PREVIEW_STATE_DIRECTORY must be set at the workflow level (so
+ * deploy, cleanup, and sweep all agree on one location) and must not resolve
+ * inside the checkout.
+ */
+test("preview credential state lives outside every job's checkout", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  const topLevelEnvBlock = /^env:[\s\S]*?(?=\njobs:)/mu.exec(workflow)?.[0];
+  assert.ok(topLevelEnvBlock, "PREVIEW_STATE_DIRECTORY must be set once at the workflow level, not per job");
+  assert.match(topLevelEnvBlock!, /PREVIEW_STATE_DIRECTORY: \$\{\{ github\.workspace \}\}\/\.\.\/preview-state/u);
+
+  const cli = read("scripts/environment/cli.mjs");
+  assert.match(
+    cli,
+    /process\.env\.PREVIEW_STATE_DIRECTORY/u,
+    "cli.mjs must read the runner-provided state location rather than always deriving one inside the checkout"
+  );
+});
+
 test("staging and production deploy only exact green revisions", () => {
   const staging = read(".github/workflows/staging-environment.yml");
   const production = read(".github/workflows/production-gate.yml");
