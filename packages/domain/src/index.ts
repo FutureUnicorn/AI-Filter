@@ -2025,8 +2025,12 @@ export interface ReviewTimingSummary {
    * Reported at application grain because truncatedSpanCount cannot
    * answer the question that matters to a reader: how much of the scope
    * was dropped. sampleSize + partiallyObservedCount accounts for every
-   * application that was opened at all, and the remainder of population
-   * is the set nobody has reviewed yet.
+   * application that produced a span. The remainder of population is
+   * mostly applications nobody has opened, but not only those: AF-54's
+   * capture path discards a span with no active time, so a candidate
+   * opened and closed again immediately arrives here indistinguishable
+   * from one never opened. This summary sees spans, not visits, and
+   * must not be read as if it saw visits.
    */
   readonly partiallyObservedCount: number;
 }
