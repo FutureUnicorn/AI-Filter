@@ -194,11 +194,13 @@ Rotate the database password like this:
    the currently active password, then replace `POSTGRES_PASSWORD` with the
    new one.
 2. Run `node scripts/environment/cli.mjs <staging|production> rotate-password`.
-   It authenticates against the already-running `postgres` service with
-   `POSTGRES_PASSWORD_PREVIOUS` and issues `ALTER ROLE ... WITH PASSWORD`, so
-   the role's actual password matches the secret being rotated in. It refuses
-   to run if `POSTGRES_PASSWORD_PREVIOUS` is absent or equal to
-   `POSTGRES_PASSWORD` (nothing to rotate).
+   It finds the environment's already-running `postgres` container, connects
+   over TCP so the outgoing password is actually verified, and issues
+   `ALTER ROLE ... WITH PASSWORD`, so the role's actual password matches the
+   secret being rotated in. It refuses to run if `POSTGRES_PASSWORD_PREVIOUS`
+   is absent or equal to `POSTGRES_PASSWORD` (nothing to rotate), and fails
+   rather than proceeding if the outgoing password is wrong or the
+   environment is not running.
 3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
    redeploy with the new password, which the role now accepts.
 4. Remove `POSTGRES_PASSWORD_PREVIOUS` from the secret store. It is only read

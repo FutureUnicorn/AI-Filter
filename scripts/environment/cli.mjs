@@ -93,11 +93,45 @@ function hostedEnvironment(appEnv) {
 }
 
 /**
+ * The container Compose is already running for a service, found the way
+ * Compose itself finds it. Rotation acts on a live environment rather than
+ * deriving a deployment, so it deliberately does not load the Compose
+ * project: review (#86) noted that a `docker compose exec` re-parses
+ * runtime.yml, and a full parse demands every deployment variable --
+ * DATABASE_URL, SESSION_SECRET and the rest -- none of which a rotation
+ * has or needs. Whether a given Compose version interpolates strictly for
+ * `exec` is a version detail this path should not depend on.
+ */
+function runningContainerId(project, service) {
+  const result = spawnSync(
+    "docker",
+    [
+      "ps",
+      "--quiet",
+      "--filter",
+      `label=com.docker.compose.project=${project}`,
+      "--filter",
+      `label=com.docker.compose.service=${service}`
+    ],
+    { cwd: repositoryRoot, encoding: "utf8" }
+  );
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`docker ps failed with status ${result.status}: ${result.stderr.trim()}`);
+  }
+  const ids = result.stdout.split("\n").filter((id) => id.trim() !== "");
+  if (ids.length !== 1) {
+    throw new Error(`Expected one running ${service} container in ${project}, found ${ids.length}`);
+  }
+  return ids[0].trim();
+}
+
+/**
  * AF-94: rotating POSTGRES_PASSWORD alone never reaches the database --
  * Postgres only applies it while initialising an empty data directory, and
  * staging/production keep a persistent volume. This authenticates with the
  * outgoing password (POSTGRES_PASSWORD_PREVIOUS) against the already-running
- * `postgres` service and issues the ALTER ROLE that makes the role's actual
+ * postgres container and issues the ALTER ROLE that makes the role's actual
  * password match the secret being rotated in. Run it, then redeploy with
  * `up` so migrate/web/worker pick up the new value.
  *
@@ -105,30 +139,35 @@ function hostedEnvironment(appEnv) {
  * forwarded to the container via a bare `-e PGPASSWORD` (Docker reads the
  * value from this process's own environment) rather than a flag value, so
  * neither password is ever written into a process's argv.
+ *
+ * `-h 127.0.0.1` is load-bearing: psql defaults to the Unix socket, where
+ * the image's pg_hba rules can admit a local connection without a password,
+ * so a rotation would report success having never checked
+ * POSTGRES_PASSWORD_PREVIOUS -- and would happily run against an
+ * environment whose outgoing password is not the one being rotated out.
+ * Over TCP the connection is subject to the image's host auth method, so a
+ * wrong outgoing password fails here instead of silently succeeding.
  */
 function rotatePassword(appEnv) {
   requireHostedControls(appEnv, process.env);
   const { previousPassword, nextPassword } = requireRotationControls(process.env);
   const user = process.env.POSTGRES_USER;
   const database = `signal_audit_${appEnv}`;
-  const project = `signal-audit-${appEnv}`;
+  const container = runningContainerId(`signal-audit-${appEnv}`, "postgres");
   const statement = buildAlterRolePasswordStatement(user, nextPassword);
   const result = spawnSync(
     "docker",
     [
-      "compose",
-      "-f",
-      composeFile,
-      "--project-name",
-      project,
       "exec",
-      "-T",
+      "-i",
       "-e",
       "PGPASSWORD",
-      "postgres",
+      container,
       "psql",
       "-v",
       "ON_ERROR_STOP=1",
+      "-h",
+      "127.0.0.1",
       "-U",
       user,
       "-d",
