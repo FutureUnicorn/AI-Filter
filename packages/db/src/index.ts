@@ -3490,9 +3490,9 @@ export async function recordAuditSample(
       }
       for (const applicationId of input.sampledApplicationIds) {
         await client.query(
-          `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, application_id)
-           VALUES ($1, $2, $3)`,
-          [auditSampleId, input.organizationId, applicationId]
+          `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
+           VALUES ($1, $2, $3, $4)`,
+          [auditSampleId, input.organizationId, input.roleId, applicationId]
         );
       }
       // Review REV-003. The deferred constraint trigger in 0020 is what
@@ -3548,6 +3548,7 @@ export async function listAuditSamplesForRole(
          LEFT JOIN "${schema}".audit_sample_members m
                 ON m.audit_sample_id = s.audit_sample_id
                AND m.organization_id = s.organization_id
+               AND m.role_id = s.role_id
         WHERE s.organization_id = $1 AND s.role_id = $2
         GROUP BY s.audit_sample_id
         ORDER BY s.drawn_at DESC, s.audit_sample_id DESC`,
@@ -3661,6 +3662,10 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'RB', $2) RETURNING role_id`,
       [orgB, memberId]
     );
+    const roleBId = roleB.rows[0]?.role_id;
+    if (roleBId === undefined) {
+      throw new Error("probe could not create an org B role");
+    }
     const intakeB = await admin.query<{ intake_id: string }>(
       `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
        VALUES ($1, $2, $3, 'b.csv', 'text/csv', $4) RETURNING intake_id`,
@@ -3674,6 +3679,31 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     const applicationBId = applicationB.rows[0]?.application_id;
     if (applicationBId === undefined) {
       throw new Error("probe could not create an org B application");
+    }
+
+    // A second role inside org A, with its own application. Review
+    // REV-004: tenant matching says nothing about role matching, so this
+    // is the fixture that can tell the two apart. Without a same-tenant
+    // second role, every cross-role attempt also crosses a tenant and is
+    // refused for the wrong reason.
+    const roleA2 = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R2', $2) RETURNING role_id`,
+      [orgA, memberId]
+    );
+    const roleA2Id = roleA2.rows[0]?.role_id;
+    const intakeA2 = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a2.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgA, roleA2Id, `probe/${suffix}-a2.csv`, memberId]
+    );
+    const applicationA2 = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'CA2', $4) RETURNING application_id`,
+      [orgA, roleA2Id, intakeA2.rows[0]?.intake_id, `ca2_${suffix}@acme.test`]
+    );
+    const applicationA2Id = applicationA2.rows[0]?.application_id;
+    if (roleA2Id === undefined || applicationA2Id === undefined) {
+      throw new Error("probe could not create a second role in org A");
     }
 
     // 1. A draw records with its membership, atomically.
@@ -3749,18 +3779,40 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     // 4. A member from another tenant, with a FRESH draw so the
     //    (sample, application) unique key cannot fire first and be
     //    mistaken for the tenant constraint doing the work.
-    let crossTenantRejected = false;
-    try {
-      await admin.query(
-        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
-        [sampleId, orgB, applicationIds[2]]
-      );
-    } catch {
-      crossTenantRejected = true;
+    //     Review REV-004: membership was tenant-bound but not role-bound,
+    //     so an application from another role in the SAME organization
+    //     could be recorded in this draw. Both directions are attempted
+    //     because they fail against different references: naming the
+    //     other role breaks the pair with audit_samples, and keeping this
+    //     role while naming the other role's application breaks the pair
+    //     with applications. The second is the one a writer would
+    //     actually produce, since it passes input.roleId unconditionally.
+    await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER audit_sample_members_exact_membership`);
+    const roleScopeAttempts: Array<[string, string, string]> = [
+      ["naming the other role", roleA2Id, applicationA2Id],
+      ["keeping this role but taking the other role's application", roleId, applicationA2Id]
+    ];
+    for (const [label, memberRoleId, memberApplicationId] of roleScopeAttempts) {
+      let sqlState = "";
+      try {
+        await admin.query(
+          `INSERT INTO audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
+           VALUES ($1, $2, $3, $4)`,
+          [sampleId, orgA, memberRoleId, memberApplicationId]
+        );
+      } catch (error) {
+        sqlState = (error as { code?: string }).code ?? "";
+      }
+      if (sqlState !== "23503") {
+        await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_exact_membership`);
+        throw new Error(
+          `a draw must refuse another role's candidate (${label}) with a foreign-key violation, got ` +
+            `${sqlState === "" ? "no error at all" : `SQLSTATE ${sqlState}`}. The stored membership would stop ` +
+            "being the role's eligible population, so recomputing the draw from its published seed diverges."
+        );
+      }
     }
-    if (!crossTenantRejected) {
-      throw new Error("a draw must not be able to claim another tenant's application");
-    }
+    await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_exact_membership`);
 
     // 4b. The real cross-tenant case: org B's application, carrying org
     //     B's organization_id, inserted into org A's draw. This is the
@@ -3779,8 +3831,9 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     let foreignMemberSqlState = "";
     try {
       await admin.query(
-        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
-        [sampleId, orgB, applicationBId]
+        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
+         VALUES ($1, $2, $3, $4)`,
+        [sampleId, orgB, roleBId, applicationBId]
       );
     } catch (error) {
       foreignMemberSqlState = (error as { code?: string }).code ?? "";
@@ -3802,20 +3855,28 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     //     it. Without this the JOIN predicate is untested belief: the two
     //     live in different files, and a later migration relaxing the key
     //     would silently reopen the read.
-    const foreignKeyName = await admin.query<{ conname: string }>(
-      `SELECT conname FROM pg_constraint
+    // Every reference from members to draws, not just the first: since
+    // REV-004 there are two (tenant-bound and role-bound) and both would
+    // otherwise refuse the row this check needs to insert.
+    const drawReferences = await admin.query<{ conname: string; definition: string }>(
+      `SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint
         WHERE conrelid = '"${schema}".audit_sample_members'::regclass
-          AND contype = 'f' AND confrelid = '"${schema}".audit_samples'::regclass`
+          AND contype = 'f' AND confrelid = '"${schema}".audit_samples'::regclass
+        ORDER BY conname`
     );
-    const constraintName = foreignKeyName.rows[0]?.conname;
-    if (constraintName === undefined) {
-      throw new Error("the composite reference from members to draws is missing entirely");
+    if (drawReferences.rows.length !== 2) {
+      throw new Error(
+        `members must reference draws on both the tenant and the role pair; found ${drawReferences.rows.length}`
+      );
     }
-    await admin.query(`ALTER TABLE audit_sample_members DROP CONSTRAINT "${constraintName}"`);
+    for (const reference of drawReferences.rows) {
+      await admin.query(`ALTER TABLE audit_sample_members DROP CONSTRAINT "${reference.conname}"`);
+    }
     await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER audit_sample_members_exact_membership`);
     await admin.query(
-      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
-      [sampleId, orgB, applicationBId]
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
+       VALUES ($1, $2, $3, $4)`,
+      [sampleId, orgB, roleBId, applicationBId]
     );
     const withForeignRow = await listAuditSamplesForRole(databaseUrl, schema, orgA, roleId);
     if (withForeignRow[0]?.sampledApplicationIds.length !== 2) {
@@ -3830,11 +3891,11 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     await admin.query(`DELETE FROM audit_sample_members WHERE organization_id = $1`, [orgB]);
     await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_append_only`);
     await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER audit_sample_members_exact_membership`);
-    await admin.query(
-      `ALTER TABLE audit_sample_members
-         ADD CONSTRAINT "${constraintName}" FOREIGN KEY (audit_sample_id, organization_id)
-         REFERENCES audit_samples (audit_sample_id, organization_id)`
-    );
+    for (const reference of drawReferences.rows) {
+      await admin.query(
+        `ALTER TABLE audit_sample_members ADD CONSTRAINT "${reference.conname}" ${reference.definition}`
+      );
+    }
 
     // 5. Nothing edits, extends by rewriting, or erases a recorded draw.
     for (const statement of [
@@ -3924,8 +3985,9 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     let extensionRejected = false;
     try {
       await admin.query(
-        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1, $2, $3)`,
-        [sampleId, orgA, applicationIds[2]]
+        `INSERT INTO audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
+         VALUES ($1, $2, $3, $4)`,
+        [sampleId, orgA, roleId, applicationIds[2]]
       );
     } catch {
       extensionRejected = true;

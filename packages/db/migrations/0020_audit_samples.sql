@@ -35,12 +35,32 @@ CREATE TABLE IF NOT EXISTS audit_samples (
   drawn_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   FOREIGN KEY (role_id, organization_id) REFERENCES roles (role_id, organization_id),
   FOREIGN KEY (organization_id, drawn_by_user_id) REFERENCES memberships (organization_id, user_id),
-  -- Redundant against the primary key, and that is the point: it gives
-  -- audit_sample_members a composite target so a member row cannot name
-  -- one organization while its draw belongs to another. Same pattern as
-  -- the roles and applications references above.
-  UNIQUE (audit_sample_id, organization_id)
+  -- Redundant against the primary key, and that is the point: they give
+  -- audit_sample_members composite targets so a member row cannot name
+  -- one organization, or one role, while its draw belongs to another.
+  -- Same pattern as the roles and applications references above.
+  UNIQUE (audit_sample_id, organization_id),
+  UNIQUE (audit_sample_id, role_id)
 );
+
+-- Review REV-004: the member reference below needs a role-bound target on
+-- applications, and only the tenant-bound one exists (0016 added it for
+-- the same reason on the evidence path). Guarded rather than
+-- unconditional: ADD CONSTRAINT has no IF NOT EXISTS and the migrate
+-- service replays every file on each run.
+DO $applications_role_key$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.applications', current_schema())::regclass
+       AND conname = 'applications_application_id_role_id_key'
+  ) THEN
+    ALTER TABLE applications
+      ADD CONSTRAINT applications_application_id_role_id_key
+      UNIQUE (application_id, role_id);
+  END IF;
+END;
+$applications_role_key$;
 
 -- One row per sampled application. Separate from the draw so the draw's
 -- own facts cannot be edited by adding or removing members, and so a
@@ -49,6 +69,15 @@ CREATE TABLE IF NOT EXISTS audit_sample_members (
   audit_sample_member_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   audit_sample_id uuid NOT NULL,
   organization_id uuid NOT NULL,
+  -- Denormalized for the same reason organization_id is: a column the
+  -- database can pair on. Review REV-004 found membership was
+  -- tenant-bound but not role-bound, so an application belonging to
+  -- role B could be recorded in a draw for role A whenever both roles
+  -- sat in the same organization. The stored membership then stops
+  -- being the role's eligible population: recomputing role A's draw
+  -- from its published seed diverges, and AF-59's role-level counts
+  -- include candidates from a different role.
+  role_id uuid NOT NULL,
   application_id uuid NOT NULL,
   -- Review: this reference used to be single-column, so a member could
   -- carry organization B while its draw carried organization A, and the
@@ -61,6 +90,13 @@ CREATE TABLE IF NOT EXISTS audit_sample_members (
   -- and that promise becomes false.
   FOREIGN KEY (audit_sample_id, organization_id) REFERENCES audit_samples (audit_sample_id, organization_id),
   FOREIGN KEY (application_id, organization_id) REFERENCES applications (application_id, organization_id),
+  -- The role axis, which the two references above do not cover. Roles
+  -- are themselves tenant-scoped, so matching on role implies matching
+  -- on organization; both pairs are kept because they fail differently
+  -- and a future migration relaxing one should not silently widen the
+  -- other.
+  FOREIGN KEY (audit_sample_id, role_id) REFERENCES audit_samples (audit_sample_id, role_id),
+  FOREIGN KEY (application_id, role_id) REFERENCES applications (application_id, role_id),
   -- A candidate appears at most once in a given draw.
   UNIQUE (audit_sample_id, application_id)
 );
