@@ -1,6 +1,7 @@
 import process from "node:process";
 
 import { loadEnvironmentConfig } from "../../packages/config/dist/index.js";
+import { storedEmailSchema } from "../../packages/contracts/dist/index.js";
 import { bootstrapOrganizationOwner, closeDatabasePools } from "../../packages/db/dist/index.js";
 
 /**
@@ -64,7 +65,26 @@ function parseArguments(argv) {
       throw new Error(`Missing required argument. ${USAGE}`);
     }
   }
-  return parsed;
+  /*
+   * Validated with the schema the sign-in endpoint itself parses with,
+   * not a second copy of it (review #88).
+   *
+   * The whole point of this command is to create somebody who can sign
+   * in. The database CHECK is only `position('@' in email) > 1`, which
+   * accepts `owner@`, `foo@@bar` and `a@b` -- and
+   * `requestMagicLinkInputSchema` rejects all three. Any grammar written
+   * out again here could drift from that one; sharing the object means
+   * it cannot. It also lowercases, matching the users table's
+   * `email = lower(email)` constraint.
+   */
+  const email = storedEmailSchema.safeParse(parsed.email);
+  if (!email.success) {
+    throw new Error(
+      `--email ${JSON.stringify(parsed.email)} is not an address the sign-in endpoint would accept, ` +
+        `so this owner could never request a magic link. Expected the form name@example.com.`
+    );
+  }
+  return { ...parsed, email: email.data };
 }
 
 /**

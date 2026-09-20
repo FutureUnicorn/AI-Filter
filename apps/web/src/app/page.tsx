@@ -4,6 +4,8 @@ import { Suspense, useState } from "react";
 import type { FormEvent } from "react";
 import { useSearchParams } from "next/navigation";
 
+import { authFailureMessage } from "../lib/auth-codes";
+
 /**
  * AF-97: the sign-in entry point, and the only page that reads the
  * `?auth=` codes `GET /auth/redeem` has always redirected here with.
@@ -15,23 +17,9 @@ import { useSearchParams } from "next/navigation";
  * server fault were all indistinguishable from a page that had simply
  * reloaded.
  *
- * The codes are a closed map rather than text taken from the query
- * string: the parameter is attacker-supplied, and a page that renders
- * whatever it is handed is a page that can be linked to with someone
- * else's wording. An unrecognized code gets the generic message, not
- * its own text.
+ * The code-to-message mapping lives in lib/auth-codes.ts, where it can
+ * be tested against the hostile inputs a public query parameter invites.
  */
-const AUTH_FAILURE_MESSAGES: Readonly<Record<string, string>> = {
-  missing_token: "That sign-in link was incomplete. Request a new one below.",
-  invalid_link:
-    "That sign-in link has expired or was already used. Sign-in links work once; request a new one below.",
-  no_account:
-    "That link is valid, but no account here matches its email address. Ask an owner or admin of your organization to invite you.",
-  error: "Something went wrong while signing you in. Request a new link and try again."
-};
-
-const GENERIC_AUTH_FAILURE = "Sign-in did not complete. Request a new link below.";
-
 type RequestState =
   | { readonly kind: "idle" }
   | { readonly kind: "sending" }
@@ -89,7 +77,7 @@ function SignIn() {
 
       {authCode !== null && (
         <p role="alert" className="notice">
-          {AUTH_FAILURE_MESSAGES[authCode] ?? GENERIC_AUTH_FAILURE}
+          {authFailureMessage(authCode)}
         </p>
       )}
 

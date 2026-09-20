@@ -698,6 +698,66 @@ export async function appendAuditEvent(
   }
 }
 
+export interface RecordedAuditEvent {
+  readonly organizationId: string;
+  readonly actorUserId: string;
+  readonly action: AuditAction;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly requestId: string;
+}
+
+/**
+ * Reads back the audit rows for one entity.
+ *
+ * Exported for the same reason the assert* probes below are: `pg` lives
+ * in this package, so a test that needs to see real rows either goes
+ * through here or reaches for a driver it cannot resolve.
+ *
+ * It exists because of review #88, which caught a test asserting the
+ * wrong thing. `POST /api/invites` answering 202 was taken as proof that
+ * the `admin_action` row had been written; it is not. Deleting the
+ * `appendAuditEvent` call entirely would still insert the token, send
+ * the mail and answer 202, and the only assertion covering AF-20's
+ * "every consequential action is attributable" invariant would have gone
+ * on passing. The row has to be read to be checked.
+ */
+export async function listAuditEventsForEntity(
+  databaseUrl: string,
+  schema: string,
+  entityType: string,
+  entityId: string
+): Promise<readonly RecordedAuditEvent[]> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_id: string;
+      actor_user_id: string;
+      action: AuditAction;
+      entity_type: string;
+      entity_id: string;
+      request_id: string;
+    }>(
+      `SELECT organization_id, actor_user_id, action, entity_type, entity_id, request_id
+         FROM "${schema}".audit_events
+        WHERE entity_type = $1 AND entity_id = $2
+        ORDER BY occurred_at ASC`,
+      [entityType, entityId]
+    );
+    return result.rows.map((row) => ({
+      organizationId: row.organization_id,
+      actorUserId: row.actor_user_id,
+      action: row.action,
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      requestId: row.request_id
+    }));
+  } finally {
+    client.release();
+  }
+}
+
 // ---- AF-40: persist model/prompt/schema/rubric versions ----
 //
 // Insert only, same as appendAuditEvent: immutability is enforced by
@@ -1171,8 +1231,31 @@ export async function bootstrapOrganizationOwner(
   if (displayName.length === 0) {
     throw new Error("bootstrapOrganizationOwner requires a non-empty display name");
   }
-  if (email.indexOf("@") < 1) {
-    throw new Error("bootstrapOrganizationOwner requires an email address");
+  // Structural only, and deliberately not an attempt to restate the
+  // grammar (review #88). The authoritative check is contracts'
+  // `storedEmailSchema` -- the very object `POST /api/auth/magic-link/request`
+  // parses with -- applied by scripts/environment/bootstrap.mjs before it
+  // gets here, because this package may not depend on contracts and a
+  // second hand-written email regex would drift from the one that decides
+  // whether the owner can actually sign in.
+  //
+  // This still refuses what the table's own CHECK is too weak to catch:
+  // `position('@' in email) > 1` accepts `owner@`, `foo@@bar` and `a@b`,
+  // every one of which `z.email()` rejects. Left unchecked, the one
+  // command whose purpose is to create somebody who can sign in could
+  // create somebody who provably cannot.
+  const [localPart, domain, ...extraParts] = email.split("@");
+  if (
+    localPart === undefined ||
+    localPart.length === 0 ||
+    domain === undefined ||
+    extraParts.length > 0 ||
+    !/^[^\s@]+\.[^\s@]+$/u.test(domain)
+  ) {
+    throw new Error(
+      `bootstrapOrganizationOwner requires an email address of the form name@example.com; ` +
+        `an address the sign-in endpoint rejects would create an owner who can never request a link`
+    );
   }
 
   const client = await acquireConnection(databaseUrl);

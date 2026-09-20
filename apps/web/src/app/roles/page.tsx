@@ -3,6 +3,8 @@
 import { Suspense, useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { roleHasCapability } from "@signal-audit/domain";
+import type { MembershipRole } from "@signal-audit/domain";
 
 interface RoleListItem {
   readonly roleId: string;
@@ -14,7 +16,10 @@ interface RoleListItem {
 interface CallerOrganizationItem {
   readonly organizationId: string;
   readonly name: string;
-  readonly role: "owner" | "admin" | "recruiter" | "auditor";
+  /** The domain's own union, not a re-spelled copy: the forms below gate
+   * on ROLE_CAPABILITIES, so a role this page invented would type-check
+   * against a policy that has never heard of it. */
+  readonly role: MembershipRole;
 }
 
 type ListState =
@@ -264,18 +269,30 @@ function RolesList() {
         </table>
       )}
 
-      <CreateRole organizationId={organizationId} onCreated={loadRoles} />
-
       {/*
-        Shown only to the roles that hold `access_admin_settings`. This is
-        presentation, not enforcement -- POST /api/invites authorizes the
-        caller server-side regardless of what this page rendered -- but
-        offering a recruiter a form the API will refuse is its own kind of
-        dishonesty.
+        Both forms are shown only to a role that holds the capability the
+        API will check, and both ask ROLE_CAPABILITIES rather than naming
+        roles here. This is presentation, not enforcement -- each route
+        authorizes the caller server-side regardless of what this page
+        rendered -- but offering someone a form guaranteed to be refused
+        is its own kind of dishonesty.
+
+        Review #88: `CreateRole` was rendered unconditionally, so an
+        auditor (no `manage_roles`) got a form that always 403s, and so
+        did a caller who reached an `?organizationId=` they have no
+        membership for -- `activeOrganization` is undefined there, which
+        is exactly the case to render nothing for. The invite form had
+        the gate and the role form did not; deriving both from the same
+        policy is what stops them diverging again.
       */}
-      {(activeOrganization?.role === "owner" || activeOrganization?.role === "admin") && (
-        <InviteMember organizationId={organizationId} />
+      {activeOrganization !== undefined && roleHasCapability(activeOrganization.role, "manage_roles") && (
+        <CreateRole organizationId={organizationId} onCreated={loadRoles} />
       )}
+
+      {activeOrganization !== undefined &&
+        roleHasCapability(activeOrganization.role, "access_admin_settings") && (
+          <InviteMember organizationId={organizationId} />
+        )}
     </main>
   );
 }
@@ -361,7 +378,7 @@ function CreateRole({
  */
 function InviteMember({ organizationId }: { readonly organizationId: string }) {
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<CallerOrganizationItem["role"]>("recruiter");
+  const [role, setRole] = useState<MembershipRole>("recruiter");
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -416,7 +433,7 @@ function InviteMember({ organizationId }: { readonly organizationId: string }) {
         id="invite-role"
         name="role"
         value={role}
-        onChange={(event) => setRole(event.target.value as CallerOrganizationItem["role"])}
+        onChange={(event) => setRole(event.target.value as MembershipRole)}
         disabled={busy}
       >
         <option value="owner">owner — full control, including admin settings</option>

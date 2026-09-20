@@ -1,14 +1,22 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   bootstrapOrganizationOwner,
   dropProbeSchema,
+  listAuditEventsForEntity,
   listOrganizationsForUser,
   provisionRouteProbeSchema,
   seedOrganizationMembership
 } from "../../packages/db/src/index.ts";
-import { SESSION_COOKIE_NAME, createSessionToken } from "../../packages/security/src/index.ts";
+import { REQUEST_ID_HEADER } from "../../packages/contracts/src/index.ts";
+import {
+  SESSION_COOKIE_NAME,
+  createSessionToken,
+  hashMagicLinkToken
+} from "../../packages/security/src/index.ts";
 import { loadWebRoute } from "../support/web-route-loader.ts";
 
 /**
@@ -306,6 +314,7 @@ test("a bootstrapped owner can invite a recruiter, who redeems into a real membe
     });
 
     const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    let inviteRequestId: string | null = null;
     const emitted = await captureStderr(async () => {
       const response = await inviteRoute.POST(
         authenticatedJsonRequest(
@@ -315,25 +324,60 @@ test("a bootstrapped owner can invite a recruiter, who redeems into a real membe
           owner.userId
         )
       );
-      // A 202 here is also the audit row's proof. The token and its
-      // `admin_action` event are written in one transaction, and
-      // audit_events' BEFORE INSERT trigger validates that the actor held a
-      // membership in the audited organization -- so a missing or
-      // unattributable audit row rolls the invite back rather than leaving
-      // an unrecorded grant behind, and no token would be delivered below.
       assert.equal(response.status, 202, await response.clone().text());
+      inviteRequestId = response.headers.get(REQUEST_ID_HEADER);
       // The invite token is a bearer credential for the invitee's mailbox;
       // echoing it to the inviter would make it interceptable by anyone who
       // can read the response.
       assert.equal(await response.text(), "");
     });
 
+    const token = extractToken(emitted);
+
+    /*
+     * The audit row, read back rather than inferred (review #88).
+     *
+     * An earlier version of this test treated the 202 above as proof that
+     * the `admin_action` event had been written. It is not: deleting the
+     * appendAuditEvent call outright would still insert the token, send the
+     * mail and answer 202, and this test would have gone on passing while
+     * AF-20's "every consequential action is attributable" invariant was
+     * unenforced. Granting a role in an organization is exactly that kind
+     * of action, so every field that makes it attributable is checked --
+     * who did it, where, what, and under which request.
+     */
+    assert.ok(inviteRequestId !== null, "the invite response must carry a request id");
+    const auditEvents = await listAuditEventsForEntity(
+      databaseUrl,
+      schema,
+      "membership_invite",
+      hashMagicLinkToken(token)
+    );
+    assert.deepEqual(auditEvents, [
+      {
+        organizationId: owner.organizationId,
+        actorUserId: owner.userId,
+        action: "admin_action",
+        entityType: "membership_invite",
+        // The token hash, never the invited address: audit_events is
+        // append-only by trigger with no delete path, so an email written
+        // there could never be removed.
+        entityId: hashMagicLinkToken(token),
+        requestId: inviteRequestId
+      }
+    ]);
+    assert.equal(
+      auditEvents[0]?.entityId.includes(recruiterEmail),
+      false,
+      "the audit trail must not carry the invited address"
+    );
+
     const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
     const redeemed = await redeemRoute.POST(
       new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
         method: "POST",
         headers: { "content-type": "application/json", "Idempotency-Key": "redeem-invite" },
-        body: JSON.stringify({ token: extractToken(emitted) })
+        body: JSON.stringify({ token })
       })
     );
     assert.equal(redeemed.status, 200, await redeemed.clone().text());
@@ -504,4 +548,56 @@ test("a signed-in user can discover their own organizations and reach a role wit
   } finally {
     await dropProbeSchema(databaseUrl, schema);
   }
+});
+
+/**
+ * The bootstrap command's own argument boundary, exercised as a real
+ * process rather than by calling the function it wraps.
+ *
+ * Review #88: `bootstrapOrganizationOwner`'s own check was structural,
+ * and the database CHECK is only `position('@' in email) > 1`, so
+ * `owner@`, `foo@@bar` and `a@b` all got through -- and every one of
+ * them is rejected by `requestMagicLinkInputSchema`. The single command
+ * whose purpose is to create somebody who can sign in could create
+ * somebody who provably could not, and nothing would say so until they
+ * tried.
+ *
+ * Driven through `node scripts/environment/bootstrap.mjs` because the
+ * fix lives in the CLI layer (it parses with contracts' own
+ * `storedEmailSchema`, which packages/db may not depend on). Validation
+ * runs before configuration is loaded and before any connection is
+ * opened, so these cases need no database at all.
+ */
+const runCommand = promisify(execFile);
+
+const BOOTSTRAP_SCRIPT = new URL("../../scripts/environment/bootstrap.mjs", import.meta.url).pathname;
+
+async function runBootstrap(
+  args: readonly string[]
+): Promise<{ readonly code: number; readonly stderr: string }> {
+  try {
+    await runCommand(process.execPath, [BOOTSTRAP_SCRIPT, ...args]);
+    return { code: 0, stderr: "" };
+  } catch (error) {
+    const failure = error as { code?: number; stderr?: string };
+    return { code: failure.code ?? -1, stderr: failure.stderr ?? "" };
+  }
+}
+
+for (const rejected of ["owner@", "foo@@bar", "a@b", "@acme.test", "not-an-email"]) {
+  test(`the bootstrap command refuses ${JSON.stringify(rejected)}, which could never sign in`, async () => {
+    const result = await runBootstrap(["--organization", "Acme", "--email", rejected, "--name", "Dana"]);
+    assert.equal(result.code, 1, `expected a clean exit 1 for ${JSON.stringify(rejected)}`);
+    assert.match(result.stderr, /is not an address the sign-in endpoint would accept/u);
+    // An operator error gets the reason, not a stack trace whose first
+    // useful line is thirty characters in.
+    assert.equal(/^\s*at /mu.test(result.stderr), false, `expected no stack trace, got: ${result.stderr}`);
+  });
+}
+
+test("the bootstrap command reports a missing argument without a stack trace", async () => {
+  const result = await runBootstrap(["--organization", "Acme"]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Missing required argument/u);
+  assert.equal(/^\s*at /mu.test(result.stderr), false);
 });

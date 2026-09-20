@@ -529,3 +529,38 @@ live Jira that nothing covered it.
 | Tests | `tests/integration/deployment-entry-point.test.ts`, 7 cases, driven against a real database through the shipped handlers: empty deployment mails nobody, bootstrap then makes the same request redeemable, re-running converges, an existing member is promoted, an owner's invite redeems into a real membership, a recruiter's invite is 403 and a cross-tenant invite is 404, and the switcher's organizationId is the one the roles API accepts. |
 | Refactor carried | The route-loading module hook was inline in two test files and would have been a third. Extracted to `tests/support/web-route-loader.ts` with an optional specifier-redirect map, which is the only thing the two copies differed by; both migrated. |
 | Verification | No Docker daemon in this environment, so Postgres 16's own binaries were used to initialize a scratch cluster, as in round 5. `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts` (164), `pnpm test:integration` against that database (375), `pnpm check:architecture` (35) and `pnpm build` all clean. `pnpm bootstrap:owner` was additionally run by hand against a fully migrated schema: first run creates, second reports `unchanged`, a missing flag exits 1 with the usage line, and the resulting rows are one owner membership with a lowercased email. |
+
+### AF-97 — PR #88 review, round 1
+
+Four findings from Copilot on the head above. All four are real; one is
+worse than reported.
+
+| | |
+|---|---|
+| Finding 1 (medium) | The `?auth=` lookup on `/` was a plain object literal, so it was not the closed map its own comment claimed. `?auth=__proto__` resolves to `Object.prototype` and `?auth=constructor` to a function -- both truthy, so `?? GENERIC_AUTH_FAILURE` never fires, and React throws when handed a non-element object. An unauthenticated crash on the one page a stranger can always reach, triggered by sending someone a link. |
+| Fix | The mapping moved to `apps/web/src/lib/auth-codes.ts` as a `Map`, which has no inherited keys, behind an `authFailureMessage(code)` that returns a string for any input at all. Extracted rather than fixed in place so the claim is testable: the page is a client component, and a test that rebuilt the map itself would prove nothing about the page that ships. |
+| Regression | `tests/unit/sign-in-auth-codes.test.ts`: eight inherited property names each yield the generic message and, specifically, a `string`; arbitrary input always yields a string; the four codes the redeem route emits are present and mutually distinguishable. |
+| Control | The pre-fix object lookup, run directly: `__proto__` yields an object and `constructor`/`toString` yield functions. Confirmed. |
+
+| | |
+|---|---|
+| Finding 2 (medium) | `CreateRole` was rendered whenever an organization was selected, including for an auditor (no `manage_roles`) and for an explicit `?organizationId=` the caller has no membership for. Both get a form guaranteed to be refused. `InviteMember` two lines below already had the gate, and the comment justifying that gate applied word for word to the form without one. |
+| Fix | Both forms now gate on `roleHasCapability` against the capability the route will check, and on `activeOrganization !== undefined`, which is exactly the not-a-member case. The page asks ROLE_CAPABILITIES rather than naming roles, so presentation cannot drift from policy; `MembershipRole` replaces the page's re-spelled copy of the union for the same reason. |
+| Coverage | The policy itself is covered by `tests/unit/role-capabilities.test.ts` (auditor holds no `manage_roles`), and the enforcement by this file's recruiter-403 case. The rendering gate is presentation with no DOM harness in this repo, so it has no test of its own -- stated rather than implied. |
+
+| | |
+|---|---|
+| Finding 3 (medium) | `bootstrapOrganizationOwner`'s email check was `indexOf("@") < 1`, and the table's CHECK is only `position('@' in email) > 1`. Both accept `owner@` and `foo@@bar` -- and, not in the finding, `a@b`. All three are rejected by `requestMagicLinkInputSchema`. The one command whose purpose is to create somebody who can sign in could create somebody who provably could not, discovered only when they tried. |
+| Fix | Validated at the CLI boundary with contracts' own `storedEmailSchema`, the very object the sign-in endpoint parses with, so no second grammar exists to drift. packages/db may not depend on contracts, so its own check stays structural -- exactly one `@`, non-empty local part, a dotted domain -- and says where the authoritative check lives. |
+| Regression | Five rejected addresses driven through `node scripts/environment/bootstrap.mjs` as a real process, asserting exit 1, the reason, and no stack trace. Validation runs before configuration loads, so these need no database. |
+| Control | Recorded directly against both predicates: `owner@`, `foo@@bar` and `a@b` all pass the old guard and the table CHECK, and all three fail `z.email()`. |
+
+| | |
+|---|---|
+| Finding 4 (low) | The invite test treated `POST /api/invites` answering 202 as proof that the `admin_action` audit row had been written. It is not: deleting the `appendAuditEvent` call outright still inserts the token, sends the mail and answers 202. The one assertion covering AF-20's attributability invariant was inferring a write it never read, and the comment asserting otherwise was wrong. |
+| Fix | `listAuditEventsForEntity` added to packages/db, for the same reason the assert* probes are exported there. The test now reads the row and asserts every field that makes the action attributable -- organization, actor, action, entity type, the token hash as entity id -- and that the request id matches the one the response returned. |
+| Control | Removed the `appendAuditEvent` call from `createInviteMagicLinkToken`: the invite test fails, where before it passed. Confirmed. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(168), `pnpm test:integration` against a real scratch Postgres (381),
+`pnpm check:architecture` (35) and `pnpm build` all clean.
