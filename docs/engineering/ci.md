@@ -15,9 +15,26 @@ production deployment behind the gate described below.
 
 `.github/workflows/ci.yml` runs for:
 
-- pull requests targeting `develop` or `main`;
-- pushes to `develop` or `main`;
+- pull requests targeting `develop`, `main`, or any `feature/**` branch;
+- pushes to `develop`, `main`, or any `feature/**` branch;
 - merge-queue validation through the `merge_group` event.
+
+AF-92: `pull_request.branches` matches a pull request's *base* branch, not its
+head. A pull request stacked on a feature branch (rather than opened directly
+against `develop`/`main`) has a feature-branch base, so before `feature/**`
+was added here no run was ever queued for it -- verified against ~30 open
+pull requests with zero workflow runs, including a suite that had been
+failing silently for hours and the repository's own tenant-isolation RLS
+probes. `push.branches` carries the same pattern so a direct push to a
+feature branch is validated too, not only a pull request into one.
+
+Branch protection is a separate, repository-settings-level ruleset that this
+workflow file cannot change (see "Aggregate merge gate" below); today it
+targets only `refs/heads/develop` and `refs/heads/main`, so a pull request
+based on a feature branch still has no required-status-check ruleset gating
+it even after this change. Extending the ruleset's target refs is a
+repository-settings change for someone with admin access to make, not
+something a workflow YAML edit can do.
 
 Superseded runs for the same pull request or ref are cancelled. Validation has
 read-only repository permission and does not receive production secrets.
