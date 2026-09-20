@@ -185,7 +185,7 @@ export function buildInferenceBudgetTelemetry(
   };
 }
 
-/** Called beside the existing budget decision; it does not make or persist that decision. */
+/** Called by executeBudgetedInference after the durable budget state is known. */
 export async function recordInferenceBudgetTelemetry(value: InferenceBudgetTelemetry): Promise<void> {
   try {
     await telemetryAdapter.startSpan(

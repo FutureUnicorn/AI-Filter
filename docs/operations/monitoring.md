@@ -67,9 +67,12 @@ ledger's `tokens used / configured cap`, preserving `ok`, `warning`, and
 
 The warning ratio remains the existing `InferenceBudgetConfig.alertThresholdRatio`
 input, and the budget period remains the ledger's caller-supplied `periodStart`.
-The hosted inference caller must source both from approved external operations
-configuration when it is introduced; AF-67 does not invent defaults while no
-hosted inference execution path exists.
+The worker's `executeBudgetedInference` boundary now owns the complete metered
+call: atomic reservation, provider execution, provider-usage settlement,
+committed budget-state calculation, and telemetry publication. Its caller must
+source the ratio, period and cap from approved external operations configuration;
+AF-67 does not invent defaults. AF-102 will deliver durable jobs to this boundary
+without changing its budget or telemetry semantics.
 
 The web detector uses `failure_rate()` because normalized request-operation
 spans provide a denominator. The current worker only serves a health endpoint

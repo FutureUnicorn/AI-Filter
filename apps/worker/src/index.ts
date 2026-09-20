@@ -8,6 +8,12 @@ import { checkStorageConnection } from "@signal-audit/ingestion";
 import { logStructured } from "@signal-audit/security";
 import { captureWorkerError } from "./observability.ts";
 
+export {
+  InferenceBudgetCappedError,
+  executeBudgetedInference
+} from "./inference.ts";
+export type { BudgetedInferenceInput } from "./inference.ts";
+
 export function startWorker(): string {
   const message = `Signal Audit worker ready; dependency center=${DOMAIN_LAYER_NAME}`;
   logStructured("info", "worker.ready");
