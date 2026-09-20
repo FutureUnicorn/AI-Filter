@@ -152,8 +152,29 @@ test("deploy verifies the source pull request is still open before creating a pr
   const workflow = read(".github/workflows/preview-environment.yml");
   assert.match(workflow, /id: pr-state/u);
   assert.match(workflow, /api\.github\.com\/repos\/\$\{\{ github\.repository \}\}\/pulls\/\$PR_NUMBER/u);
-  assert.match(workflow, /echo "state=\$state" >> "\$GITHUB_OUTPUT"/u);
-  assert.match(workflow, /if: steps\.pr-state\.outputs\.state == 'open'/u);
+  assert.match(workflow, /echo "state=\$\(jq -r '\.state' <<< "\$response"\)" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(workflow, /if: >-\s*\n\s+steps\.pr-state\.outputs\.state == 'open'/u);
+});
+
+/**
+ * AF-93 PR #85 review (Copilot), "previously missed" finding surfaced once
+ * the checkout split above landed. The deploy job's `if:` gate only sees
+ * workflow_run.pull_requests[0].base.ref, a snapshot from when CI was
+ * TRIGGERED -- if the PR is retargeted away from develop/main while that CI
+ * run is still in flight, the snapshot still reads develop/main and the job
+ * still starts. The live check already re-reads open/closed from the API
+ * for the same reason (a late-completing run can't trust the snapshot); it
+ * must re-read base.ref from that same response too, or retargeting during
+ * the run is a live gap the closing-during-the-run case right next to it no
+ * longer has.
+ */
+test("deploy re-validates the current base branch, not just the workflow_run snapshot", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  assert.match(workflow, /echo "base_ref=\$\(jq -r '\.base\.ref' <<< "\$response"\)" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(
+    workflow,
+    /steps\.pr-state\.outputs\.base_ref == 'develop' \|\| steps\.pr-state\.outputs\.base_ref == 'main'/u
+  );
 });
 
 /**

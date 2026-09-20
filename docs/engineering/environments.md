@@ -94,11 +94,15 @@ first place. Deploy also verifies the source pull request is still open
 calling `preview up`, since a CI run that started before the PR closed can
 complete after it, which the event payload alone cannot distinguish.
 
-Every checkout in this workflow (deploy, cleanup, and sweep) also sets
-`clean: false` -- `actions/checkout` defaults to wiping every gitignored file,
-and the preview state directory (the record of which previews exist) is
-gitignored, so the default checkout destroyed that record before each job
-could read it.
+Every checkout that orchestration code runs FROM (deploy's trusted
+default-branch checkout, and cleanup's and sweep's) also sets `clean: false`
+-- `actions/checkout` defaults to wiping every gitignored file, and the
+preview state directory (the record of which previews exist) is gitignored,
+so the default checkout destroyed that record before each job could read it.
+The one exception is deploy's second checkout, `pr-source` (the untrusted PR
+revision, see below): it is never executed and carries no state of its own
+between runs, only Docker build input that should be exactly the tested
+SHA's tree every time, so it deliberately keeps the default `clean: true`.
 
 Preview state -- one JSON file per PR carrying its generated database and
 storage credentials -- lives at `PREVIEW_STATE_DIRECTORY`
