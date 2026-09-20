@@ -10,8 +10,9 @@ import {
   setWorkerTelemetryAdapterForTesting
 } from "../../apps/worker/src/observability.ts";
 import {
+  dropProbeSchema,
   getInferenceUsage,
-  seedOrganizationMembership
+  provisionInferenceBudgetProbeSchema
 } from "../../packages/db/src/index.ts";
 import type {
   AiAdapter,
@@ -59,16 +60,11 @@ function fakeAdapter(model: string, onCall: () => void): AiAdapter {
 
 test("the production inference boundary settles real usage and emits detector-compatible budget telemetry", async (t) => {
   const databaseUrl = requireDatabase();
-  const organizationId = randomUUID();
+  const probe = await provisionInferenceBudgetProbeSchema(databaseUrl);
+  const { organizationId, schema } = probe;
+  t.after(() => dropProbeSchema(databaseUrl, schema));
   const model = `af67-budget-${randomUUID()}`;
   const periodStart = "2026-09-01";
-  await seedOrganizationMembership(databaseUrl, "public", {
-    organizationId,
-    organizationName: "AF-67 Synthetic Budget Probe",
-    email: `af67-${organizationId}@example.test`,
-    displayName: "AF-67 Synthetic Operator",
-    role: "owner"
-  });
 
   const spans: Array<Record<string, unknown>> = [];
   setWorkerTelemetryAdapterForTesting({
@@ -106,13 +102,13 @@ test("the production inference boundary settles real usage and emits detector-co
   const result = await executeBudgetedInference(
     adapter,
     databaseUrl,
-    "public",
+    schema,
     input
   );
   assert.deepEqual(result.output, { items: [] });
   assert.equal(providerCalls, 1);
   assert.deepEqual(
-    await getInferenceUsage(databaseUrl, "public", {
+    await getInferenceUsage(databaseUrl, schema, {
       organizationId,
       model,
       periodStart
@@ -142,7 +138,7 @@ test("the production inference boundary settles real usage and emits detector-co
     () => executeBudgetedInference(
       adapter,
       databaseUrl,
-      "public",
+      schema,
       {
         ...input,
         estimatedInputTokens: 190,
@@ -166,16 +162,11 @@ test("the production inference boundary settles real usage and emits detector-co
 
 test("a telemetry outage cannot change a settled production inference result", async (t) => {
   const databaseUrl = requireDatabase();
-  const organizationId = randomUUID();
+  const probe = await provisionInferenceBudgetProbeSchema(databaseUrl);
+  const { organizationId, schema } = probe;
+  t.after(() => dropProbeSchema(databaseUrl, schema));
   const model = `af67-telemetry-outage-${randomUUID()}`;
   const periodStart = "2026-09-01";
-  await seedOrganizationMembership(databaseUrl, "public", {
-    organizationId,
-    organizationName: "AF-67 Synthetic Telemetry Outage Probe",
-    email: `af67-outage-${organizationId}@example.test`,
-    displayName: "AF-67 Synthetic Operator",
-    role: "owner"
-  });
 
   setWorkerTelemetryAdapterForTesting({
     captureException() {
@@ -190,7 +181,7 @@ test("a telemetry outage cannot change a settled production inference result", a
   const result = await executeBudgetedInference(
     fakeAdapter(model, () => undefined),
     databaseUrl,
-    "public",
+    schema,
     {
       organizationId,
       model,
@@ -203,7 +194,7 @@ test("a telemetry outage cannot change a settled production inference result", a
   );
   assert.deepEqual(result.output, { items: [] });
   assert.deepEqual(
-    await getInferenceUsage(databaseUrl, "public", {
+    await getInferenceUsage(databaseUrl, schema, {
       organizationId,
       model,
       periodStart
