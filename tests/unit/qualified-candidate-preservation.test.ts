@@ -127,6 +127,52 @@ test("two verdicts for one candidate throws rather than double-counting", () => 
   );
 });
 
+test("duplicate surfaced rows for one candidate are rejected, in either order", () => {
+  // The defect: the last row won, so the same pair reported a miss one
+  // way round and a save the other. A duplicate from a queue-to-evidence
+  // join could move the North Star safety rate with no change in the
+  // workflow at all.
+  //
+  // The message is matched specifically rather than with a bare
+  // assert.throws, because the duplicate-adjudication guard throws too
+  // and a loose assertion would pass on that one instead.
+  for (const rows of [
+    [surfaced("a", CITED), surfaced("a", NONE)],
+    [surfaced("a", NONE), surfaced("a", CITED)]
+  ]) {
+    assert.throws(
+      () => summarizeQualifiedPreservation([strong("a")], rows),
+      /two surfaced rows for a/
+    );
+  }
+});
+
+test("an identical duplicate surfaced row is rejected as well", () => {
+  // The rule is about the shape of the input, not about whether the two
+  // rows happened to agree. Accepting the agreeing case would leave a
+  // fanned-out join undetected until the day its rows disagreed, which
+  // is the day the metric moves.
+  assert.throws(
+    () => summarizeQualifiedPreservation([strong("a")], [surfaced("a", CITED), surfaced("a", CITED)]),
+    /two surfaced rows for a/
+  );
+});
+
+test("a duplicate surfaced row is rejected even for a candidate nobody adjudicated", () => {
+  // Checked across every row, not only the ones that reach the
+  // denominator: the join is equally broken either way, and which rows
+  // the fan-out lands on is not something a caller can be relied on to
+  // notice.
+  assert.throws(
+    () =>
+      summarizeQualifiedPreservation(
+        [strong("a")],
+        [surfaced("a", CITED), surfaced("b", CITED), surfaced("b", NONE)]
+      ),
+    /two surfaced rows for b/
+  );
+});
+
 test("human decisions play no part: surfacing is not advancing", () => {
   // The most dangerous available shortcut is reading AF-51's `advance`
   // decisions as the surfacing signal. Nothing in this function's inputs

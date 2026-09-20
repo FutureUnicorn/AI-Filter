@@ -2359,6 +2359,11 @@ export interface CandidateAdjudication {
   readonly blindToWorkflowOutput: boolean;
 }
 
+/**
+ * One row per application, describing what the reviewer actually got.
+ * A second row for the same `applicationId` is rejected rather than
+ * merged: see `summarizeQualifiedPreservation`.
+ */
 export interface SurfacedCandidate {
   readonly applicationId: string;
   /**
@@ -2414,6 +2419,25 @@ export function summarizeQualifiedPreservation(
 
   const evidenceByApplication = new Map<string, EvidenceStrengthSummary | null>();
   for (const candidate of surfaced) {
+    if (evidenceByApplication.has(candidate.applicationId)) {
+      // Rejected for the same reason as a duplicate adjudication, and at
+      // the same point: before anything has been counted. Letting the
+      // last row win made the North Star safety metric depend on input
+      // order, so a `cited` row followed by a `none` row for one
+      // candidate reported a miss while the same two rows the other way
+      // round reported a save.
+      //
+      // No merge rule is defined instead, because a second row for one
+      // application does not mean the candidate was surfaced twice; it
+      // means the caller's queue-to-evidence join fanned out, and
+      // neither row is known to be what the reviewer saw. Picking the
+      // strongest would let a broken join turn misses into saves, and
+      // picking the weakest would invent losses. Both answer a question
+      // the input cannot support.
+      throw new Error(
+        `summarizeQualifiedPreservation received two surfaced rows for ${candidate.applicationId}`
+      );
+    }
     evidenceByApplication.set(candidate.applicationId, candidate.evidence);
   }
 
