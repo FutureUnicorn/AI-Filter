@@ -337,6 +337,77 @@ test("the decision endpoint exposes POST and GET and no other verb", async () =>
   assert.deepEqual(await loadRouteMethods(DECISIONS_ROUTE), ["GET", "POST"]);
 });
 
+// ---- The harness's own read path ----
+//
+// PR #90 review, REV-001. `readProbeRows` refused a write by matching a
+// leading SELECT, which checks only how the string starts. With no parameters
+// `pg` uses the simple query protocol and runs several statements in one call,
+// so `SELECT 1; DELETE FROM memberships` passed the guard and emptied the
+// table -- measured at five rows to zero.
+//
+// Each case asserts the rows SURVIVE as well as that the call throws. A
+// version that deleted and then threw would satisfy the throw alone, which is
+// the same shape of mistake this whole file exists to stop making.
+
+const MEMBERSHIP_COUNT = "SELECT count(*)::int AS n FROM memberships";
+
+interface CountRow extends Record<string, unknown> {
+  readonly n: number;
+}
+
+const REFUSED_READS: readonly { readonly label: string; readonly sql: string }[] = [
+  // Layer 2: a second statement cannot reach the server at all.
+  { label: "a second statement appended after a SELECT", sql: "SELECT 1; DELETE FROM memberships" },
+  // The same shape carrying a COMMIT, which would otherwise end the read-only
+  // transaction and let what follows run read-write.
+  {
+    label: "an injected COMMIT followed by a write",
+    sql: "SELECT 1; COMMIT; DELETE FROM memberships"
+  },
+  // DDL, which no table trigger guards -- the first probe of this bug used a
+  // table whose append-only trigger refused the delete, which made the guard
+  // look sound when it was not.
+  { label: "a second statement creating a table", sql: "SELECT 1; CREATE TABLE bypass_probe (x int)" },
+  // Layer 3: one statement, beginning with neither SELECT nor a second
+  // command, that is nonetheless a delete.
+  {
+    label: "a single-statement CTE delete",
+    sql: "WITH d AS (DELETE FROM memberships RETURNING *) SELECT * FROM d"
+  }
+];
+
+for (const refused of REFUSED_READS) {
+  test(`readProbeRows refuses ${refused.label}, and the rows survive`, async () => {
+    await withApiRouteHarness(async (harness) => {
+      const before = await harness.rows<CountRow>(MEMBERSHIP_COUNT);
+      assert.ok((before[0]?.n ?? 0) > 0, "the harness must have seeded memberships for this to mean anything");
+
+      await assert.rejects(
+        async () => harness.rows(refused.sql),
+        `readProbeRows must refuse: ${refused.sql}`
+      );
+
+      const after = await harness.rows<CountRow>(MEMBERSHIP_COUNT);
+      assert.equal(after[0]?.n, before[0]?.n, "a refused read must not have changed the database on its way out");
+    });
+  });
+}
+
+test("readProbeRows still reads, with and without parameters", async () => {
+  await withApiRouteHarness(async (harness) => {
+    // The named-statement change would be easy to get wrong in the direction
+    // of refusing everything, so prove both call shapes still work.
+    const all = await harness.rows<CountRow>(MEMBERSHIP_COUNT);
+    assert.ok((all[0]?.n ?? 0) > 0);
+
+    const scoped = await harness.rows<CountRow>(
+      "SELECT count(*)::int AS n FROM memberships WHERE organization_id = $1",
+      [harness.probe.organizationId]
+    );
+    assert.equal(scoped[0]?.n, 4, "owner, admin, recruiter and auditor are seeded in the primary organization");
+  });
+});
+
 // ---- The second human-attributed writer ----
 
 test("a correction appends a row naming the corrector and leaves the original in place", async () => {

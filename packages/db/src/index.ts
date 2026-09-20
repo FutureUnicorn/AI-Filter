@@ -1375,6 +1375,25 @@ export async function provisionApiRouteSchema(
  * but about what this export can become: a general writer here would be a way
  * to put rows in the database without going through the writers whose
  * constraints and transactions are the thing under test.
+ *
+ * Three layers, because the first one alone did not hold. Review of PR #90
+ * (REV-001) showed the leading-SELECT regex checks only how the string starts:
+ * with no parameters `pg` uses the simple query protocol, which runs several
+ * statements in one call, so `SELECT 1; DELETE FROM memberships` passed the
+ * regex and emptied the table. Measured, not reasoned about.
+ *
+ *   1. The regex, kept as a fast and legible first refusal.
+ *   2. A NAMED statement, which forces the extended query protocol. Postgres
+ *      rejects multiple commands in a prepared statement, so a second
+ *      statement cannot be appended at all -- including a `COMMIT` that would
+ *      end layer 3 and let what follows run read-write. Named rather than
+ *      parameterised because an empty `values` array still selects the simple
+ *      protocol; the name is unique per call so nothing collides in the
+ *      session's prepared-statement cache.
+ *   3. A READ ONLY transaction, which is what refuses a write that needs no
+ *      second statement -- `WITH d AS (DELETE ... RETURNING *) SELECT * FROM d`
+ *      begins with SELECT nowhere but is a delete, and a SELECT over a
+ *      volatile function can write too. The database decides, not a pattern.
  */
 export async function readProbeRows<TRow extends Record<string, unknown>>(
   databaseUrl: string,
@@ -1389,8 +1408,18 @@ export async function readProbeRows<TRow extends Record<string, unknown>>(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
+    await client.query("BEGIN READ ONLY");
+    // SET is permitted inside a read-only transaction; it changes the session,
+    // not the database.
     await client.query(`SET search_path TO "${schema}"`);
-    const result = await client.query<TRow>(sql, [...parameters]);
+    const result = await client.query<TRow>({
+      name: `probe_read_${randomBytes(8).toString("hex")}`,
+      text: sql,
+      values: [...parameters]
+    });
+    // Rollback rather than commit: a read-only transaction has nothing to
+    // persist, and saying so leaves no doubt about the intent.
+    await client.query("ROLLBACK");
     return result.rows;
   } finally {
     await client.end().catch(() => undefined);
