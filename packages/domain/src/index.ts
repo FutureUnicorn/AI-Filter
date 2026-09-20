@@ -2152,6 +2152,22 @@ export function beginReviewTiming(atMs: number): ReviewTimingState {
  * difference between a truncated span being a lower bound on the review,
  * which is what it is described as and what makes it safe to exclude,
  * and it being the review plus up to two minutes of absence.
+ *
+ * What the flag cannot tell you, for whoever tries to refine this. A
+ * truncated span covers two situations this producer cannot separate:
+ * the reviewer broke off mid-candidate and came back, and the reviewer
+ * finished, sat a while, and closed the tab. The obvious discriminator
+ * is that a truncated span which is the LAST one for its application,
+ * with a decision recorded afterwards, is the second case. That is a
+ * real improvement to the exclusion rule and it is worth having, but it
+ * is worth being clear about what it does not do: it does not make the
+ * underlying signal less ambiguous. A reviewer reading a long CV without
+ * scrolling or clicking is indistinguishable from an empty chair, and
+ * that is equally true BELOW the cutoff, where the silent stretch is
+ * counted as review and no flag is raised at all. No threshold and no
+ * discriminator fixes that, which is why the count of excluded
+ * applications is published rather than the exclusion being presented as
+ * clean. Agreed with AF-55, which consumes these spans.
  */
 export function settleReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingState {
   if (state.truncatedByIdle) {
