@@ -69,6 +69,16 @@ test("preview lifecycle is green-SHA scoped with close and TTL cleanup", () => {
   assert.match(workflow, /preview sweep/u);
 });
 
+test("local Compose explicitly loads .env.local without affecting hosted commands", () => {
+  const cli = read("scripts/environment/cli.mjs");
+
+  assert.match(cli, /const localEnvFile = path\.join\(repositoryRoot, "\.env\.local"\);/u);
+  assert.match(cli, /if \(!fs\.existsSync\(localEnvFile\)\) \{[\s\S]*?Missing \.env\.local\. Copy \.env\.example to \.env\.local before running local infrastructure\.[\s\S]*?\}/u);
+  assert.match(cli, /if \(local\) \{[\s\S]*?files\.push\("--env-file", localEnvFile\);[\s\S]*?\}/u);
+  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "postgres", "storage"\], local\);/u);
+  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "--build", "web", "worker"\]\);/u);
+});
+
 test("staging and production deploy only exact green revisions", () => {
   const staging = read(".github/workflows/staging-environment.yml");
   const production = read(".github/workflows/production-gate.yml");
