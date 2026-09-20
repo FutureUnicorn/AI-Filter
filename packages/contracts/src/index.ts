@@ -43,6 +43,7 @@ import type {
   MetricLimitation,
   MetricSample,
   ReviewTimeBaseline,
+  CandidateAdjudication,
   NotFoundEvidence,
   Organization,
   PartiallySupportedEvidence,
@@ -825,3 +826,21 @@ export const reviewTimeBaselineSchema = z.strictObject({
   source: z.enum(REVIEW_TIME_BASELINE_SOURCES),
   medianActiveMs: z.number().positive().finite()
 }) satisfies z.ZodType<ReviewTimeBaseline>;
+
+/**
+ * AF-56. The independent adjudication that the North Star safety metric
+ * is measured against. Like the AF-55 baseline this arrives from outside
+ * the system, and it is the more dangerous of the two: a contaminated
+ * ground truth does not make the metric noisy, it makes the metric agree
+ * with whatever it was supposed to be checking.
+ *
+ * `blindToWorkflowOutput` is required with no default, and is a boolean
+ * rather than an optional flag, so an adjudication of unknown provenance
+ * cannot be constructed at all. A default here would be applied once and
+ * then inherited silently by every import that forgot to say.
+ */
+export const candidateAdjudicationSchema = z.strictObject({
+  applicationId: z.uuid(),
+  verdict: z.enum(["strong", "not_strong"]),
+  blindToWorkflowOutput: z.boolean()
+}) satisfies z.ZodType<CandidateAdjudication>;
