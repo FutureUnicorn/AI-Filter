@@ -2325,22 +2325,42 @@ export function describeFailedDocumentRate(
 //
 // "Consistently" is the whole ticket, and the honest finding is that it
 // is not currently achievable. Measured against the real migrations, on
-// a candidate with one document and one evidence outcome, EVERY deletion
-// path fails:
+// a candidate with one document, one evidence outcome and one decision,
+// the deletion paths split in two:
 //
-//   DELETE evidence_outcomes  -> append-only trigger rejects DELETE
-//   UPDATE evidence_outcomes  -> append-only trigger rejects UPDATE too,
-//                                so the quote cannot even be redacted
-//   DELETE applications       -> FK violation from evidence_outcomes
-//   DELETE file_intakes       -> FK violation from applications
+//   DELETE evidence_outcomes   -> append-only trigger rejects DELETE
+//   UPDATE evidence_outcomes   -> append-only trigger rejects UPDATE too,
+//                                 so the quote cannot even be redacted
+//   DELETE candidate_decisions -> append-only, DELETE and UPDATE both
+//   DELETE applications        -> FK violation, from evidence_outcomes
+//                                 and independently candidate_decisions
+//   DELETE file_intakes        -> FK violation from applications
 //
-// The candidate's name, email, full canonical CV text and quoted CV text
-// all survive. That is not a bug in any one migration: 0016 is
-// append-only because an evidence record that can be edited after the
-// fact cannot serve as an audit trail, and it deliberately has no
-// ON DELETE CASCADE because a cascade issues a DELETE that the very same
-// trigger rejects (the AF-20 defect). Both decisions are right on their
-// own terms and together they make retention unimplementable.
+//   DELETE canonical_text_extractions -> permitted, the row goes
+//   DELETE import_rows                -> permitted, the row goes
+//
+// So the two surfaces the ticket names directly, canonical text and a
+// derived index, can be purged on time today. What cannot is the layer
+// the ticket does not mention: candidate_full_name and candidate_email
+// on applications, declared_filename on file_intakes, the verbatim
+// quote on evidence_outcomes and the rationale on candidate_decisions.
+//
+// Every line above is asserted against a real Postgres by
+// assertRetentionPurgeBlockers, the permitted ones included. The first
+// revision of this module called canonical_text_extractions and
+// import_rows blocked, reasoning from their cascade through file_intakes
+// and never trying the direct DELETE, and the probe is what disproved
+// it. A plan that overstates what survives is wrong in the same way as
+// one that understates it, which is why both directions are proved.
+//
+// That the blocked half is blocked is not a bug in any one migration:
+// 0016_evidence_outcomes.sql is append-only because an evidence record
+// that can be edited after the fact cannot serve as an audit trail, and
+// it deliberately has no ON DELETE CASCADE because a cascade issues a
+// DELETE that the very same trigger rejects (the AF-20 defect).
+// 0019_candidate_decisions.sql repeats both decisions for the same
+// stated reasons. Each is right on its own terms and together they make
+// a complete purge unimplementable.
 //
 // So this module does NOT pretend to purge. It produces a plan in which
 // every surface carries an explicit disposition, blocked ones say why,
@@ -2455,16 +2475,26 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "overlook as PII and is often exactly 'Firstname_Lastname_CV.pdf'."
   },
   canonical_text_extractions: {
-    disposition: "blocked_by_reference",
+    disposition: "purge",
     holds: "the full extracted text of the candidate's document",
     detail:
-      "ON DELETE CASCADE from file_intakes would remove it, but file_intakes itself cannot be " +
-      "deleted while an application references it. The largest single store of raw candidate text."
+      "Deletable directly by intake_id. Nothing references this table and it carries no " +
+      "append-only trigger, so the row goes. It also cascades away with its file_intake, and " +
+      "that route is blocked while an application references the intake, but it is not the " +
+      "only route: reading the cascade alone is what previously made this surface look " +
+      "blocked. The largest single store of raw candidate text, and it can go on time. " +
+      "Purging it does leave the citation quotes in evidence_outcomes with no source text to " +
+      "validate against, which is a consequence to accept deliberately rather than discover."
   },
   import_rows: {
-    disposition: "blocked_by_reference",
+    disposition: "purge",
     holds: "failure_reason, which can quote the offending row",
-    detail: "Cascades from file_intakes, and inherits its blocker."
+    detail:
+      "Deletable directly by intake_id, for the same reason as canonical_text_extractions: " +
+      "nothing references it and no trigger guards it. The cascade from file_intakes is " +
+      "blocked, but it is not the only route. Purging it drops rows from the per-row import " +
+      "ledger, so AF-32's 'every input row is accounted for' stops holding once an intake " +
+      "has expired."
   },
   applications: {
     disposition: "blocked_by_reference",

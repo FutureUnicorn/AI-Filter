@@ -145,10 +145,44 @@ test("the survival summary produces a sentence a privacy notice can use truthful
   );
 });
 
-test("the survival summary lists every blocked surface, not just the append-only ones", () => {
+test("the survival summary lists exactly the surfaces that survive, no more and no fewer", () => {
+  // deepEqual, not a list of includes checks. The earlier version
+  // asserted four surfaces were present and said nothing about a fifth,
+  // so it kept passing while the plan named canonical_text_extractions
+  // as surviving something it is not subject to. Overstating what is
+  // retained is a false statement to a candidate in the same way
+  // understating it is, so the set has to be exact in both directions.
+  // Proved against the database in
+  // tests/integration/retention-purge-blockers.test.ts.
   const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW));
-  const named = summary.surfaces.map((surface) => surface.surface);
-  for (const expected of ["evidence_outcomes", "candidate_decisions", "applications", "canonical_text_extractions"]) {
-    assert.ok(named.includes(expected as never), `${expected} survives but is not reported`);
+  assert.deepEqual(
+    summary.surfaces.map((surface) => surface.surface),
+    ["file_intakes", "applications", "evidence_outcomes", "candidate_decisions"]
+  );
+});
+
+test("the surfaces the ticket names by hand, canonical text and a derived index, can be purged", () => {
+  // "Applied consistently across object storage, canonical text, and
+  // derived indexes." All three of those are purgeable. The blocked
+  // layer is the one the ticket does not mention. An earlier revision
+  // had these two blocked, reasoning from their cascade through
+  // file_intakes and never trying the direct DELETE the database
+  // permits.
+  const plan = planRetention(policy(), NOW);
+  for (const surface of ["object_storage_documents", "canonical_text_extractions", "import_rows"]) {
+    const entry = plan.surfaces.find((candidate) => candidate.surface === surface);
+    assert.equal(entry?.disposition, "purge", `${surface} is not marked purgeable`);
   }
+});
+
+test("a purgeable surface still says what purging it costs", () => {
+  // A disposition of "purge" is not the end of the thought. Deleting the
+  // canonical text leaves evidence citations with no source to validate
+  // against, and deleting import_rows breaks AF-32's per-row accounting.
+  // Both are consequences to accept deliberately, not to discover.
+  const plan = planRetention(policy(), NOW);
+  const canonical = plan.surfaces.find((surface) => surface.surface === "canonical_text_extractions");
+  assert.match(canonical?.detail ?? "", /no source text to\s+validate against/);
+  const rows = plan.surfaces.find((surface) => surface.surface === "import_rows");
+  assert.match(rows?.detail ?? "", /every input row is accounted for/);
 });

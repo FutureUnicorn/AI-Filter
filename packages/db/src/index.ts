@@ -4252,41 +4252,142 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
 
 // ---- AF-61: prove the retention purge blockers against the real schema ----
 
+export interface RetentionPurgeProbe {
+  /**
+   * Every purge the plan calls blocked, mapped to the database's own
+   * rejection message.
+   */
+  readonly failures: Record<string, string>;
+  /**
+   * Every purge the plan calls possible, mapped to the number of rows it
+   * actually removed. A surface the plan calls blocked while the
+   * database deletes it happily is wrong in the other direction: the
+   * privacy notice then overstates what is retained, which is still a
+   * false statement to a candidate.
+   */
+  readonly permitted: Record<string, number>;
+}
+
 /**
- * The domain's retention plan claims certain surfaces cannot be purged.
- * This proves it, rather than leaving the claim resting on my reading of
- * the migrations -- the same two-readings-must-agree shape as AF-57's
- * card/metric check, applied to a claim that will end up in a privacy
- * notice.
+ * The domain's retention plan claims a disposition for every surface.
+ * This proves each one against a real Postgres, rather than leaving the
+ * claim resting on my reading of the migrations -- the same
+ * two-readings-must-agree shape as AF-57's card/metric check, applied to
+ * a claim that will end up in a privacy notice.
  *
- * If a future migration ever unblocks one of these paths, the assertion
- * that it still fails is what makes that visible. A retention plan that
- * says "blocked" about something now deletable is a different kind of
- * wrong, but still wrong.
+ * Both directions are proved, not just the blocked one. The first
+ * revision of this probe covered evidence_outcomes, applications and
+ * file_intakes only, and the three surfaces it left to unit tests
+ * reading the plan's own static content included two the plan had
+ * wrong: canonical_text_extractions and import_rows are directly
+ * deletable, because nothing references them and no trigger guards
+ * them. Only the cascade route through file_intakes is blocked, and
+ * reasoning from that route alone is what produced the wrong
+ * disposition. Asserting the permitted deletes is what stops that
+ * recurring.
+ *
+ * If a future migration ever unblocks a blocked path, or pins a
+ * currently free one, the assertion here is what makes it visible.
  */
-export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<Record<string, string>> {
+export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<RetentionPurgeProbe> {
   const suffix = randomBytes(4).toString("hex");
   const schema = `ret_probe_${suffix}`;
   const org = "11111111-1111-4111-8111-111111111111";
   const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const roleId = "33333333-3333-4333-8333-333333333333";
   const intakeId = "55555555-5555-4555-8555-555555555555";
+  // A second intake with the same dependents but no application, so the
+  // cascade the plan describes can be shown to work where nothing pins
+  // the parent. Without it "cascades from file_intakes" is a claim about
+  // a path no test ever walks.
+  const freeIntakeId = "55555555-5555-4555-8555-555555555556";
   const applicationId = "44444444-4444-4444-8444-444444444444";
+  // A second application carrying a decision and no evidence, so the
+  // candidate_decisions foreign key can be shown to block on its own.
+  // On the first application the evidence_outcomes constraint is checked
+  // first and is all the error names, which is how it stayed hidden.
+  const decidedApplicationId = "44444444-4444-4444-8444-444444444445";
   const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const decisionId = "77777777-7777-4777-8777-777777777777";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const failures: Record<string, string> = {};
+  const permitted: Record<string, number> = {};
 
-  const expectRejected = async (label: string, sql: string): Promise<void> => {
+  const countRows = async (sql: string, params: readonly unknown[]): Promise<number> => {
+    const result = await admin.query<{ count: string }>(sql, [...params]);
+    return Number(result.rows[0]?.count ?? 0);
+  };
+
+  /**
+   * A bare catch here would record any error as a retention blocker,
+   * including a typo: "relation does not exist" is SQLSTATE 42P01 and
+   * reads exactly like a refusal. So the caller states which refusal it
+   * expects, and for a referential one, which constraint had to be the
+   * refusing party.
+   */
+  const expectRejected = async (
+    label: string,
+    expected: { readonly sqlstate: string; readonly constraint?: string },
+    sql: string
+  ): Promise<void> => {
+    let refusal: unknown;
+    let refused = false;
     try {
       await admin.query(sql);
-      throw new Error(`assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.startsWith("assertRetentionPurgeBlockers:")) {
-        throw error;
-      }
-      failures[label] = message;
+      refused = true;
+      refusal = error;
     }
+    if (!refused) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`
+      );
+    }
+    const sqlstate = (refusal as { code?: unknown }).code;
+    const constraint = (refusal as { constraint?: unknown }).constraint;
+    const message = refusal instanceof Error ? refusal.message : String(refusal);
+    if (sqlstate !== expected.sqlstate) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused with SQLSTATE ${String(sqlstate)}, ` +
+          `expected ${expected.sqlstate}. The probe is testing something other than it thinks: ${message}`
+      );
+    }
+    if (expected.constraint !== undefined && constraint !== expected.constraint) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused by constraint ${String(constraint)}, ` +
+          `expected ${expected.constraint}: ${message}`
+      );
+    }
+    failures[label] = message;
+  };
+
+  /**
+   * The mirror of the above, for a surface the plan says can be purged.
+   * Guarded on rows being present first: a DELETE matching nothing
+   * violates no foreign key and fires no row trigger, so it reports
+   * success for a reason that proves nothing at all.
+   */
+  const expectPermitted = async (
+    label: string,
+    deleteSql: string,
+    countSql: string,
+    params: readonly unknown[]
+  ): Promise<void> => {
+    const before = await countRows(countSql, params);
+    if (before === 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" needs rows present; a DELETE affecting none of them ` +
+          `succeeds without proving the surface is purgeable`
+      );
+    }
+    const deleted = await admin.query(deleteSql, [...params]);
+    const after = await countRows(countSql, params);
+    if (after !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" reported success but ${after} row(s) are still there`
+      );
+    }
+    permitted[label] = deleted.rowCount ?? 0;
   };
 
   try {
@@ -4301,7 +4402,8 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       "0013_file_intake_validation.sql",
       "0014_canonical_text_extractions.sql",
       "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql"
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
@@ -4310,21 +4412,36 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       userId,
       `ret_${suffix}@acme.test`
     ]);
+    // candidate_decisions requires the decider to hold a membership in
+    // the organization, not merely to exist as a user.
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter')`, [
+      org,
+      userId
+    ]);
     await admin.query(
       `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
       [roleId, org, userId]
     );
-    await admin.query(
-      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
-         declared_mime_type, status, created_by_user_id)
-       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
-      [intakeId, org, roleId, `key-${suffix}`, userId]
-    );
-    await admin.query(
-      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
-       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
-      [intakeId]
-    );
+    for (const intake of [intakeId, freeIntakeId]) {
+      await admin.query(
+        `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+           declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+        [intake, org, roleId, `key-${suffix}-${intake.slice(-1)}`, userId]
+      );
+      await admin.query(
+        `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+         VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+        [intake]
+      );
+      // A failed row, because failure_reason is the column that holds
+      // candidate text: it quotes the row it could not parse.
+      await admin.query(
+        `INSERT INTO import_rows (intake_id, row_number, outcome, failure_reason)
+         VALUES ($1, 1, 'failed', 'could not parse: Jane Doe,jane@example.test')`,
+        [intake]
+      );
+    }
     await admin.query(
       `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
          candidate_full_name, candidate_email)
@@ -4332,31 +4449,122 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       [applicationId, org, roleId, intakeId]
     );
     await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,2,'Jo Roe','jo@example.test')`,
+      [decidedApplicationId, org, roleId, intakeId]
+    );
+    await admin.query(
       `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
        VALUES ($1,$2,$3,'python','supported',
          '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
       [outcomeId, org, applicationId]
     );
+    await admin.query(
+      `INSERT INTO candidate_decisions (decision_id, organization_id, application_id, decision, rationale,
+         decided_by_user_id)
+       VALUES ($1,$2,$3,'decline','Jo Roe has no Python depth on the CV',$4)`,
+      [decisionId, org, decidedApplicationId, userId]
+    );
 
+    // 1. The append-only surfaces. P0001 is what RAISE EXCEPTION in
+    //    reject_append_only_mutation() reports.
     await expectRejected(
       "evidence_outcomes:delete",
+      { sqlstate: "P0001" },
       `DELETE FROM evidence_outcomes WHERE evidence_outcome_id = '${outcomeId}'`
     );
     await expectRejected(
       "evidence_outcomes:redact",
+      { sqlstate: "P0001" },
       `UPDATE evidence_outcomes SET outcome = '{"kind":"supported","criterionId":"python"}'::jsonb
         WHERE evidence_outcome_id = '${outcomeId}'`
     );
     await expectRejected(
+      "candidate_decisions:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM candidate_decisions WHERE decision_id = '${decisionId}'`
+    );
+    await expectRejected(
+      "candidate_decisions:redact",
+      { sqlstate: "P0001" },
+      `UPDATE candidate_decisions SET rationale = 'redacted' WHERE decision_id = '${decisionId}'`
+    );
+
+    // 2. The referential blockers, each named by the constraint that
+    //    refused rather than by a substring of the message. Two separate
+    //    applications because Postgres reports only the first constraint
+    //    it checks, so one row carrying both dependents would prove one
+    //    of them and hide the other.
+    await expectRejected(
       "applications:delete",
+      { sqlstate: "23503", constraint: "evidence_outcomes_application_id_organization_id_fkey" },
       `DELETE FROM applications WHERE application_id = '${applicationId}'`
     );
     await expectRejected(
+      "applications:delete_pinned_only_by_a_decision",
+      { sqlstate: "23503", constraint: "candidate_decisions_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${decidedApplicationId}'`
+    );
+    await expectRejected(
       "file_intakes:delete",
+      { sqlstate: "23503", constraint: "applications_intake_id_fkey" },
       `DELETE FROM file_intakes WHERE intake_id = '${intakeId}'`
     );
 
-    // The candidate's data is all still here, which is the point.
+    // 3. The surfaces the plan says are purgeable, proved by purging
+    //    them. Nothing references either table and neither carries a
+    //    trigger, so the row goes directly, whatever the cascade route
+    //    through file_intakes does.
+    await expectPermitted(
+      "canonical_text_extractions:delete",
+      `DELETE FROM canonical_text_extractions WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    await expectPermitted(
+      "import_rows:delete",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    // 4. The cascade the plan describes is real, shown on the intake
+    //    nothing pins. This is the route that IS blocked for the first
+    //    intake, and asserting it here is what keeps the plan's
+    //    explanation of why honest.
+    const cascading = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (cascading !== 2) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: the cascade check needs both dependents present, found ${cascading}`
+      );
+    }
+    await expectPermitted(
+      "file_intakes:delete_when_unreferenced",
+      `DELETE FROM file_intakes WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM file_intakes WHERE intake_id = $1`,
+      [freeIntakeId]
+    );
+    const orphaned = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (orphaned !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: deleting an unreferenced file_intake left ${orphaned} dependent row(s), ` +
+          `so the plan's "cascades from file_intakes" is wrong`
+      );
+    }
+    permitted["canonical_text_extractions:cascade_from_file_intakes"] = 1;
+    permitted["import_rows:cascade_from_file_intakes"] = 1;
+
+    // 5. The candidate's identity survived every blocked path, which is
+    //    the finding the privacy statement is written from.
     const surviving = await admin.query<{ candidate_full_name: string }>(
       `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
       [applicationId]
@@ -4364,7 +4572,7 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     if (surviving.rows[0]?.candidate_full_name !== "Jane Doe") {
       throw new Error("assertRetentionPurgeBlockers: expected the candidate row to have survived every purge attempt");
     }
-    return failures;
+    return { failures, permitted };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
