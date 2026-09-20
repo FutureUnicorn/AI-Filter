@@ -8,6 +8,9 @@ import {
 } from "../../packages/domain/src/index.ts";
 import type { ReviewKeyAction } from "../../packages/domain/src/index.ts";
 
+import { revealReviewItem } from "../../apps/web/src/lib/review-focus.ts";
+import type { RevealableItem } from "../../apps/web/src/lib/review-focus.ts";
+
 // AF-53: "Recruiters reviewing hundreds of applications need
 // keyboard-driven navigation between cards and source context, not
 // mouse-only review."
@@ -122,4 +125,87 @@ test("a single-item list is stable under every movement", () => {
   for (const action of ["next", "previous", "first", "last"] as const) {
     assert.equal(nextReviewIndex(action, 0, 1), 0);
   }
+});
+
+// ---- REV-001: a moved index that never reaches the DOM ----
+//
+// The first cut of AF-53 moved React state and drew an outline. An
+// outline is invisible below the fold, so in the queue this feature
+// exists for -- hundreds of applications -- `j` walked the selection
+// off-screen and `Enter` opened a candidate the reviewer never saw.
+// These cover the part of the repair that is decidable without a
+// browser: whether an item is revealed at all, which one, and how.
+
+interface RecordingItem extends RevealableItem {
+  readonly calls: readonly string[];
+}
+
+function recordingItem(): RecordingItem {
+  const calls: string[] = [];
+  return {
+    calls,
+    focus(options) {
+      calls.push(`focus ${JSON.stringify(options)}`);
+    },
+    scrollIntoView(options) {
+      calls.push(`scrollIntoView ${JSON.stringify(options)}`);
+    }
+  };
+}
+
+test("a moved selection is focused and scrolled to, not merely outlined", () => {
+  const item = recordingItem();
+  const revealed = revealReviewItem(new Map([[1, item]]), { index: 1, movementCount: 1 });
+
+  assert.equal(revealed, true);
+  // preventScroll matters: the browser's own focus scroll walks every
+  // scrollable ancestor and may centre the row, which throws the rest of
+  // the queue off screen on every keypress. "nearest" moves the minimum.
+  assert.deepEqual(item.calls, ['focus {"preventScroll":true}', 'scrollIntoView {"block":"nearest"}']);
+});
+
+test("only the selected item is revealed", () => {
+  const first = recordingItem();
+  const second = recordingItem();
+  const items = new Map([
+    [0, first],
+    [1, second]
+  ]);
+
+  revealReviewItem(items, { index: 1, movementCount: 4 });
+
+  assert.deepEqual(first.calls, [], "an unselected row must not be focused out from under the reviewer");
+  assert.equal(second.calls.length, 2);
+});
+
+test("nothing is focused before the reviewer has pressed a navigation key", () => {
+  // Selection starts at index 0, so revealing unconditionally would yank
+  // focus to the first row the moment the fetch resolves -- discarding
+  // wherever the reviewer had put it and cutting off a screen reader
+  // mid-announcement. That is a regression introduced by the fix, not by
+  // the bug, which is why it is pinned here.
+  const item = recordingItem();
+
+  assert.equal(revealReviewItem(new Map([[0, item]]), { index: 0, movementCount: 0 }), false);
+  assert.deepEqual(item.calls, []);
+});
+
+test("pressing the key again at the end of the list still brings the last item back", () => {
+  // The clamp means the index stops changing at the end, but `j` is
+  // still a request to see that row, and the reviewer may have scrolled
+  // away with the mouse. Revealing on index change alone would do
+  // nothing here, so the movement count, not the index, is the trigger.
+  const item = recordingItem();
+  const items = new Map([[4, item]]);
+
+  assert.equal(revealReviewItem(items, { index: 4, movementCount: 7 }), true);
+  assert.equal(revealReviewItem(items, { index: 4, movementCount: 8 }), true);
+  assert.equal(item.calls.length, 4);
+});
+
+test("an empty list and an item that has not rendered reveal nothing rather than throwing", () => {
+  // nextReviewIndex reports -1 for an empty queue, and a row can be
+  // unregistered for a frame while the filter re-renders the table.
+  assert.equal(revealReviewItem(new Map(), { index: -1, movementCount: 3 }), false);
+  assert.equal(revealReviewItem(new Map([[0, recordingItem()]]), { index: 2, movementCount: 3 }), false);
 });

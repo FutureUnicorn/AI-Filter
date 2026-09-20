@@ -1,18 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { nextReviewIndex, resolveReviewKeyAction } from "@signal-audit/domain";
 import type { ReviewKeyAction } from "@signal-audit/domain";
+
+import { revealReviewItem } from "./review-focus";
+import type { RevealableItem } from "./review-focus";
 
 /**
  * AF-53: the thin glue over the decision layer in packages/domain.
  *
  * Everything decidable without a browser lives there and is tested
- * exhaustively; this file does the two things that genuinely need a DOM
- * and nothing else -- work out whether focus is in a text field, and
- * attach the listener. Keeping the split at exactly that line is what
- * lets the rules be tested at all in a repository with no jsdom.
+ * exhaustively; this file does the things that genuinely need a DOM and
+ * nothing else -- work out whether focus is in a text field, attach the
+ * listener, and hand the selected element to `revealReviewItem`. Keeping
+ * the split at exactly that line is what lets the rules be tested at all
+ * in a repository with no jsdom.
  */
 function isEditingText(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
@@ -42,12 +46,52 @@ export interface ReviewKeyboardState {
   readonly focusedIndex: number;
   readonly helpVisible: boolean;
   readonly setFocusedIndex: (index: number) => void;
+  /**
+   * REV-001: the selection has to reach the DOM, not just React state.
+   * Every navigable row or card passes its element through this so the
+   * hook can focus and scroll to the one the reviewer moved to.
+   */
+  readonly registerItem: (index: number) => (element: RevealableItem | null) => void;
 }
 
 export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboardState {
   const { itemCount, onOpen, onRevealSource } = options;
   const [focusedIndex, setFocusedIndex] = useState(itemCount > 0 ? 0 : -1);
   const [helpVisible, setHelpVisible] = useState(false);
+  // Counts navigation keypresses rather than index changes, because the
+  // two differ exactly where it matters: on the first render nothing has
+  // been pressed and focus must stay where the reviewer put it, and at
+  // the end of the list the index stops changing while `j` keeps being a
+  // request to show the last row.
+  const [movementCount, setMovementCount] = useState(0);
+
+  // Held in a ref as well as in state because key repeat can deliver the
+  // next keydown before React has re-rendered; reading the index from
+  // state would then move from a position the reviewer has already left.
+  const focusedIndexRef = useRef(focusedIndex);
+  const itemsRef = useRef(new Map<number, RevealableItem>());
+  const callbacksRef = useRef({ onOpen, onRevealSource });
+
+  useEffect(() => {
+    callbacksRef.current = { onOpen, onRevealSource };
+  }, [onOpen, onRevealSource]);
+
+  const select = useCallback((index: number): void => {
+    focusedIndexRef.current = index;
+    setFocusedIndex(index);
+  }, []);
+
+  const registerItem = useCallback(
+    (index: number) =>
+      (element: RevealableItem | null): void => {
+        if (element === null) {
+          itemsRef.current.delete(index);
+          return;
+        }
+        itemsRef.current.set(index, element);
+      },
+    []
+  );
 
   useEffect(() => {
     function handle(event: KeyboardEvent): void {
@@ -69,26 +113,33 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
         setHelpVisible((visible) => !visible);
         return;
       }
-      setFocusedIndex((current) => {
-        const next = nextReviewIndex(action, current, itemCount);
-        if (action === "open" && next >= 0) {
-          onOpen?.(next);
-        }
-        if (action === "reveal-source" && next >= 0) {
-          onRevealSource?.(next);
-        }
-        return next;
-      });
+      const next = nextReviewIndex(action, focusedIndexRef.current, itemCount);
+      select(next);
+      setMovementCount((count) => count + 1);
+      // Called here rather than inside a state updater: an updater must
+      // be pure, and React invokes it twice in development, which would
+      // route the reviewer to a candidate twice.
+      const callbacks = callbacksRef.current;
+      if (action === "open" && next >= 0) {
+        callbacks.onOpen?.(next);
+      }
+      if (action === "reveal-source" && next >= 0) {
+        callbacks.onRevealSource?.(next);
+      }
     }
     window.addEventListener("keydown", handle);
     return () => window.removeEventListener("keydown", handle);
-  }, [itemCount, onOpen, onRevealSource]);
+  }, [itemCount, select]);
 
   useEffect(() => {
     // A list that shrinks under the cursor must not leave focus past the
     // end -- AF-47's filters do exactly that.
-    setFocusedIndex((current) => nextReviewIndex("none", current, itemCount));
-  }, [itemCount]);
+    select(nextReviewIndex("none", focusedIndexRef.current, itemCount));
+  }, [itemCount, select]);
 
-  return { focusedIndex, helpVisible, setFocusedIndex };
+  useEffect(() => {
+    revealReviewItem(itemsRef.current, { index: focusedIndex, movementCount });
+  }, [focusedIndex, movementCount]);
+
+  return { focusedIndex, helpVisible, setFocusedIndex: select, registerItem };
 }

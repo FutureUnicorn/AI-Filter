@@ -56,3 +56,62 @@ test("both review surfaces use the shared hook rather than their own listeners",
     assert.ok(source.includes("ShortcutHelp"), `${page} must expose the shortcut list`);
   }
 });
+
+// ---- REV-001 ----
+//
+// The original review was right: the hook moved an index and the pages
+// drew an outline, and nothing ever touched the DOM. What a browser
+// would prove cannot be proved here, but the wiring that has to exist
+// for it to work can be, and it is exactly the wiring a later refactor
+// would drop without any test noticing.
+
+test("the hook reveals the selected element rather than only re-rendering", () => {
+  // Matched on the call, not the name: a comment mentioning the helper
+  // would otherwise satisfy this.
+  const callIndex = hook.indexOf("revealReviewItem(");
+  assert.ok(
+    callIndex > 0,
+    "moving the index must move the reviewer: an outline below the fold is invisible"
+  );
+  // Delegated, not reimplemented, for the same reason every binding is:
+  // the reveal rules are tested in tests/unit and a second copy here
+  // would not be.
+  assert.doesNotMatch(
+    hook,
+    /\.focus\(|\.scrollIntoView\(/u,
+    "focus handling belongs in review-focus.ts, where node --test can reach it"
+  );
+  const call = hook.slice(callIndex, hook.indexOf(");", callIndex));
+  // A hard-coded count would pass the live counter's name but not its
+  // value, and would reveal on the very first render.
+  assert.match(
+    call,
+    /movementCount(?!\s*:\s*\d)/u,
+    "the reveal must be keyed on a keypress, or the first render steals focus from wherever the reviewer left it"
+  );
+});
+
+test("both review surfaces hand their navigable element to the hook", () => {
+  for (const page of [
+    "apps/web/src/app/roles/[roleId]/applications/page.tsx",
+    "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"
+  ]) {
+    const source = readFileSync(join(repositoryRoot, page), "utf8");
+    assert.match(
+      source,
+      /ref=\{registerItem\(index\)\}/u,
+      `${page} registers no element, so the hook has nothing to focus or scroll to`
+    );
+    // Roving tabindex. Without a tabindex the row cannot take focus at
+    // all, so focus() is a no-op and the whole repair is decorative.
+    assert.match(
+      source,
+      /tabIndex=\{index === focusedIndex \? 0 : -1\}/u,
+      `${page} must put exactly the selected item in the tab order`
+    );
+    assert.ok(
+      !source.includes("aria-selected="),
+      `${page} must not use aria-selected: it is unsupported outside a grid, so it announced nothing`
+    );
+  }
+});

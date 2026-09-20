@@ -95,7 +95,7 @@ export default function EvidenceCardPage() {
   const cards = state.kind === "ready" ? state.cards.cards : [];
   // AF-53: "navigation between cards and source context" -- j/k moves
   // between criterion cards, s reveals the citation for the focused one.
-  const { focusedIndex, helpVisible } = useReviewKeyboard({
+  const { focusedIndex, helpVisible, registerItem, setFocusedIndex } = useReviewKeyboard({
     itemCount: cards.length,
     onRevealSource: (index) => setRevealedSource(index)
   });
@@ -204,8 +204,15 @@ export default function EvidenceCardPage() {
           {state.cards.cards.map((card, index) => (
             <article
               key={card.criterionId}
+              // REV-001: same as the queue. A card list is taller than the
+              // viewport as soon as a criterion has more than one quote, so
+              // `j` walks the selection off-screen and `s` then reveals a
+              // citation nobody can see.
+              ref={registerItem(index)}
+              tabIndex={index === focusedIndex ? 0 : -1}
               aria-label={`Evidence for ${card.criterionId}`}
               aria-current={index === focusedIndex ? "true" : undefined}
+              onFocus={() => setFocusedIndex(index)}
               style={index === focusedIndex ? { outline: "2px solid" } : undefined}
             >
               <h2>{card.criterionId}</h2>
