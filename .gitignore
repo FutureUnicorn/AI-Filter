@@ -34,3 +34,9 @@ Thumbs.db
 # real applicant data must never be committed to this repo
 *.applicant.txt
 data/
+
+# prospect research belongs in the CRM, not in git -- see
+# docs/validation/target-account-list.md. The .example.json file is
+# synthetic and stays committed.
+docs/validation/target-accounts.json
+*.accounts.json
