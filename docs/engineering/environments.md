@@ -188,14 +188,35 @@ secret store and redeploying changes what `migrate`, `web`, and `worker`
 *send* without changing what the database role *accepts* -- every hosted
 service then fails authentication against a role whose password never moved.
 
-Rotate the database password like this:
+Rotation is an operator action performed on the environment's own host, by a
+member of `ADMIN_ROLE_ALLOWLIST`. **No workflow performs it.** The staging and
+production jobs inject `POSTGRES_PASSWORD` for a deploy and nothing injects
+the outgoing password, so `rotate-password` cannot be driven from them as they
+stand -- see "Automating rotation" below. Putting the outgoing password into
+the GitHub secret store does not make it reachable either; nothing exports it.
 
-1. In the environment's secret store, add `POSTGRES_PASSWORD_PREVIOUS` set to
-   the currently active password, then replace `POSTGRES_PASSWORD` with the
-   new one.
-2. Run `node scripts/environment/cli.mjs <staging|production> rotate-password`.
-   It finds the environment's already-running `postgres` container, connects
-   over TCP so the outgoing password is actually verified, and issues
+1. Replace `POSTGRES_PASSWORD` in the environment's secret store with the new
+   password. That is what the next deploy will send; on its own it changes
+   nothing about what the database accepts.
+2. On the environment's host, supply the outgoing and incoming passwords to a
+   single invocation and rotate. `read -rs` takes each value on stdin, so
+   neither reaches shell history, and `rotate-password` keeps both out of
+   every process's argv:
+
+   ```bash
+   read -rsp 'outgoing password: ' POSTGRES_PASSWORD_PREVIOUS; echo
+   read -rsp 'new password: ' POSTGRES_PASSWORD; echo
+   export POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
+   node scripts/environment/cli.mjs <staging|production> rotate-password
+   unset POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
+   ```
+
+   The command also requires the environment's other hosted controls to be
+   present (`requireHostedControls`: the AF-11 enablement flag, the cost and
+   admin references, `POSTGRES_USER`, and the storage credentials --
+   `PRODUCTION_VALIDATION_ONLY` as well for production). It finds the
+   environment's already-running `postgres` container, connects over TCP so
+   the outgoing password is actually verified, and issues
    `ALTER ROLE ... WITH PASSWORD`, so the role's actual password matches the
    secret being rotated in. It refuses to run if `POSTGRES_PASSWORD_PREVIOUS`
    is absent or equal to `POSTGRES_PASSWORD` (nothing to rotate), and fails
@@ -203,9 +224,18 @@ Rotate the database password like this:
    environment is not running.
 3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
    redeploy with the new password, which the role now accepts.
-4. Remove `POSTGRES_PASSWORD_PREVIOUS` from the secret store. It is only read
-   during step 2, and leaving the outgoing password in the store afterward
-   is exposure with no remaining purpose.
+
+### Automating rotation
+
+Driving this from CI would need a job that injects both the outgoing and the
+incoming password from the environment's secrets. That is deliberately not
+added here: `production-gate.yml` has no manual trigger, and
+`tests/integration/environment-policy.test.ts` asserts it never gains one, so
+introducing a dispatchable job that can act on production is a policy decision
+for the owners of that rule rather than a detail of this change. Until such a
+job exists, treat the host procedure above as the supported path, and record
+the rotation against `ADMIN_AUDIT_REFERENCE` like any other administrative
+action.
 
 Storage credentials (`STORAGE_ACCESS_KEY_ID`/`STORAGE_SECRET_ACCESS_KEY`) are
 MinIO's root user, which MinIO re-reads from the environment on every start
