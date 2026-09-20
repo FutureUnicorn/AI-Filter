@@ -60,6 +60,26 @@ test("the cutoff boundary itself is still reviewing", () => {
   assert.equal(pastBoundary?.truncatedByIdle, true);
 });
 
+test("the cutoff moves active time, it does not only set a flag", () => {
+  // Where the cliff is, pinned. One millisecond either side of the
+  // cutoff swings activeMs by the whole width of the grace window,
+  // because below it we believe the reviewer was reading silently and
+  // above it we stop believing. That is what a threshold means rather
+  // than an artefact, but it is worth a test, because it makes the cost
+  // of moving the constant concrete: lengthening the cutoff does not
+  // merely flag fewer spans, it lets more provably idle time count as
+  // review inside the spans that stay unflagged, and that inflates the
+  // very baseline this ticket exists to produce.
+  const state = activity(beginReviewTiming(START), START + 10_000);
+  const justInside = sealReviewTiming(state, START + 10_000 + REVIEW_IDLE_CUTOFF_MS);
+  const justOutside = sealReviewTiming(state, START + 10_000 + REVIEW_IDLE_CUTOFF_MS + 1);
+
+  assert.equal(justInside?.activeMs, 10_000 + REVIEW_IDLE_CUTOFF_MS);
+  assert.equal(justInside?.truncatedByIdle, false);
+  assert.equal(justOutside?.activeMs, 10_000, "past the cutoff, only the proven interaction counts");
+  assert.equal(justOutside?.truncatedByIdle, true);
+});
+
 test("coming back after the cutoff ends the old span and opens a new one", () => {
   // Not a resumption: the gap is not review. Handing the finished span
   // back is also what stops the other failure -- a span that truncated
