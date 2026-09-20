@@ -2470,9 +2470,13 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
     disposition: "blocked_by_reference",
     holds: "candidate_full_name, candidate_email, external_reference_id",
     detail:
-      "DELETE fails with a foreign key violation from evidence_outcomes, which has no " +
-      "ON DELETE CASCADE -- deliberately, since a cascade issues a DELETE the append-only " +
-      "trigger would reject anyway."
+      "DELETE fails with a foreign key violation, and two uncascaded foreign keys point here, " +
+      "either one of which is enough on its own: evidence_outcomes " +
+      "(0016_evidence_outcomes.sql) and candidate_decisions (0019_candidate_decisions.sql). " +
+      "Neither carries ON DELETE CASCADE, deliberately, since a " +
+      "cascade issues a DELETE the append-only trigger would reject anyway. Postgres names " +
+      "only the first one it finds, so unblocking that surface independently leaves this one " +
+      "blocked by the other."
   },
   evidence_outcomes: {
     disposition: "blocked_append_only",

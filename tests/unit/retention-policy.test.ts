@@ -98,6 +98,25 @@ test("the append-only evidence store is named as the root blocker", () => {
   assert.match(evidence?.detail ?? "", /cannot be redacted in place/);
 });
 
+test("the applications blocker names both foreign keys, not only the one Postgres reports", () => {
+  // Two independent uncascaded FKs reference applications: one from
+  // evidence_outcomes (0016) and one from candidate_decisions (0019).
+  // A DELETE reports whichever it checks first, so a detail written from
+  // one error message reads as "fix evidence_outcomes and this unblocks",
+  // which is false. Proved by probe in the integration test: an
+  // application pinned only by candidate_decisions is refused by
+  // candidate_decisions_application_id_organization_id_fkey.
+  const plan = planRetention(policy(), NOW);
+  const applications = plan.surfaces.find((surface) => surface.surface === "applications");
+  assert.match(applications?.detail ?? "", /evidence_outcomes/);
+  assert.match(applications?.detail ?? "", /candidate_decisions/);
+  assert.match(
+    applications?.detail ?? "",
+    /independently/,
+    "naming both is not enough; the detail has to say that removing one leaves the other"
+  );
+});
+
 test("the candidate's filename is recognised as PII, not just a label", () => {
   // Easy to overlook, and routinely "Firstname_Lastname_CV.pdf".
   const plan = planRetention(policy(), NOW);
