@@ -179,6 +179,22 @@ test("compose passes the web service its session secret and the shared hosted co
   assert.doesNotMatch(workerService!, /SESSION_SECRET/u, "the worker must not require a session secret it never reads");
 });
 
+test("compose maps service-specific Sentry projects and a shared explicit sample rate", () => {
+  const compose = read("infra/compose/runtime.yml");
+  const runtimeEnvironmentBlock = /x-runtime-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  assert.ok(runtimeEnvironmentBlock);
+  assert.match(runtimeEnvironmentBlock!, /SENTRY_TRACES_SAMPLE_RATE: \$\{SENTRY_TRACES_SAMPLE_RATE:-\}/u);
+
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(webService);
+  assert.ok(workerService);
+  assert.match(webService!, /SENTRY_DSN: \$\{SENTRY_WEB_DSN:-\}/u);
+  assert.match(workerService!, /SENTRY_DSN: \$\{SENTRY_WORKER_DSN:-\}/u);
+  assert.doesNotMatch(webService!, /SENTRY_WORKER_DSN/u);
+  assert.doesNotMatch(workerService!, /SENTRY_WEB_DSN/u);
+});
+
 test("the web server refuses to start without a session secret", () => {
   // REV-003's other half. Documenting SESSION_SECRET is not enough on its own:
   // read at request time, its absence is a 500 per request rather than a
@@ -186,7 +202,7 @@ test("the web server refuses to start without a session secret", () => {
   // calls register() once and waits for it before serving, so throwing there
   // is what makes absence a startup failure.
   const instrumentation = read("apps/web/src/instrumentation.ts");
-  assert.match(instrumentation, /export function register\(/u, "Next.js only calls a function named register");
+  assert.match(instrumentation, /export (?:async )?function register\(/u, "Next.js only calls a function named register");
   assert.match(instrumentation, /SESSION_SECRET/u);
   assert.match(instrumentation, /throw new Error/u, "it has to throw; logging a warning still serves requests");
 });

@@ -6,6 +6,7 @@ import { checkDatabaseConnection } from "@signal-audit/db";
 import { DOMAIN_LAYER_NAME } from "@signal-audit/domain";
 import { checkStorageConnection } from "@signal-audit/ingestion";
 import { logStructured } from "@signal-audit/security";
+import { captureWorkerError } from "./observability.ts";
 
 export function startWorker(): string {
   const message = `Signal Audit worker ready; dependency center=${DOMAIN_LAYER_NAME}`;
@@ -61,9 +62,19 @@ export function createWorkerHealthServer(
 const entryPath = process.argv[1];
 
 if (entryPath !== undefined && import.meta.url === pathToFileURL(entryPath).href) {
-  startWorker();
-  const config = loadEnvironmentConfig(process.env);
-  createWorkerHealthServer().listen(config.ports.worker, "0.0.0.0", () => {
-    logStructured("info", "worker.health_listening");
-  });
+  try {
+    startWorker();
+    const config = loadEnvironmentConfig(process.env);
+    const server = createWorkerHealthServer();
+    server.once("error", (error) => {
+      captureWorkerError(error, "worker.startup");
+      process.exitCode = 1;
+    });
+    server.listen(config.ports.worker, "0.0.0.0", () => {
+      logStructured("info", "worker.health_listening");
+    });
+  } catch (error) {
+    captureWorkerError(error, "worker.startup");
+    process.exitCode = 1;
+  }
 }

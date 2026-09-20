@@ -364,9 +364,11 @@ export const LOG_EVENT_NAMES = [
   // is how an operator sees the failure the caller is not told about.
   "magic_link.delivery_failed",
   "magic_link.queued",
+  "web.request_failed",
   "web.environment_health_failed",
   "worker.environment_health_failed",
   "worker.health_listening",
+  "worker.operation_failed",
   "worker.ready"
 ] as const;
 
