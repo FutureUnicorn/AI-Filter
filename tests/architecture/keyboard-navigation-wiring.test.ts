@@ -97,16 +97,19 @@ test("both review surfaces hand their navigable element to the hook", () => {
     "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"
   ]) {
     const source = readFileSync(join(repositoryRoot, page), "utf8");
+    // The index variable is named per surface (REV-002 renamed the
+    // evidence card's to cardIndex), so the identifier is not pinned here,
+    // only that the element reaches the hook.
     assert.match(
       source,
-      /ref=\{registerItem\(index\)\}/u,
+      /ref=\{registerItem\([A-Za-z]+\)\}/u,
       `${page} registers no element, so the hook has nothing to focus or scroll to`
     );
     // Roving tabindex. Without a tabindex the row cannot take focus at
     // all, so focus() is a no-op and the whole repair is decorative.
     assert.match(
       source,
-      /tabIndex=\{index === focusedIndex \? 0 : -1\}/u,
+      /tabIndex=\{[A-Za-z]+ === focusedIndex \? 0 : -1\}/u,
       `${page} must put exactly the selected item in the tab order`
     );
     assert.ok(
@@ -114,4 +117,54 @@ test("both review surfaces hand their navigable element to the hook", () => {
       `${page} must not use aria-selected: it is unsupported outside a grid, so it announced nothing`
     );
   }
+});
+
+// ---- REV-002 ----
+//
+// `s` stored the focused card index and the JSX compared it against the
+// citation index, which shadowed it. Card 0 revealed the first citation
+// of every card; card 2 revealed nothing unless some card happened to
+// have three citations.
+//
+// The repair is not the rename. The revealed value is now the criterion
+// id, so the wrong comparison is a type error rather than a convention,
+// and tsc in the gate is what enforces it. These two assertions cover
+// what tsc cannot: that the comparison was not simply moved back onto a
+// position, and that the shadowing which made the mistake invisible
+// cannot reappear in this file.
+//
+// Said plainly: nothing here renders the component, so "every citation
+// on the selected card shows its context" is guaranteed by the compiler
+// and by the shape of the code, not by an assertion about output. That
+// would need jsdom, which this repository does not have.
+
+test("the source reveal is scoped to the card, by identity rather than by position", () => {
+  const page = readFileSync(
+    join(repositoryRoot, "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"),
+    "utf8"
+  );
+  assert.match(
+    page,
+    /revealedCriterion === card\.criterionId/u,
+    "the reveal must be gated on the focused card's identity, not on any index"
+  );
+  assert.ok(
+    !page.includes("revealedSource"),
+    "a revealed index is comparable to a citation index and TypeScript cannot object"
+  );
+});
+
+test("no loop in the evidence card page is named index, because two of them nest", () => {
+  // The cards map and the citations map are nested, so a parameter named
+  // `index` in both means the inner one silently wins. Distinct names are
+  // what make the comparison readable at the point it is written.
+  const page = readFileSync(
+    join(repositoryRoot, "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"),
+    "utf8"
+  );
+  assert.doesNotMatch(
+    page,
+    /\.map\(\([A-Za-z]+, index\)/u,
+    "name it cardIndex or citationIndex: a shared name is what hid REV-002"
+  );
 });

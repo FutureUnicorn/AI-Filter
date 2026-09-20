@@ -4,7 +4,8 @@ import test from "node:test";
 import {
   REVIEW_SHORTCUTS,
   nextReviewIndex,
-  resolveReviewKeyAction
+  resolveReviewKeyAction,
+  revealedCriterionId
 } from "../../packages/domain/src/index.ts";
 import type { ReviewKeyAction } from "../../packages/domain/src/index.ts";
 
@@ -208,4 +209,50 @@ test("an empty list and an item that has not rendered reveal nothing rather than
   // unregistered for a frame while the filter re-renders the table.
   assert.equal(revealReviewItem(new Map(), { index: -1, movementCount: 3 }), false);
   assert.equal(revealReviewItem(new Map([[0, recordingItem()]]), { index: 2, movementCount: 3 }), false);
+});
+
+// ---- REV-002: `s` revealed the wrong thing ----
+//
+// The focused CARD index was stored and the JSX compared it against the
+// CITATION index, which shadowed it. Card 0 revealed the first citation
+// of every card, and selecting card 2 revealed nothing at all unless
+// some card happened to have three citations.
+//
+// The scope decision, stated once: the reveal is card-scoped. The
+// published shortcut is "Reveal the source citation for the focused
+// card", and j/k/g/G move over cards only. Nothing moves between the
+// citations inside a card, so a citation-scoped reveal would target
+// something the reviewer cannot select. Which is what the bug did.
+//
+// So the revealed value is a criterion id, not a position. These cover
+// the conversion; the comparison itself is a type error now, and tsc in
+// the gate is what proves that half.
+
+test("the focused card is resolved by identity, including a card that is not the first", () => {
+  // The reviewer's case from the report: select a later card, press `s`.
+  // Returning the criterion at that position is the whole of it, and it
+  // must not quietly return the first one or nothing.
+  const criteria = ["communication", "system-design", "testing"];
+
+  assert.equal(revealedCriterionId(criteria, 2), "testing");
+  assert.equal(revealedCriterionId(criteria, 1), "system-design");
+  assert.equal(revealedCriterionId(criteria, 0), "communication");
+});
+
+test("no card focused reveals no source, rather than the first card's", () => {
+  // nextReviewIndex reports -1 for an empty list, and an index that has
+  // run past a list which shrank must not resolve to a neighbour.
+  assert.equal(revealedCriterionId(["communication"], -1), undefined);
+  assert.equal(revealedCriterionId([], 0), undefined);
+  assert.equal(revealedCriterionId(["communication", "testing"], 5), undefined);
+});
+
+test("the revealed value is a criterion id, so it cannot be a citation position", () => {
+  // The defect was structural: two numbers, one of them shadowed, and
+  // nothing in the type system to object. An id is a string, so the
+  // comparison that caused this no longer compiles. This asserts the
+  // property that makes that true.
+  const revealed = revealedCriterionId(["communication", "system-design"], 1);
+  assert.equal(typeof revealed, "string");
+  assert.notEqual(revealed, 1);
 });
