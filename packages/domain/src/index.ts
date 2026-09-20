@@ -1809,6 +1809,17 @@ function stableHash(value: string): number {
 }
 
 /**
+ * Bumped whenever `selectAuditSample` would return a different set for the
+ * same seed and population.
+ *
+ * Stored on every draw. Without it a future auditor recomputing a draw made
+ * under an older rule sees a mismatch and cannot tell "the selection was
+ * tampered with" from "the algorithm changed in 2027", and those two
+ * conclusions could not be further apart.
+ */
+export const AUDIT_SAMPLE_ALGORITHM_VERSION = 1;
+
+/**
  * Selects `size` applications for independent review from those whose
  * evidence is weak or absent.
  *

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ import type {
   Rubric,
   RubricCriterion,
   RubricStatus,
+  AuditSampleCandidate,
   User
 } from "@signal-audit/domain";
 import {
@@ -38,6 +39,8 @@ import {
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   mapCsvRowToApplication,
+  AUDIT_SAMPLE_ALGORITHM_VERSION,
+  selectAuditSample,
   summarizeImportRows
 } from "@signal-audit/domain";
 import { Client } from "pg";
@@ -3438,9 +3441,35 @@ export interface RecordAuditSampleInput {
   readonly roleId: string;
   readonly seed: string;
   readonly requestedSize: number;
-  readonly eligibleCount: number;
   readonly drawnByUserId: string;
-  readonly sampledApplicationIds: readonly string[];
+  /**
+   * The population to draw FROM, not the draw.
+   *
+   * Review REV-005: this used to be `sampledApplicationIds` plus an
+   * `eligibleCount`, and the writer checked only that the count was right.
+   * A caller could run `selectAuditSample`, throw the answer away, and
+   * persist any other subset of the same size under the same seed. The
+   * recorded seed then attests to a draw that never happened, which is
+   * precisely the thing the migration's own comment says this table exists
+   * to make impossible.
+   *
+   * Handing in the population instead of the result makes that
+   * unconstructible rather than merely refused. There is no argument the
+   * caller can pass that expresses a cherry-picked membership.
+   */
+  readonly candidates: readonly AuditSampleCandidate[];
+}
+
+/**
+ * The eligibility fingerprint an auditor recomputes.
+ *
+ * Sorted so it does not depend on the order rows came back in, and over
+ * eligible ids only, because the eligible set is what the seed was applied
+ * to. Newline-joined and sha256'd so the recipe is short enough to restate
+ * in another language, the same reason AF-52 chose FNV-1a for the draw.
+ */
+export function digestEligiblePopulation(eligibleApplicationIds: readonly string[]): string {
+  return createHash("sha256").update([...eligibleApplicationIds].sort().join("\n")).digest("hex");
 }
 
 export interface RecordedAuditSample {
@@ -3470,17 +3499,29 @@ export async function recordAuditSample(
     await client.connect();
     await client.query("BEGIN");
     try {
+      // Derived here, from the population, using the same function any
+      // auditor would run. The caller has no way to influence which
+      // applications end up in the draw beyond deciding who was eligible,
+      // and that decision is itself pinned by the digest below.
+      const selection = selectAuditSample(input.candidates, input.seed, input.requestedSize);
+      const eligibleApplicationIds = input.candidates
+        .filter((candidate) => candidate.strength !== "cited")
+        .map((candidate) => candidate.applicationId);
+
       const drawn = await client.query<{ audit_sample_id: string }>(
         `INSERT INTO "${schema}".audit_samples
-           (organization_id, role_id, seed, requested_size, eligible_count, drawn_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (organization_id, role_id, seed, requested_size, eligible_count,
+            eligible_digest, algorithm_version, drawn_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING audit_sample_id`,
         [
           input.organizationId,
           input.roleId,
           input.seed,
           input.requestedSize,
-          input.eligibleCount,
+          selection.eligibleCount,
+          digestEligiblePopulation(eligibleApplicationIds),
+          AUDIT_SAMPLE_ALGORITHM_VERSION,
           input.drawnByUserId
         ]
       );
@@ -3488,7 +3529,7 @@ export async function recordAuditSample(
       if (auditSampleId === undefined) {
         throw new Error("recording an audit sample did not produce a draw row");
       }
-      for (const applicationId of input.sampledApplicationIds) {
+      for (const applicationId of selection.sampledApplicationIds) {
         await client.query(
           `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, role_id, application_id)
            VALUES ($1, $2, $3, $4)`,
@@ -3501,12 +3542,12 @@ export async function recordAuditSample(
       // call site instead of a check_violation surfacing from a COMMIT
       // that names no application code, which is a materially worse thing
       // to debug at 3am.
-      const expected = Math.min(input.requestedSize, input.eligibleCount);
-      if (input.sampledApplicationIds.length !== expected) {
+      const expected = Math.min(input.requestedSize, selection.eligibleCount);
+      if (selection.sampledApplicationIds.length !== expected) {
         throw new Error(
           `an audit sample must record exactly ${expected} member(s), the lesser of requestedSize ` +
-            `${input.requestedSize} and eligibleCount ${input.eligibleCount}, but ` +
-            `${input.sampledApplicationIds.length} were supplied`
+            `${input.requestedSize} and eligibleCount ${selection.eligibleCount}, but ` +
+            `${selection.sampledApplicationIds.length} were derived`
         );
       }
       await client.query("COMMIT");
@@ -3577,6 +3618,82 @@ export async function listAuditSamplesForRole(
  * happened while checking this table by hand, and made a cross-tenant
  * case look enforced when the unique index had fired instead.
  */
+export interface AuditSampleVerification {
+  readonly matchesRecordedMembership: boolean;
+  readonly matchesRecordedPopulation: boolean;
+  readonly algorithmVersionMatches: boolean;
+  readonly recomputedApplicationIds: readonly string[];
+}
+
+/**
+ * Review REV-005: recomputes a stored draw from its own seed and reports
+ * whether the stored membership is the one that seed produces.
+ *
+ * The database cannot enforce this. It has no idea what the selection rule
+ * is, so a correct-count membership assembled by hand satisfies every
+ * constraint on the table. What closes the hole at write time is that
+ * `recordAuditSample` derives the membership rather than accepting one; this
+ * is the other half, for anyone checking a draw they did not write, which is
+ * the entire audience an audit sample exists for.
+ *
+ * The caller supplies the population it believes was eligible. The digest
+ * says whether that belief matches what the draw was actually made from, so
+ * a mismatch distinguishes "you are checking against the wrong population"
+ * from "the membership was tampered with", which would otherwise look
+ * identical.
+ */
+export async function verifyAuditSampleDraw(
+  databaseUrl: string,
+  schema: string,
+  auditSampleId: string,
+  candidates: readonly AuditSampleCandidate[]
+): Promise<AuditSampleVerification> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const stored = await client.query<{
+      seed: string;
+      requested_size: number;
+      eligible_digest: string;
+      algorithm_version: number;
+      application_ids: string[] | null;
+    }>(
+      `SELECT s.seed, s.requested_size, s.eligible_digest, s.algorithm_version,
+              array_agg(m.application_id ORDER BY m.application_id)
+                FILTER (WHERE m.application_id IS NOT NULL) AS application_ids
+         FROM "${schema}".audit_samples s
+         LEFT JOIN "${schema}".audit_sample_members m
+                ON m.audit_sample_id = s.audit_sample_id
+               AND m.organization_id = s.organization_id
+               AND m.role_id = s.role_id
+        WHERE s.audit_sample_id = $1
+        GROUP BY s.audit_sample_id, s.seed, s.requested_size, s.eligible_digest, s.algorithm_version`,
+      [auditSampleId]
+    );
+    const row = stored.rows[0];
+    if (row === undefined) {
+      throw new Error(`no audit sample ${auditSampleId} to verify`);
+    }
+
+    const recomputed = selectAuditSample(candidates, row.seed, row.requested_size);
+    const eligibleApplicationIds = candidates
+      .filter((candidate) => candidate.strength !== "cited")
+      .map((candidate) => candidate.applicationId);
+    const recordedMembership = [...(row.application_ids ?? [])].sort();
+
+    return {
+      matchesRecordedMembership:
+        JSON.stringify([...recomputed.sampledApplicationIds].sort()) === JSON.stringify(recordedMembership),
+      matchesRecordedPopulation: digestEligiblePopulation(eligibleApplicationIds) === row.eligible_digest,
+      algorithmVersionMatches: row.algorithm_version === AUDIT_SAMPLE_ALGORITHM_VERSION,
+      recomputedApplicationIds: recomputed.sampledApplicationIds
+    };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
 export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<void> {
   const suffix = randomBytes(4).toString("hex");
   const schema = `sample_probe_${suffix}`;
@@ -3707,14 +3824,17 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     }
 
     // 1. A draw records with its membership, atomically.
+    const population: readonly AuditSampleCandidate[] = applicationIds.map((applicationId) => ({
+      applicationId,
+      strength: "none" as const
+    }));
     const sampleId = await recordAuditSample(databaseUrl, schema, {
       organizationId: orgA,
       roleId,
       seed: `audit-${suffix}`,
       requestedSize: 2,
-      eligibleCount: 3,
       drawnByUserId: memberId,
-      sampledApplicationIds: applicationIds.slice(0, 2)
+      candidates: population
     });
     const drawn = await listAuditSamplesForRole(databaseUrl, schema, orgA, roleId);
     if (drawn.length !== 1 || drawn[0]?.sampledApplicationIds.length !== 2) {
@@ -3734,9 +3854,8 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
         roleId,
         seed: `atomic-${suffix}`,
         requestedSize: 1,
-        eligibleCount: 3,
         drawnByUserId: memberId,
-        sampledApplicationIds: ["99999999-9999-4999-8999-999999999999"]
+        candidates: [{ applicationId: "99999999-9999-4999-8999-999999999999", strength: "none" }]
       });
     } catch {
       partialRejected = true;
@@ -3916,33 +4035,13 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       }
     }
 
-    // 6. Review REV-003: the draw must record exactly what it drew.
-    //    Both directions matter and they lie differently. Too few reads
-    //    as "we sampled and found nobody"; too many reads as "we sampled
-    //    everybody". Neither required the seed to decide anything.
-    for (const [label, size, eligible, ids] of [
-      ["no members at all", 2, 3, [] as string[]],
-      ["fewer members than it drew", 2, 3, [applicationIds[0] as string]],
-      ["more members than it drew", 2, 3, applicationIds.slice(0, 3)]
-    ] as const) {
-      let rejected = false;
-      try {
-        await recordAuditSample(databaseUrl, schema, {
-          organizationId: orgA,
-          roleId,
-          seed: `exact-${label}-${suffix}`,
-          requestedSize: size,
-          eligibleCount: eligible,
-          drawnByUserId: memberId,
-          sampledApplicationIds: ids
-        });
-      } catch {
-        rejected = true;
-      }
-      if (!rejected) {
-        throw new Error(`a draw recording ${label} must not commit`);
-      }
-    }
+    // 6. Review REV-003's writer-level cases are gone, deliberately.
+    //    They passed a member list that disagreed with the counts, and
+    //    REV-005 removed the ability to pass a member list at all. A test
+    //    for an argument that no longer exists would not compile, and
+    //    keeping a weakened version of it would suggest coverage that the
+    //    type system now provides outright. The database-level enforcement
+    //    is still exercised at step 7, which bypasses the writer.
 
     // A draw over an empty eligible population legitimately records
     // nothing, and must still be allowed. This is why the constraint
@@ -3954,9 +4053,8 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       roleId,
       seed: `empty-${suffix}`,
       requestedSize: 5,
-      eligibleCount: 0,
       drawnByUserId: memberId,
-      sampledApplicationIds: []
+      candidates: []
     });
 
     // 7. The database enforces it too, not just the writer. A caller
@@ -3977,6 +4075,60 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
     }
     if (!rawUnderfilledRejected) {
       throw new Error("a draw inserted directly with no members must be refused at commit, not only by the writer");
+    }
+
+    // 7b. Review REV-005: the draw must be the seed's answer, not merely a
+    //     valid-looking set of the right size.
+    //
+    //     The write path closes this by construction, since there is no
+    //     argument left that expresses a membership. What this checks is the
+    //     other half: that someone who did not write the draw can tell.
+    const honest = await verifyAuditSampleDraw(databaseUrl, schema, sampleId, population);
+    if (!honest.matchesRecordedMembership || !honest.matchesRecordedPopulation) {
+      throw new Error(
+        `a draw written by recordAuditSample must verify against its own seed; got membership=${honest.matchesRecordedMembership} population=${honest.matchesRecordedPopulation}`
+      );
+    }
+    if (!honest.algorithmVersionMatches) {
+      throw new Error("a freshly written draw must record the current algorithm version");
+    }
+
+    //     Now the attack. Swap a selected application for an eligible one
+    //     the seed did not choose, keeping the count identical, which is
+    //     exactly what the count trigger cannot see. Triggers come off
+    //     because the tamper is meant to model a writer going around the
+    //     application, not an attack on the append-only rules themselves.
+    const notChosen = applicationIds.find((id) => !honest.recomputedApplicationIds.includes(id));
+    const chosen = honest.recomputedApplicationIds[0];
+    if (notChosen === undefined || chosen === undefined) {
+      throw new Error("probe needs one selected and one unselected application to tamper with");
+    }
+    for (const trigger of ["audit_sample_members_append_only", "audit_sample_members_exact_membership"]) {
+      await admin.query(`ALTER TABLE audit_sample_members DISABLE TRIGGER ${trigger}`);
+    }
+    await admin.query(
+      `UPDATE audit_sample_members SET application_id = $1
+        WHERE audit_sample_id = $2 AND application_id = $3`,
+      [notChosen, sampleId, chosen]
+    );
+    const tampered = await verifyAuditSampleDraw(databaseUrl, schema, sampleId, population);
+    await admin.query(
+      `UPDATE audit_sample_members SET application_id = $1
+        WHERE audit_sample_id = $2 AND application_id = $3`,
+      [chosen, sampleId, notChosen]
+    );
+    for (const trigger of ["audit_sample_members_append_only", "audit_sample_members_exact_membership"]) {
+      await admin.query(`ALTER TABLE audit_sample_members ENABLE TRIGGER ${trigger}`);
+    }
+    if (tampered.matchesRecordedMembership) {
+      throw new Error(
+        "a membership of the right size that the seed did not produce must fail verification, or the recorded seed attests to a draw that never happened"
+      );
+    }
+    if (!tampered.matchesRecordedPopulation) {
+      throw new Error(
+        "tampering with membership must not also report a population mismatch; the two findings mean different things and must stay distinguishable"
+      );
     }
 
     // 8. And a committed draw cannot be extended afterwards. The

@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS audit_samples (
   -- one of 3 from 4000, which is the difference between a check and a
   -- gesture.
   eligible_count integer NOT NULL CHECK (eligible_count >= 0),
+  -- Review REV-005: eligible_count says how many were in the pot, and
+  -- nothing said WHICH. Two auditors recomputing the same seed over two
+  -- different populations of the same size both get a "valid" answer and
+  -- disagree, with no way to tell which population was drawn from. The
+  -- digest pins it: sha256 over the eligible application ids, sorted
+  -- ascending and joined with newlines, which anyone can recompute.
+  eligible_digest text NOT NULL CHECK (eligible_digest ~ '^[0-9a-f]{64}$'),
+  -- Which selection rule produced the membership. Without it, a draw made
+  -- under an older rule looks tampered with rather than merely old.
+  algorithm_version integer NOT NULL CHECK (algorithm_version > 0),
   drawn_by_user_id uuid NOT NULL,
   drawn_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   FOREIGN KEY (role_id, organization_id) REFERENCES roles (role_id, organization_id),
