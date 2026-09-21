@@ -49,9 +49,16 @@ test("CI exposes every AF-12 check and a fail-closed aggregate gate", () => {
   assert.match(ci, /if \[ "\$result" != "success" \]; then/);
 });
 
-test("CI targets both protected branches with read-only, secret-free validation", () => {
-  assert.match(ci, /pull_request:\s*\n\s+branches: \[develop, main\]/);
-  assert.match(ci, /push:\s*\n\s+branches: \[develop, main\]/);
+test("CI targets both protected branches and stacked feature branches with read-only, secret-free validation", () => {
+  // AF-92: `pull_request.branches` matches a PR's BASE branch. Every PR
+  // stacked on a feature branch (rather than develop/main directly) has a
+  // feature-branch base, so without this pattern no run was ever queued for
+  // it -- confirmed live on ~30 open PRs, including AF-19's own suite and
+  // the RLS tenant-isolation probes, silent for hours with nobody able to
+  // see it. `push.branches` gets the same pattern so a direct push to a
+  // feature branch (not just a PR into one) is validated too.
+  assert.match(ci, /pull_request:\s*\n\s+branches: \[develop, main, "feature\/\*\*"\]/);
+  assert.match(ci, /push:\s*\n\s+branches: \[develop, main, "feature\/\*\*"\]/);
   assert.match(ci, /merge_group:\s*\n\s+types: \[checks_requested\]/);
   assert.match(ci, /permissions:\s*\n\s+contents: read/);
   assert.doesNotMatch(ci, /continue-on-error:\s*true/);
