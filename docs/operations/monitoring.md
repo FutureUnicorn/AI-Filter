@@ -23,8 +23,13 @@ collection for users, cookies, headers, bodies, query parameters, database
 values, local variables, source context, and generative-AI input/output.
 Breadcrumbs are disabled. A final allowlist rebuilds error events and spans,
 preserving only normalized operation/service identity, release/environment,
-trace identifiers, safe status fields, and generated request IDs. Error
-messages are replaced before capture. Candidate names, email addresses,
+trace identifiers, safe status fields, generated request IDs, and bounded
+error diagnostics. Error class names must come from the closed code-owned
+allowlist; error codes are limited to a closed set of operational network
+codes and bounded provider HTTP status codes. Those fields form a
+stable operation/name/code fingerprint while messages, causes, and stack
+content are replaced before capture. The same diagnostics are written to the
+structured first-party error stream, never as a raw error object. Candidate names, email addresses,
 filenames, resume text, prompts, quotes, object keys, raw SQL values, raw
 provider responses, and arbitrary context must never be added to telemetry.
 

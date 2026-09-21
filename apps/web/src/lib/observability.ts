@@ -1,6 +1,6 @@
 import * as Sentry from "@sentry/nextjs";
 import { loadMonitoringConfig, type EnvironmentSource, type MonitoringConfig } from "@signal-audit/config";
-import { logStructured } from "@signal-audit/security";
+import { describeError, logStructured, type SafeErrorDiagnostic } from "@signal-audit/security";
 import type { ErrorEvent, Event, Span } from "@sentry/nextjs";
 
 type SentrySpanJson = ReturnType<typeof Sentry.spanToJSON>;
@@ -76,9 +76,9 @@ function safeOperation(value: unknown, fallback: WebOperation = "web.request"): 
   return typeof value === "string" && WEB_OPERATION_SET.has(value) ? (value as WebOperation) : fallback;
 }
 
-function safeError(): Error {
+function safeError(diagnostic: SafeErrorDiagnostic): Error {
   const sanitized = new Error("Unexpected server failure");
-  sanitized.name = "ServerOperationError";
+  sanitized.name = diagnostic.errorName;
   return sanitized;
 }
 
@@ -109,20 +109,14 @@ export function sanitizeTelemetryEvent<T extends Event>(event: T, config: Monito
   const operation = safeOperation(event.tags?.operation ?? event.transaction);
   const requestId = event.extra?.request_id;
   const contexts = safeTraceContext(event);
-  const exception = event.exception?.values?.map((value) => ({
-    type: "ServerOperationError",
-    value: "Unexpected server failure",
-    ...(value.stacktrace?.frames === undefined
-      ? {}
-      : {
-          stacktrace: {
-            frames: value.stacktrace.frames.map((frame) => ({
-              lineno: frame.lineno,
-              colno: frame.colno,
-              in_app: frame.in_app
-            }))
-          }
-        })
+  const hasDiagnostic =
+    typeof event.tags?.error_name === "string" || typeof event.tags?.error_code === "string";
+  const diagnostic = hasDiagnostic
+    ? describeError({ name: event.tags?.error_name, code: event.tags?.error_code })
+    : undefined;
+  const exceptionValues = event.exception?.values?.map(() => ({
+    type: diagnostic?.errorName ?? "ServerOperationError",
+    value: "Unexpected server failure"
   }));
   return {
     event_id: event.event_id,
@@ -132,12 +126,21 @@ export function sanitizeTelemetryEvent<T extends Event>(event: T, config: Monito
     environment: config.environment,
     release: config.release,
     transaction: operation,
-    tags: { service: config.service, operation },
+    tags: {
+      service: config.service,
+      operation,
+      ...(diagnostic === undefined
+        ? {}
+        : { error_name: diagnostic.errorName, error_code: diagnostic.errorCode })
+    },
+    ...(diagnostic === undefined
+      ? {}
+      : { fingerprint: [operation, diagnostic.errorName, diagnostic.errorCode] }),
     ...(typeof requestId === "string" && REQUEST_ID_PATTERN.test(requestId)
       ? { extra: { request_id: requestId } }
       : {}),
     ...(contexts === undefined ? {} : { contexts }),
-    ...(exception === undefined ? {} : { exception })
+    ...(exceptionValues === undefined ? {} : { exception: { values: exceptionValues } })
   } as unknown as T;
 }
 
@@ -217,10 +220,16 @@ export function captureServerError(
   error: unknown,
   context: { readonly operation: WebOperation; readonly requestId?: string }
 ): void {
+  const diagnostic = describeError(error);
   try {
     telemetryAdapter.getActiveSpan()?.setStatus({ code: 2, message: "internal_error" });
-    telemetryAdapter.captureException(safeError(), {
-      tags: { service: "web", operation: context.operation },
+    telemetryAdapter.captureException(safeError(diagnostic), {
+      tags: {
+        service: "web",
+        operation: context.operation,
+        error_name: diagnostic.errorName,
+        error_code: diagnostic.errorCode
+      },
       ...(context.requestId !== undefined && REQUEST_ID_PATTERN.test(context.requestId)
         ? { extra: { request_id: context.requestId } }
         : {})
@@ -233,7 +242,8 @@ export function captureServerError(
       ...(context.requestId === undefined ? {} : { requestId: context.requestId }),
       action: context.operation,
       statusCode: 500,
-      errorCode: "internal_error"
+      errorName: diagnostic.errorName,
+      errorCode: diagnostic.errorCode
     });
   } catch {
     // A broken telemetry/log sink must not replace the original response.
@@ -253,10 +263,27 @@ export function withServerOperation<Arguments extends unknown[], Result>(
   handler: (...args: Arguments) => Promise<Result>
 ): (...args: Arguments) => Promise<Result> {
   return async (...args: Arguments): Promise<Result> => {
-    let completed = false;
-    let didThrow = false;
-    let result: Result | undefined;
-    let applicationError: unknown;
+    let execution: Promise<Result> | undefined;
+    const executeOnce = (span?: SpanHandle): Promise<Result> => {
+      if (execution !== undefined) {
+        return execution;
+      }
+      execution = Promise.resolve().then(async () => {
+        try {
+          const result = await handler(...args);
+          if (result instanceof Response && result.status >= 500 && span !== undefined) {
+            markSpanFailed(span);
+          }
+          return result;
+        } catch (error) {
+          if (span !== undefined) {
+            markSpanFailed(span);
+          }
+          throw error;
+        }
+      });
+      return execution;
+    };
     try {
       await telemetryAdapter.startSpan(
         {
@@ -266,30 +293,12 @@ export function withServerOperation<Arguments extends unknown[], Result>(
           forceTransaction: true,
           attributes: { "service.name": "web", "monitor.operation": operation }
         },
-        async (span) => {
-          try {
-            result = await handler(...args);
-            if (result instanceof Response && result.status >= 500) {
-              markSpanFailed(span);
-            }
-          } catch (error) {
-            didThrow = true;
-            applicationError = error;
-            markSpanFailed(span);
-          } finally {
-            completed = true;
-          }
-        }
+        (span) => executeOnce(span)
       );
     } catch {
-      if (!completed) {
-        return handler(...args);
-      }
+      return executeOnce();
     }
-    if (didThrow) {
-      throw applicationError;
-    }
-    return result as Result;
+    return executeOnce();
   };
 }
 

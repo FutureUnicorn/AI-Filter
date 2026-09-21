@@ -8,7 +8,12 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { createMagicLinkToken, getMembershipsForUser, getUserByEmail } from "@signal-audit/db";
-import { createMagicLinkEmailSender, generateMagicLinkToken, logStructured } from "@signal-audit/security";
+import {
+  createMagicLinkEmailSender,
+  describeError,
+  generateMagicLinkToken,
+  logStructured
+} from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 import { captureServerError, withServerOperation } from "../../../../../lib/observability";
 
@@ -99,8 +104,14 @@ async function handlePOST(request: NextRequest): Promise<Response> {
       // of the retained log stream (AF-21).
       try {
         await emailSender.sendMagicLink({ email, link });
-      } catch {
-        logStructured("error", "magic_link.delivery_failed");
+      } catch (error) {
+        const diagnostic = describeError(error);
+        logStructured("error", "magic_link.delivery_failed", {
+          requestId,
+          action: "email.send",
+          errorName: diagnostic.errorName,
+          errorCode: diagnostic.errorCode
+        });
       }
     }
     // Same response regardless of the branch above, including when delivery

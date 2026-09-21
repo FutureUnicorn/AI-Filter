@@ -55,7 +55,7 @@ const monitoringSource = {
 const webConfig = loadMonitoringConfig(monitoringSource, "web");
 const workerConfig = loadMonitoringConfig(monitoringSource, "worker");
 
-test("handled server failures capture only a generic error plus request correlation", (t) => {
+test("handled server failures retain bounded diagnostics without error messages or payloads", (t) => {
   const captures: Array<{ error: Error; context: { tags: Record<string, string>; extra?: Record<string, string> } }> = [];
   const statuses: unknown[] = [];
   t.mock.method(console, "error", () => undefined);
@@ -72,17 +72,26 @@ test("handled server failures capture only a generic error plus request correlat
   });
   t.after(() => setWebTelemetryAdapterForTesting(undefined));
 
-  captureServerError(new Error("Alice Example resume.pdf contained private text"), {
+  const failure = Object.assign(
+    new TypeError("Alice Example resume.pdf contained private text"),
+    { code: "ECONNRESET" }
+  );
+  captureServerError(failure, {
     requestId: REQUEST_ID,
     operation: "file.extract_text"
   });
 
   assert.equal(captures.length, 1);
-  assert.equal(captures[0]?.error.name, "ServerOperationError");
+  assert.equal(captures[0]?.error.name, "TypeError");
   assert.equal(captures[0]?.error.message, "Unexpected server failure");
   assert.equal(captures[0]?.error.stack?.includes("Alice Example"), false);
   assert.deepEqual(captures[0]?.context, {
-    tags: { service: "web", operation: "file.extract_text" },
+    tags: {
+      service: "web",
+      operation: "file.extract_text",
+      error_name: "TypeError",
+      error_code: "econnreset"
+    },
     extra: { request_id: REQUEST_ID }
   });
   assert.equal(statuses.length, 1);
@@ -136,6 +145,35 @@ test("telemetry adapter failure never changes a request or capture outcome", asy
   assert.equal(calls, 1, "falling back after a tracing failure must not duplicate application work");
 });
 
+test("a tracing rejection after callback start cannot execute a handler twice", async (t) => {
+  let calls = 0;
+  let releaseHandler: (() => void) | undefined;
+  const handlerGate = new Promise<void>((resolve) => {
+    releaseHandler = resolve;
+  });
+  setWebTelemetryAdapterForTesting({
+    captureException() { return undefined; },
+    getActiveSpan() { return undefined; },
+    startSpan(_options, callback) {
+      void callback({ setStatus() { return undefined; } });
+      return Promise.reject(new Error("trace export failed after callback start"));
+    }
+  });
+  t.after(() => setWebTelemetryAdapterForTesting(undefined));
+
+  const wrapped = withServerOperation("auth.magic_link.request", async () => {
+    calls += 1;
+    await handlerGate;
+    return new Response(null, { status: 202 });
+  });
+  const pending = wrapped();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1, "the tracing fallback must await the in-flight execution, not start another one");
+  releaseHandler?.();
+  assert.equal((await pending).status, 202);
+  assert.equal(calls, 1);
+});
+
 test("the final event and span allowlists remove request PII and high-cardinality IDs", () => {
   const event = {
     event_id: "a".repeat(32),
@@ -147,7 +185,12 @@ test("the final event and span allowlists remove request PII and high-cardinalit
     },
     user: { email: "alice@example.test", username: "Alice Example" },
     breadcrumbs: [{ message: "resume evidence quote" }],
-    tags: { operation: "file.extract_text", organization_id: "33333333-3333-4333-8333-333333333333" },
+    tags: {
+      operation: "file.extract_text",
+      error_name: "TypeError",
+      error_code: "econnreset",
+      organization_id: "33333333-3333-4333-8333-333333333333"
+    },
     extra: { request_id: REQUEST_ID, filename: "Alice Example resume.pdf", prompt: "private prompt" },
     exception: {
       values: [{
@@ -164,6 +207,17 @@ test("the final event and span allowlists remove request PII and high-cardinalit
   }
   assert.match(serializedEvent, /file\.extract_text/u);
   assert.match(serializedEvent, new RegExp(REQUEST_ID, "u"));
+  const cleanException = cleanEvent.exception as {
+    readonly values?: ReadonlyArray<{
+      readonly type?: string;
+      readonly value?: string;
+      readonly stacktrace?: unknown;
+    }>;
+  } | undefined;
+  assert.equal(cleanException?.values?.[0]?.type, "TypeError");
+  assert.equal(cleanException?.values?.[0]?.value, "Unexpected server failure");
+  assert.equal(cleanException?.values?.[0]?.stacktrace, undefined);
+  assert.deepEqual(cleanEvent.fingerprint, ["file.extract_text", "TypeError", "econnreset"]);
 
   const cleanSpan = sanitizeTelemetrySpan({
     trace_id: "a".repeat(32),
@@ -222,13 +276,23 @@ test("token-budget telemetry reuses ok, warning, and capped decisions without mo
 
 test("worker event allowlisting drops arbitrary context", () => {
   const clean = sanitizeWorkerEvent({
-    tags: { operation: "worker.job", application_id: "secret-id" },
+    tags: {
+      operation: "worker.job",
+      error_name: "TypeError",
+      error_code: "econnreset",
+      application_id: "secret-id"
+    },
     extra: { prompt: "private prompt", response: "raw provider response" },
     user: { email: "candidate@example.test" },
     exception: { values: [{ value: "candidate@example.test", type: "Error" }] }
   }, workerConfig);
   const serialized = JSON.stringify(clean);
   assert.match(serialized, /Unexpected worker failure/u);
+  assert.equal(clean.exception?.values?.[0]?.type, "TypeError");
+  assert.deepEqual(
+    (clean as typeof clean & { readonly fingerprint?: readonly string[] }).fingerprint,
+    ["worker.job", "TypeError", "econnreset"]
+  );
   assert.doesNotMatch(serialized, /candidate@example\.test|private prompt|raw provider response|secret-id/u);
 });
 

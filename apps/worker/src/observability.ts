@@ -1,7 +1,7 @@
 import * as Sentry from "@sentry/node";
 import { loadMonitoringConfig, type EnvironmentSource, type MonitoringConfig } from "@signal-audit/config";
 import type { InferenceBudgetConfig, InferenceBudgetStatus, InferenceUsageSnapshot } from "@signal-audit/domain";
-import { logStructured } from "@signal-audit/security";
+import { describeError, logStructured, type SafeErrorDiagnostic } from "@signal-audit/security";
 import type { Event, Span } from "@sentry/node";
 
 type SentrySpanJson = ReturnType<typeof Sentry.spanToJSON>;
@@ -41,9 +41,9 @@ export function setWorkerTelemetryAdapterForTesting(adapter: WorkerTelemetryAdap
   telemetryAdapter = adapter ?? sentryAdapter;
 }
 
-function safeWorkerError(): Error {
+function safeWorkerError(diagnostic: SafeErrorDiagnostic): Error {
   const sanitized = new Error("Unexpected worker failure");
-  sanitized.name = "WorkerOperationError";
+  sanitized.name = diagnostic.errorName;
   return sanitized;
 }
 
@@ -53,20 +53,14 @@ export function sanitizeWorkerEvent<T extends Event>(event: T, config: Monitorin
     operation === "worker.startup" || operation === "worker.job" || operation === "inference.token_budget"
       ? operation
       : "worker.job";
-  const exception = event.exception?.values?.map((value) => ({
-    type: "WorkerOperationError",
-    value: "Unexpected worker failure",
-    ...(value.stacktrace?.frames === undefined
-      ? {}
-      : {
-          stacktrace: {
-            frames: value.stacktrace.frames.map((frame) => ({
-              lineno: frame.lineno,
-              colno: frame.colno,
-              in_app: frame.in_app
-            }))
-          }
-        })
+  const hasDiagnostic =
+    typeof event.tags?.error_name === "string" || typeof event.tags?.error_code === "string";
+  const diagnostic = hasDiagnostic
+    ? describeError({ name: event.tags?.error_name, code: event.tags?.error_code })
+    : undefined;
+  const exceptionValues = event.exception?.values?.map(() => ({
+    type: diagnostic?.errorName ?? "WorkerOperationError",
+    value: "Unexpected worker failure"
   }));
   return {
     event_id: event.event_id,
@@ -76,8 +70,17 @@ export function sanitizeWorkerEvent<T extends Event>(event: T, config: Monitorin
     environment: config.environment,
     release: config.release,
     transaction: safeOperation,
-    tags: { service: "worker", operation: safeOperation },
-    ...(exception === undefined ? {} : { exception })
+    tags: {
+      service: "worker",
+      operation: safeOperation,
+      ...(diagnostic === undefined
+        ? {}
+        : { error_name: diagnostic.errorName, error_code: diagnostic.errorCode })
+    },
+    ...(diagnostic === undefined
+      ? {}
+      : { fingerprint: [safeOperation, diagnostic.errorName, diagnostic.errorCode] }),
+    ...(exceptionValues === undefined ? {} : { exception: { values: exceptionValues } })
   } as unknown as T;
 }
 
@@ -146,9 +149,15 @@ export function initializeWorkerTelemetry(source: EnvironmentSource = process.en
 }
 
 export function captureWorkerError(error: unknown, operation: "worker.startup" | "worker.job"): void {
+  const diagnostic = describeError(error);
   try {
-    telemetryAdapter.captureException(safeWorkerError(), {
-      tags: { service: "worker", operation }
+    telemetryAdapter.captureException(safeWorkerError(diagnostic), {
+      tags: {
+        service: "worker",
+        operation,
+        error_name: diagnostic.errorName,
+        error_code: diagnostic.errorCode
+      }
     });
   } catch {
     // Monitoring must never change worker retry/failure behavior.
@@ -157,7 +166,8 @@ export function captureWorkerError(error: unknown, operation: "worker.startup" |
     logStructured("error", "worker.operation_failed", {
       action: operation,
       statusCode: 500,
-      errorCode: "internal_error"
+      errorName: diagnostic.errorName,
+      errorCode: diagnostic.errorCode
     });
   } catch {
     // A broken telemetry/log sink must not replace worker failure semantics.

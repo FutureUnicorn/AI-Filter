@@ -5,7 +5,9 @@ import {
   LOG_EVENT_NAMES,
   buildLogEntry,
   createConsoleMagicLinkEmailSender,
+  createHttpMagicLinkEmailSender,
   createMagicLinkEmailSender,
+  describeError,
   logStructured,
   redactPii
 } from "../../packages/security/src/index.ts";
@@ -71,9 +73,57 @@ test("buildLogEntry drops undeclared context keys such as candidateName", () => 
 });
 
 test("buildLogEntry leaves valid numeric context values (statusCode, durationMs) untouched", () => {
-  const entry = buildLogEntry("info", "worker.ready", { statusCode: 200, durationMs: 42 });
+  const entry = buildLogEntry("info", "worker.ready", {
+    statusCode: 200,
+    durationMs: 42,
+    errorName: "TypeError"
+  });
   assert.equal(entry.context?.statusCode, 200);
   assert.equal(entry.context?.durationMs, 42);
+  assert.equal(entry.context?.errorName, "TypeError");
+});
+
+test("describeError keeps only allowlisted names and diagnostic codes", () => {
+  const networkFailure = Object.assign(new TypeError("candidate@example.test"), {
+    cause: { code: "ECONNREFUSED", detail: "candidate@example.test" }
+  });
+  assert.deepEqual(describeError(networkFailure), {
+    errorName: "TypeError",
+    errorCode: "econnrefused"
+  });
+  assert.deepEqual(
+    describeError({ name: "AliceSmithError", code: "candidate@example.test" }),
+    { errorName: "NonErrorThrown", errorCode: "unknown_error" }
+  );
+  assert.deepEqual(describeError({ name: "Error", code: "alice_smith" }), {
+    errorName: "Error",
+    errorCode: "unknown_error"
+  });
+});
+
+test("hosted email failures expose a bounded status code without provider payloads", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    new Response("candidate@example.test rejected", { status: 429 })
+  );
+  const sender = createHttpMagicLinkEmailSender({
+    endpoint: "https://email.example.test/send",
+    apiKey: "provider-secret",
+    from: "no-reply@example.test"
+  });
+  await assert.rejects(
+    () => sender.sendMagicLink({
+      email: "candidate@example.test",
+      link: "https://app.example.test/auth/redeem?token=secret"
+    }),
+    (error: unknown) => {
+      assert.deepEqual(describeError(error), {
+        errorName: "MagicLinkDeliveryError",
+        errorCode: "email_provider_http_429"
+      });
+      assert.doesNotMatch(JSON.stringify(describeError(error)), /candidate|token|provider-secret/iu);
+      return true;
+    }
+  );
 });
 
 test("buildLogEntry drops invalid numeric context values instead of coercing them to strings", () => {
@@ -157,10 +207,12 @@ test("an allowlisted string field that is not identifier-shaped is redacted", ()
   const entry = buildLogEntry("warn", "worker.ready", {
     entityId: "Alice Smith",
     action: "Interview Jane Doe",
+    errorName: "AliceSmithError",
     errorCode: "555-1234"
-  } as unknown as { entityId: string; action: string; errorCode: string });
+  } as unknown as { entityId: string; action: string; errorName: string; errorCode: string });
   assert.equal(entry.context?.entityId, "[REDACTED]");
   assert.equal(entry.context?.action, "[REDACTED]");
+  assert.equal(entry.context?.errorName, "[REDACTED]");
   assert.equal(entry.context?.errorCode, "[REDACTED]");
 });
 
