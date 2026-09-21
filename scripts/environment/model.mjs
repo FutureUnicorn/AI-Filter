@@ -91,6 +91,45 @@ export function requireRotationControls(source) {
 }
 
 /**
+ * The docker argv that runs psql against a hosted environment's database.
+ *
+ * Reaching the database from a throwaway container on the environment's
+ * private network -- rather than `docker exec` into the postgres container
+ * itself -- is what makes the password real. Review (#86, REV-001) showed
+ * the earlier `-h 127.0.0.1` did not: `initdb` generates
+ * `host all all 127.0.0.1/32 trust` and the image's entrypoint *appends*
+ * `host all all all scram-sha-256`, so a loopback connection matches the
+ * trust rule first and the password is accepted and discarded. Verified by
+ * reproduction: over loopback a deliberately wrong password connects; from
+ * a non-loopback address the same wrong password is rejected.
+ *
+ * Takes no password: PGPASSWORD is forwarded by name, so no secret can
+ * reach any process's argv.
+ */
+export function buildRotationCommand({ image, network, user, database, host = "postgres" }) {
+  return [
+    "run",
+    "--rm",
+    "--interactive",
+    "--network",
+    network,
+    "--env",
+    "PGPASSWORD",
+    image,
+    "psql",
+    "--no-psqlrc",
+    "-v",
+    "ON_ERROR_STOP=1",
+    "--host",
+    host,
+    "--username",
+    user,
+    "--dbname",
+    database
+  ];
+}
+
+/**
  * Built for a statement sent over psql's stdin, never through a shell, so
  * SQL string-literal quote doubling is the only escaping this needs.
  */

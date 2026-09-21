@@ -7,6 +7,7 @@ import {
   assertDestructiveEnvironmentAllowed,
   buildAlterRolePasswordStatement,
   buildDatabaseUrl,
+  buildRotationCommand,
   derivePreviewEnvironment,
   requireHostedControls,
   requireRotationControls,
@@ -92,8 +93,22 @@ function hostedEnvironment(appEnv) {
   };
 }
 
+function dockerLines(arguments_, description) {
+  const result = spawnSync("docker", arguments_, { cwd: repositoryRoot, encoding: "utf8" });
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${description} failed with status ${result.status}: ${result.stderr.trim()}`);
+  }
+  return result.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+}
+
+function only(lines, description) {
+  if (lines.length !== 1) throw new Error(`Expected one ${description}, found ${lines.length}`);
+  return lines[0];
+}
+
 /**
- * The container Compose is already running for a service, found the way
+ * Where a hosted environment's database can be reached, found the way
  * Compose itself finds it. Rotation acts on a live environment rather than
  * deriving a deployment, so it deliberately does not load the Compose
  * project: review (#86) noted that a `docker compose exec` re-parses
@@ -101,29 +116,56 @@ function hostedEnvironment(appEnv) {
  * DATABASE_URL, SESSION_SECRET and the rest -- none of which a rotation
  * has or needs. Whether a given Compose version interpolates strictly for
  * `exec` is a version detail this path should not depend on.
+ *
+ * The image is read from the running container rather than hard-coded, so
+ * the psql client cannot drift from the server runtime.yml pins.
  */
-function runningContainerId(project, service) {
-  const result = spawnSync(
-    "docker",
-    [
-      "ps",
-      "--quiet",
-      "--filter",
-      `label=com.docker.compose.project=${project}`,
-      "--filter",
-      `label=com.docker.compose.service=${service}`
-    ],
-    { cwd: repositoryRoot, encoding: "utf8" }
+function hostedDatabaseAccess(project) {
+  const container = only(
+    dockerLines(
+      [
+        "ps",
+        "--quiet",
+        "--filter",
+        `label=com.docker.compose.project=${project}`,
+        "--filter",
+        "label=com.docker.compose.service=postgres"
+      ],
+      "docker ps"
+    ),
+    `running postgres container in ${project}`
   );
-  if (result.error !== undefined) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`docker ps failed with status ${result.status}: ${result.stderr.trim()}`);
-  }
-  const ids = result.stdout.split("\n").filter((id) => id.trim() !== "");
-  if (ids.length !== 1) {
-    throw new Error(`Expected one running ${service} container in ${project}, found ${ids.length}`);
-  }
-  return ids[0].trim();
+  const network = only(
+    dockerLines(
+      [
+        "network",
+        "ls",
+        "--quiet",
+        "--filter",
+        `label=com.docker.compose.project=${project}`,
+        "--filter",
+        "label=com.docker.compose.network=private"
+      ],
+      "docker network ls"
+    ),
+    `private network in ${project}`
+  );
+  const image = only(
+    dockerLines(["inspect", "--format", "{{.Config.Image}}", container], "docker inspect"),
+    `image for the postgres container in ${project}`
+  );
+  return { network, image };
+}
+
+/** True when `password` authenticates as the role. Quiet: this is a probe. */
+function passwordAuthenticates(command, password) {
+  const result = spawnSync("docker", command, {
+    cwd: repositoryRoot,
+    env: { ...process.env, PGPASSWORD: password },
+    input: "SELECT 1;\n",
+    encoding: "utf8"
+  });
+  return result.error === undefined && result.status === 0;
 }
 
 /**
@@ -136,56 +178,45 @@ function runningContainerId(project, service) {
  * `up` so migrate/web/worker pick up the new value.
  *
  * The statement is sent on psql's stdin, and the outgoing password is
- * forwarded to the container via a bare `-e PGPASSWORD` (Docker reads the
- * value from this process's own environment) rather than a flag value, so
- * neither password is ever written into a process's argv.
+ * forwarded via a bare `--env PGPASSWORD` (Docker reads the value from this
+ * process's own environment) rather than a flag value, so neither password
+ * is ever written into a process's argv. See buildRotationCommand for why
+ * this runs on the private network instead of `docker exec`.
  *
- * `-h 127.0.0.1` is load-bearing: psql defaults to the Unix socket, where
- * the image's pg_hba rules can admit a local connection without a password,
- * so a rotation would report success having never checked
- * POSTGRES_PASSWORD_PREVIOUS -- and would happily run against an
- * environment whose outgoing password is not the one being rotated out.
- * Over TCP the connection is subject to the image's host auth method, so a
- * wrong outgoing password fails here instead of silently succeeding.
+ * Rerunning after a successful rotation is a no-op rather than an error
+ * (#86, REV-003): once the outgoing password is genuinely checked, a retry
+ * would otherwise fail authentication indistinguishably from having typed
+ * the wrong one -- on a credential path, mid-incident.
  */
 function rotatePassword(appEnv) {
   requireHostedControls(appEnv, process.env);
   const { previousPassword, nextPassword } = requireRotationControls(process.env);
   const user = process.env.POSTGRES_USER;
   const database = `signal_audit_${appEnv}`;
-  const container = runningContainerId(`signal-audit-${appEnv}`, "postgres");
-  const statement = buildAlterRolePasswordStatement(user, nextPassword);
-  const result = spawnSync(
-    "docker",
-    [
-      "exec",
-      "-i",
-      "-e",
-      "PGPASSWORD",
-      container,
-      "psql",
-      "-v",
-      "ON_ERROR_STOP=1",
-      "-h",
-      "127.0.0.1",
-      "-U",
-      user,
-      "-d",
-      database
-    ],
-    {
-      cwd: repositoryRoot,
-      env: { ...process.env, PGPASSWORD: previousPassword },
-      input: statement,
-      stdio: ["pipe", "inherit", "inherit"]
-    }
-  );
+  const { network, image } = hostedDatabaseAccess(`signal-audit-${appEnv}`);
+  const command = buildRotationCommand({ image, network, user, database });
+
+  if (passwordAuthenticates(command, nextPassword)) {
+    console.log(
+      `${user}@${appEnv} already accepts the password in POSTGRES_PASSWORD; nothing to rotate. Continue from the redeploy step.`
+    );
+    return;
+  }
+
+  const result = spawnSync("docker", command, {
+    cwd: repositoryRoot,
+    env: { ...process.env, PGPASSWORD: previousPassword },
+    input: buildAlterRolePasswordStatement(user, nextPassword),
+    stdio: ["pipe", "inherit", "inherit"]
+  });
   if (result.error !== undefined) throw result.error;
   if (result.status !== 0) {
-    throw new Error(`password rotation for ${appEnv} failed with status ${result.status}`);
+    throw new Error(
+      `password rotation for ${appEnv} failed with status ${result.status}. If the outgoing password was rejected, confirm POSTGRES_PASSWORD_PREVIOUS is the one the role currently accepts.`
+    );
   }
   console.log(
-    `Rotated ${user}@${appEnv} to the password in POSTGRES_PASSWORD. Run 'up' to redeploy migrate/web/worker with it, then drop POSTGRES_PASSWORD_PREVIOUS from the secret store.`
+    `Rotated ${user}@${appEnv} to the password in POSTGRES_PASSWORD. Services fail authentication until you redeploy with 'up'.`
   );
 }
 
@@ -213,7 +244,21 @@ function previewStatePath(pr) {
 }
 
 function readState(statePath) {
-  return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  // Teardown replays these variables, and runtime.yml now requires
+  // DATABASE_URL, which states written before AF-94 do not carry (#86,
+  // REV-005). Deriving it here keeps previews deployed from the old code
+  // tearable down, rather than resting on whether a given Compose version
+  // enforces `:?` on `down`.
+  const variables = state.variables;
+  if (variables !== undefined && variables.DATABASE_URL === undefined) {
+    variables.DATABASE_URL = buildDatabaseUrl({
+      user: variables.POSTGRES_USER,
+      password: variables.POSTGRES_PASSWORD,
+      database: variables.POSTGRES_DB
+    });
+  }
+  return state;
 }
 
 function stopPreview(state, removeState = true) {

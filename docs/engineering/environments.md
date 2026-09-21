@@ -214,16 +214,30 @@ the GitHub secret store does not make it reachable either; nothing exports it.
    The command also requires the environment's other hosted controls to be
    present (`requireHostedControls`: the AF-11 enablement flag, the cost and
    admin references, `POSTGRES_USER`, and the storage credentials --
-   `PRODUCTION_VALIDATION_ONLY` as well for production). It finds the
-   environment's already-running `postgres` container, connects over TCP so
-   the outgoing password is actually verified, and issues
-   `ALTER ROLE ... WITH PASSWORD`, so the role's actual password matches the
-   secret being rotated in. It refuses to run if `POSTGRES_PASSWORD_PREVIOUS`
-   is absent or equal to `POSTGRES_PASSWORD` (nothing to rotate), and fails
-   rather than proceeding if the outgoing password is wrong or the
+   `PRODUCTION_VALIDATION_ONLY` as well for production). It locates the
+   environment's database through the Compose labels on its running
+   containers and network, connects to it from a throwaway container on that
+   private network -- which is what subjects the connection to the image's
+   `scram-sha-256` host rule, so the outgoing password is genuinely checked
+   -- and issues `ALTER ROLE ... WITH PASSWORD`. It refuses to run if
+   `POSTGRES_PASSWORD_PREVIOUS` is absent or equal to `POSTGRES_PASSWORD`,
+   and fails rather than proceeding if the outgoing password is wrong or the
    environment is not running.
+
+   **From this point until step 3 finishes, the environment is down.** The
+   role no longer accepts the password `web` and `worker` are still
+   configured with, and the connection pool recycles idle connections within
+   about ten seconds, so every request begins failing authentication. Step 3
+   rebuilds images, so expect minutes, not seconds. Authentication errors
+   during this window are the rotation working, not failing.
 3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
-   redeploy with the new password, which the role now accepts.
+   redeploy with the new password, which the role now accepts, and the
+   environment recovers.
+
+If step 2 reported success but step 3 failed, do not start over from step 1:
+the role is already on the new password. Rerunning `rotate-password` is safe
+-- it detects that `POSTGRES_PASSWORD` already authenticates and exits
+without changing anything -- but the work left is step 3.
 
 ### Automating rotation
 
