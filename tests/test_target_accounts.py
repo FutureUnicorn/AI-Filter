@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from target_accounts import (  # noqa: E402
+    _ALLOWED_RECORD_KEYS,
     Account,
     AtsFraudTooling,
     Claim,
@@ -29,6 +30,26 @@ def _claims(observed_on: date = date(2026, 9, 10)) -> tuple[Claim, ...]:
         Claim(claim=name, source=f"https://example.invalid/{name}", observed_on=observed_on)
         for name in ("headcount", "hiring_volume", "ats", "buyer")
     )
+
+
+def _record(**overrides) -> dict:
+    """A well-formed register record, as it would appear in the JSON file."""
+    record = {
+        "account_id": "northwind-robotics",
+        "company": "Northwind Robotics",
+        "headcount": 240,
+        "remote_technical_hiring": True,
+        "applications_per_requisition": 430,
+        "ats_platform": "lever",
+        "ats_fraud_tooling": "absent",
+        "buyer_title": "head_of_talent",
+        "claims": [
+            {"claim": name, "source": "https://example.invalid", "observed_on": "2026-09-10"}
+            for name in ("headcount", "hiring_volume", "ats", "buyer")
+        ],
+    }
+    record.update(overrides)
+    return record
 
 
 def _account(**overrides) -> Account:
@@ -114,7 +135,7 @@ def test_a_recruiter_is_not_a_buyer():
 
 
 def test_opt_out_disqualifies_an_otherwise_perfect_account():
-    assessment = assess(_account(do_not_contact=True), AS_OF)
+    assessment = assess(_account(outreach_opt_out=True), AS_OF)
     assert assessment.qualification is Qualification.DISQUALIFIED
     assert any("not to be contacted" in reason for reason in assessment.reasons)
 
@@ -138,9 +159,13 @@ def test_a_claim_at_the_freshness_boundary_still_counts():
     assert assessment.qualification is Qualification.QUALIFIED
 
 
-def test_a_claim_dated_in_the_future_is_not_evidence():
+def test_a_claim_dated_in_the_future_is_not_evidence_and_says_why():
+    """A mistyped year must not read as "go re-source a note you took this
+    morning" -- the reason strings are this tool's working output."""
     assessment = assess(_account(claims=_claims(date(2026, 10, 1))), AS_OF)
     assert assessment.qualification is Qualification.NEEDS_EVIDENCE
+    assert all("check the date" in reason for reason in assessment.reasons)
+    assert all("older than" not in reason for reason in assessment.reasons)
 
 
 def test_a_disqualifier_wins_over_missing_evidence():
@@ -152,9 +177,23 @@ def test_a_disqualifier_wins_over_missing_evidence():
 
 
 def test_unrecognized_clean_platform_is_flagged_rather_than_tiered():
-    assessment = assess(_account(ats_platform="bespoke-internal-ats"), AS_OF)
-    assert assessment.qualification is Qualification.NEEDS_EVIDENCE
-    assert any("not a known" in reason for reason in assessment.reasons)
+    """Pinned to "other" specifically: that is the value a researcher writes
+    when the platform has not been identified, so it is the one that must not
+    reach tier A. An arbitrary unknown string would pass this test while
+    "other" sailed through."""
+    for platform in ("other", "Other", "bespoke-internal-ats"):
+        assessment = assess(_account(ats_platform=platform), AS_OF)
+        assert assessment.qualification is Qualification.NEEDS_EVIDENCE, platform
+        assert assessment.tier is Tier.NONE
+        assert any("not a known" in reason for reason in assessment.reasons)
+
+
+def test_platform_names_are_normalized_on_parse():
+    """"Lever", "lever " and "lever" are one platform, not two rejections
+    and a pass."""
+    account = parse_account(_record(ats_platform="  LEVER "))
+    assert account.ats_platform == "lever"
+    assert assess(account, AS_OF).tier is Tier.A
 
 
 def test_register_rolls_up_counts_and_reports_the_shortfall():
@@ -200,6 +239,15 @@ def test_duplicate_account_ids_are_rejected():
         raise AssertionError("expected a RegisterError for a duplicate account_id")
 
 
+def _assert_register_error(callable_, expected: str):
+    try:
+        callable_()
+    except RegisterError as error:
+        assert expected in str(error), f"expected {expected!r}, got {str(error)!r}"
+    else:
+        raise AssertionError(f"expected a RegisterError mentioning {expected!r}")
+
+
 def test_register_parsing_rejects_malformed_input():
     for raw, expected in [
         ("{}", "must be a JSON array"),
@@ -207,51 +255,71 @@ def test_register_parsing_rejects_malformed_input():
         ('[{"company": "No Id"}]', "non-empty string account_id"),
         ('[{"account_id": "x", "company": "X"}]', "missing required field"),
     ]:
-        try:
-            load_register(raw)
-        except RegisterError as error:
-            assert expected in str(error)
-        else:
-            raise AssertionError(f"expected a RegisterError mentioning {expected!r}")
+        _assert_register_error(lambda raw=raw: load_register(raw), expected)
+
+
+def test_a_quoted_boolean_is_rejected_rather_than_coerced():
+    """bool("false") is True, and a register exported from a spreadsheet or a
+    CRM is exactly where a quoted boolean comes from. This is the one field
+    where coercion would turn a disqualified account into a qualified one
+    with no reason recorded."""
+    for value in ("false", "no", 0, 1, None):
+        _assert_register_error(
+            lambda value=value: parse_account(_record(remote_technical_hiring=value)),
+            "expected a JSON boolean",
+        )
+        _assert_register_error(
+            lambda value=value: parse_account(_record(outreach_opt_out=value)),
+            "expected a JSON boolean",
+        )
+
+
+def test_an_unknown_field_is_rejected_by_name():
+    """Person-shaped data must fail at the first run, not sit unread on disk."""
+    _assert_register_error(
+        lambda: parse_account(
+            _record(buyer_name="A Person", notes="spoke to them Tuesday")
+        ),
+        "unknown field(s) ['buyer_name', 'notes']",
+    )
+    _assert_register_error(
+        lambda: parse_account(
+            _record(claims=[{"claim": "buyer", "source": "s", "observed_on": "2026-09-10", "contact": "a@example.invalid"}])
+        ),
+        "unknown field(s) ['contact']",
+    )
+
+
+def test_two_claims_for_one_qualifier_are_rejected():
+    """Otherwise a fresh claim and a stale one for the same qualifier resolve
+    by array order -- the one property a mechanical check must not have."""
+    _assert_register_error(
+        lambda: parse_account(
+            _record(
+                claims=[
+                    {"claim": "headcount", "source": "s", "observed_on": "2026-09-10"},
+                    {"claim": "headcount", "source": "s", "observed_on": "2026-02-01"},
+                ]
+            )
+        ),
+        "more than one 'headcount' claim",
+    )
 
 
 def test_an_unknown_fraud_tooling_value_is_a_register_error_not_a_guess():
-    record = {
-        "account_id": "x",
-        "company": "X",
-        "headcount": 100,
-        "remote_technical_hiring": True,
-        "applications_per_requisition": 300,
-        "ats_platform": "lever",
-        "ats_fraud_tooling": "probably_fine",
-        "buyer_title": "head_of_talent",
-    }
-    try:
-        parse_account(record)
-    except RegisterError as error:
-        assert "unknown ats_fraud_tooling" in str(error)
-    else:
-        raise AssertionError("expected a RegisterError for an unknown tooling value")
+    _assert_register_error(
+        lambda: parse_account(_record(ats_fraud_tooling="probably_fine")),
+        "unknown ats_fraud_tooling",
+    )
 
 
 def test_a_claim_without_an_iso_date_is_a_register_error():
-    record = {
-        "account_id": "x",
-        "company": "X",
-        "headcount": 100,
-        "remote_technical_hiring": True,
-        "applications_per_requisition": 300,
-        "ats_platform": "lever",
-        "ats_fraud_tooling": "absent",
-        "buyer_title": "head_of_talent",
-        "claims": [{"claim": "headcount", "source": "s", "observed_on": "last spring"}],
-    }
-    try:
-        parse_account(record)
-    except RegisterError as error:
-        assert "ISO date" in str(error)
-    else:
-        raise AssertionError("expected a RegisterError for a non-ISO observed_on")
+    _assert_register_error(
+        lambda: parse_account(
+            _record(claims=[{"claim": "headcount", "source": "s", "observed_on": "last spring"}])
+        ),
+        "ISO date",
+    )
 
 
 def test_the_example_register_parses_and_covers_every_outcome():
@@ -266,12 +334,15 @@ def test_the_example_register_parses_and_covers_every_outcome():
 
 def test_the_example_register_holds_no_real_company_or_contact_data():
     """It ships in the repository, so it must stay obviously synthetic: no real
-    domains to mistake for research, and no named individuals at all."""
-    raw = EXAMPLE_REGISTER.read_text(encoding="utf-8")
-    records = json.loads(raw)
+    domains to mistake for research, and no named individuals at all.
+
+    Stated as a subset of the schema's keys rather than a list of field names
+    to forbid: a denylist passes every key nobody thought of, which is how a
+    pasted `contact_email` or `call_notes` would have got in."""
+    records = json.loads(EXAMPLE_REGISTER.read_text(encoding="utf-8"))
     for record in records:
         assert "SYNTHETIC" in record["company"]
-        assert "buyer_name" not in record
-        assert "contact" not in record
+        unknown = set(record) - _ALLOWED_RECORD_KEYS
+        assert not unknown, f"{record['account_id']} carries unknown field(s) {unknown}"
     for source in (claim["source"] for r in records for claim in r.get("claims", [])):
         assert "http" not in source or ".invalid" in source

@@ -13,6 +13,7 @@ are about candidates, and no part of this file may ever be pointed at one.
 Run it against the register:
 
     uv run python scripts/target_accounts.py path/to/target-accounts.json
+    uv run python scripts/target_accounts.py <register> --as-of 2026-09-20
 
 See docs/validation/target-account-list.md for the qualification contract
 this implements and where the real register lives.
@@ -87,9 +88,16 @@ class Tier(str, Enum):
     NONE = "none"
 
 
-_PLATFORMS_WITHOUT_NATIVE_TOOLING = frozenset(
-    {"lever", "workable", "jazzhr", "breezy", "recruitee", "other"}
-)
+# Platforms whose fraud/spam posture we recognize well enough to act on a
+# recorded "absent". This is not a claim that these platforms ship nothing --
+# Employ sells identity verification into Lever and JazzHR alike, so the
+# per-account ats_fraud_tooling field still decides. It only means an
+# "absent" here is a reading someone could check, rather than a blank.
+#
+# "other" is deliberately NOT a member: it is what a researcher writes when
+# the platform has not been identified, and an unidentified platform cannot
+# support tier A's claim that the pitch stands without caveats.
+_RECOGNIZED_PLATFORMS = frozenset({"lever", "workable", "jazzhr", "breezy", "recruitee"})
 
 # Titles that can sign a $500 pilot without a committee. A recruiter or a
 # sourcer can be a champion, but they are not the buyer AF-74 asks for.
@@ -118,8 +126,14 @@ class Claim:
     source: str
     observed_on: date
 
+    def is_stale(self, as_of: date) -> bool:
+        return (as_of - self.observed_on).days > EVIDENCE_FRESHNESS_DAYS
+
+    def is_future_dated(self, as_of: date) -> bool:
+        return self.observed_on > as_of
+
     def is_fresh(self, as_of: date) -> bool:
-        return 0 <= (as_of - self.observed_on).days <= EVIDENCE_FRESHNESS_DAYS
+        return not self.is_stale(as_of) and not self.is_future_dated(as_of)
 
 
 @dataclass(frozen=True)
@@ -132,12 +146,20 @@ class Account:
     ats_platform: str
     ats_fraud_tooling: AtsFraudTooling
     buyer_title: str
-    # Honoring an opt-out is not optional, and the register is where it is
-    # remembered. Contact details never live here -- see the doc.
-    do_not_contact: bool = False
+    # An employer's request not to be approached again. Honoring it is not
+    # optional, and the register is where it is remembered. Contact details
+    # never live here -- see docs/validation/target-account-list.md.
+    #
+    # Deliberately NOT named do_not_contact: that token is reserved in
+    # docs/PRODUCT_BOUNDARY.md ("Human review, attribution, and failure
+    # states") for a prohibited candidate employment outcome. Different
+    # subject, opposite intent, and this repository greps for identifiers.
+    outreach_opt_out: bool = False
     claims: tuple[Claim, ...] = ()
 
     def claim_for(self, name: str) -> Claim | None:
+        # Duplicate claim names are rejected at parse time, so the first
+        # match is the only match.
         for claim in self.claims:
             if claim.claim == name:
                 return claim
@@ -179,7 +201,7 @@ def _disqualifiers(account: Account) -> list[str]:
     by finding better evidence -- it is the wrong account."""
     reasons: list[str] = []
 
-    if account.do_not_contact:
+    if account.outreach_opt_out:
         reasons.append("account asked not to be contacted")
 
     if not MINIMUM_HEADCOUNT <= account.headcount <= MAXIMUM_HEADCOUNT:
@@ -220,7 +242,15 @@ def _evidence_gaps(account: Account, as_of: date) -> list[str]:
         claim = account.claim_for(required)
         if claim is None:
             gaps.append(f"no sourced claim for {required}")
-        elif not claim.is_fresh(as_of):
+        elif claim.is_future_dated(as_of):
+            # Says nothing about how old the claim is: a mistyped year or a
+            # timezone-shifted export should not send someone back out to
+            # re-source a note they took this morning.
+            gaps.append(
+                f"{required} claim is dated {claim.observed_on.isoformat()}, after "
+                f"the {as_of.isoformat()} assessment date -- check the date"
+            )
+        elif claim.is_stale(as_of):
             gaps.append(
                 f"{required} claim from {claim.observed_on.isoformat()} is older than "
                 f"{EVIDENCE_FRESHNESS_DAYS} days"
@@ -237,7 +267,7 @@ def _evidence_gaps(account: Account, as_of: date) -> list[str]:
 def _tier(account: Account) -> Tier:
     if (
         account.ats_fraud_tooling is AtsFraudTooling.ABSENT
-        and account.ats_platform in _PLATFORMS_WITHOUT_NATIVE_TOOLING
+        and account.ats_platform in _RECOGNIZED_PLATFORMS
     ):
         return Tier.A
     if account.ats_fraud_tooling is AtsFraudTooling.AVAILABLE_NOT_ENABLED:
@@ -263,9 +293,10 @@ def assess(account: Account, as_of: date) -> AccountAssessment:
 
     tier = _tier(account)
     if tier is Tier.NONE:
-        # Reachable only if a platform is recorded as having no native
-        # tooling but is not on the known-clean list: that is a research
-        # answer to record, not an account to start calling.
+        # Reachable when tooling is recorded absent on a platform we do not
+        # recognize -- "other" above all, the value written when nobody has
+        # identified it. That is a research answer to record, not an account
+        # to start calling.
         return AccountAssessment(
             account,
             Qualification.NEEDS_EVIDENCE,
@@ -297,10 +328,44 @@ def assess_register(accounts: list[Account], as_of: date) -> RegisterReport:
     return RegisterReport(assessments=assessments, as_of=as_of, counts=counts)
 
 
+# The complete set of keys a record may carry. Anything else is refused by
+# name: the point is that a register cannot quietly grow a buyer_name, an
+# email, or a pasted call note. Declining to *read* an extra field would
+# leave it sitting on disk, which is not the same protection at all.
+_ALLOWED_RECORD_KEYS = frozenset(
+    {
+        "account_id",
+        "company",
+        "headcount",
+        "remote_technical_hiring",
+        "applications_per_requisition",
+        "ats_platform",
+        "ats_fraud_tooling",
+        "buyer_title",
+        "outreach_opt_out",
+        "claims",
+    }
+)
+
+_ALLOWED_CLAIM_KEYS = frozenset({"claim", "source", "observed_on"})
+
+
 def _require(record: dict, key: str, account_id: str):
     if key not in record:
         raise RegisterError(f"account {account_id!r} is missing required field {key!r}")
     return record[key]
+
+
+def _require_bool(value, field: str, account_id: str) -> bool:
+    # Not bool(): bool("false") is True, and a register exported from a
+    # spreadsheet or a CRM is exactly where a quoted boolean comes from.
+    # This is the one field where a wrong answer would beat an error.
+    if not isinstance(value, bool):
+        raise RegisterError(
+            f"account {account_id!r} has {field}={value!r}; expected a JSON "
+            "boolean (true or false, unquoted)"
+        )
+    return value
 
 
 def parse_account(record: dict) -> Account:
@@ -311,15 +376,32 @@ def parse_account(record: dict) -> Account:
     if not isinstance(account_id, str) or not account_id:
         raise RegisterError("every account needs a non-empty string account_id")
 
+    unknown = sorted(set(record) - _ALLOWED_RECORD_KEYS)
+    if unknown:
+        raise RegisterError(
+            f"account {account_id!r} carries unknown field(s) {unknown}. If this is "
+            "contact or note data it belongs in the CRM, not in the register; if "
+            "the schema genuinely needs it, add it to _ALLOWED_RECORD_KEYS first"
+        )
+
     claims: list[Claim] = []
+    seen_claims: set[str] = set()
     for raw in record.get("claims", []):
+        if not isinstance(raw, dict):
+            raise RegisterError(
+                f"account {account_id!r} has a claim that is not an object"
+            )
+        unknown_claim_keys = sorted(set(raw) - _ALLOWED_CLAIM_KEYS)
+        if unknown_claim_keys:
+            raise RegisterError(
+                f"account {account_id!r} has a claim carrying unknown field(s) "
+                f"{unknown_claim_keys}"
+            )
         try:
-            claims.append(
-                Claim(
-                    claim=raw["claim"],
-                    source=raw["source"],
-                    observed_on=date.fromisoformat(raw["observed_on"]),
-                )
+            claim = Claim(
+                claim=raw["claim"],
+                source=raw["source"],
+                observed_on=date.fromisoformat(raw["observed_on"]),
             )
         except (KeyError, TypeError) as error:
             raise RegisterError(
@@ -330,6 +412,18 @@ def parse_account(record: dict) -> Account:
                 f"account {account_id!r} has a claim whose observed_on is not an "
                 "ISO date (YYYY-MM-DD)"
             ) from error
+
+        # Two observations of one qualifier is a normal thing to accumulate,
+        # and when they disagree the answer must not depend on which was
+        # appended first. Rejecting it is the same call as duplicate
+        # account_id: say so, and let a human decide which reading holds.
+        if claim.claim in seen_claims:
+            raise RegisterError(
+                f"account {account_id!r} has more than one {claim.claim!r} claim; "
+                "keep the observation that still holds and drop the other"
+            )
+        seen_claims.add(claim.claim)
+        claims.append(claim)
 
     # Every _require call stays outside the try blocks below: RegisterError is
     # itself a ValueError, so a missing field caught there would be reported as
@@ -359,16 +453,28 @@ def parse_account(record: dict) -> Account:
             f"applications_per_requisition: {error}"
         ) from error
 
+    if not isinstance(ats_platform, str):
+        raise RegisterError(
+            f"account {account_id!r} has a non-string ats_platform {ats_platform!r}"
+        )
+
     return Account(
         account_id=account_id,
         company=company,
         headcount=headcount,
-        remote_technical_hiring=bool(remote),
+        remote_technical_hiring=_require_bool(
+            remote, "remote_technical_hiring", account_id
+        ),
         applications_per_requisition=applications_per_requisition,
-        ats_platform=ats_platform,
+        # Normalized so that "Lever", "lever " and "lever" are one platform.
+        # Case and stray spaces previously fell through to needs_evidence,
+        # which was safe but left the researcher guessing why.
+        ats_platform=ats_platform.strip().lower(),
         ats_fraud_tooling=tooling,
         buyer_title=buyer_title,
-        do_not_contact=bool(record.get("do_not_contact", False)),
+        outreach_opt_out=_require_bool(
+            record.get("outreach_opt_out", False), "outreach_opt_out", account_id
+        ),
         claims=tuple(claims),
     )
 
@@ -416,19 +522,34 @@ def format_report(report: RegisterReport) -> str:
     return "\n".join(lines)
 
 
+_USAGE = (
+    "usage: python scripts/target_accounts.py <register.json> [--as-of YYYY-MM-DD]\n"
+    "example register: docs/validation/target-accounts.example.json"
+)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(
-            "usage: python scripts/target_accounts.py <register.json>\n"
-            "example register: docs/validation/target-accounts.example.json",
-            file=sys.stderr,
-        )
+    # --as-of exists so a register with fixed dates -- the committed example,
+    # or a roll-up attached to a ticket -- keeps producing the output it was
+    # documented with, instead of aging into all-stale on a later run.
+    as_of = date.today()
+    arguments = argv[1:]
+    if len(arguments) == 3 and arguments[1] == "--as-of":
+        try:
+            as_of = date.fromisoformat(arguments[2])
+        except ValueError:
+            print(f"error: --as-of must be an ISO date, got {arguments[2]!r}", file=sys.stderr)
+            return 2
+        arguments = arguments[:1]
+
+    if len(arguments) != 1:
+        print(_USAGE, file=sys.stderr)
         return 2
 
     try:
-        with open(argv[1], encoding="utf-8") as handle:
+        with open(arguments[0], encoding="utf-8") as handle:
             accounts = load_register(handle.read())
-        report = assess_register(accounts, date.today())
+        report = assess_register(accounts, as_of)
     except (OSError, RegisterError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

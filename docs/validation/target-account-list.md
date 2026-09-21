@@ -49,15 +49,19 @@ and sourcers can be champions; they are not the buyer this gate needs.
 An account that trips any of these is off the list and does not come back with
 better research:
 
-- **Native ATS fraud/spam tooling already in place.** Crosschq ApplicantX,
-  Ashby's native fraud detection, Greenhouse Real Talent, or Lever with the
-  Employ/ID.me add-on. The pitch cannot honestly claim to beat what they have
+- **Native ATS fraud/spam tooling already in place**, observed on this
+  account. Known examples: Crosschq ApplicantX, Ashby's Fraudulent Candidate
+  Detection, Greenhouse Real Talent, and Employ's ID.me identity verification
+  on its own platforms. The pitch cannot honestly claim to beat what they have
   already bought, so it should not be made.
 - **Headcount outside the band**, hiring volume below the threshold, or no
   remote/distributed technical hiring.
 - **No qualifying buyer title.**
-- **An opt-out.** `do_not_contact` is recorded in the register and honored
-  permanently, whatever else the record says.
+- **An opt-out.** `outreach_opt_out` is recorded in the register and honored
+  permanently, whatever else the record says. (The field is deliberately not
+  called `do_not_contact`: that token is reserved in
+  [`../PRODUCT_BOUNDARY.md`](../PRODUCT_BOUNDARY.md) for a prohibited
+  *candidate* outcome. Different subject, opposite intent.)
 
 ## Priority tiers
 
@@ -66,12 +70,23 @@ not by how appealing the logo is.
 
 | Tier | Condition | Frame |
 |---|---|---|
-| A | Platform ships no native fraud/spam tooling: Lever (no Employ/ID.me), Workable, JazzHR, Breezy, Recruitee | The pitch stands without caveats. |
-| B | Platform sells the capability but this account has not enabled it — verified, not assumed | Honest "before you turn that on" conversation. |
+| A | Fraud/spam tooling observed **absent** on a platform we recognize: Lever, Workable, JazzHR, Breezy, Recruitee | The pitch stands without caveats. |
+| B | Tooling available on the platform but **not enabled** on this account — verified, not assumed | Honest "before you turn that on" conversation. |
 
-An account whose tooling status is `unknown` is not tier B by default. It is
-`needs_evidence` until someone checks. Guessing here is how the list quietly
-fills up with accounts that already solved the problem.
+Read the tier A list as the platforms whose posture we know well enough to
+act on a recorded `absent` — **not** as a claim that these platforms ship
+nothing. Employ sells ID.me identity verification into Lever and JazzHR
+alike, and Ashby has said its fraud detection is included on all plans, so
+the platform name never settles the question. `ats_fraud_tooling`, observed
+per account, does.
+
+Two values do not reach a tier at all:
+
+- `unknown` — nobody has checked. `needs_evidence`, not an optimistic tier B.
+- `other` as the platform — nobody has identified the ATS. An unidentified
+  platform cannot support tier A's claim that the pitch stands without
+  caveats, so it is `needs_evidence` too. Guessing here is how a list quietly
+  fills up with accounts that already solved the problem.
 
 ## Evidence rule
 
@@ -94,14 +109,20 @@ application-form footer that names the ATS, a press release, dated call notes.
 The register is a JSON array of account records. **It is not committed.**
 
 Prospect research accumulates named individuals and call notes, and this
-repository has no business holding that; `.gitignore` excludes
-`docs/validation/target-accounts.json` and `*.accounts.json` for that reason.
-Keep the working register at `docs/validation/target-accounts.json` locally,
-and keep names, emails, and contact history in the CRM instead.
+repository has no business holding that. `.gitignore` excludes every `.json`
+file under `docs/validation/` except the `.example.json`, plus anything
+matching `*accounts*.json` anywhere in the tree — by directory rather than by
+one filename, so a dated copy, a Q4 register or an underscore instead of a
+hyphen is not committable either. Keep the working register at
+`docs/validation/target-accounts.json` locally, and keep names, emails, and
+contact history in the CRM instead.
 
-The record schema carries `buyer_title`, never a person's name — the schema
-itself is designed so that a leaked register is a list of companies, not a
-list of people.
+The record schema carries `buyer_title` and no person field at all, and
+`parse_account` **rejects any key it does not know** rather than ignoring it.
+That is what makes a leaked register a list of companies rather than a list of
+people: an accidental CRM paste fails at the first run instead of sitting
+unread on disk. If the schema genuinely needs a new field, add it to
+`_ALLOWED_RECORD_KEYS` deliberately.
 
 [`target-accounts.example.json`](target-accounts.example.json) is a synthetic
 example covering each outcome. Every company in it is invented; the domains
@@ -119,7 +140,7 @@ are `.invalid` on purpose.
   "ats_platform": "lever",
   "ats_fraud_tooling": "absent",
   "buyer_title": "head_of_talent",
-  "do_not_contact": false,
+  "outreach_opt_out": false,
   "claims": [
     {"claim": "headcount", "source": "https://…/about", "observed_on": "2026-09-08"}
   ]
@@ -128,8 +149,14 @@ are `.invalid` on purpose.
 
 `ats_fraud_tooling` is one of `absent`, `available_not_enabled`, `native`, or
 `unknown`. It is recorded as observed and never inferred from the platform
-name: Greenhouse and Ashby both sell the capability without every customer
-enabling it, and that difference is the entire prioritization.
+name: a platform can sell the capability without a given customer having it
+on, and that difference is the entire prioritization.
+
+Booleans must be real JSON booleans — a quoted `"false"` is refused rather
+than coerced, because `bool("false")` is `True` and a register exported from
+a spreadsheet is exactly where a quoted boolean comes from. One qualifier
+gets one claim: two `headcount` claims are refused rather than resolved by
+array order, so a contradiction is settled by a human.
 
 ## Running the check
 
@@ -142,11 +169,17 @@ specific reason — then the roll-up against the 30-account target. Exit code 0
 means AF-74 is met; 1 means the list is short; 2 means the register is
 malformed.
 
-Run it against the example to see each outcome:
+Run it against the example to see each outcome. The example's dates are
+fixed, so pin the assessment date too — otherwise every claim in it ages past
+the 90-day rule and the whole file reads as `needs_evidence`:
 
 ```bash
-uv run python scripts/target_accounts.py docs/validation/target-accounts.example.json
+uv run python scripts/target_accounts.py \
+  docs/validation/target-accounts.example.json --as-of 2026-09-20
 ```
+
+That run reports two qualified (one tier A, one tier B), two needing
+evidence, two disqualified, and exits 1 on the 28-account shortfall.
 
 ## Current status
 
