@@ -99,6 +99,10 @@ test("describeError keeps only allowlisted names and diagnostic codes", () => {
     errorName: "Error",
     errorCode: "unknown_error"
   });
+  assert.deepEqual(describeError({ name: "Error", status: 429 }), {
+    errorName: "Error",
+    errorCode: "http_429"
+  });
 });
 
 test("hosted email failures expose a bounded status code without provider payloads", async (t) => {

@@ -28,8 +28,11 @@ error diagnostics. Error class names must come from the closed code-owned
 allowlist; error codes are limited to a closed set of operational network
 codes and bounded provider HTTP status codes. Those fields form a
 stable operation/name/code fingerprint while messages, causes, and stack
-content are replaced before capture. The same diagnostics are written to the
-structured first-party error stream, never as a raw error object. Candidate names, email addresses,
+traces are omitted entirely before capture. Incident diagnosis starts from the
+operation, error name/code, fingerprint, release, environment, and request ID;
+Sentry will not contain source frames for these sanitized events. The same
+diagnostics are written to the structured first-party error stream, never as a
+raw error object. Candidate names, email addresses,
 filenames, resume text, prompts, quotes, object keys, raw SQL values, raw
 provider responses, and arbitrary context must never be added to telemetry.
 
@@ -85,6 +88,13 @@ and runs no durable jobs, so there is no honest worker failure-rate denominator
 before AF-102. Its unexpected failures use a separately configurable error
 count detector for now; replace that with a job failure rate only after AF-102
 publishes completed job volume.
+
+Web and worker `/health/environment` failures are deliberately excluded from
+the Sentry application-error detectors. They remain visible through the health
+response and the structured `*.environment_health_failed` log events; runtime
+health monitoring should alert on probe availability separately. Capturing each
+probe failure as an application exception would contradict AF-67's health-check
+exclusion and can create repeated error events for one dependency outage.
 
 ## Pre-customer validation
 
