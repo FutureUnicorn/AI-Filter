@@ -7,7 +7,12 @@ import {
   withRequestId
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { createInviteMagicLinkToken, getMembershipsForUser } from "@signal-audit/db";
+import {
+  createInviteMagicLinkToken,
+  getMembershipIdForEmail,
+  getMembershipsForUser,
+  previewInviteEffect
+} from "@signal-audit/db";
 import {
   authorizeResourceAccess,
   createMagicLinkEmailSender,
@@ -39,15 +44,26 @@ export const runtime = "nodejs";
  */
 export async function POST(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
-  const idempotency = idempotencyErrorResponse(
-    checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key")),
-    requestId
-  );
+  const requirement = checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key"));
+  const idempotency = idempotencyErrorResponse(requirement, requestId);
   if (idempotency !== undefined) {
     return Response.json(idempotency.body, {
       status: idempotency.status,
       headers: withRequestId(undefined, requestId)
     });
+  }
+  // Honoured, not merely validated (review #88, REV-007). Requiring a header
+  // and then discarding it is worse than not requiring one: it tells the
+  // caller a retry is safe while a timed-out retry mints a second live
+  // credential, a second audit trail and a second email.
+  const idempotencyKey = requirement.required && requirement.outcome === "present" ? requirement.key : undefined;
+  if (idempotencyKey === undefined) {
+    const error = buildApiError({
+      requestId,
+      code: "missing_idempotency_key",
+      message: "Mutating requests require an Idempotency-Key header."
+    });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
 
   const userId = readSessionUserId(request);
@@ -83,14 +99,97 @@ export async function POST(request: NextRequest): Promise<Response> {
       });
     }
 
+    /*
+     * What this invite would actually do, resolved before anything is
+     * minted (review #88, REV-002 and REV-003).
+     *
+     * `POST /api/invites` is not only an "add somebody" endpoint, because
+     * redemption ends in `ON CONFLICT ... DO UPDATE SET role`. Two outcomes
+     * needed answering here rather than at redemption, which is far too late
+     * for both:
+     *
+     *   - A role replacement was silent. The invitee's click committed it,
+     *     from a link their mail client shows as an ordinary sign-in.
+     *   - A last-owner demotion was accepted, audited and delivered, then
+     *     failed at redemption forever: the transaction rolls back so
+     *     `consumed_at` stays null, every retry reproduces it, the invitee
+     *     lands on `/?auth=error`, and nothing tells the admin who issued
+     *     it. That is precisely the undiagnosable bounce this ticket's
+     *     sign-in page exists to end, reintroduced through this route.
+     *
+     * The preview is advisory: it is a read, so the membership can change
+     * before redemption, and `provisionInvitedMembership`'s own guard inside
+     * the redemption transaction remains the enforcement. What it buys is
+     * that the ordinary case fails at the person who can act on it.
+     */
+    const effect = await previewInviteEffect(config.database.url, config.database.schema, {
+      organizationId: parsed.data.organizationId,
+      email: parsed.data.email,
+      role: parsed.data.role
+    });
+
+    if (effect.outcome === "strands_organization") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message:
+          `This would leave the organization with no owner: ${parsed.data.email} is its only owner, and ` +
+          `the invite names ${effect.to}. Promote another owner first.`
+      });
+      return Response.json(error.body, {
+        status: error.status,
+        headers: withRequestId(undefined, requestId)
+      });
+    }
+
+    if (effect.outcome === "changes_role" && parsed.data.replaceExistingRole !== true) {
+      // Refused rather than performed, because "invite" is not a word that
+      // warns anybody a role is about to be replaced. An admin who means it
+      // says so; the default cannot mutate existing access by accident.
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message:
+          `${parsed.data.email} already belongs to this organization as ${effect.from}. Sending this invite ` +
+          `would change their role to ${effect.to} when they open the link. Resend with ` +
+          `replaceExistingRole: true if that is what you intend.`
+      });
+      return Response.json(error.body, {
+        status: error.status,
+        headers: withRequestId(undefined, requestId)
+      });
+    }
+
+    const roleChange =
+      effect.outcome === "changes_role"
+        ? await getMembershipIdForEmail(
+            config.database.url,
+            config.database.schema,
+            parsed.data.organizationId,
+            parsed.data.email
+          )
+        : undefined;
+
     const generated = generateMagicLinkToken();
-    await createInviteMagicLinkToken(config.database.url, config.database.schema, {
+    const creation = await createInviteMagicLinkToken(config.database.url, config.database.schema, {
+      idempotencyKey,
       tokenHash: generated.tokenHash,
       email: parsed.data.email,
       invite: { organizationId: parsed.data.organizationId, role: parsed.data.role },
       expiresAt: generated.expiresAt,
-      audit: { actorUserId: userId, requestId }
+      audit: { actorUserId: userId, requestId },
+      ...(effect.outcome === "changes_role" && roleChange !== undefined
+        ? { roleChange: { membershipId: roleChange, from: effect.from, to: effect.to } }
+        : {})
     });
+
+    if (creation.outcome === "replayed") {
+      // This key already minted an invite. Nothing was written, and nothing
+      // is sent: re-delivering would put a second live link in the
+      // recipient's mailbox for one act. The 202 is the same as the first
+      // call's, which is the point of the header.
+      return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
+    }
 
     // Built from configured state, never from the request host, for the
     // same reason the login route does it: a caller controls `Host`, and a
@@ -103,7 +202,13 @@ export async function POST(request: NextRequest): Promise<Response> {
       delivery: config.magicLinkEmail
     });
     try {
-      await emailSender.sendMagicLink({ email: parsed.data.email, link });
+      // The recipient's click is what commits a role change, so the mail
+      // must say which of the two this link is (review #88, REV-002).
+      await emailSender.sendMagicLink({
+        email: parsed.data.email,
+        link,
+        purpose: effect.outcome === "changes_role" ? "role_change" : "invite"
+      });
     } catch (deliveryError) {
       // Reported honestly, unlike the login endpoint's deliberate silence.
       // That endpoint is unauthenticated, so telling the caller anything

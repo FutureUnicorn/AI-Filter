@@ -26,7 +26,19 @@ import moduleHooks from "node:module";
  * which is what `redirects` covers.
  */
 
-let hooksRegistered = false;
+/**
+ * The redirect map the hook was registered with, kept so a later call
+ * passing a *different* one is an error rather than a silent no-op.
+ *
+ * Review #88, REV-004: the previous version returned early once registered,
+ * so the second and later calls' `redirects` were discarded. The doc comment
+ * said to pass it on the first call and nothing enforced it, which is the
+ * shape of trap that costs an afternoon: a future test file loading one
+ * route without a redirect and a second with the storage stub would silently
+ * get the real package, and the failure would surface as a confusing storage
+ * error rather than as "you passed a redirect too late".
+ */
+let registeredRedirects: Readonly<Record<string, string>> | undefined;
 
 /**
  * The shape every route module shares: named method exports returning a
@@ -53,13 +65,32 @@ export interface WebRouteModule {
  * hooks are global and already-resolved specifiers are cached.
  */
 export function registerWebRouteResolution(redirects: Readonly<Record<string, string>> = {}): void {
-  if (hooksRegistered) {
+  if (registeredRedirects !== undefined) {
+    // Node's module hooks are global and resolved specifiers are cached, so a
+    // second registration could not take effect anyway. Refusing a differing
+    // map turns that from a silent wrong answer into a named one; an
+    // identical map is the ordinary case (file-intake-route-errors.test.ts
+    // passes its redirect on every call) and is accepted.
+    const before = JSON.stringify(registeredRedirects);
+    const now = JSON.stringify(redirects);
+    if (before !== now) {
+      throw new Error(
+        `web-route-loader was already registered with a different redirect map, and module hooks cannot be ` +
+          `re-registered: the second map would be silently ignored. Pass the same redirects on every call in ` +
+          `a process.\n  registered: ${before}\n  attempted:  ${now}`
+      );
+    }
     return;
   }
-  hooksRegistered = true;
+  registeredRedirects = redirects;
+  // A Map, for the reason auth-codes.ts is one: indexing a plain object with
+  // a value that did not come from it is not a closed lookup. A module
+  // specifier equal to `constructor` is not realistic, but the argument the
+  // rest of this branch makes applies here too.
+  const redirectsBySpecifier = new Map(Object.entries(redirects));
   moduleHooks.registerHooks({
     resolve(specifier, context, nextResolve) {
-      const redirect = redirects[specifier];
+      const redirect = redirectsBySpecifier.get(specifier);
       if (redirect !== undefined) {
         return { url: redirect, shortCircuit: true };
       }

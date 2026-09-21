@@ -388,8 +388,25 @@ export type MagicLinkVerification =
   | { readonly outcome: "not_found" };
 
 /** Domain-owned port; packages/security provides a dev-only console adapter. */
+/**
+ * What the link the recipient is about to click will do, so the mail can
+ * say it.
+ *
+ * Review #88, REV-002: every link looked like "Your sign-in link / Open
+ * this link to sign in", including one whose redemption replaces the
+ * recipient's own role in an organization. The click is what commits that
+ * change, so the person doing the committing is the one person who must
+ * not be told something else.
+ */
+export type MagicLinkPurpose = "sign_in" | "invite" | "role_change";
+
 export interface MagicLinkEmailSender {
-  sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void>;
+  sendMagicLink(input: {
+    readonly email: string;
+    readonly link: string;
+    /** Defaults to `sign_in`, which is what the login route sends. */
+    readonly purpose?: MagicLinkPurpose;
+  }): Promise<void>;
 }
 
 // ---- AF-17: owner/admin/recruiter/auditor roles ----

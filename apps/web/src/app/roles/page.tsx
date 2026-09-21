@@ -347,7 +347,7 @@ function CreateRole({
   }
 
   return (
-    <form onSubmit={create}>
+    <form className="stacked-form" onSubmit={create}>
       <h2>Add a role</h2>
       <label htmlFor="role-title">Role title</label>
       <input
@@ -382,9 +382,12 @@ function InviteMember({ organizationId }: { readonly organizationId: string }) {
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
+  /** Set when the API refused because this would replace an existing role,
+   * so the confirmation is a second, deliberate action rather than a
+   * checkbox nobody reads. */
+  const [replaceConflict, setReplaceConflict] = useState<string | undefined>(undefined);
 
-  async function invite(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
+  async function send(replaceExistingRole: boolean): Promise<void> {
     setBusy(true);
     setSent(false);
     setError(undefined);
@@ -392,16 +395,30 @@ function InviteMember({ organizationId }: { readonly organizationId: string }) {
       const response = await fetch("/api/invites", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
-        body: JSON.stringify({ email, organizationId, role })
+        body: JSON.stringify({
+          email,
+          organizationId,
+          role,
+          ...(replaceExistingRole ? { replaceExistingRole: true } : {})
+        })
       });
       if (!response.ok) {
         const body = (await response.json().catch(() => undefined)) as
-          | { error?: { message: string } }
+          | { error?: { code?: string; message: string } }
           | undefined;
-        setError(body?.error?.message ?? `Request failed (${response.status}).`);
+        const message = body?.error?.message ?? `Request failed (${response.status}).`;
+        // A 409 naming an existing role is the opt-in prompt, not a failure
+        // to report and forget: the admin is one confirmed click from what
+        // they meant, and the message already names the current role.
+        if (response.status === 409 && !replaceExistingRole && /already belongs/u.test(message)) {
+          setReplaceConflict(message);
+          return;
+        }
+        setError(message);
         return;
       }
       setEmail("");
+      setReplaceConflict(undefined);
       setSent(true);
     } catch (caught: unknown) {
       setError(caught instanceof Error ? caught.message : "Request failed.");
@@ -410,12 +427,28 @@ function InviteMember({ organizationId }: { readonly organizationId: string }) {
     }
   }
 
+  async function invite(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setReplaceConflict(undefined);
+    await send(false);
+  }
+
   return (
-    <form onSubmit={invite}>
+    <form className="stacked-form" onSubmit={invite}>
       <h2>Invite someone</h2>
       <p className="footnote">
-        They receive a single-use link. Redeeming it creates their account and their membership in this
+        They receive a single-use link. Opening it creates their account and their membership in this
         organization with the role you choose here.
+      </p>
+      {/*
+        Review #88, REV-002: the copy above described only the add case, and
+        the endpoint also replaces an existing member's role. That is now
+        refused unless the admin opts in, and this says so before they send,
+        rather than leaving them to discover it from a 409.
+      */}
+      <p className="footnote">
+        If they already belong to this organization, sending this replaces their current role — the
+        change takes effect when they open the link. You will be asked to confirm.
       </p>
       <label htmlFor="invite-email">Their work email</label>
       <input
@@ -444,6 +477,14 @@ function InviteMember({ organizationId }: { readonly organizationId: string }) {
       <button type="submit" disabled={busy || email.length === 0}>
         {busy ? "Sending…" : "Send invite"}
       </button>
+      {replaceConflict !== undefined && (
+        <div role="alert" className="notice">
+          <p>{replaceConflict}</p>
+          <button type="button" onClick={() => void send(true)} disabled={busy}>
+            {busy ? "Sending…" : `Yes, change their role to ${role}`}
+          </button>
+        </div>
+      )}
       {sent && <p role="status">Invite sent. It expires shortly and can be used once.</p>}
       {error !== undefined && <p role="alert">Could not send the invite: {error}</p>}
     </form>

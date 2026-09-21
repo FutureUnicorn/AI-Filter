@@ -612,10 +612,26 @@ export const requestMagicLinkInputSchema = z.strictObject({
   email: storedEmailSchema
 });
 
+/**
+ * `replaceExistingRole` added by review #88 (REV-002).
+ *
+ * Redemption ends in `ON CONFLICT ... DO UPDATE SET role`, so an invite
+ * naming somebody who is already a member replaces their role -- committed
+ * by the target's own click on what their mail client presents as a routine
+ * sign-in link. Nothing in the invite form's wording, the email's wording,
+ * or this schema said so.
+ *
+ * Defaulting to false means the destructive reading of an ambiguous request
+ * is the one that cannot happen by accident: an invite that would change an
+ * existing member's role is refused unless the caller says that is what they
+ * meant. It stays optional so the ordinary case -- inviting somebody who is
+ * not a member -- is unaffected.
+ */
 export const createInviteInputSchema = z.strictObject({
   email: storedEmailSchema,
   organizationId: z.uuid(),
-  role: z.enum(MEMBERSHIP_ROLES)
+  role: z.enum(MEMBERSHIP_ROLES),
+  replaceExistingRole: z.boolean().optional()
 });
 
 export type CreateInviteInput = z.infer<typeof createInviteInputSchema>;

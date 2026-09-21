@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import {
   bootstrapOrganizationOwner,
   dropProbeSchema,
+  getMembershipIdForEmail,
   listAuditEventsForEntity,
   listOrganizationsForUser,
   provisionRouteProbeSchema,
@@ -600,4 +601,257 @@ test("the bootstrap command reports a missing argument without a stack trace", a
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Missing required argument/u);
   assert.equal(/^\s*at /mu.test(result.stderr), false);
+});
+
+// ---- Review #88 round 2: what an invite does to an existing member ----
+//
+// `POST /api/invites` is not only an "add somebody" endpoint, because
+// redemption ends in `ON CONFLICT ... DO UPDATE SET role`. Nothing could
+// reach that line before this ticket exposed invite creation over HTTP, and
+// nothing covered it.
+
+/** Bootstraps an owner, then invites and redeems `email` into `role`. */
+async function seedMemberThroughInvite(
+  databaseUrl: string,
+  schema: string,
+  owner: { readonly organizationId: string; readonly userId: string },
+  email: string,
+  role: "owner" | "admin" | "recruiter" | "auditor",
+  keySuffix: string
+): Promise<{ readonly userId: string }> {
+  const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+  const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+  const emitted = await captureStderr(async () => {
+    const response = await inviteRoute.POST(
+      authenticatedJsonRequest(
+        "http://localhost:3000/api/invites",
+        { email, organizationId: owner.organizationId, role },
+        `seed-invite-${keySuffix}`,
+        owner.userId
+      )
+    );
+    assert.equal(response.status, 202, await response.clone().text());
+  });
+  const redeemed = await redeemRoute.POST(
+    new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+      method: "POST",
+      headers: { "content-type": "application/json", "Idempotency-Key": `seed-redeem-${keySuffix}` },
+      body: JSON.stringify({ token: extractToken(emitted) })
+    })
+  );
+  assert.equal(redeemed.status, 200, await redeemed.clone().text());
+  return (await redeemed.json()) as { userId: string };
+}
+
+test("an invite that would replace an existing member's role is refused unless the admin says so", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `replace-owner-${Date.now()}@acme.test`;
+  const memberEmail = `replace-member-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Replace Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+    const member = await seedMemberThroughInvite(
+      databaseUrl,
+      schema,
+      owner,
+      memberEmail,
+      "recruiter",
+      "replace"
+    );
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+
+    // Without the opt-in: refused, and the message names the current role so
+    // the admin can tell whether they meant it.
+    const refused = await inviteRoute.POST(
+      authenticatedJsonRequest(
+        "http://localhost:3000/api/invites",
+        { email: memberEmail, organizationId: owner.organizationId, role: "auditor" },
+        "replace-no-optin",
+        owner.userId
+      )
+    );
+    assert.equal(refused.status, 409, await refused.clone().text());
+    const refusedBody = (await refused.json()) as { error: { message: string } };
+    assert.match(refusedBody.error.message, /already belongs to this organization as recruiter/u);
+
+    // Nothing was minted by the refusal: the member is untouched and no
+    // link went out.
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["recruiter"]
+    );
+
+    // With the opt-in: accepted, and the redemption actually applies it.
+    const emitted = await captureStderr(async () => {
+      const accepted = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "auditor",
+            replaceExistingRole: true
+          },
+          "replace-optin",
+          owner.userId
+        )
+      );
+      assert.equal(accepted.status, 202, await accepted.clone().text());
+    });
+
+    // The mail must not call a role change a sign-in link: the recipient's
+    // click is what commits it.
+    assert.match(emitted, /purpose: role_change/u);
+
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+    const redeemed = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "replace-redeem" },
+        body: JSON.stringify({ token: extractToken(emitted) })
+      })
+    );
+    assert.equal(redeemed.status, 200, await redeemed.clone().text());
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["auditor"]
+    );
+
+    // And the effect is in the durable trail, not only the intent: an
+    // investigator reading audit_events can see that this membership went
+    // from recruiter to auditor, and who authorized it.
+    const membershipId = await getMembershipIdForEmail(
+      databaseUrl,
+      schema,
+      owner.organizationId,
+      memberEmail
+    );
+    assert.ok(membershipId !== undefined);
+    const roleChangeEvents = await listAuditEventsForEntity(
+      databaseUrl,
+      schema,
+      "membership_role_change",
+      `${membershipId}:recruiter->auditor`
+    );
+    assert.equal(roleChangeEvents.length, 1);
+    assert.equal(roleChangeEvents[0]?.actorUserId, owner.userId);
+    assert.equal(roleChangeEvents[0]?.action, "admin_action");
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+test("an invite that would strand an organization without an owner is refused at creation, not at redemption", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `strand-owner-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Strand Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const emitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: ownerEmail,
+            organizationId: owner.organizationId,
+            role: "recruiter",
+            // Even with the opt-in: this is not a role change the admin is
+            // permitted to make, it is one redemption would refuse forever.
+            replaceExistingRole: true
+          },
+          "strand-invite",
+          owner.userId
+        )
+      );
+      // 409 at the admin who can act on it. Before this, the invite was
+      // created, audited, emailed and answered 202, then failed at
+      // redemption on every attempt until expiry -- bouncing the invitee to
+      // /?auth=error with nothing telling the admin anything.
+      assert.equal(response.status, 409, await response.clone().text());
+      const body = (await response.json()) as { error: { message: string } };
+      assert.match(body.error.message, /no owner/u);
+    });
+
+    // The refusal must mint nothing: no token delivered, and the owner is
+    // still the owner.
+    assert.equal(/[?&]token=/u.test(emitted), false, "a refused invite must not deliver a link");
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, owner.userId)).map((o) => o.role),
+      ["owner"]
+    );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+test("retrying an invite with the same Idempotency-Key mints one token, one audit trail, one email", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `idem-owner-${Date.now()}@acme.test`;
+  const inviteeEmail = `idem-invitee-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Idem Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const body = { email: inviteeEmail, organizationId: owner.organizationId, role: "recruiter" };
+
+    const first = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, "retry-me", owner.userId)
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const token = extractToken(first);
+
+    // The retry a timed-out client makes. Same answer, and nothing new.
+    const second = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, "retry-me", owner.userId)
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    assert.equal(
+      /[?&]token=/u.test(second),
+      false,
+      "a replayed invite must not put a second live link in the recipient's mailbox"
+    );
+
+    // One audit row for one administrative act, not two.
+    const events = await listAuditEventsForEntity(
+      databaseUrl,
+      schema,
+      "membership_invite",
+      hashMagicLinkToken(token)
+    );
+    assert.equal(events.length, 1, "a retry must not show two grants where the admin performed one");
+
+    // A different key for the same body is a different act and is allowed.
+    const third = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, "retry-me-again", owner.userId)
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    assert.equal(/[?&]token=/u.test(third), true, "a new key is a new invite");
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
 });

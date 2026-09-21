@@ -124,6 +124,47 @@ services:
     networks: [private]
     security_opt: ["no-new-privileges:true"]
 
+  # AF-97: the only way to create a deployment's first organization, user and
+  # owner membership. Authentication here is invite-only and the first invite
+  # has nobody to come from, so this step cannot live behind a session -- and
+  # it is deliberately not an HTTP route, because an unauthenticated
+  # privilege-granting endpoint that must be disabled after first use is not a
+  # security control.
+  #
+  # It is a compose service rather than something an operator runs from their
+  # laptop because `postgres` sits only on the `private` network, which is
+  # `internal: true` and publishes no port (review #88, REV-001). There is no
+  # path to that database from outside the project, so the command has to run
+  # inside it. That keeps the authorization exactly where the design says it
+  # is: on the deployment's own database credentials, with nothing new
+  # exposed.
+  #
+  #   docker compose --profile tools run --rm bootstrap \
+  #     --organization "Acme" --email owner@acme.test --name "Dana Ops"
+  #
+  # Unlike `seed`, this is NOT refused in production: a production deployment
+  # is precisely where somebody has to be the first owner. It writes only the
+  # three rows it names, and re-running it converges rather than duplicating.
+  bootstrap:
+    build:
+      context: ../..
+      dockerfile: infra/docker/runtime.Dockerfile
+      target: runtime-base
+    restart: "no"
+    profiles: [tools]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *runtime-environment
+    # The pnpm script adds `--env-file-if-exists=.env.local`, which is a
+    # developer convenience and not present here; the environment above is
+    # the deployment's own. Arguments from `docker compose run` are appended
+    # to this entrypoint.
+    entrypoint: ["node", "scripts/environment/bootstrap.mjs"]
+    networks: [private]
+    security_opt: ["no-new-privileges:true"]
+
   web:
     build:
       context: ../..

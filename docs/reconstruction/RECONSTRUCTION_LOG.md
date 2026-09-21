@@ -564,3 +564,44 @@ worse than reported.
 **Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
 (168), `pnpm test:integration` against a real scratch Postgres (381),
 `pnpm check:architecture` (35) and `pnpm build` all clean.
+
+### AF-97 — PR #88 review, round 2
+
+Eight findings from hemnaath04, one blocking. All eight verified as real and
+fixed.
+
+| | |
+|---|---|
+| Finding (REV-001, HIGH, blocking) | `pnpm bootstrap:owner` could not be run against the deployment this repo ships. `runtime.Dockerfile` copies `apps` and `packages` and not `scripts`, so the script is absent from both runtime stages; and `postgres` sits only on the `private` network, which is `internal: true` with no published port, so there is no path to the database from outside the project either. Both halves confirmed by inspection. For the one ticket whose purpose is that a deployment can be entered, every documented way in was closed, and `README.md` instructed an operation that could not be performed. |
+| Fix | `COPY scripts scripts` in the build stage, plus a `bootstrap` service in `runtime.yml` under `profiles: [tools]`, built from `runtime-base`, on the `private` network, using the shared runtime environment: `docker compose --profile tools run --rm bootstrap --organization ... --email ... --name ...`. This keeps the command's security argument intact rather than weakening it -- it runs inside the deployment with the deployment's own credentials, and nothing new is exposed. Deliberately not given `seed`'s production refusal: production is where a first owner is most needed. README and `docs/engineering/environments.md` now document both the local and hosted paths. |
+| Regression | `tests/integration/environment-policy.test.ts` asserts the `COPY scripts scripts` line, and that the bootstrap service exists with the right entrypoint, network, profile and shared environment, and does **not** carry the production refusal. |
+| Control | Removing the COPY line fails it; removing the service fails it with "expected a bootstrap service". Both confirmed. |
+
+| | |
+|---|---|
+| Finding (REV-002, MEDIUM) | `POST /api/invites` is also a role-change endpoint. `provisionInvitedMembership` ends in `ON CONFLICT ... DO UPDATE SET role`, unreachable from outside the process until this ticket exposed invite creation. So an invite naming an existing member replaced their role, committed by their own click on a mail that said "Your sign-in link"; and only the invite was audited, never its effect. |
+| Fix | Three parts. `previewInviteEffect` resolves what an invite would do before anything is minted; a role replacement is refused with 409 unless the caller passes `replaceExistingRole: true`, so the destructive reading of an ambiguous request cannot happen by accident. The mail now varies by purpose (`MagicLinkPurpose` on the domain port, honoured by both adapters), and the role-change wording tells the recipient that opening the link changes their access. A second `admin_action` row with `entity_type = membership_role_change` records the effect, written at creation where the accountable human is -- not at redemption, where the actor would be the person the change is being done *to*, and where audit_events' membership trigger would turn an offboarded inviter into an unredeemable invite. |
+| Limitation stated | The from/to roles travel inside `entity_id` because audit_events has no column for them, and adding one to an append-only table is not a change to make in passing. Semantic content in that column has precedent here (the kill-switch path writes "engaged"/"disengaged"). |
+
+| | |
+|---|---|
+| Finding (REV-003, MEDIUM) | An invite that would demote an organization's sole owner was created, audited, emailed and answered 202, then failed at redemption forever: the transaction rolls back so `consumed_at` stays null, every retry reproduces it, the invitee lands on `/?auth=error`, and nothing tells the admin who issued it. The undiagnosable bounce this PR's sign-in page exists to end, reintroduced through its invite route. The guard had no test at all, before or after. |
+| Fix | The same check runs in the route before minting, answering 409 with the reason, so the refusal lands on the admin who can act on it. Advisory by construction -- it is a read, and `provisionInvitedMembership`'s guard inside the redemption transaction remains the enforcement; what it buys is that the ordinary case fails in the right place. |
+
+| | |
+|---|---|
+| Finding (REV-007, LOW) | The invite route required an `Idempotency-Key` and then discarded it, so a timed-out retry minted a second live token, a second audit trail and a second email for one act. Worse than not requiring one: it tells the caller the retry is safe. |
+| Fix | `0023_invite_idempotency.sql` adds a nullable `idempotency_key` and a partial unique index on `(organization_id, idempotency_key)`; the INSERT is the deduplication, so two concurrent retries cannot both proceed, and a replay writes nothing, sends nothing and answers the same 202. Partial and organization-scoped so login tokens (no organization, no client key) are unaffected. The reviewer's premise was checked and correct: `decisions`, `finalize` and `corrections` all carry their key into the persistence layer, so an invite was the odd one out among consequential writes, not consistent with them. |
+
+| | |
+|---|---|
+| Findings (REV-004, REV-005, REV-006, REV-008, LOW) | The shared route loader dropped `redirects` on every call after the first, enforcing nothing while its doc comment said to pass it first. The new `globals.css` rules were bare element selectors, restyling the rubric and import pages this PR does not claim to touch. `sign-in-auth-codes.test.ts` compared against a hardcoded code list, so the drift its own comment warned about could not fail it. The bootstrap's `ON CONFLICT (email) DO NOTHING` does not block on a concurrent uncommitted insert, so a loser threw "did not resolve a user". |
+| Fixes | The loader throws on a later differing map instead of silently ignoring it, and looks up through a `Map`. The CSS is scoped to `.stacked-form`, leaving the other pages exactly as they were -- global consistency is a deliberate visual decision for the tickets that own those pages, not a side effect of this one. The test now extracts `?auth=` codes from the redeem route's source and asserts both directions; adding a fifth code without a message fails it (confirmed by control). The upsert matches `provisionInvitedMembership`'s `DO UPDATE SET email = EXCLUDED.email`, which takes the row lock, and reads `xmax = 0` to report whether the row was new. |
+
+**New coverage:** three integration cases (role replacement refused then confirmed, with the audit row and the mail's purpose asserted; last-owner invite refused at creation minting nothing; a retried key producing one token, one audit row and one email), plus the REV-001 infrastructure assertions.
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(168), `pnpm test:integration` against a real scratch Postgres (385),
+`pnpm check:architecture` (35) and `pnpm build` all clean. The 24 migrations
+replay from empty and then replay again idempotently, which the migrate
+service requires.

@@ -86,7 +86,7 @@ function SignIn() {
         in — there is no password to remember or lose.
       </p>
 
-      <form onSubmit={requestLink}>
+      <form className="stacked-form" onSubmit={requestLink}>
         <label htmlFor="email">Work email</label>
         <input
           id="email"

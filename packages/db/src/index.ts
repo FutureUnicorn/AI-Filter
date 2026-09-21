@@ -505,6 +505,125 @@ export async function createMagicLinkToken(
   }
 }
 
+/**
+ * What redeeming an invite would actually do to the target's membership.
+ *
+ * Review #88, REV-002 and REV-003: `POST /api/invites` is not only an
+ * "add somebody" endpoint. `provisionInvitedMembership` ends in
+ * `ON CONFLICT ... DO UPDATE SET role`, which nothing could reach before
+ * this ticket exposed invite creation over HTTP. So an invite naming an
+ * existing member silently replaces their role when they click what their
+ * mail client shows as a routine sign-in link; and an invite that would
+ * demote an organization's sole owner is accepted, audited and delivered,
+ * then fails at redemption forever, bouncing the invitee to `/?auth=error`
+ * with nothing telling the admin who issued it.
+ *
+ * This lets the route answer for both before minting anything.
+ */
+export type InviteEffect =
+  /** No membership exists yet: the ordinary invite. */
+  | { readonly outcome: "creates_membership" }
+  /** Already a member in exactly this role; redemption changes nothing. */
+  | { readonly outcome: "unchanged"; readonly role: MembershipRole }
+  /** Replaces an existing member's role. */
+  | { readonly outcome: "changes_role"; readonly from: MembershipRole; readonly to: MembershipRole }
+  /** Would leave the organization with no owner; redemption refuses this. */
+  | { readonly outcome: "strands_organization"; readonly from: MembershipRole; readonly to: MembershipRole };
+
+/**
+ * Advisory, not the enforcement.
+ *
+ * This is a read, so between it and redemption the membership can change.
+ * `provisionInvitedMembership`'s own last-owner guard, inside the
+ * redemption transaction and holding `FOR UPDATE` on the owner rows, stays
+ * the actual invariant. What this buys is that the common case fails at the
+ * admin who can act on it rather than at an invitee holding a link that can
+ * never work.
+ */
+export async function previewInviteEffect(
+  databaseUrl: string,
+  schema: string,
+  input: { readonly organizationId: string; readonly email: string; readonly role: MembershipRole }
+): Promise<InviteEffect> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // AF-18's memberships policy needs this for the reads below under any
+      // role RLS applies to; is_local ties it to this transaction.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [input.organizationId]);
+      const existing = await client.query<{ user_id: string; role: MembershipRole }>(
+        `SELECT m.user_id, m.role
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email, input.organizationId]
+      );
+      const current = existing.rows[0];
+      if (current === undefined) {
+        await client.query("COMMIT");
+        return { outcome: "creates_membership" };
+      }
+      if (current.role === input.role) {
+        await client.query("COMMIT");
+        return { outcome: "unchanged", role: current.role };
+      }
+      if (input.role !== "owner") {
+        const owners = await client.query<{ user_id: string }>(
+          `SELECT user_id FROM "${schema}".memberships
+            WHERE organization_id = $1 AND role = 'owner'`,
+          [input.organizationId]
+        );
+        const ownerIds = owners.rows.map((owner) => owner.user_id);
+        if (ownerIds.length === 1 && ownerIds[0] === current.user_id) {
+          await client.query("COMMIT");
+          return { outcome: "strands_organization", from: current.role, to: input.role };
+        }
+      }
+      await client.query("COMMIT");
+      return { outcome: "changes_role", from: current.role, to: input.role };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** The membership an invite would change, for the audit row that records it. */
+export async function getMembershipIdForEmail(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  email: string
+): Promise<string | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const result = await client.query<{ membership_id: string }>(
+        `SELECT m.membership_id
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email.toLowerCase(), organizationId]
+      );
+      await client.query("COMMIT");
+      return result.rows[0]?.membership_id;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 export interface CreateInviteMagicLinkTokenInput {
   readonly tokenHash: string;
   readonly email: string;
@@ -523,7 +642,41 @@ export interface CreateInviteMagicLinkTokenInput {
     readonly actorUserId: string;
     readonly requestId: string;
   };
+  /**
+   * Present when this invite replaces an existing member's role, so the
+   * effect lands in the audit trail and not only the intent.
+   *
+   * Review #88, REV-002: the `membership_invite` row records that an invite
+   * was minted. It does not record that member X went from `recruiter` to
+   * `auditor`, and redemption writes no audit row at all -- so the durable
+   * half of the trail carried the act and not its consequence, on exactly
+   * the invariant AF-20 and POL-001 exist for.
+   *
+   * It is recorded here, at creation, rather than at redemption, because
+   * this is where the accountable human is. The person clicking the link is
+   * not the person who decided; `magic_link_tokens` does not carry an
+   * inviter, and audit_events' membership trigger would reject a row naming
+   * an actor who has since been offboarded, turning an old invite into an
+   * unredeemable one. The admin who authorized the change is the honest
+   * actor and is known right here.
+   */
+  readonly roleChange?: {
+    readonly membershipId: string;
+    readonly from: MembershipRole;
+    readonly to: MembershipRole;
+  };
+  /**
+   * The caller's Idempotency-Key, honoured rather than merely validated
+   * (review #88, REV-007). A retry after a timeout must not mint a second
+   * live credential, a second audit trail and a second email for one
+   * administrative act.
+   */
+  readonly idempotencyKey: string;
 }
+
+/** `replayed` means this exact key already minted an invite: nothing was
+ * written and nothing should be sent. */
+export type CreateInviteOutcome = { readonly outcome: "created" } | { readonly outcome: "replayed" };
 
 /**
  * Mints an invite token and its audit row in one transaction.
@@ -544,18 +697,37 @@ export async function createInviteMagicLinkToken(
   databaseUrl: string,
   schema: string,
   input: CreateInviteMagicLinkTokenInput
-): Promise<void> {
+): Promise<CreateInviteOutcome> {
   assertSafeSchema(schema);
   const email = input.email.toLowerCase();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
-      await client.query(
-        `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [input.tokenHash, email, input.invite.organizationId, input.invite.role, input.expiresAt]
+      // The INSERT is the deduplication, not a check before it: the partial
+      // unique index means exactly one concurrent caller can claim a key, so
+      // two simultaneous retries cannot both proceed. On conflict nothing is
+      // written and the audit rows below are skipped with it, inside this
+      // same transaction.
+      const inserted = await client.query(
+        `INSERT INTO "${schema}".magic_link_tokens
+           (token_hash, email, organization_id, role, expires_at, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+         DO NOTHING`,
+        [
+          input.tokenHash,
+          email,
+          input.invite.organizationId,
+          input.invite.role,
+          input.expiresAt,
+          input.idempotencyKey
+        ]
       );
+      if (inserted.rowCount === 0) {
+        await client.query("COMMIT");
+        return { outcome: "replayed" };
+      }
       await appendAuditEvent(
         databaseUrl,
         schema,
@@ -569,7 +741,31 @@ export async function createInviteMagicLinkToken(
         },
         client
       );
+      if (input.roleChange !== undefined) {
+        // Same transaction as the token, so an authorized role change cannot
+        // exist without the record of who authorized it.
+        //
+        // The roles travel in entity_id because audit_events has no column
+        // for them, and adding one to an append-only table is not a change to
+        // make in passing. Semantic content in entity_id has precedent here:
+        // the kill-switch path writes "engaged"/"disengaged" rather than an
+        // id. The membership id leads the value so the row still joins.
+        await appendAuditEvent(
+          databaseUrl,
+          schema,
+          {
+            organizationId: input.invite.organizationId,
+            actorUserId: input.audit.actorUserId,
+            action: "admin_action",
+            entityType: "membership_role_change",
+            entityId: `${input.roleChange.membershipId}:${input.roleChange.from}->${input.roleChange.to}`,
+            requestId: input.audit.requestId
+          },
+          client
+        );
+      }
       await client.query("COMMIT");
+      return { outcome: "created" };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
@@ -1298,28 +1494,39 @@ export async function bootstrapOrganizationOwner(
         throw new Error("bootstrap did not resolve an organization");
       }
 
-      const insertedUser = await client.query<{ user_id: string }>(
+      // Whether this row is new is read from the insert itself rather than
+      // from a prior SELECT, because `xmax = 0` is true only for a tuple this
+      // statement inserted.
+      //
+      // `DO UPDATE SET email = EXCLUDED.email` rather than `DO NOTHING`
+      // (review #88, REV-008), matching provisionInvitedMembership above.
+      // DO NOTHING returns no row on conflict and does not block on a
+      // concurrent uncommitted insert of the same email; the fallback SELECT
+      // could not see that uncommitted row under READ COMMITTED either, so
+      // two operators bootstrapping the same person into differently named
+      // organizations at the same moment would leave one of them throwing
+      // "did not resolve a user". The advisory lock above only serialises
+      // runs naming the same organization, so it does not cover this. The
+      // no-op update takes the row lock, waits for the other transaction,
+      // and then returns the row.
+      //
+      // Setting `email` to itself is what makes it a no-op: the display name
+      // is deliberately not overwritten, because this command exists to grant
+      // access, and silently renaming a person whose name an operator typed
+      // differently is not that.
+      const insertedUser = await client.query<{ user_id: string; inserted: boolean }>(
         `INSERT INTO "${schema}".users (email, display_name)
          VALUES ($1, $2)
-         ON CONFLICT (email) DO NOTHING
-         RETURNING user_id`,
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+         RETURNING user_id, (xmax = 0) AS inserted`,
         [email, displayName]
       );
-      const userCreated = insertedUser.rows[0] !== undefined;
-      // Deliberately does not overwrite an existing display name: this
-      // command exists to grant access, and silently renaming a person
-      // because an operator typed their name differently is not that.
-      const userId =
-        insertedUser.rows[0]?.user_id ??
-        (
-          await client.query<{ user_id: string }>(
-            `SELECT user_id FROM "${schema}".users WHERE email = $1`,
-            [email]
-          )
-        ).rows[0]?.user_id;
-      if (userId === undefined) {
+      const userRow = insertedUser.rows[0];
+      if (userRow === undefined) {
         throw new Error("bootstrap did not resolve a user");
       }
+      const userCreated = userRow.inserted;
+      const userId = userRow.user_id;
 
       // AF-18's memberships policy requires this for both the SELECT and
       // the INSERT below under any role RLS applies to; is_local = true
@@ -1408,7 +1615,10 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
       // file below is the fix; applying the first without the second would
       // give the probe a shape no real database has ever had.
       "0006_audit_events_delete_and_membership_fixes.sql",
-      "0009_roles.sql"
+      "0009_roles.sql",
+      // The invite route deduplicates on this column (review #88, REV-007),
+      // so a probe without it would not exercise the route as it ships.
+      "0023_invite_idempotency.sql"
     ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
