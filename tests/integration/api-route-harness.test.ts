@@ -393,6 +393,38 @@ for (const refused of REFUSED_READS) {
   });
 }
 
+/**
+ * The case that makes the read-only transaction load-bearing rather than
+ * decorative.
+ *
+ * Raised in re-review of PR #90: `SELECT * INTO t2 FROM memberships` is ONE
+ * statement that begins with `SELECT`, so the regex admits it and the
+ * prepared statement admits it, and it writes. Only layer 3 refuses it.
+ *
+ * Added because the four cases above did not need it: removing the
+ * `BEGIN READ ONLY`/`ROLLBACK` pair entirely left all twenty tests in this
+ * file green, which is precisely the "two layers are decorative" state the
+ * re-review warned about -- the guard would have been one layer with extra
+ * reading, and nothing would have said so.
+ */
+test("readProbeRows refuses a SELECT that writes, which only the read-only transaction catches", async () => {
+  await withApiRouteHarness(async (harness) => {
+    const created = "select_into_probe";
+    await assert.rejects(
+      async () => harness.rows(`SELECT * INTO ${created} FROM memberships`),
+      "a SELECT INTO passes both the regex and the protocol check, so the transaction must refuse it"
+    );
+
+    // The refusal has to mean the table does not exist, not merely that the
+    // call threw on its way back.
+    const tables = await harness.rows<CountRow>(
+      "SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2",
+      [harness.probe.schema, created]
+    );
+    assert.equal(tables[0]?.n, 0, "a refused SELECT INTO must not have created a table");
+  });
+});
+
 test("readProbeRows still reads, with and without parameters", async () => {
   await withApiRouteHarness(async (harness) => {
     // The named-statement change would be easy to get wrong in the direction
