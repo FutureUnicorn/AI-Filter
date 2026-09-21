@@ -296,7 +296,7 @@ test("worker event allowlisting drops arbitrary context", () => {
   assert.doesNotMatch(serialized, /candidate@example\.test|private prompt|raw provider response|secret-id/u);
 });
 
-test("alert definitions require external thresholds and omit the blocked queue-age signal", () => {
+test("alert definitions require external thresholds and stage blocked producers safely", () => {
   const thresholds = Object.fromEntries(MONITORED_OPERATIONS.map((operation) => [operation, 1000]));
   const definitions = buildDetectorDefinitions({
     APP_ENV: "staging",
@@ -315,6 +315,44 @@ test("alert definitions require external thresholds and omit the blocked queue-a
   assert.match(serialized, /p95\(span\.duration\)/u);
   assert.match(serialized, /inference\.token_budget/u);
   assert.doesNotMatch(serialized, /queue\.age|dollar|rupee|currency/iu);
+  const tokenBudgetDefinition = definitions.find((definition) =>
+    definition.payload.name.includes("inference token budget")
+  );
+  assert.equal(tokenBudgetDefinition?.payload.enabled, false);
+  assert.match(tokenBudgetDefinition?.payload.description ?? "", /AF-102/u);
+
+  const readyDefinitions = buildDetectorDefinitions({
+    APP_ENV: "staging",
+    SENTRY_WEB_PROJECT: "web",
+    SENTRY_WORKER_PROJECT: "worker",
+    SENTRY_ALERT_EVALUATION_WINDOW_SECONDS: "300",
+    SENTRY_ALERT_MIN_EVENT_VOLUME: "20",
+    SENTRY_ALERT_ERROR_RATE_THRESHOLD_PERCENT: "5",
+    SENTRY_ALERT_WORKER_ERROR_COUNT_THRESHOLD: "1",
+    SENTRY_ALERT_TOKEN_BUDGET_EVENT_THRESHOLD: "1",
+    SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY: "true",
+    SENTRY_ALERT_P95_THRESHOLDS_MS: JSON.stringify(thresholds)
+  });
+  assert.equal(
+    readyDefinitions.find((definition) =>
+      definition.payload.name.includes("inference token budget")
+    )?.payload.enabled,
+    true
+  );
+  assert.throws(
+    () => buildDetectorDefinitions({
+      APP_ENV: "staging",
+      SENTRY_WEB_PROJECT: "web",
+      SENTRY_ALERT_EVALUATION_WINDOW_SECONDS: "300",
+      SENTRY_ALERT_MIN_EVENT_VOLUME: "20",
+      SENTRY_ALERT_ERROR_RATE_THRESHOLD_PERCENT: "5",
+      SENTRY_ALERT_WORKER_ERROR_COUNT_THRESHOLD: "1",
+      SENTRY_ALERT_TOKEN_BUDGET_EVENT_THRESHOLD: "1",
+      SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY: "yes",
+      SENTRY_ALERT_P95_THRESHOLDS_MS: JSON.stringify(thresholds)
+    }),
+    /SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY must be true or false/u
+  );
   assert.throws(
     () => buildDetectorDefinitions({}),
     /required to render AF-67 alert definitions/u

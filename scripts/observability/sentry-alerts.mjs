@@ -32,6 +32,17 @@ function positiveInteger(source, name, { allowZero = false } = {}) {
   return value;
 }
 
+function optionalBoolean(source, name) {
+  const raw = source[name]?.trim();
+  if (raw === undefined || raw === "") {
+    return false;
+  }
+  if (raw !== "true" && raw !== "false") {
+    throw new Error(`${name} must be true or false`);
+  }
+  return raw === "true";
+}
+
 function parseP95Thresholds(source) {
   const raw = required(source, "SENTRY_ALERT_P95_THRESHOLDS_MS");
   let parsed;
@@ -95,6 +106,10 @@ export function buildDetectorDefinitions(source) {
   const tokenBudgetEventThreshold = positiveInteger(
     source,
     "SENTRY_ALERT_TOKEN_BUDGET_EVENT_THRESHOLD"
+  );
+  const tokenBudgetProducerReady = optionalBoolean(
+    source,
+    "SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY"
   );
   const workerErrorCountThreshold = positiveInteger(
     source,
@@ -185,9 +200,11 @@ export function buildDetectorDefinitions(source) {
     project: workerProject,
     payload: {
       ...common,
+      enabled: tokenBudgetProducerReady,
       name: `[AF-67][${environment}] inference token budget`,
       description:
-        "Existing inference budget checks reported warning or capped. This is token-budget utilization, not monetary provider spend.",
+        "Existing inference budget checks reported warning or capped. This is token-budget utilization, not monetary provider spend. " +
+        "Keep disabled until AF-102 connects the durable production job consumer to executeBudgetedInference and a staging drill verifies delivery.",
       data_sources: spanDataSource({
         aggregate: "count()",
         environment,

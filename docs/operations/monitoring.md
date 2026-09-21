@@ -51,6 +51,7 @@ The operator must provide thresholds; there are no production defaults:
 - `SENTRY_ALERT_MIN_EVENT_VOLUME`
 - `SENTRY_ALERT_P95_THRESHOLDS_MS` (JSON object with every normalized operation)
 - `SENTRY_ALERT_TOKEN_BUDGET_EVENT_THRESHOLD`
+- `SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY` (`false` until AF-102's production consumer is connected and drilled)
 - `SENTRY_ALERT_WORKFLOW_IDS`
 - `SENTRY_ALERT_OWNER`
 - `SENTRY_ORG`, `SENTRY_WEB_PROJECT`, and optionally `SENTRY_WORKER_PROJECT`
@@ -82,6 +83,14 @@ source the ratio, period and cap from approved external operations configuration
 AF-67 does not invent defaults. AF-102 will deliver durable jobs to this boundary
 without changing its budget or telemetry semantics.
 
+There is no deployed production caller of `executeBudgetedInference` before
+AF-102. The token-budget detector definition is therefore rendered but disabled
+by default, and it will not emit or alert in the current worker. Set
+`SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY=true` only after AF-102 connects the
+durable job consumer to this boundary and a synthetic staging drill proves the
+warning and capped signals reach Sentry. Until then, do not treat the rendered
+detector as active token-budget coverage.
+
 The web detector uses `failure_rate()` because normalized request-operation
 spans provide a denominator. The current worker only serves a health endpoint
 and runs no durable jobs, so there is no honest worker failure-rate denominator
@@ -91,10 +100,13 @@ publishes completed job volume.
 
 Web and worker `/health/environment` failures are deliberately excluded from
 the Sentry application-error detectors. They remain visible through the health
-response and the structured `*.environment_health_failed` log events; runtime
-health monitoring should alert on probe availability separately. Capturing each
-probe failure as an application exception would contradict AF-67's health-check
-exclusion and can create repeated error events for one dependency outage.
+response and the structured `*.environment_health_failed` log events. Those log
+events carry only the bounded `errorName`, `errorCode`, and `statusCode=503`
+diagnostics; raw messages, causes, configuration values, and dependency payloads
+remain excluded. Runtime health monitoring should alert on probe availability
+separately. Capturing each probe failure as an application exception would
+contradict AF-67's health-check exclusion and can create repeated error events
+for one dependency outage.
 
 ## Pre-customer validation
 
