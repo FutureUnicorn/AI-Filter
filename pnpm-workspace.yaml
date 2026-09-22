@@ -3,6 +3,9 @@ packages:
   - "packages/*"
 storeDir: .cache/pnpm-store
 allowBuilds:
+  # Source-map upload is disabled until a hosted project and scoped token exist.
+  # The runtime SDK does not need the CLI install script.
+  '@sentry/cli': false
   esbuild: true
 minimumReleaseAgeExclude:
   - '@next/env@16.3.2'

@@ -251,6 +251,79 @@ export interface EnvironmentConfig {
 
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
 
+export const OBSERVABILITY_SERVICES = ["web", "worker"] as const;
+export type ObservabilityService = (typeof OBSERVABILITY_SERVICES)[number];
+
+const optionalDsn = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().url().refine((value) => value.startsWith("https://"), "SENTRY_DSN must use https").optional()
+);
+const optionalTraceSampleRate = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.coerce.number().min(0).max(1).optional()
+);
+
+const monitoringEnvironmentSchema = z
+  .object({
+    APP_ENV: z.enum(APP_ENVIRONMENTS),
+    DEPLOYMENT_COMMIT_SHA: z.string().trim().min(1),
+    SENTRY_DSN: optionalDsn,
+    SENTRY_TRACES_SAMPLE_RATE: optionalTraceSampleRate
+  })
+  .superRefine((value, context) => {
+    if (isHostedEnvironment(value.APP_ENV) && value.SENTRY_DSN === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["SENTRY_DSN"],
+        message: `SENTRY_DSN is required for ${value.APP_ENV}; hosted monitoring cannot be silently disabled`
+      });
+    }
+    if (value.SENTRY_DSN !== undefined && value.SENTRY_TRACES_SAMPLE_RATE === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["SENTRY_TRACES_SAMPLE_RATE"],
+        message: "SENTRY_TRACES_SAMPLE_RATE is required when Sentry is enabled; sampling must be an explicit operations decision"
+      });
+    }
+  });
+
+export interface MonitoringConfig {
+  readonly enabled: boolean;
+  readonly service: ObservabilityService;
+  readonly environment: AppEnvironment;
+  readonly release: string;
+  readonly dsn?: string;
+  readonly tracesSampleRate?: number;
+}
+
+/**
+ * Runtime monitoring identity and enablement. Development and test can run
+ * without a Sentry account; every hosted environment fails closed if its
+ * service-specific DSN was not mapped to SENTRY_DSN by the deployment.
+ */
+export function loadMonitoringConfig(
+  source: EnvironmentSource,
+  service: ObservabilityService
+): MonitoringConfig {
+  const parsed = monitoringEnvironmentSchema.safeParse(source);
+  if (!parsed.success) {
+    const details = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "environment"}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`Invalid monitoring configuration: ${details}`);
+  }
+  return {
+    enabled: parsed.data.SENTRY_DSN !== undefined,
+    service,
+    environment: parsed.data.APP_ENV,
+    release: parsed.data.DEPLOYMENT_COMMIT_SHA,
+    ...(parsed.data.SENTRY_DSN === undefined ? {} : { dsn: parsed.data.SENTRY_DSN }),
+    ...(parsed.data.SENTRY_TRACES_SAMPLE_RATE === undefined
+      ? {}
+      : { tracesSampleRate: parsed.data.SENTRY_TRACES_SAMPLE_RATE })
+  };
+}
+
 export function loadEnvironmentConfig(source: EnvironmentSource): EnvironmentConfig {
   const parsed = rawEnvironmentSchema.safeParse(source);
   if (!parsed.success) {
