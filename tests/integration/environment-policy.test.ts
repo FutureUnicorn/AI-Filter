@@ -243,3 +243,100 @@ test("the web server refuses to start without a session secret", () => {
   assert.match(instrumentation, /SESSION_SECRET/u);
   assert.match(instrumentation, /throw new Error/u, "it has to throw; logging a warning still serves requests");
 });
+
+test("hosted backups leave application credentials isolated and use an off-host encrypted target", () => {
+  const compose = read("infra/compose/runtime.yml");
+  const backupService = /^ {2}backup:[\s\S]*?(?=\n {2}\S|\nnetworks:)/mu.exec(compose)?.[0];
+  const backupEnvironment = /x-backup-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(backupService);
+  assert.ok(backupEnvironment);
+  assert.ok(webService);
+  assert.ok(workerService);
+
+  assert.match(backupService!, /profiles: \[backups\]/u);
+  assert.match(backupService!, /networks: \[public, private\]/u);
+  assert.match(backupService!, /read_only: true/u);
+  assert.match(backupService!, /cap_drop: \["ALL"\]/u);
+  assert.match(backupService!, /no-new-privileges:true/u);
+  assert.match(backupService!, /signal-audit-backup", "health/u);
+  assert.match(backupEnvironment!, /BACKUP_CONTROL_OWNER:/u);
+  assert.match(backupEnvironment!, /BACKUP_ENCRYPTION_REFERENCE:/u);
+  assert.doesNotMatch(webService!, /BACKUP_ACCESS_KEY_ID|BACKUP_SECRET_ACCESS_KEY/u);
+  assert.doesNotMatch(workerService!, /BACKUP_ACCESS_KEY_ID|BACKUP_SECRET_ACCESS_KEY/u);
+
+  const script = read("scripts/backups/backup.sh");
+  assert.match(script, /BACKUP_ENDPOINT must use https/u);
+  assert.match(script, /--enc-s3/u);
+  assert.match(script, /mc --quiet mirror[\s\S]*?--overwrite[\s\S]*?--remove/u);
+  assert.equal((script.match(/mirror_storage "\$backup_id"/gu) ?? []).length, 2);
+  assert.match(script, /pg_dump[\s\S]*?--format=custom/u);
+  assert.match(script, /pg_restore --list/u);
+  assert.match(script, /sha256sum/u);
+  assert.match(script, /last-success-epoch/u);
+  assert.doesNotMatch(
+    script,
+    /\b(?:echo|printf)\b[^\n]*\$\{?(?:STORAGE|BACKUP)_SECRET_ACCESS_KEY/u,
+    "secret values must never be written to backup logs"
+  );
+});
+
+test("backup retention is reproducible and preserves current source objects", () => {
+  const script = read("scripts/backups/backup.sh");
+  assert.match(script, /mc --quiet version enable/u);
+  assert.match(script, /mc --quiet ilm rule import/u);
+  assert.match(script, /af68-database-retention/u);
+  assert.match(script, /af68-manifest-history-retention/u);
+  assert.match(script, /af68-latest-manifest-history-retention/u);
+  assert.match(script, /af68-storage-history-retention/u);
+  assert.match(script, /NoncurrentVersionExpiration/u);
+  assert.match(script, /ExpiredObjectDeleteMarker/u);
+
+  const storageRule =
+    /"ID": "af68-storage-history-retention"[\s\S]*?\n {4}\}/u.exec(script)?.[0];
+  assert.ok(storageRule);
+  assert.doesNotMatch(
+    storageRule!,
+    /"Expiration": \{ "Days"/u,
+    "current mirrored objects must not expire while they still exist in primary storage"
+  );
+
+  for (const ruleId of ["af68-database-retention", "af68-manifest-history-retention"]) {
+    const expiringRule = new RegExp(`"ID": "${ruleId}"[\\s\\S]*?\\n {4}\\}`, "u").exec(script)?.[0];
+    assert.ok(expiringRule, `expected ${ruleId}`);
+    assert.match(
+      expiringRule!,
+      /"NoncurrentVersionExpiration": \{ "NoncurrentDays": 1 \}/u,
+      `${ruleId} must remove versions left behind when current objects expire`
+    );
+  }
+});
+
+test("hosted workflows pass backup policy as variables and credentials as secrets", () => {
+  for (const file of [
+    ".github/workflows/staging-environment.yml",
+    ".github/workflows/production-gate.yml"
+  ]) {
+    const workflow = read(file);
+    assert.match(workflow, /BACKUP_ENABLED: \$\{\{ vars\.BACKUP_ENABLED \}\}/u);
+    assert.match(workflow, /BACKUP_INTERVAL_SECONDS: \$\{\{ vars\.BACKUP_INTERVAL_SECONDS \}\}/u);
+    assert.match(workflow, /BACKUP_RETENTION_DAYS: \$\{\{ vars\.BACKUP_RETENTION_DAYS \}\}/u);
+    assert.match(workflow, /BACKUP_ACCESS_KEY_ID: \$\{\{ secrets\.BACKUP_ACCESS_KEY_ID \}\}/u);
+    assert.match(workflow, /BACKUP_SECRET_ACCESS_KEY: \$\{\{ secrets\.BACKUP_SECRET_ACCESS_KEY \}\}/u);
+    assert.doesNotMatch(workflow, /BACKUP_SECRET_ACCESS_KEY: \$\{\{ vars\./u);
+  }
+});
+
+test("hosted backup deployment builds and configures the exact backup image before starting it", () => {
+  const cli = read("scripts/environment/cli.mjs");
+  assert.match(
+    cli,
+    /"run",\s*"--build",\s*"--rm",\s*"backup-init"/u,
+    "backup-init must not reuse a stale image from an earlier deployment"
+  );
+  assert.match(
+    cli,
+    /"up",\s*"-d",\s*"--build",\s*"web",\s*"worker",\s*"backup"/u
+  );
+});

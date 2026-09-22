@@ -20,6 +20,27 @@ x-runtime-environment: &runtime-environment
   SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
   WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
 
+x-backup-environment: &backup-environment
+  APP_ENV: ${APP_ENV:?APP_ENV is required}
+  DEPLOYMENT_COMMIT_SHA: ${DEPLOYMENT_COMMIT_SHA:?DEPLOYMENT_COMMIT_SHA is required}
+  PGHOST: postgres
+  PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+  PGUSER: ${POSTGRES_USER:?POSTGRES_USER is required}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:?STORAGE_BUCKET is required}
+  STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:?STORAGE_ACCESS_KEY_ID is required}
+  STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:?STORAGE_SECRET_ACCESS_KEY is required}
+  BACKUP_ENDPOINT: ${BACKUP_ENDPOINT:-}
+  BACKUP_REGION: ${BACKUP_REGION:-}
+  BACKUP_BUCKET: ${BACKUP_BUCKET:-}
+  BACKUP_ACCESS_KEY_ID: ${BACKUP_ACCESS_KEY_ID:-}
+  BACKUP_SECRET_ACCESS_KEY: ${BACKUP_SECRET_ACCESS_KEY:-}
+  BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-}
+  BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
+  BACKUP_PATH_STYLE: ${BACKUP_PATH_STYLE:-auto}
+  BACKUP_CONTROL_OWNER: ${BACKUP_CONTROL_OWNER:-}
+  BACKUP_ENCRYPTION_REFERENCE: ${BACKUP_ENCRYPTION_REFERENCE:-}
+
 services:
   postgres:
     image: postgres:17.10-alpine3.23
@@ -124,6 +145,51 @@ services:
     volumes:
       - ../../tests/fixtures/environment:/fixtures:ro
     networks: [private]
+    security_opt: ["no-new-privileges:true"]
+
+  backup-init:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["configure"]
+    restart: "no"
+    environment:
+      <<: *backup-environment
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=70,gid=70
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  backup:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["loop"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *backup-environment
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/signal-audit-backup", "health"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=${BACKUP_TEMP_SIZE:-512m},mode=1770,uid=70,gid=70
+    mem_limit: ${BACKUP_MEMORY_LIMIT:-512m}
+    cpus: ${BACKUP_CPU_LIMIT:-0.50}
+    cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
 
   web:

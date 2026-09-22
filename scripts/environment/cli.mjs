@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { requireBackupControls } from "../backups/model.mjs";
+
 import {
   assertDestructiveEnvironmentAllowed,
   derivePreviewEnvironment,
@@ -77,11 +79,14 @@ function localEnvironment() {
 
 function hostedEnvironment(appEnv) {
   requireHostedControls(appEnv, process.env);
+  const backup = requireBackupControls(appEnv, process.env);
   const sha = validateCommitSha(option("--sha") ?? process.env.DEPLOYMENT_COMMIT_SHA);
   return {
     project: `signal-audit-${appEnv}`,
+    backupEnabled: backup.enabled,
     variables: {
       ...process.env,
+      ...backup.variables,
       APP_ENV: appEnv,
       DEPLOYMENT_COMMIT_SHA: sha,
       POSTGRES_DB: `signal_audit_${appEnv}`,
@@ -109,6 +114,27 @@ function startEnvironment(environment, { local = false, seed = false } = {}) {
 
 function deployEnvironment(environment, seed) {
   startEnvironment(environment, { seed });
+  if (environment.backupEnabled === true) {
+    runDocker(environment.project, environment.variables, [
+      "--profile",
+      "backups",
+      "run",
+      "--build",
+      "--rm",
+      "backup-init"
+    ]);
+    runDocker(environment.project, environment.variables, [
+      "--profile",
+      "backups",
+      "up",
+      "-d",
+      "--build",
+      "web",
+      "worker",
+      "backup"
+    ]);
+    return;
+  }
   runDocker(environment.project, environment.variables, ["up", "-d", "--build", "web", "worker"]);
 }
 
