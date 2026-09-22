@@ -28,6 +28,11 @@ Per-job timestamps support queue wait and duration through
 `deriveEvidenceExtractionJobTiming`. Failure codes are bounded machine values;
 job rows, logs, and monitoring telemetry contain no candidate names, emails,
 filenames, document text, prompts, quotes, or raw provider responses.
+Retryable attempts do not page as terminal job failures. Once the durable
+retry transition returns `failed`, the worker emits a bounded
+`worker.job_failed` log and Sentry error with only the closed failure code and
+safe diagnostic classification. Failures while recording an unexpected retry
+transition are reported separately without changing worker control flow.
 
 Before enabling real data, run `pnpm check`, deploy the exact green SHA to
 staging, enqueue only a synthetic document, and drill: successful completion,

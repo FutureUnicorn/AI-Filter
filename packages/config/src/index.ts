@@ -421,6 +421,10 @@ const optionalPositiveInteger = z.preprocess(
   (value) => (value === "" || value === undefined ? undefined : value),
   z.coerce.number().int().positive().optional()
 );
+const optionalWorkerConcurrency = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.coerce.number().int().positive().max(16).optional()
+);
 const optionalRatio = z.preprocess(
   (value) => (value === "" || value === undefined ? undefined : value),
   z.coerce.number().min(0).max(1).optional()
@@ -446,7 +450,7 @@ const workerProcessingSchema = z
       z.enum(["day", "month"]).optional()
     ),
     INFERENCE_ESTIMATED_OUTPUT_TOKENS: optionalPositiveInteger,
-    WORKER_CONCURRENCY: optionalPositiveInteger,
+    WORKER_CONCURRENCY: optionalWorkerConcurrency,
     WORKER_POLL_INTERVAL_MS: optionalPositiveInteger,
     WORKER_HEARTBEAT_INTERVAL_MS: optionalPositiveInteger,
     WORKER_LEASE_DURATION_MS: optionalPositiveInteger,
@@ -496,7 +500,7 @@ export function loadWorkerProcessingConfig(source: EnvironmentSource): WorkerPro
   const value = parsed.data;
   const base = {
     enabled: value.WORKER_PROCESSING_ENABLED,
-    concurrency: Math.min(value.WORKER_CONCURRENCY ?? 1, 16),
+    concurrency: value.WORKER_CONCURRENCY ?? 1,
     pollIntervalMs: value.WORKER_POLL_INTERVAL_MS ?? 1_000,
     heartbeatIntervalMs: value.WORKER_HEARTBEAT_INTERVAL_MS ?? 10_000,
     leaseDurationMs: value.WORKER_LEASE_DURATION_MS ?? 60_000,

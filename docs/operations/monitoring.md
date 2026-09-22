@@ -40,7 +40,7 @@ provider responses, and arbitrary context must never be added to telemetry.
 
 `scripts/observability/sentry-alerts.mjs` renders current Sentry detector API
 payloads without network access by default. It creates definitions for web
-failure rate, P95 for all twelve normalized operations, and worker inference
+failure rate, P95 for all thirteen normalized operations, and worker inference
 token-budget warning/capped events. It never defines a queue-age detector.
 
 The operator must provide thresholds; there are no production defaults:
@@ -61,6 +61,11 @@ requires a narrowly scoped `SENTRY_AUTH_TOKEN`; it updates exact-name monitors
 or creates them and refuses to apply without an owner and notification
 workflow. Account-specific workflow actions/channels are configured outside
 the repository, so no personal address or channel is committed.
+
+The P95 threshold JSON must include the distinct
+`application.evidence_extraction.enqueue` operation before definitions can be
+rendered or applied. Its production threshold remains an operations decision;
+the repository deliberately supplies no default.
 
 Sentry's detector API currently represents one aggregate threshold per metric
 monitor and cannot express `failure_rate above X AND request count at least Y`

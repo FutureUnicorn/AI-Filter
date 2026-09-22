@@ -212,6 +212,11 @@ test("worker processing is credential-free while disabled and validates hosted p
     retryBaseDelayMs: 5_000,
     maxAttempts: 3
   });
+  assert.equal(loadWorkerProcessingConfig({ WORKER_CONCURRENCY: "16" }).concurrency, 16);
+  assert.throws(
+    () => loadWorkerProcessingConfig({ WORKER_CONCURRENCY: "17" }),
+    /WORKER_CONCURRENCY.*16/u
+  );
   const enabled = loadWorkerProcessingConfig({
     WORKER_PROCESSING_ENABLED: "true",
     WORKER_INSTANCE_ID: "worker-staging-1",

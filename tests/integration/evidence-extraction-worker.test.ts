@@ -246,6 +246,91 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
   assert.equal(snapshot.heartbeatAgeMs, 0);
 });
 
+test("queue monitoring snapshot selects the oldest recoverable backlog with a fixed clock", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+
+  const emptyObservedAt = new Date("2030-01-01T00:00:00.000Z");
+  assert.deepEqual(
+    await getEvidenceExtractionQueueMonitoringSnapshot(databaseUrl, probe.schema, emptyObservedAt),
+    {
+      observedAt: emptyObservedAt.toISOString(),
+      oldestReadyAgeMs: null,
+      readyJobs: 0,
+      runningJobs: 0,
+      failedJobs: 0,
+      completedJobs: 0,
+      totalAttempts: 0,
+      lastHeartbeatAt: null,
+      heartbeatAgeMs: null
+    }
+  );
+
+  const jobs = [];
+  for (const suffix of ["one", "two", "three"]) {
+    const queued = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+      organizationId: probe.organizationId,
+      roleId: probe.roleId,
+      applicationId: probe.applicationId,
+      sourceIntakeId: probe.sourceIntakeId,
+      rubricId: probe.rubricId,
+      workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-monitoring-${suffix}`,
+      maxAttempts: 3
+    });
+    assert.equal(queued.outcome, "enqueued");
+    if (queued.outcome === "enqueued") jobs.push(queued.job);
+  }
+  assert.equal(jobs.length, 3);
+
+  const allEnqueued = jobs.map((job) => new Date(job.enqueuedAt).getTime());
+  const readyObservedAt = new Date(Math.max(...allEnqueued) + 1_000);
+  const readySnapshot = await getEvidenceExtractionQueueMonitoringSnapshot(
+    databaseUrl,
+    probe.schema,
+    readyObservedAt
+  );
+  assert.equal(readySnapshot.readyJobs, 3);
+  assert.equal(readySnapshot.runningJobs, 0);
+  assert.equal(readySnapshot.oldestReadyAgeMs, readyObservedAt.getTime() - Math.min(...allEnqueued));
+
+  const claimed = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-monitoring",
+    leaseDurationMs: 10_000,
+    now: readyObservedAt
+  });
+  assert.ok(claimed !== undefined);
+
+  const remainingEnqueued = jobs
+    .filter((job) => job.jobId !== claimed.jobId)
+    .map((job) => new Date(job.enqueuedAt).getTime());
+  const liveLeaseObservedAt = new Date(readyObservedAt.getTime() + 5_000);
+  const liveLeaseSnapshot = await getEvidenceExtractionQueueMonitoringSnapshot(
+    databaseUrl,
+    probe.schema,
+    liveLeaseObservedAt
+  );
+  assert.equal(liveLeaseSnapshot.readyJobs, 2, "a live running lease is not ready backlog");
+  assert.equal(liveLeaseSnapshot.runningJobs, 1);
+  assert.equal(
+    liveLeaseSnapshot.oldestReadyAgeMs,
+    liveLeaseObservedAt.getTime() - Math.min(...remainingEnqueued)
+  );
+
+  const expiredLeaseObservedAt = new Date(readyObservedAt.getTime() + 10_001);
+  const expiredLeaseSnapshot = await getEvidenceExtractionQueueMonitoringSnapshot(
+    databaseUrl,
+    probe.schema,
+    expiredLeaseObservedAt
+  );
+  assert.equal(expiredLeaseSnapshot.readyJobs, 3, "an expired retryable lease is recoverable backlog");
+  assert.equal(expiredLeaseSnapshot.runningJobs, 0);
+  assert.equal(
+    expiredLeaseSnapshot.oldestReadyAgeMs,
+    expiredLeaseObservedAt.getTime() - Math.min(...allEnqueued)
+  );
+});
+
 test("the real worker path calls the provider once and atomically records budget, run, outcomes, and completion", async (t) => {
   const databaseUrl = requireDatabase();
   const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
@@ -376,6 +461,20 @@ test("transient provider failures back off, exhaust the bound, and surface safe 
   if (enqueue.outcome === "not_eligible") return;
   let now = new Date(Date.now() + 1_000);
   let calls = 0;
+  const captures: Array<{ readonly error: Error; readonly context: { readonly tags: Record<string, string> } }> = [];
+  const errorLines: string[] = [];
+  t.mock.method(console, "error", (line?: unknown) => {
+    errorLines.push(String(line));
+  });
+  setWorkerTelemetryAdapterForTesting({
+    captureException(error, context) {
+      captures.push({ error, context });
+    },
+    startSpan(_options, callback) {
+      return callback({ setStatus() { return undefined; }, setAttributes() { return undefined; } });
+    }
+  });
+  t.after(() => setWorkerTelemetryAdapterForTesting(undefined));
   const unavailable: AiAdapter = {
     async runStructuredCall() {
       calls += 1;
@@ -407,12 +506,20 @@ test("transient provider failures back off, exhaust the bound, and surface safe 
   };
   assert.equal(await processNextEvidenceExtractionJob(dependencies), true);
   assert.equal((await getEvidenceExtractionJob(databaseUrl, probe.schema, probe.organizationId, enqueue.job.jobId))?.state, "ready");
+  assert.equal(captures.length, 0, "a retryable attempt must not emit a terminal failure");
+  assert.equal(errorLines.some((line) => line.includes("worker.job_failed")), false);
   now = new Date(now.getTime() + 100);
   assert.equal(await processNextEvidenceExtractionJob(dependencies), true);
   const failed = await getEvidenceExtractionJob(databaseUrl, probe.schema, probe.organizationId, enqueue.job.jobId);
   assert.equal(failed?.state, "failed");
   assert.equal(failed?.failureCode, "provider_transient");
   assert.equal(calls, 2);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0]?.error.message, "Unexpected worker failure");
+  assert.equal(captures[0]?.context.tags.operation, "worker.job");
+  assert.equal(captures[0]?.context.tags.failure_code, "provider_transient");
+  assert.equal(errorLines.filter((line) => line.includes("worker.job_failed")).length, 1);
+  assert.doesNotMatch(JSON.stringify({ captures, errorLines }), /candidate@example\.test|provider outage/iu);
   const outcomes = await listCurrentEvidenceOutcomesForApplication(
     databaseUrl,
     probe.schema,

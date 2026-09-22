@@ -16,6 +16,7 @@ export const WEB_OPERATIONS = [
   "csv.finalize",
   "application.review_queue",
   "application.evidence",
+  "application.evidence_extraction.enqueue",
   "application.evidence.correct",
   "application.decision",
   "role.list",
@@ -314,6 +315,7 @@ const ROUTE_OPERATIONS: Readonly<Record<string, WebOperation>> = {
   "/api/roles/[roleId]/files/[intakeId]/finalize": "csv.finalize",
   "/api/roles/[roleId]/applications": "application.review_queue",
   "/api/roles/[roleId]/applications/[applicationId]/evidence": "application.evidence",
+  "/api/roles/[roleId]/applications/[applicationId]/evidence-extraction": "application.evidence_extraction.enqueue",
   "/api/roles/[roleId]/applications/[applicationId]/evidence/[criterionId]/corrections": "application.evidence.correct",
   "/api/roles/[roleId]/applications/[applicationId]/decisions": "application.decision"
 };

@@ -35,7 +35,7 @@ import type {
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 
 import { InferenceBudgetCappedError, executeBudgetedInference } from "./inference.ts";
-import { captureWorkerError } from "./observability.ts";
+import { captureWorkerError, captureWorkerJobFailure } from "./observability.ts";
 
 export const EVIDENCE_EXTRACTION_PROMPT_VERSION = "1.0.0";
 const DOCUMENT_LABEL = "application_document";
@@ -215,6 +215,9 @@ export async function processEvidenceExtractionJob(
       availableAt: now,
       now
     });
+    if (result === "failed") {
+      captureWorkerJobFailure(new Error("Evidence-extraction job context is invalid"), "invalid_job_context");
+    }
     return result;
   }
   const criterionIds = context.criteria.map((criterion) => criterion.criterionId);
@@ -336,6 +339,9 @@ export async function processEvidenceExtractionJob(
       terminalOutcomes: fixedOutcomes(job, criterionIds, "failed", failureCode),
       now
     });
+    if (result === "failed") {
+      captureWorkerJobFailure(error, failureCode);
+    }
     return result;
   }
 }
@@ -362,7 +368,7 @@ export async function processNextEvidenceExtractionJob(
       failureCode: "unexpected_error",
       retryable: true,
       availableAt: retryAt((dependencies.now ?? (() => new Date()))(), job.attemptCount, dependencies.config.retryBaseDelayMs)
-    }).catch(() => undefined);
+    }).catch((bookkeepingError: unknown) => captureWorkerError(bookkeepingError, "worker.job"));
   }
   return true;
 }

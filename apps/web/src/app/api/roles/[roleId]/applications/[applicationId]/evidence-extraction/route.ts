@@ -122,7 +122,7 @@ async function handlePOST(request: NextRequest, context: RouteContext): Promise<
       }
     );
   } catch (error) {
-    captureServerError(error, { requestId, operation: "application.evidence" });
+    captureServerError(error, { requestId, operation: "application.evidence_extraction.enqueue" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -135,4 +135,4 @@ async function handlePOST(request: NextRequest, context: RouteContext): Promise<
   }
 }
 
-export const POST = withServerOperation("application.evidence", handlePOST);
+export const POST = withServerOperation("application.evidence_extraction.enqueue", handlePOST);
