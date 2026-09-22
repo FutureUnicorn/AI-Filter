@@ -205,6 +205,33 @@ test("compose maps service-specific Sentry projects and a shared explicit sample
   assert.doesNotMatch(workerService!, /SENTRY_WEB_DSN/u);
 });
 
+test("compose keeps provider secrets worker-only and gives the unexposed worker outbound access", () => {
+  const compose = read("infra/compose/runtime.yml");
+  const runtimeEnvironmentBlock = /x-runtime-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(runtimeEnvironmentBlock);
+  assert.ok(webService);
+  assert.ok(workerService);
+  assert.match(runtimeEnvironmentBlock!, /WORKER_MAX_ATTEMPTS: \$\{WORKER_MAX_ATTEMPTS:-3\}/u);
+  assert.doesNotMatch(runtimeEnvironmentBlock!, /OPENAI_API_KEY/u);
+  assert.doesNotMatch(webService!, /OPENAI_API_KEY|WORKER_PROCESSING_ENABLED/u);
+  for (const name of [
+    "WORKER_PROCESSING_ENABLED",
+    "WORKER_INSTANCE_ID",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "OPENAI_ESCALATION_MODEL",
+    "INFERENCE_MAX_TOKENS_PER_PERIOD",
+    "INFERENCE_ALERT_THRESHOLD_RATIO",
+    "INFERENCE_BUDGET_PERIOD"
+  ]) {
+    assert.match(workerService!, new RegExp(`${name}:`, "u"));
+  }
+  assert.match(workerService!, /networks: \[public, private\]/u);
+  assert.doesNotMatch(workerService!, /^ {4}ports:/mu, "the worker needs egress, not a host-exposed port");
+});
+
 test("the web server refuses to start without a session secret", () => {
   // REV-003's other half. Documenting SESSION_SECRET is not enough on its own:
   // read at request time, its absence is a 500 per request rather than a

@@ -1,11 +1,21 @@
 import { createServer, type Server } from "node:http";
 import { pathToFileURL } from "node:url";
 
-import { loadEnvironmentConfig, publicEnvironmentSummary } from "@signal-audit/config";
-import { checkDatabaseConnection } from "@signal-audit/db";
+import { createOpenAiAdapter } from "@signal-audit/ai";
+import {
+  loadEnvironmentConfig,
+  loadWorkerProcessingConfig,
+  publicEnvironmentSummary
+} from "@signal-audit/config";
+import {
+  checkDatabaseConnection,
+  closeDatabasePools,
+  getInferenceKillSwitchStatus
+} from "@signal-audit/db";
 import { DOMAIN_LAYER_NAME } from "@signal-audit/domain";
 import { checkStorageConnection } from "@signal-audit/ingestion";
 import { describeError, logStructured } from "@signal-audit/security";
+import { runEvidenceExtractionWorker } from "./extraction.ts";
 import { captureWorkerError } from "./observability.ts";
 
 export {
@@ -13,6 +23,12 @@ export {
   executeBudgetedInference
 } from "./inference.ts";
 export type { BudgetedInferenceInput } from "./inference.ts";
+export {
+  processEvidenceExtractionJob,
+  processNextEvidenceExtractionJob,
+  runEvidenceExtractionWorker
+} from "./extraction.ts";
+export type { EvidenceExtractionWorkerDependencies } from "./extraction.ts";
 
 export function startWorker(): string {
   const message = `Signal Audit worker ready; dependency center=${DOMAIN_LAYER_NAME}`;
@@ -72,20 +88,89 @@ export function createWorkerHealthServer(
 
 const entryPath = process.argv[1];
 
-if (entryPath !== undefined && import.meta.url === pathToFileURL(entryPath).href) {
-  try {
-    startWorker();
-    const config = loadEnvironmentConfig(process.env);
-    const server = createWorkerHealthServer();
-    server.once("error", (error) => {
-      captureWorkerError(error, "worker.startup");
-      process.exitCode = 1;
-    });
-    server.listen(config.ports.worker, "0.0.0.0", () => {
-      logStructured("info", "worker.health_listening");
-    });
-  } catch (error) {
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error === undefined ? resolve() : reject(error)));
+  });
+}
+
+async function main(): Promise<void> {
+  startWorker();
+  const environment = loadEnvironmentConfig(process.env);
+  const processing = loadWorkerProcessingConfig(process.env);
+  const server = createWorkerHealthServer();
+  const abortController = new AbortController();
+
+  server.once("error", (error) => {
     captureWorkerError(error, "worker.startup");
     process.exitCode = 1;
+    abortController.abort();
+  });
+  server.listen(environment.ports.worker, "0.0.0.0", () => {
+    logStructured("info", "worker.health_listening");
+  });
+
+  let processingLoop: Promise<void> | undefined;
+  if (processing.enabled) {
+    if (processing.workerId === undefined || processing.openAi === undefined || processing.budget === undefined) {
+      throw new Error("Enabled worker processing configuration was not fully validated");
+    }
+    const openAi = processing.openAi;
+    const adapters = new Map<string, ReturnType<typeof createOpenAiAdapter>>();
+    processingLoop = runEvidenceExtractionWorker(
+      {
+        databaseUrl: environment.database.url,
+        schema: environment.database.schema,
+        config: {
+          ...processing,
+          enabled: true,
+          workerId: processing.workerId,
+          openAi: processing.openAi,
+          budget: processing.budget
+        },
+        adapterForModel(model) {
+          const existing = adapters.get(model);
+          if (existing !== undefined) return existing;
+          const created = createOpenAiAdapter({
+            apiKey: openAi.apiKey,
+            model,
+            checkKillSwitch: () =>
+              getInferenceKillSwitchStatus(environment.database.url, environment.database.schema)
+          });
+          adapters.set(model, created);
+          return created;
+        }
+      },
+      abortController.signal
+    ).catch((error: unknown) => {
+      captureWorkerError(error, "worker.job");
+      process.exitCode = 1;
+      abortController.abort();
+    });
+    logStructured("info", "worker.processing_started");
+  } else {
+    logStructured("info", "worker.processing_disabled");
   }
+
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      abortController.abort();
+      resolve();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+    abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+  await Promise.allSettled([
+    processingLoop ?? Promise.resolve(),
+    closeServer(server),
+    closeDatabasePools()
+  ]);
+}
+
+if (entryPath !== undefined && import.meta.url === pathToFileURL(entryPath).href) {
+  void main().catch((error: unknown) => {
+    captureWorkerError(error, "worker.startup");
+    process.exitCode = 1;
+  });
 }

@@ -3,6 +3,7 @@ import {
   reserveInferenceBudget,
   settleInferenceReservation
 } from "@signal-audit/db";
+import { InferenceKillSwitchEngagedError } from "@signal-audit/ai";
 import {
   checkInferenceBudget,
   type AiAdapter,
@@ -131,6 +132,20 @@ export async function executeBudgetedInference(
   try {
     result = await adapter.runStructuredCall(input.call);
   } catch (error) {
+    // The real adapter checks the kill switch immediately before touching the
+    // provider. A reservation necessarily exists by then, so release it as a
+    // zero-token settlement; otherwise every paused poll would accumulate an
+    // estimated reservation and eventually turn an operator pause into a
+    // false budget cap without a single provider call.
+    if (error instanceof InferenceKillSwitchEngagedError) {
+      await settleInferenceReservation(databaseUrl, schema, {
+        reservationId: reservation.reservationId,
+        actualInputTokens: 0,
+        actualOutputTokens: 0
+      });
+      await publishCommittedBudgetState(databaseUrl, schema, input);
+      throw error;
+    }
     // A structured-output parse failure is still a billed provider call. The
     // AI adapter deliberately carries provider-reported usage on that error,
     // so settle it before preserving the original failure for retry policy.

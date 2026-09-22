@@ -14,6 +14,8 @@ import type {
   CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRunRef,
+  EvidenceExtractionJob,
+  EvidenceExtractionQueueMonitoringSnapshot,
   EvidenceOutcome,
   FailedDocumentRate,
   FileIntake,
@@ -644,16 +646,17 @@ export interface RecordEvidenceExtractionRunInput {
 export async function recordEvidenceExtractionRun(
   databaseUrl: string,
   schema: string,
-  input: RecordEvidenceExtractionRunInput
-): Promise<void> {
+  input: RecordEvidenceExtractionRunInput,
+  existingClient?: DatabaseQueryable
+): Promise<string> {
   assertSafeSchema(schema);
-  const client = await acquireConnection(databaseUrl);
-  try {
-    await client.query(
+  const insert = async (client: DatabaseQueryable): Promise<string> => {
+    const result = await client.query<{ run_id: string }>(
       `INSERT INTO "${schema}".evidence_extraction_runs
          (organization_id, entity_type, entity_id, provider, model, prompt_version,
           extraction_schema_version, extraction_schema_name, rubric_version)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING run_id`,
       [
         input.organizationId,
         input.entityType,
@@ -666,6 +669,18 @@ export async function recordEvidenceExtractionRun(
         input.rubricVersion
       ]
     );
+    const runId = result.rows[0]?.run_id;
+    if (runId === undefined) {
+      throw new Error("evidence extraction run insert returned no row");
+    }
+    return runId;
+  };
+  if (existingClient !== undefined) {
+    return insert(existingClient);
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    return await insert(client);
   } finally {
     client.release();
   }
@@ -798,6 +813,30 @@ export interface SetInferenceKillSwitchInput {
     readonly actorUserId: string;
     readonly requestId: string;
   };
+}
+
+/** Fail closed when the singleton control row is absent. */
+export async function getInferenceKillSwitchStatus(
+  databaseUrl: string,
+  schema: string
+): Promise<{ readonly engaged: boolean; readonly reason?: string }> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ engaged: boolean; reason: string | null }>(
+      `SELECT engaged, reason FROM "${schema}".inference_kill_switch WHERE id = true`
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("inference_kill_switch has no row; refusing to assume inference is allowed");
+    }
+    return {
+      engaged: row.engaged,
+      ...(row.reason === null ? {} : { reason: row.reason })
+    };
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -1607,6 +1646,148 @@ export async function getRubricForRole(
          FROM "${schema}".rubrics
         WHERE role_id = $1
         ORDER BY (status = 'draft') DESC, version DESC
+        LIMIT 1`,
+      [roleId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToRubric(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionQueueProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly roleId: string;
+  readonly applicationId: string;
+  readonly sourceIntakeId: string;
+  readonly rubricId: string;
+}
+
+/** A fully valid synthetic application/document/rubric chain for worker tests. */
+export async function provisionEvidenceExtractionQueueProbeSchema(
+  databaseUrl: string
+): Promise<EvidenceExtractionQueueProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `extraction_queue_probe_${suffix}`;
+  const organizationId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0007_inference_usage_ledger.sql",
+      "0008_inference_kill_switch.sql",
+      "0009_inference_kill_switch_nonblank_reason.sql",
+      "0009_roles.sql",
+      "0010_kill_switch_reason_non_whitespace.sql",
+      "0011_rubrics.sql",
+      "0012_immutable_published_rubrics.sql",
+      "0013_file_intakes.sql",
+      "0014_file_intake_validation.sql",
+      "0015_canonical_text_extractions.sql",
+      "0016_applications_and_import_finalization.sql",
+      "0017_evidence_outcomes.sql",
+      "0023_evidence_extraction_jobs.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'AF-102 Synthetic Queue Probe')`, [
+      organizationId
+    ]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'AF-102 Probe') RETURNING user_id`,
+      [`af102_${suffix}@example.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) throw new Error("queue probe did not create a user");
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Synthetic Engineer', $2)
+       RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    if (roleId === undefined) throw new Error("queue probe did not create a role");
+    const criteria = Array.from({ length: 5 }, (_, index) => ({
+      criterionId: `criterion_${index + 1}`,
+      description: `Synthetic criterion ${index + 1}`,
+      evidenceGuidance: `Find explicit evidence for criterion ${index + 1}`
+    }));
+    const rubric = await admin.query<{ rubric_id: string }>(
+      `INSERT INTO rubrics
+         (role_id, version, status, criteria, approved_by_user_id, approved_at)
+       VALUES ($1, 1, 'published', $2::jsonb, $3, clock_timestamp())
+       RETURNING rubric_id`,
+      [roleId, JSON.stringify(criteria), userId]
+    );
+    const rubricId = rubric.rows[0]?.rubric_id;
+    const csvIntake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status,
+          created_by_user_id, sniffed_mime_type, size_bytes, sha256_hash)
+       VALUES ($1, $2, $3, 'applications.csv', 'text/csv', 'imported', $4, 'text/csv', 128, $5)
+       RETURNING intake_id`,
+      [organizationId, roleId, `probe/${suffix}/applications.csv`, userId, "a".repeat(64)]
+    );
+    const csvIntakeId = csvIntake.rows[0]?.intake_id;
+    if (csvIntakeId === undefined || rubricId === undefined) {
+      throw new Error("queue probe did not create rubric and CSV intake");
+    }
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications
+         (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Synthetic Candidate', 'candidate@example.test')
+       RETURNING application_id`,
+      [organizationId, roleId, csvIntakeId]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    const source = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status,
+          created_by_user_id, sniffed_mime_type, size_bytes, sha256_hash)
+       VALUES ($1, $2, $3, 'synthetic.pdf', 'application/pdf', 'validated', $4,
+               'application/pdf', 256, $5)
+       RETURNING intake_id`,
+      [organizationId, roleId, `probe/${suffix}/synthetic.pdf`, userId, "b".repeat(64)]
+    );
+    const sourceIntakeId = source.rows[0]?.intake_id;
+    if (applicationId === undefined || sourceIntakeId === undefined) {
+      throw new Error("queue probe did not create application and source intake");
+    }
+    const text = "Built and operated PostgreSQL services with TypeScript and reliable queue workers.";
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, $2::jsonb, 1, 'full')`,
+      [sourceIntakeId, JSON.stringify([{ pageNumber: 1, text, characterCount: text.length }])]
+    );
+    return { schema, organizationId, userId, roleId, applicationId, sourceIntakeId, rubricId };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/** The immutable published rubric version used by hosted extraction. */
+export async function getLatestPublishedRubricForRole(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Rubric | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<RubricRow>(
+      `SELECT ${RUBRIC_COLUMNS}
+         FROM "${schema}".rubrics
+        WHERE role_id = $1 AND status = 'published'
+        ORDER BY version DESC
         LIMIT 1`,
       [roleId]
     );
@@ -4172,11 +4353,11 @@ export interface RecordedEvidenceOutcome {
 export async function recordEvidenceOutcome(
   databaseUrl: string,
   schema: string,
-  input: RecordEvidenceOutcomeInput
+  input: RecordEvidenceOutcomeInput,
+  existingClient?: DatabaseQueryable
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = await acquireConnection(databaseUrl);
-  try {
+  const insert = async (client: DatabaseQueryable): Promise<void> => {
     await client.query(
       `INSERT INTO "${schema}".evidence_outcomes
          (organization_id, application_id, criterion_id, kind, outcome, run_id)
@@ -4190,6 +4371,14 @@ export async function recordEvidenceOutcome(
         input.runId ?? null
       ]
     );
+  };
+  if (existingClient !== undefined) {
+    await insert(existingClient);
+    return;
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await insert(client);
   } finally {
     client.release();
   }
@@ -5470,6 +5659,578 @@ export async function listCandidateDecisionsForApplication(
       ...(row.supersedes_decision_id === null ? {} : { supersedesDecisionId: row.supersedes_decision_id }),
       decidedAt: row.decided_at.toISOString()
     }));
+  } finally {
+    client.release();
+  }
+}
+
+// ---- AF-102: durable evidence-extraction jobs ----
+
+interface EvidenceExtractionJobRow {
+  readonly job_id: string;
+  readonly organization_id: string;
+  readonly role_id: string;
+  readonly application_id: string;
+  readonly source_intake_id: string;
+  readonly rubric_id: string;
+  readonly workflow_version: string;
+  readonly state: EvidenceExtractionJob["state"];
+  readonly enqueued_at: Date;
+  readonly available_at: Date;
+  readonly started_at: Date | null;
+  readonly completed_at: Date | null;
+  readonly failed_at: Date | null;
+  readonly attempt_count: number;
+  readonly max_attempts: number;
+  readonly lease_owner: string | null;
+  readonly lease_expires_at: Date | null;
+  readonly failure_code: string | null;
+  readonly updated_at: Date;
+}
+
+const EVIDENCE_EXTRACTION_JOB_COLUMNS =
+  "job_id, organization_id, role_id, application_id, source_intake_id, rubric_id, workflow_version, " +
+  "state, enqueued_at, available_at, started_at, completed_at, failed_at, attempt_count, max_attempts, " +
+  "lease_owner, lease_expires_at, failure_code, updated_at";
+
+function rowToEvidenceExtractionJob(row: EvidenceExtractionJobRow): EvidenceExtractionJob {
+  return {
+    jobId: row.job_id,
+    organizationId: row.organization_id,
+    roleId: row.role_id,
+    applicationId: row.application_id,
+    sourceIntakeId: row.source_intake_id,
+    rubricId: row.rubric_id,
+    workflowVersion: row.workflow_version,
+    state: row.state,
+    enqueuedAt: row.enqueued_at.toISOString(),
+    availableAt: row.available_at.toISOString(),
+    ...(row.started_at === null ? {} : { startedAt: row.started_at.toISOString() }),
+    ...(row.completed_at === null ? {} : { completedAt: row.completed_at.toISOString() }),
+    ...(row.failed_at === null ? {} : { failedAt: row.failed_at.toISOString() }),
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    ...(row.lease_owner === null ? {} : { leaseOwner: row.lease_owner }),
+    ...(row.lease_expires_at === null ? {} : { leaseExpiresAt: row.lease_expires_at.toISOString() }),
+    ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+function assertWorkerId(workerId: string): void {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(workerId)) {
+    throw new Error("workerId must contain only safe machine-identity characters");
+  }
+}
+
+function assertFailureCode(failureCode: string): void {
+  if (!/^[a-z][a-z0-9_]{0,63}$/u.test(failureCode)) {
+    throw new Error("failureCode must be a bounded machine-readable code");
+  }
+}
+
+export interface EnqueueEvidenceExtractionJobInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly applicationId: string;
+  readonly sourceIntakeId: string;
+  readonly rubricId: string;
+  readonly workflowVersion: string;
+  readonly maxAttempts: number;
+}
+
+export type EnqueueEvidenceExtractionJobOutcome =
+  | { readonly outcome: "enqueued" | "replayed"; readonly job: EvidenceExtractionJob }
+  | { readonly outcome: "not_eligible" };
+
+/**
+ * One production enqueue boundary. The INSERT ... SELECT proves, in the same
+ * statement, that application, canonical document and published rubric all
+ * belong to the same tenant and role.
+ */
+export async function enqueueEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: EnqueueEvidenceExtractionJobInput
+): Promise<EnqueueEvidenceExtractionJobOutcome> {
+  assertSafeSchema(schema);
+  if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
+    throw new Error("maxAttempts must be a positive integer");
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const inserted = await client.query<EvidenceExtractionJobRow>(
+      `INSERT INTO "${schema}".evidence_extraction_jobs
+         (organization_id, role_id, application_id, source_intake_id, rubric_id, workflow_version, max_attempts)
+       SELECT $1, $2, $3, $4, $5, $6, $7
+         FROM "${schema}".applications a
+         JOIN "${schema}".file_intakes f
+           ON f.intake_id = $4 AND f.organization_id = a.organization_id AND f.role_id = a.role_id
+         JOIN "${schema}".canonical_text_extractions c ON c.intake_id = f.intake_id
+         JOIN "${schema}".rubrics r
+           ON r.rubric_id = $5 AND r.role_id = a.role_id AND r.status = 'published'
+        WHERE a.application_id = $3 AND a.organization_id = $1 AND a.role_id = $2
+          AND f.status = 'validated'
+          AND f.sniffed_mime_type IN ('application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+       ON CONFLICT (application_id, source_intake_id, rubric_id, workflow_version) DO NOTHING
+       RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+      [
+        input.organizationId,
+        input.roleId,
+        input.applicationId,
+        input.sourceIntakeId,
+        input.rubricId,
+        input.workflowVersion,
+        input.maxAttempts
+      ]
+    );
+    const created = inserted.rows[0];
+    if (created !== undefined) {
+      return { outcome: "enqueued", job: rowToEvidenceExtractionJob(created) };
+    }
+    const existing = await client.query<EvidenceExtractionJobRow>(
+      `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+         FROM "${schema}".evidence_extraction_jobs
+        WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
+          AND rubric_id = $4 AND workflow_version = $5`,
+      [input.organizationId, input.applicationId, input.sourceIntakeId, input.rubricId, input.workflowVersion]
+    );
+    const row = existing.rows[0];
+    return row === undefined ? { outcome: "not_eligible" } : { outcome: "replayed", job: rowToEvidenceExtractionJob(row) };
+  } finally {
+    client.release();
+  }
+}
+
+export async function getEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  jobId: string
+): Promise<EvidenceExtractionJob | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<EvidenceExtractionJobRow>(
+      `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+         FROM "${schema}".evidence_extraction_jobs
+        WHERE organization_id = $1 AND job_id = $2`,
+      [organizationId, jobId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : rowToEvidenceExtractionJob(row);
+  } finally {
+    client.release();
+  }
+}
+
+export interface ClaimEvidenceExtractionJobInput {
+  readonly workerId: string;
+  readonly leaseDurationMs: number;
+  readonly now?: Date;
+}
+
+export async function claimEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: ClaimEvidenceExtractionJobInput
+): Promise<EvidenceExtractionJob | undefined> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  if (!Number.isInteger(input.leaseDurationMs) || input.leaseDurationMs < 1) {
+    throw new Error("leaseDurationMs must be a positive integer");
+  }
+  const now = input.now ?? new Date();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = 'failed', failed_at = $1, lease_owner = NULL, lease_expires_at = NULL,
+                failure_code = 'lease_expired_exhausted', updated_at = $1
+          WHERE state = 'running' AND lease_expires_at <= $1 AND attempt_count >= max_attempts`,
+        [now]
+      );
+      const result = await client.query<EvidenceExtractionJobRow>(
+        `WITH candidate AS (
+           SELECT job_id
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE (
+              (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+            )
+              AND attempt_count < max_attempts
+            ORDER BY enqueued_at, job_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+         )
+         UPDATE "${schema}".evidence_extraction_jobs j
+            SET state = 'running',
+                started_at = COALESCE(j.started_at, $1),
+                attempt_count = j.attempt_count + 1,
+                lease_owner = $2,
+                lease_expires_at = $1 + ($3::bigint * interval '1 millisecond'),
+                updated_at = $1
+           FROM candidate
+          WHERE j.job_id = candidate.job_id
+         RETURNING j.${EVIDENCE_EXTRACTION_JOB_COLUMNS.split(", ").join(", j.")}`,
+        [now, input.workerId, input.leaseDurationMs]
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0];
+      return row === undefined ? undefined : rowToEvidenceExtractionJob(row);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionJobContext {
+  readonly job: EvidenceExtractionJob;
+  readonly pages: readonly CanonicalTextPage[];
+  readonly quality: CanonicalTextQuality;
+  readonly rubricVersion: number;
+  readonly criteria: readonly RubricCriterion[];
+}
+
+export async function getEvidenceExtractionJobContext(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  jobId: string
+): Promise<EvidenceExtractionJobContext | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<EvidenceExtractionJobRow & {
+      pages: readonly CanonicalTextPage[];
+      quality: CanonicalTextQuality;
+      rubric_version: number;
+      criteria: readonly RubricCriterion[];
+    }>(
+      `SELECT j.${EVIDENCE_EXTRACTION_JOB_COLUMNS.split(", ").join(", j.")},
+              c.pages, c.quality, r.version AS rubric_version, r.criteria
+         FROM "${schema}".evidence_extraction_jobs j
+         JOIN "${schema}".canonical_text_extractions c ON c.intake_id = j.source_intake_id
+         JOIN "${schema}".rubrics r ON r.rubric_id = j.rubric_id AND r.status = 'published'
+        WHERE j.organization_id = $1 AND j.job_id = $2`,
+      [organizationId, jobId]
+    );
+    const row = result.rows[0];
+    return row === undefined
+      ? undefined
+      : {
+          job: rowToEvidenceExtractionJob(row),
+          pages: row.pages,
+          quality: row.quality,
+          rubricVersion: row.rubric_version,
+          criteria: row.criteria
+        };
+  } finally {
+    client.release();
+  }
+}
+
+export async function renewEvidenceExtractionJobLease(
+  databaseUrl: string,
+  schema: string,
+  input: { readonly organizationId: string; readonly jobId: string; readonly workerId: string; readonly leaseDurationMs: number; readonly now?: Date }
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  const now = input.now ?? new Date();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query(
+      `UPDATE "${schema}".evidence_extraction_jobs
+          SET lease_expires_at = $4 + ($5::bigint * interval '1 millisecond'), updated_at = $4
+        WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+          AND lease_expires_at > $4`,
+      [input.organizationId, input.jobId, input.workerId, now, input.leaseDurationMs]
+    );
+    return result.rowCount === 1;
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionRunMetadata {
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly extractionSchemaVersion: string;
+  readonly extractionSchemaName: string;
+  readonly rubricVersion: string;
+}
+
+async function lockOwnedJob(
+  client: ClientBase,
+  schema: string,
+  organizationId: string,
+  jobId: string,
+  workerId: string,
+  now: Date
+): Promise<EvidenceExtractionJobRow | undefined> {
+  const result = await client.query<EvidenceExtractionJobRow>(
+    `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+       FROM "${schema}".evidence_extraction_jobs
+      WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+        AND lease_expires_at > $4
+      FOR UPDATE`,
+    [organizationId, jobId, workerId, now]
+  );
+  return result.rows[0];
+}
+
+export async function completeEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly outcomes: readonly EvidenceOutcome[];
+    readonly run?: EvidenceExtractionRunMetadata;
+    readonly now?: Date;
+  }
+): Promise<"completed" | "lease_lost"> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  const now = input.now ?? new Date();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      const job = await lockOwnedJob(client, schema, input.organizationId, input.jobId, input.workerId, now);
+      if (job === undefined) {
+        await client.query("ROLLBACK");
+        return "lease_lost";
+      }
+      const runId = input.run === undefined
+        ? undefined
+        : await recordEvidenceExtractionRun(databaseUrl, schema, {
+            organizationId: input.organizationId,
+            entityType: "application",
+            entityId: job.application_id,
+            provider: input.run.provider,
+            model: input.run.model,
+            promptVersion: input.run.promptVersion,
+            extractionSchemaVersion: input.run.extractionSchemaVersion,
+            extractionSchemaName: input.run.extractionSchemaName,
+            rubricVersion: input.run.rubricVersion
+          }, client);
+      for (const outcome of input.outcomes) {
+        await recordEvidenceOutcome(databaseUrl, schema, {
+          organizationId: input.organizationId,
+          applicationId: job.application_id,
+          outcome,
+          ...(runId === undefined ? {} : { runId })
+        }, client);
+      }
+      await client.query(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = 'completed', completed_at = $2, failed_at = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = $2
+          WHERE job_id = $1`,
+        [input.jobId, now]
+      );
+      await client.query("COMMIT");
+      return "completed";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export async function retryOrFailEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly failureCode: string;
+    readonly retryable: boolean;
+    readonly availableAt: Date;
+    readonly run?: EvidenceExtractionRunMetadata;
+    readonly terminalOutcomes?: readonly EvidenceOutcome[];
+    readonly now?: Date;
+  }
+): Promise<"retrying" | "failed" | "lease_lost"> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertFailureCode(input.failureCode);
+  const now = input.now ?? new Date();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      const job = await lockOwnedJob(client, schema, input.organizationId, input.jobId, input.workerId, now);
+      if (job === undefined) {
+        await client.query("ROLLBACK");
+        return "lease_lost";
+      }
+      const runId = input.run === undefined
+        ? undefined
+        : await recordEvidenceExtractionRun(databaseUrl, schema, {
+          organizationId: input.organizationId,
+          entityType: "application",
+          entityId: job.application_id,
+          provider: input.run.provider,
+          model: input.run.model,
+          promptVersion: input.run.promptVersion,
+          extractionSchemaVersion: input.run.extractionSchemaVersion,
+          extractionSchemaName: input.run.extractionSchemaName,
+          rubricVersion: input.run.rubricVersion
+        }, client);
+      const retry = input.retryable && job.attempt_count < job.max_attempts;
+      if (!retry) {
+        for (const outcome of input.terminalOutcomes ?? []) {
+          await recordEvidenceOutcome(databaseUrl, schema, {
+            organizationId: input.organizationId,
+            applicationId: job.application_id,
+            outcome,
+            ...(runId === undefined ? {} : { runId })
+          }, client);
+        }
+      }
+      await client.query(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = $2::text,
+                available_at = CASE WHEN $2::text = 'ready' THEN $3::timestamptz ELSE available_at END,
+                failed_at = CASE WHEN $2::text = 'failed' THEN $4::timestamptz ELSE NULL::timestamptz END,
+                lease_owner = NULL, lease_expires_at = NULL,
+                failure_code = $5, updated_at = $4
+          WHERE job_id = $1`,
+        [input.jobId, retry ? "ready" : "failed", input.availableAt, now, input.failureCode]
+      );
+      await client.query("COMMIT");
+      return retry ? "retrying" : "failed";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** Operator controls (kill switch/budget cap) defer without consuming retries. */
+export async function deferEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly failureCode: string;
+    readonly availableAt: Date;
+    readonly now?: Date;
+  }
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertFailureCode(input.failureCode);
+  const now = input.now ?? new Date();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query(
+      `UPDATE "${schema}".evidence_extraction_jobs
+          SET state = 'ready', available_at = $5, attempt_count = GREATEST(0, attempt_count - 1),
+              lease_owner = NULL, lease_expires_at = NULL, failure_code = $4, updated_at = $6
+        WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+          AND lease_expires_at > $6`,
+      [input.organizationId, input.jobId, input.workerId, input.failureCode, input.availableAt, now]
+    );
+    return result.rowCount === 1;
+  } finally {
+    client.release();
+  }
+}
+
+export async function recordWorkerHeartbeat(
+  databaseUrl: string,
+  schema: string,
+  workerId: string,
+  now: Date = new Date()
+): Promise<void> {
+  assertSafeSchema(schema);
+  assertWorkerId(workerId);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `INSERT INTO "${schema}".worker_heartbeats (worker_id, last_seen_at)
+       VALUES ($1, $2)
+       ON CONFLICT (worker_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+      [workerId, now]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getEvidenceExtractionQueueMonitoringSnapshot(
+  databaseUrl: string,
+  schema: string,
+  now: Date = new Date()
+): Promise<EvidenceExtractionQueueMonitoringSnapshot> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      oldest_ready_at: Date | null;
+      ready_jobs: string;
+      running_jobs: string;
+      failed_jobs: string;
+      completed_jobs: string;
+      total_attempts: string;
+      last_heartbeat_at: Date | null;
+    }>(
+      `SELECT
+         MIN(enqueued_at) FILTER (
+           WHERE (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+         ) AS oldest_ready_at,
+         COUNT(*) FILTER (
+           WHERE (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+         )::text AS ready_jobs,
+         COUNT(*) FILTER (WHERE state = 'running' AND lease_expires_at > $1)::text AS running_jobs,
+         COUNT(*) FILTER (WHERE state = 'failed')::text AS failed_jobs,
+         COUNT(*) FILTER (WHERE state = 'completed')::text AS completed_jobs,
+         COALESCE(SUM(attempt_count), 0)::text AS total_attempts,
+         (SELECT MAX(last_seen_at) FROM "${schema}".worker_heartbeats) AS last_heartbeat_at
+       FROM "${schema}".evidence_extraction_jobs`,
+      [now]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("queue monitoring query returned no row");
+    }
+    const oldestReadyAgeMs = row.oldest_ready_at === null
+      ? null
+      : Math.max(0, now.getTime() - row.oldest_ready_at.getTime());
+    const heartbeatAgeMs = row.last_heartbeat_at === null
+      ? null
+      : Math.max(0, now.getTime() - row.last_heartbeat_at.getTime());
+    return {
+      observedAt: now.toISOString(),
+      oldestReadyAgeMs,
+      readyJobs: Number(row.ready_jobs),
+      runningJobs: Number(row.running_jobs),
+      failedJobs: Number(row.failed_jobs),
+      completedJobs: Number(row.completed_jobs),
+      totalAttempts: Number(row.total_attempts),
+      lastHeartbeatAt: row.last_heartbeat_at?.toISOString() ?? null,
+      heartbeatAgeMs
+    };
   } finally {
     client.release();
   }

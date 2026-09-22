@@ -57,6 +57,12 @@ import type {
   User
 } from "@signal-audit/domain";
 
+/**
+ * Bump whenever the hosted extraction prompt/schema orchestration changes in
+ * a way that should create new logical work for an application.
+ */
+export const EVIDENCE_EXTRACTION_WORKFLOW_VERSION = "1.0.0";
+
 /** Placeholder boundary shape; a later ticket beyond AF-13 owns wiring this
  * into a real adapter boundary. The versioned runtime contracts themselves
  * (evidenceOutcomeSchema and friends, below) are AF-13's actual deliverable
@@ -1033,3 +1039,11 @@ export const recordCandidateDecisionInputSchema = z.strictObject({
   decision: z.enum(CANDIDATE_DECISION_KINDS),
   rationale: correctionReasonSchema
 });
+
+// ---- AF-102: hosted evidence-extraction enqueue contract ----
+
+export const enqueueEvidenceExtractionInputSchema = z.strictObject({
+  sourceIntakeId: z.uuid()
+});
+
+export type EnqueueEvidenceExtractionInput = z.infer<typeof enqueueEvidenceExtractionInputSchema>;

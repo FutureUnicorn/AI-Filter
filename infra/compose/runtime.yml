@@ -18,6 +18,7 @@ x-runtime-environment: &runtime-environment
   MAGIC_LINK_EMAIL_API_KEY: ${MAGIC_LINK_EMAIL_API_KEY:-}
   MAGIC_LINK_EMAIL_FROM: ${MAGIC_LINK_EMAIL_FROM:-}
   SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
+  WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
 
 services:
   postgres:
@@ -172,6 +173,20 @@ services:
     environment:
       <<: *runtime-environment
       SENTRY_DSN: ${SENTRY_WORKER_DSN:-}
+      WORKER_PROCESSING_ENABLED: ${WORKER_PROCESSING_ENABLED:-false}
+      WORKER_INSTANCE_ID: ${WORKER_INSTANCE_ID:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-10000}
+      WORKER_LEASE_DURATION_MS: ${WORKER_LEASE_DURATION_MS:-60000}
+      WORKER_RETRY_BASE_DELAY_MS: ${WORKER_RETRY_BASE_DELAY_MS:-5000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_ESCALATION_MODEL: ${OPENAI_ESCALATION_MODEL:-}
+      INFERENCE_MAX_TOKENS_PER_PERIOD: ${INFERENCE_MAX_TOKENS_PER_PERIOD:-}
+      INFERENCE_ALERT_THRESHOLD_RATIO: ${INFERENCE_ALERT_THRESHOLD_RATIO:-}
+      INFERENCE_BUDGET_PERIOD: ${INFERENCE_BUDGET_PERIOD:-}
+      INFERENCE_ESTIMATED_OUTPUT_TOKENS: ${INFERENCE_ESTIMATED_OUTPUT_TOKENS:-2000}
     healthcheck:
       test:
         [
@@ -183,7 +198,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    networks: [private]
+    # No host port is published, but provider execution requires outbound access.
+    networks: [public, private]
     mem_limit: ${WORKER_MEMORY_LIMIT:-384m}
     cpus: ${WORKER_CPU_LIMIT:-0.50}
     security_opt: ["no-new-privileges:true"]
