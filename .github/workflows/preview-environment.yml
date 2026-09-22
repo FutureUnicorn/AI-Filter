@@ -70,26 +70,6 @@ jobs:
       name: preview/pr-${{ github.event.workflow_run.pull_requests[0].number }}
       url: https://pr-${{ github.event.workflow_run.pull_requests[0].number }}.${{ vars.PREVIEW_BASE_DOMAIN }}
     steps:
-      # AF-93 PR #85 review (Copilot), high severity: cli.mjs previously ran
-      # from the same, untrusted checkout it was building -- so a PR could
-      # modify cli.mjs itself to read PREVIEW_STATE_DIRECTORY and exfiltrate
-      # every OTHER preview's credentials, or run arbitrary commands as the
-      # runner user. Orchestration now runs from THIS checkout (trusted,
-      # default-branch code); the untrusted PR's own revision is checked out
-      # below into pr-source and used ONLY as the Docker build context, never
-      # executed directly.
-      - name: Check out trusted orchestration code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-          clean: false
-      - name: Check out the exact revision that passed CI (build context only)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          path: pr-source
-          persist-credentials: false
       # AF-93 PR #85 review (Copilot): the deploy `if:` above only sees
       # workflow_run's pull_requests[0].base.ref, a snapshot from when CI was
       # TRIGGERED. If the PR is retargeted away from develop/main while that
@@ -103,8 +83,19 @@ jobs:
       # `jq`. Every other step in this repository's workflows runs on
       # ubuntu-latest, where jq is preinstalled; this step runs on the
       # self-hosted signal-audit-preview label, where jq is whatever the host
-      # happens to have. node is already a hard requirement two steps below
-      # (it runs cli.mjs), so it cannot be the thing that's missing.
+      # happens to have. node is already a hard requirement several steps
+      # below (it runs cli.mjs), so it cannot be the thing that's missing.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-009): this is now the FIRST step,
+      # ahead of both checkouts. It needs neither (a plain API call), and a
+      # PR that is closed or retargeted before this runs should not pay for
+      # checking out either revision, let alone place the untrusted tree on
+      # the runner, only to decline afterward. The job's `environment:` block
+      # above still registers a GitHub deployment the moment the job starts,
+      # before this step can run -- that part is a GitHub Actions constraint
+      # this step ordering cannot reach; closing it fully would need splitting
+      # this into a separate, environment-free "check" job upstream of a
+      # "deploy" job, which is a larger change than this fix's scope.
       - name: Check whether the source pull request is still open and in scope
         id: pr-state
         env:
@@ -118,6 +109,47 @@ jobs:
             console.log(`state=${pr.state}`);
             console.log(`base_ref=${pr.base.ref}`);
           ' "$response" >> "$GITHUB_OUTPUT"
+      - name: Report a declined deploy
+        if: >-
+          steps.pr-state.outputs.state != 'open' ||
+          (steps.pr-state.outputs.base_ref != 'develop' && steps.pr-state.outputs.base_ref != 'main')
+        run: |
+          {
+            echo "### Preview deploy declined"
+            echo "PR #${{ github.event.workflow_run.pull_requests[0].number }} is no longer open and in scope " \
+              "(current state: \`${{ steps.pr-state.outputs.state }}\`, current base: " \
+              "\`${{ steps.pr-state.outputs.base_ref }}\`). No preview was built or deployed."
+          } >> "$GITHUB_STEP_SUMMARY"
+      # AF-93 PR #85 review (Copilot), high severity: cli.mjs previously ran
+      # from the same, untrusted checkout it was building -- so a PR could
+      # modify cli.mjs itself to read PREVIEW_STATE_DIRECTORY and exfiltrate
+      # every OTHER preview's credentials, or run arbitrary commands as the
+      # runner user. Orchestration now runs from THIS checkout (trusted,
+      # default-branch code); the untrusted PR's own revision is checked out
+      # below into pr-source and used ONLY as the Docker build context, never
+      # executed directly.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-009): both checkouts below are
+      # now gated on the same live check pr-state performed above, so a
+      # declined PR does not have its tree checked out at all.
+      - name: Check out trusted orchestration code
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          clean: false
+      - name: Check out the exact revision that passed CI (build context only)
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: pr-source
+          persist-credentials: false
       # AF-93 PR #85 review (hemnaath04, REV-005). The trust split means what
       # actually gets built is decided by DEPLOY_SOURCE_DIRECTORY plus
       # whether infra/compose/runtime.yml (now always the DEFAULT BRANCH's

@@ -390,6 +390,46 @@ test("the untrusted build-context checkout is removed after every deploy attempt
   assert.match(deployJob, /if: always\(\)\s*\n\s+run: rm -rf pr-source/u);
 });
 
+/**
+ * AF-93 PR #85 review (hemnaath04, REV-009). Found only in the review's
+ * summary body, not delivered as an inline comment, but real: the live
+ * pr-state check used to run AFTER both checkouts, so a PR that was already
+ * closed or retargeted still paid for checking out both revisions -- and
+ * placed the untrusted PR tree on the runner -- before declining. pr-state
+ * needs neither checkout (a plain API call), so it now runs first, and both
+ * checkouts are gated on its result the same way the build-context
+ * verification and deploy steps already were. A declined run also writes to
+ * $GITHUB_STEP_SUMMARY, so the reason is visible without reading the `if:`.
+ *
+ * The job-level `environment:` block still registers a GitHub deployment
+ * the moment the job starts, before any step (including this one) can run
+ * -- reordering steps cannot reach that; closing it fully would need
+ * splitting this into a separate, environment-free check job ahead of a
+ * deploy job, out of scope for this fix and noted as such in the workflow.
+ */
+test("the live PR-state check runs before either checkout, and both checkouts are gated on it", () => {
+  const workflow = read(".github/workflows/preview-environment.yml");
+  const deployJob = extractJob(workflow, "deploy");
+
+  const prStateIndex = deployJob.indexOf("id: pr-state");
+  const firstCheckoutIndex = deployJob.indexOf("uses: actions/checkout");
+  assert.ok(prStateIndex >= 0 && firstCheckoutIndex >= 0, "expected both the pr-state step and a checkout step");
+  assert.ok(prStateIndex < firstCheckoutIndex, "the live PR-state check must run before any checkout");
+
+  const checkoutSteps = [...deployJob.matchAll(/- name: Check out[^\n]*\n([\s\S]*?)(?=\n {6}- name:|\n {4}\S|$)/gu)];
+  assert.equal(checkoutSteps.length, 2, "expected exactly two checkout steps in the deploy job");
+  for (const [, withBlock] of checkoutSteps) {
+    assert.match(
+      withBlock ?? "",
+      /steps\.pr-state\.outputs\.state == 'open'/u,
+      "every checkout must be gated on the same live check, not run unconditionally before it's known whether to deploy"
+    );
+  }
+
+  assert.match(deployJob, /name: Report a declined deploy/u);
+  assert.match(deployJob, /GITHUB_STEP_SUMMARY/u);
+});
+
 test("local Compose explicitly loads .env.local without affecting hosted commands", () => {
   const cli = read("scripts/environment/cli.mjs");
 
