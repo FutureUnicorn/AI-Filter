@@ -9,6 +9,7 @@ import { loadEnvironmentConfig } from "@signal-audit/config";
 import { getFileIntakeById, getMembershipsForUser, markFileIntakeUploaded } from "@signal-audit/db";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -27,7 +28,7 @@ interface RouteContext {
  * not roleId directly, since organizationId is what the intake was
  * actually created under (see AF-28's files/route.ts).
  */
-export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const idempotency = idempotencyErrorResponse(
     checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key")),
@@ -76,7 +77,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     }
     return Response.json(outcome.intake, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("file upload completion failed", error);
+    captureServerError(error, { requestId, operation: "file.upload.complete" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -85,3 +86,5 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("file.upload.complete", handlePOST);

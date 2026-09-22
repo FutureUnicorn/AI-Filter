@@ -17,6 +17,7 @@ x-runtime-environment: &runtime-environment
   MAGIC_LINK_EMAIL_ENDPOINT: ${MAGIC_LINK_EMAIL_ENDPOINT:-}
   MAGIC_LINK_EMAIL_API_KEY: ${MAGIC_LINK_EMAIL_API_KEY:-}
   MAGIC_LINK_EMAIL_FROM: ${MAGIC_LINK_EMAIL_FROM:-}
+  SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
 
 services:
   postgres:
@@ -138,6 +139,7 @@ services:
     environment:
       <<: *runtime-environment
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      SENTRY_DSN: ${SENTRY_WEB_DSN:-}
     ports:
       - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_HOST_PORT:-3000}:3000"
     healthcheck:
@@ -169,6 +171,7 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *runtime-environment
+      SENTRY_DSN: ${SENTRY_WORKER_DSN:-}
     healthcheck:
       test:
         [

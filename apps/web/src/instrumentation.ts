@@ -16,7 +16,7 @@
  * requiring it there would make the worker fail to boot over a secret it never
  * reads. This keeps the requirement where the requirement actually is.
  */
-export function register(): void {
+export async function register(): Promise<void> {
   const secret = process.env.SESSION_SECRET;
   if (secret === undefined || secret.length < 32) {
     throw new Error(
@@ -25,4 +25,17 @@ export function register(): void {
         "would boot and then fail every request. See .env.example."
     );
   }
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { initializeWebTelemetry } = await import("./lib/observability");
+    initializeWebTelemetry();
+  }
 }
+
+export const onRequestError: Instrumentation.onRequestError = async (error, _request, context) => {
+  if (process.env.NEXT_RUNTIME !== "nodejs") {
+    return;
+  }
+  const { captureServerError, operationForRoute } = await import("./lib/observability");
+  captureServerError(error, { operation: operationForRoute(context.routePath) });
+};
+import type { Instrumentation } from "next";

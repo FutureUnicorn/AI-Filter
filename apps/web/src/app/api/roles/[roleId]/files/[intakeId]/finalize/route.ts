@@ -23,6 +23,7 @@ import {
 } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -43,7 +44,7 @@ interface RouteContext {
  * success): rejecting 'imported' outright here would break replay for
  * exactly the case idempotency keys exist to handle.
  */
-export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const requirement = checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key"));
   const idempotencyError = idempotencyErrorResponse(requirement, requestId);
@@ -210,8 +211,10 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       { status: outcome.outcome === "finalized" ? 201 : 200, headers: withRequestId(undefined, requestId) }
     );
   } catch (error) {
-    console.error("csv import finalization failed", error);
+    captureServerError(error, { requestId, operation: "csv.finalize" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not finalize the import." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("csv.finalize", handlePOST);

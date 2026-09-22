@@ -112,6 +112,16 @@ export interface MagicLinkEmailDelivery {
   readonly from: string;
 }
 
+class MagicLinkDeliveryError extends Error {
+  readonly code: string;
+
+  constructor(statusCode: number) {
+    super("Magic-link email delivery failed");
+    this.name = "MagicLinkDeliveryError";
+    this.code = `email_provider_http_${statusCode}`;
+  }
+}
+
 /**
  * `appEnv` has no default ON PURPOSE. It used to default to
  * "development", so the one production call site --
@@ -213,7 +223,7 @@ export function createHttpMagicLinkEmailSender(
         // Deliberately does not include the response body: a provider
         // error payload can echo the recipient address back, and this
         // message reaches error logs.
-        throw new Error(`Magic-link email delivery failed with status ${response.status}`);
+        throw new MagicLinkDeliveryError(response.status);
       }
       // Same non-PII structured event the console path emits, so the
       // two adapters are indistinguishable in the retained log stream.
@@ -364,9 +374,11 @@ export const LOG_EVENT_NAMES = [
   // is how an operator sees the failure the caller is not told about.
   "magic_link.delivery_failed",
   "magic_link.queued",
+  "web.request_failed",
   "web.environment_health_failed",
   "worker.environment_health_failed",
   "worker.health_listening",
+  "worker.operation_failed",
   "worker.ready"
 ] as const;
 
@@ -721,6 +733,107 @@ export function verifySessionToken(
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+const SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  "AbortError",
+  "AggregateError",
+  "AiStructuredCallParseError",
+  "AiUsageUnavailableError",
+  "CredentialsProviderError",
+  "Error",
+  "EvalError",
+  "InferenceBudgetCappedError",
+  "InferenceKillSwitchEngagedError",
+  "MagicLinkDeliveryError",
+  "NonErrorThrown",
+  "ObjectChangedError",
+  "ObjectTooLargeError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "SystemError",
+  "TimeoutError",
+  "TypeError",
+  "URIError",
+  "UnknownError",
+  "ZodError"
+]);
+const SAFE_DIAGNOSTIC_CODES: ReadonlySet<string> = new Set([
+  "abort_err",
+  "eacces",
+  "eaddrinuse",
+  "eai_again",
+  "econnrefused",
+  "econnreset",
+  "ehostunreach",
+  "emfile",
+  "enfile",
+  "enospc",
+  "enotfound",
+  "epipe",
+  "etimedout",
+  "timeout"
+]);
+const SAFE_PROVIDER_HTTP_CODE = /^email_provider_http_[1-5][0-9]{2}$/u;
+
+export interface SafeErrorDiagnostic {
+  readonly errorName: string;
+  readonly errorCode: string;
+}
+
+function errorProperty(error: unknown, key: "name" | "code" | "status" | "statusCode" | "cause"): unknown {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return undefined;
+  }
+  try {
+    return (error as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeDiagnosticCode(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.toLowerCase();
+  return SAFE_DIAGNOSTIC_CODES.has(normalized) || SAFE_PROVIDER_HTTP_CODE.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function httpDiagnosticCode(error: unknown): string | undefined {
+  for (const key of ["statusCode", "status"] as const) {
+    const value = errorProperty(error, key);
+    if (typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599) {
+      return `http_${value}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extracts only bounded, code-like diagnostics. Error messages and stacks are
+ * deliberately never inspected here because they can contain request or
+ * candidate data. Unknown names/codes fail closed to stable generic values.
+ */
+export function describeError(error: unknown): SafeErrorDiagnostic {
+  const rawName = errorProperty(error, "name");
+  const errorName =
+    typeof rawName === "string" && SAFE_ERROR_NAMES.has(rawName)
+      ? rawName
+      : error instanceof Error
+        ? "UnknownError"
+        : "NonErrorThrown";
+  const cause = errorProperty(error, "cause");
+  const errorCode =
+    normalizeDiagnosticCode(errorProperty(error, "code")) ??
+    httpDiagnosticCode(error) ??
+    normalizeDiagnosticCode(errorProperty(cause, "code")) ??
+    httpDiagnosticCode(cause) ??
+    "unknown_error";
+  return { errorName, errorCode };
+}
+
 /**
  * Closed set of safe structured fields: IDs and metadata only.
  * Deliberately no field for a name, email, phone, address, or
@@ -736,6 +849,8 @@ export interface LogContext {
   readonly entityId?: string;
   /** HTTP status code when available; values outside 100..599 are dropped. */
   readonly statusCode?: number;
+  /** Closed, known error class name from describeError. */
+  readonly errorName?: string;
   readonly errorCode?: string;
   /** Milliseconds since start, non-negative only. */
   readonly durationMs?: number;
@@ -756,6 +871,7 @@ const LOG_CONTEXT_KEYS = [
   "entityType",
   "entityId",
   "statusCode",
+  "errorName",
   "errorCode",
   "durationMs"
 ] as const;
@@ -785,6 +901,7 @@ const LOG_CONTEXT_VALIDATORS: Readonly<Record<(typeof LOG_CONTEXT_KEYS)[number],
   action: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
   entityType: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
   entityId: (value) => typeof value === "string" && (UUID_ONLY.test(value) || SAFE_TOKEN.test(value)),
+  errorName: (value) => typeof value === "string" && SAFE_ERROR_NAMES.has(value),
   errorCode: (value) => typeof value === "string" && SAFE_TOKEN.test(value),
   statusCode: (value) => typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599,
   durationMs: (value) => typeof value === "number" && Number.isFinite(value) && value >= 0
