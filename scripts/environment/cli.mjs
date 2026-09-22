@@ -16,6 +16,7 @@ const runtimeDirectory = path.join(repositoryRoot, ".runtime");
 const previewDirectory = path.join(runtimeDirectory, "previews");
 const composeFile = path.join(repositoryRoot, "infra/compose/runtime.yml");
 const localComposeFile = path.join(repositoryRoot, "infra/compose/local.yml");
+const localEnvFile = path.join(repositoryRoot, ".env.local");
 
 function option(name) {
   const index = process.argv.indexOf(name);
@@ -23,9 +24,23 @@ function option(name) {
 }
 
 function runDocker(project, variables, arguments_, local = false) {
-  const files = ["compose", "-f", composeFile];
-  if (local) files.push("-f", localComposeFile);
+  const files = ["compose"];
+
+  if (local) {
+    if (!fs.existsSync(localEnvFile)) {
+      throw new Error("Missing .env.local. Copy .env.example to .env.local before running local infrastructure.");
+    }
+    files.push("--env-file", localEnvFile);
+  }
+
+  files.push("-f", composeFile);
+
+  if (local) {
+    files.push("-f", localComposeFile);
+  }
+
   files.push("--project-name", project, ...arguments_);
+
   const result = spawnSync("docker", files, {
     cwd: repositoryRoot,
     env: { ...process.env, ...variables },

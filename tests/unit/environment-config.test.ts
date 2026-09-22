@@ -6,6 +6,7 @@ import {
   assertEnvironmentIsolation,
   assertSyntheticDataAllowed,
   loadEnvironmentConfig,
+  loadMonitoringConfig,
   publicEnvironmentSummary,
   type EnvironmentSource
 } from "../../packages/config/src/index.ts";
@@ -155,5 +156,46 @@ test("a hosted environment with delivery settings loads and exposes them", () =>
 test("development and test still load without delivery settings, so local sign-in stays completable", () => {
   for (const appEnv of ["development", "test"] as const) {
     assert.doesNotThrow(() => loadEnvironmentConfig(validEnvironment({ APP_ENV: appEnv })));
+  }
+});
+
+test("local monitoring is disabled without a Sentry account and keeps stable service identity", () => {
+  assert.deepEqual(loadMonitoringConfig(validEnvironment(), "web"), {
+    enabled: false,
+    service: "web",
+    environment: "development",
+    release: "local"
+  });
+});
+
+test("hosted monitoring fails closed when its service DSN is absent", () => {
+  for (const appEnv of ["preview", "staging", "production"] as const) {
+    assert.throws(
+      () => loadMonitoringConfig(validEnvironment({ APP_ENV: appEnv }), "worker"),
+      /SENTRY_DSN is required/u
+    );
+  }
+});
+
+test("monitoring derives environment and release and requires an explicit valid sample rate", () => {
+  const source = validEnvironment({
+    APP_ENV: "staging",
+    DEPLOYMENT_COMMIT_SHA: "abc1234",
+    SENTRY_DSN: "https://public-key@sentry.example/123",
+    SENTRY_TRACES_SAMPLE_RATE: "0.25"
+  });
+  assert.deepEqual(loadMonitoringConfig(source, "worker"), {
+    enabled: true,
+    service: "worker",
+    environment: "staging",
+    release: "abc1234",
+    dsn: "https://public-key@sentry.example/123",
+    tracesSampleRate: 0.25
+  });
+  for (const rate of [undefined, "-0.1", "1.1", "not-a-number"]) {
+    assert.throws(
+      () => loadMonitoringConfig({ ...source, SENTRY_TRACES_SAMPLE_RATE: rate }, "worker"),
+      /SENTRY_TRACES_SAMPLE_RATE/u
+    );
   }
 });

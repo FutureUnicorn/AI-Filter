@@ -17,6 +17,7 @@ import {
 } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -34,7 +35,7 @@ interface RouteContext {
  * explicitly out of scope: it has no "canonical text" in this sense,
  * it goes through AF-31/32's own mapping path instead.
  */
-export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, intakeId } = await context.params;
   const userId = readSessionUserId(request);
@@ -142,8 +143,10 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     });
     return Response.json(extraction, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("canonical text extraction failed", error);
+    captureServerError(error, { requestId, operation: "file.extract_text" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not extract text." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("file.extract_text", handlePOST);

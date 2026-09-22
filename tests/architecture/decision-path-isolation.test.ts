@@ -80,6 +80,9 @@ test("no HTTP verb other than POST and GET exists on the decision endpoint", () 
     ),
     "utf8"
   );
-  const handlers = [...route.matchAll(/export async function ([A-Z]+)\(/gu)].map((match) => match[1]);
+  const handlers = [
+    ...[...route.matchAll(/export async function ([A-Z]+)\(/gu)].map((match) => match[1]),
+    ...[...route.matchAll(/export const ([A-Z]+)\s*=/gu)].map((match) => match[1])
+  ];
   assert.deepEqual([...handlers].sort(), ["GET", "POST"]);
 });

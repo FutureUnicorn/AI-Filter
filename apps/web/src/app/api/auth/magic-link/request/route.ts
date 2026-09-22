@@ -8,8 +8,14 @@ import {
 } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { createMagicLinkToken, getMembershipsForUser, getUserByEmail } from "@signal-audit/db";
-import { createMagicLinkEmailSender, generateMagicLinkToken, logStructured } from "@signal-audit/security";
+import {
+  createMagicLinkEmailSender,
+  describeError,
+  generateMagicLinkToken,
+  logStructured
+} from "@signal-audit/security";
 import type { NextRequest } from "next/server";
+import { captureServerError, withServerOperation } from "../../../../../lib/observability";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -22,7 +28,7 @@ export const runtime = "nodejs";
  * onboarding invite is a separate, admin-initiated flow, not something
  * this endpoint accepts from the requester themselves.
  */
-export async function POST(request: NextRequest): Promise<Response> {
+async function handlePOST(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const idempotency = idempotencyErrorResponse(
     checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key")),
@@ -98,16 +104,21 @@ export async function POST(request: NextRequest): Promise<Response> {
       // of the retained log stream (AF-21).
       try {
         await emailSender.sendMagicLink({ email, link });
-      } catch (deliveryError) {
-        logStructured("error", "magic_link.delivery_failed");
-        console.error("magic-link delivery failed", deliveryError);
+      } catch (error) {
+        const diagnostic = describeError(error);
+        logStructured("error", "magic_link.delivery_failed", {
+          requestId,
+          action: "email.send",
+          errorName: diagnostic.errorName,
+          errorCode: diagnostic.errorCode
+        });
       }
     }
     // Same response regardless of the branch above, including when delivery
     // above failed. Indistinguishable by design.
     return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("magic-link request failed", error);
+    captureServerError(error, { requestId, operation: "auth.magic_link.request" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -119,3 +130,5 @@ export async function POST(request: NextRequest): Promise<Response> {
     });
   }
 }
+
+export const POST = withServerOperation("auth.magic_link.request", handlePOST);
