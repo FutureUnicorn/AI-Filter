@@ -605,3 +605,19 @@ fixed.
 `pnpm check:architecture` (35) and `pnpm build` all clean. The 24 migrations
 replay from empty and then replay again idempotently, which the migrate
 service requires.
+
+### AF-97 — merging develop (AF-67 monitoring) into PR #88
+
+`develop` gained AF-67's monitoring and alerts (PR #89) while this branch was
+waiting on review, and the PR went un-mergeable.
+
+| | |
+|---|---|
+| Textual conflict | `package.json` only, in `test:unit:ts` and `test:integration` — both sides registered new test files. Resolved as a union: this branch's `sign-in-auth-codes` and `deployment-entry-point`, develop's `budgeted-inference` and `observability`. `tests/architecture/test-registration.test.ts` then confirms the result is complete on disk and free of duplicates, which is exactly the drift that list exists to catch. |
+| Semantic conflict | Nothing textual, and the merge still broke the build. AF-67 added `observability.test.ts`, which walks every `apps/web/src/**/*.ts` and asserts no `console.error` survives anywhere: handled 500s must go through `captureServerError`, which sanitizes the diagnostic before it reaches the telemetry sink. This branch's two new routes were written before that rule existed, so they carried three raw `console.error` calls. Merged cleanly, failed honestly — the reason the gate runs after a merge and not before. |
+| Fix | `/api/me/organizations` and `/api/invites` converted to the same shape develop gave every other route: handler renamed to `handleGET`/`handlePOST`, exported through `withServerOperation`, and the outer catch replaced with `captureServerError`. The invite route's delivery-failure branch follows the magic-link request route's precedent verbatim -- `describeError` into the existing `magic_link.delivery_failed` structured event, carrying `errorName`/`errorCode` rather than a raw error. |
+| Scope held | `organization.list` and `invite.create` added to `WEB_OPERATIONS` so their spans and events carry a real name instead of collapsing into `web.request`, and deliberately **not** to the alerts script's narrower `MONITORED_OPERATIONS`. That p95 alert set is AF-67's to widen; `role.*` and `rubric.*` already sit in exactly this position, so this follows the existing split rather than inventing one. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(171), `pnpm test:integration` against a real scratch Postgres (402),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.

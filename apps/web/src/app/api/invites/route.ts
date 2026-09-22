@@ -16,6 +16,7 @@ import {
 import {
   authorizeResourceAccess,
   createMagicLinkEmailSender,
+  describeError,
   generateMagicLinkToken,
   logStructured,
   resourceAuthorizationErrorResponse
@@ -23,6 +24,7 @@ import {
 import type { NextRequest } from "next/server";
 
 import { readSessionUserId } from "../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../lib/observability";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -42,7 +44,7 @@ export const runtime = "nodejs";
  * same authority as adding people to the tenant. Owner and admin hold
  * `access_admin_settings`; recruiter and auditor do not.
  */
-export async function POST(request: NextRequest): Promise<Response> {
+async function handlePOST(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const requirement = checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key"));
   const idempotency = idempotencyErrorResponse(requirement, requestId);
@@ -221,8 +223,13 @@ export async function POST(request: NextRequest): Promise<Response> {
       // the invite exists and is simply undelivered: it expires on its own,
       // and issuing another one is the fix. Saying so is more useful than a
       // 202 that leaves an admin waiting for mail that will never arrive.
-      logStructured("error", "magic_link.delivery_failed");
-      console.error("invite delivery failed", deliveryError);
+      const diagnostic = describeError(deliveryError);
+      logStructured("error", "magic_link.delivery_failed", {
+        requestId,
+        action: "email.send",
+        errorName: diagnostic.errorName,
+        errorCode: diagnostic.errorCode
+      });
       const error = buildApiError({
         requestId,
         code: "service_unavailable",
@@ -239,7 +246,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     // link interceptable by anyone who can read this response.
     return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("invite creation failed", error);
+    captureServerError(error, { requestId, operation: "invite.create" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -251,3 +258,5 @@ export async function POST(request: NextRequest): Promise<Response> {
     });
   }
 }
+
+export const POST = withServerOperation("invite.create", handlePOST);

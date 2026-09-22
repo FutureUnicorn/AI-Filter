@@ -1,6 +1,7 @@
 import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import { listOrganizationsForUser } from "@signal-audit/db";
+import { captureServerError, withServerOperation } from "../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 import { readSessionUserId } from "../../../../lib/session";
@@ -25,7 +26,7 @@ export const runtime = "nodejs";
  * `/organizations` for exactly that reason -- this is not an
  * organization directory and must never be mistaken for one.
  */
-export async function GET(request: NextRequest): Promise<Response> {
+async function handleGET(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const userId = readSessionUserId(request);
   if (userId === undefined) {
@@ -42,7 +43,7 @@ export async function GET(request: NextRequest): Promise<Response> {
     );
     return Response.json({ organizations }, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("organization list failed", error);
+    captureServerError(error, { requestId, operation: "organization.list" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -54,3 +55,5 @@ export async function GET(request: NextRequest): Promise<Response> {
     });
   }
 }
+
+export const GET = withServerOperation("organization.list", handleGET);
