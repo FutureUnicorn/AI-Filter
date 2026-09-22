@@ -10,6 +10,7 @@ import {
 import { buildCorrectedEvidenceCardSet } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -35,7 +36,7 @@ interface RouteContext {
  * is reported rather than omitted. A review screen that silently drops a
  * criterion tells a recruiter the rubric was smaller than it is.
  */
-export async function GET(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handleGET(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, applicationId } = await context.params;
   const userId = readSessionUserId(request);
@@ -102,7 +103,7 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       { status: 200, headers: withRequestId(undefined, requestId) }
     );
   } catch (error) {
-    console.error("evidence card lookup failed", error);
+    captureServerError(error, { requestId, operation: "application.evidence" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -111,3 +112,5 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const GET = withServerOperation("application.evidence", handleGET);

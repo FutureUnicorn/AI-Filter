@@ -14,6 +14,7 @@ import {
 } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -38,7 +39,7 @@ interface RouteContext {
  * be used to probe which role IDs exist elsewhere (AF-19's rule, and
  * why authorizeResourceAccess maps no_membership to 404, not 403).
  */
-export async function GET(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handleGET(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId } = await context.params;
   const userId = readSessionUserId(request);
@@ -98,7 +99,7 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       headers: withRequestId(undefined, requestId)
     });
   } catch (error) {
-    console.error("application review queue lookup failed", error);
+    captureServerError(error, { requestId, operation: "application.review_queue" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -107,3 +108,5 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const GET = withServerOperation("application.review_queue", handleGET);

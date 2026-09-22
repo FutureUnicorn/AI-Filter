@@ -5,7 +5,14 @@ import { loadEnvironmentConfig, publicEnvironmentSummary } from "@signal-audit/c
 import { checkDatabaseConnection } from "@signal-audit/db";
 import { DOMAIN_LAYER_NAME } from "@signal-audit/domain";
 import { checkStorageConnection } from "@signal-audit/ingestion";
-import { logStructured } from "@signal-audit/security";
+import { describeError, logStructured } from "@signal-audit/security";
+import { captureWorkerError } from "./observability.ts";
+
+export {
+  InferenceBudgetCappedError,
+  executeBudgetedInference
+} from "./inference.ts";
+export type { BudgetedInferenceInput } from "./inference.ts";
 
 export function startWorker(): string {
   const message = `Signal Audit worker ready; dependency center=${DOMAIN_LAYER_NAME}`;
@@ -47,8 +54,13 @@ export function createWorkerHealthServer(
         "Content-Type": "application/json"
       });
       response.end(JSON.stringify(result));
-    } catch {
-      logStructured("error", "worker.environment_health_failed");
+    } catch (error) {
+      const diagnostic = describeError(error);
+      logStructured("error", "worker.environment_health_failed", {
+        errorName: diagnostic.errorName,
+        errorCode: diagnostic.errorCode,
+        statusCode: 503
+      });
       response.writeHead(503, {
         "Cache-Control": "no-store",
         "Content-Type": "application/json"
@@ -61,9 +73,19 @@ export function createWorkerHealthServer(
 const entryPath = process.argv[1];
 
 if (entryPath !== undefined && import.meta.url === pathToFileURL(entryPath).href) {
-  startWorker();
-  const config = loadEnvironmentConfig(process.env);
-  createWorkerHealthServer().listen(config.ports.worker, "0.0.0.0", () => {
-    logStructured("info", "worker.health_listening");
-  });
+  try {
+    startWorker();
+    const config = loadEnvironmentConfig(process.env);
+    const server = createWorkerHealthServer();
+    server.once("error", (error) => {
+      captureWorkerError(error, "worker.startup");
+      process.exitCode = 1;
+    });
+    server.listen(config.ports.worker, "0.0.0.0", () => {
+      logStructured("info", "worker.health_listening");
+    });
+  } catch (error) {
+    captureWorkerError(error, "worker.startup");
+    process.exitCode = 1;
+  }
 }

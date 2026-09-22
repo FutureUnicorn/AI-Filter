@@ -5,6 +5,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 import { SESSION_COOKIE_OPTIONS, redeemMagicLinkForSession } from "../../../lib/magic-link";
+import { captureServerError, withServerOperation } from "../../../lib/observability";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -31,7 +32,7 @@ export const runtime = "nodejs";
  * would remove the prefetch risk at the cost of an extra click; that is a
  * product decision, not one to make silently here.
  */
-export async function GET(request: NextRequest): Promise<Response> {
+async function handleGET(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const token = new URL(request.url).searchParams.get("token");
   const headers = withRequestId(undefined, requestId);
@@ -61,7 +62,9 @@ export async function GET(request: NextRequest): Promise<Response> {
   } catch (error) {
     // Never echo the failure to the caller: the same opaque destination for
     // any server-side fault, with the detail kept to the server log.
-    console.error("magic-link redeem (email link) failed", error);
+    captureServerError(error, { requestId, operation: "auth.magic_link.redeem" });
     return NextResponse.redirect(new URL("/?auth=error", origin), { headers });
   }
 }
+
+export const GET = withServerOperation("auth.magic_link.redeem", handleGET);
