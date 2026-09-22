@@ -14,9 +14,23 @@ on:
 # self-hosted production runner happens to prevent that today, but that is an
 # infrastructure fact this repository does not control and would lose the moment
 # a second production runner is added for capacity. A constant group states the
-# guarantee here instead of inheriting it. cancel-in-progress stays false so a
-# queued revision waits for the in-flight deployment rather than killing it
-# part-way through a migration.
+# guarantee here instead of inheriting it.
+#
+# What this does and does not promise. cancel-in-progress: false protects the
+# run that is already executing: a newer revision never kills a deployment
+# part-way through a migration. It does not queue every revision. GitHub's
+# default is queue: single -- at most one run may be pending per group, and a
+# newer arrival cancels the run already waiting and takes its place. So one
+# revision deploys, one waits, and a third evicts the waiter, which never
+# deploys at all. That is the intended trade here: this is an empty validation
+# environment, so putting every intermediate revision through it buys nothing.
+# queue: max is the documented opt-in if that ever stops being true.
+#
+# The cost worth knowing up front: the production environment requires a named
+# approving reviewer, so a run parked on that approval holds this group for the
+# whole approval window, and no newer revision advances -- not even its cheap
+# ubuntu-latest eligibility job. Under the old per-revision group an
+# un-actioned approval blocked nothing.
 concurrency:
   group: production
   cancel-in-progress: false
