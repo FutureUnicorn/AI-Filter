@@ -9,6 +9,7 @@ import { SESSION_COOKIE_NAME } from "@signal-audit/security";
 import { z } from "zod";
 import { SESSION_COOKIE_OPTIONS, redeemMagicLinkForSession } from "../../../../../lib/magic-link";
 import type { NextRequest } from "next/server";
+import { captureServerError, withServerOperation } from "../../../../../lib/observability";
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -28,7 +29,7 @@ const redeemInputSchema = z.strictObject({ token: z.string().min(1) });
  * already fail earlier, at the atomic redeemMagicLinkToken step
  * (already_consumed), before this code runs.
  */
-export async function POST(request: NextRequest): Promise<Response> {
+async function handlePOST(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
   const idempotency = idempotencyErrorResponse(
     checkIdempotencyRequirement(request.method, request.headers.get("Idempotency-Key")),
@@ -75,7 +76,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     response.cookies.set(SESSION_COOKIE_NAME, redemption.sessionToken, SESSION_COOKIE_OPTIONS);
     return response;
   } catch (error) {
-    console.error("magic-link redeem failed", error);
+    captureServerError(error, { requestId, operation: "auth.magic_link.redeem" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -87,3 +88,5 @@ export async function POST(request: NextRequest): Promise<Response> {
     });
   }
 }
+
+export const POST = withServerOperation("auth.magic_link.redeem", handlePOST);

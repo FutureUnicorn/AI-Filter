@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1627,6 +1627,39 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
     await admin.end().catch(() => undefined);
   }
   return schema;
+}
+
+export interface InferenceBudgetProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+}
+
+/** Provision the minimal isolated schema needed by the budgeted worker path. */
+export async function provisionInferenceBudgetProbeSchema(
+  databaseUrl: string
+): Promise<InferenceBudgetProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `budget_path_probe_${suffix}`;
+  const organizationId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0007_inference_usage_ledger.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(
+      `INSERT INTO organizations (organization_id, name) VALUES ($1, 'AF-67 Synthetic Budget Probe')`,
+      [organizationId]
+    );
+    return { schema, organizationId };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export interface FileIntakeRouteProbe {

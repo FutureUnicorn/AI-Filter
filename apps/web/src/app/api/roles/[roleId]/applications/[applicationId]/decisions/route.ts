@@ -17,6 +17,7 @@ import {
 import { deriveCandidateWorkflowStatus } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 import type { z } from "zod";
 
@@ -50,7 +51,7 @@ interface RouteContext {
  * UPDATE outright -- so "change the status" and "record a new decision"
  * are the same operation, which is what makes the log the only source.
  */
-export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, applicationId } = await context.params;
 
@@ -216,14 +217,14 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       { status: 201, headers: withRequestId(undefined, requestId) }
     );
   } catch (error) {
-    console.error("recording a candidate decision failed", error);
+    captureServerError(error, { requestId, operation: "application.decision" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not record the decision." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
 
 /** The current status plus the full decision history behind it. */
-export async function GET(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handleGET(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, applicationId } = await context.params;
   const userId = readSessionUserId(request);
@@ -275,8 +276,11 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
       { status: 200, headers: withRequestId(undefined, requestId) }
     );
   } catch (error) {
-    console.error("candidate status lookup failed", error);
+    captureServerError(error, { requestId, operation: "application.decision" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not load the status." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("application.decision", handlePOST);
+export const GET = withServerOperation("application.decision", handleGET);

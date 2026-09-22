@@ -15,6 +15,7 @@ import {
 } from "@signal-audit/db";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 import type { z } from "zod";
 
@@ -47,7 +48,7 @@ interface RouteContext {
  * someone else, and 0019_correction_attribution.sql's membership foreign key means that user must
  * actually belong to the organization whose evidence they are changing.
  */
-export async function POST(request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
 
   // Review #83, P2, the same gap as the decision endpoint. Corrections are
@@ -200,7 +201,7 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
       { status: 201, headers: withRequestId(undefined, requestId) }
     );
   } catch (error) {
-    console.error("evidence correction failed", error);
+    captureServerError(error, { requestId, operation: "application.evidence.correct" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -209,3 +210,5 @@ export async function POST(request: NextRequest, context: RouteContext): Promise
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("application.evidence.correct", handlePOST);
