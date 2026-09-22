@@ -112,6 +112,16 @@ and sweep all agree on it. Falling back to an in-repo `.runtime/` when the
 variable is unset keeps local, manual `pnpm preview:*` usage on a
 developer's own machine unchanged.
 
+This state root moved with this change (from inside the checkout to
+`PREVIEW_STATE_DIRECTORY`). Since this workflow has never fired -- confirmed
+via the GitHub Actions API, which returns no recorded runs, consistent with
+these files existing only on `develop` and not yet on the default branch --
+there should be nothing at the old in-workspace path to strand. If that
+changes before this promotes, confirm on the runner that the old
+`<workspace>/.runtime/previews` is empty and `docker compose ls` shows no
+`signal-audit-pr-` projects before relying on the new path; see "Preview
+leak" under Troubleshooting below for locating a project by that prefix.
+
 That alone is not enough, and the deploy job is structured around the
 reason: `scripts/environment/cli.mjs` -- the orchestration script that reads
 `PREVIEW_STATE_DIRECTORY` and shells out to Docker -- must never itself be
@@ -133,10 +143,30 @@ behavior unchanged.
 This closes the orchestration-script attack surface Copilot's review
 identified. It does not, on its own, sandbox the `docker build` step itself
 -- a PR's own Dockerfile still executes build instructions on the shared
-runner host during that build, which is the same underlying question as
-finding 3 below (untrusted code on a persistent, reused runner) and needs
-the same kind of infrastructure decision (ephemeral build runners, or
-tighter Docker daemon sandboxing) to close fully.
+runner host during that build. That is the open question of untrusted code
+executing on a persistent, reused self-hosted runner, tracked separately,
+and needs the same kind of infrastructure decision (ephemeral build
+runners, or tighter Docker daemon sandboxing) to close fully.
+
+One consequence worth stating plainly (PR #85 review, hemnaath04, REV-005):
+because `cli.mjs` resolves `infra/compose/runtime.yml` from its own
+(trusted, default-branch) checkout, a preview always runs the DEFAULT
+BRANCH's compose topology -- service definitions, resource limits, network
+and security settings -- never the PR's own edits to that file. Only the
+Dockerfile (via `DEPLOY_SOURCE_DIRECTORY`, itself relative to whatever the
+compose file's `build.context` says), migrations, and fixtures come from
+the PR. This is deliberate, not an oversight: letting an untrusted PR
+control the compose file directly (volumes, `security_opt`, network mode)
+would reopen the exact credential-exposure and arbitrary-execution risk the
+checkout split exists to close. The practical implication is that a PR
+which edits the compose file -- for example adding an environment variable
+a service needs -- gets a preview that does not reflect that edit, in a way
+that will not reproduce locally. The deploy job verifies (via
+`docker compose config`, against the actual resolved configuration rather
+than the compose file's source text) that both `web` and `worker`
+`build.context` resolve to the untrusted checkout before deploying, so a
+regression here fails the job loudly instead of silently building the wrong
+revision.
 
 Each preview receives:
 
@@ -211,6 +241,7 @@ Preview variables:
 | `AF11_ENABLE_HOSTED_ENVIRONMENTS` | explicit deployment enablement |
 | `PREVIEW_BASE_DOMAIN` | wildcard preview DNS suffix |
 | `PREVIEW_TTL_HOURS` | orphan lifetime, normally `72` |
+| `PREVIEW_STATE_DIRECTORY` | optional; overrides the default per-runner-workspace preview state path. Set this to a host-level absolute path (for example `/var/lib/signal-audit/preview-state`) if the `signal-audit-preview` runner label ever backs more than one runner process on the same host -- otherwise each process gets an independent, empty state directory and cleanup dispatched to the wrong one silently finds nothing to remove (PR #85 review, REV-011). |
 
 Staging and production environment secrets:
 

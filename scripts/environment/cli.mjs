@@ -7,6 +7,7 @@ import {
   assertDestructiveEnvironmentAllowed,
   derivePreviewEnvironment,
   requireHostedControls,
+  resolvePreviewStateDirectory,
   validateCommitSha,
   validatePullRequestNumber
 } from "./model.mjs";
@@ -18,7 +19,8 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 // (finding 1). Left inside the repository root, that combination handed the
 // untrusted checkout read access to every OTHER preview's already-generated
 // database and storage credentials the moment it ran cli.mjs -- a real
-// escalation of the runner-isolation gap (finding 3), not just a
+// escalation of the runner-isolation gap (tracked separately: untrusted code
+// executing on a persistent, reused self-hosted runner), not just a
 // hypothetical one, since .gitignore itself documents the exact path to
 // look in. PREVIEW_STATE_DIRECTORY moves the credential store to a fixed
 // location outside the git working tree entirely, so it is never part of
@@ -26,10 +28,11 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 // job (deploy, cleanup, sweep) at the same absolute, runner-persistent path;
 // falling back to an in-repo `.runtime/` when unset keeps local, manual
 // `pnpm preview:*` usage on a developer's own machine unchanged.
-const runtimeDirectory =
-  process.env.PREVIEW_STATE_DIRECTORY !== undefined && process.env.PREVIEW_STATE_DIRECTORY.trim() !== ""
-    ? path.resolve(process.env.PREVIEW_STATE_DIRECTORY)
-    : path.join(repositoryRoot, ".runtime");
+//
+// Resolution itself lives in model.mjs (resolvePreviewStateDirectory) so a
+// test can assert the resolved PATH directly, not just that this file
+// mentions the env var's name (PR #85 review, REV-002).
+const runtimeDirectory = resolvePreviewStateDirectory(repositoryRoot);
 const previewDirectory = path.join(runtimeDirectory, "previews");
 const composeFile = path.join(repositoryRoot, "infra/compose/runtime.yml");
 const localComposeFile = path.join(repositoryRoot, "infra/compose/local.yml");

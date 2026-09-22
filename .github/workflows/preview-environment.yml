@@ -26,7 +26,21 @@ env:
   # what an untrusted PR checkout contains (see scripts/environment/cli.mjs).
   # Shared across deploy, cleanup, and sweep so all three agree on where
   # state lives.
-  PREVIEW_STATE_DIRECTORY: ${{ github.workspace }}/../preview-state
+  #
+  # AF-93 PR #85 review (hemnaath04, REV-011): the default below is scoped to
+  # ONE runner process's own _work directory (github.workspace), while the
+  # Docker daemon whose containers this state describes is shared by the
+  # whole host. A second runner process on this host would get an
+  # independent, empty state directory: cleanup dispatched to it finds
+  # nothing, prints "Preview N already absent", exits 0, and the stack it
+  # can't see keeps running. Not a new problem -- the pre-AF-93 in-workspace
+  # `.runtime/` had the same property -- but this is the change that picks
+  # the path, so it is the right moment to make the fix available: set
+  # repository variable PREVIEW_STATE_DIRECTORY to a host-level absolute path
+  # (for example /var/lib/signal-audit/preview-state) if this runner label
+  # ever backs more than one runner process on the same host. Documented
+  # alongside the signal-audit-preview runner prerequisites.
+  PREVIEW_STATE_DIRECTORY: ${{ vars.PREVIEW_STATE_DIRECTORY || format('{0}/../preview-state', github.workspace) }}
 
 jobs:
   deploy:
@@ -84,6 +98,13 @@ jobs:
       # closed PR but says nothing about its current base. Read base.ref from
       # this same live API response too, so retargeting during the run is
       # caught the same way closing during the run already is.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-008): parsed with `node`, not
+      # `jq`. Every other step in this repository's workflows runs on
+      # ubuntu-latest, where jq is preinstalled; this step runs on the
+      # self-hosted signal-audit-preview label, where jq is whatever the host
+      # happens to have. node is already a hard requirement two steps below
+      # (it runs cli.mjs), so it cannot be the thing that's missing.
       - name: Check whether the source pull request is still open and in scope
         id: pr-state
         env:
@@ -92,8 +113,54 @@ jobs:
         run: |
           response=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER")
-          echo "state=$(jq -r '.state' <<< "$response")" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(jq -r '.base.ref' <<< "$response")" >> "$GITHUB_OUTPUT"
+          node -e '
+            const pr = JSON.parse(process.argv[1]);
+            console.log(`state=${pr.state}`);
+            console.log(`base_ref=${pr.base.ref}`);
+          ' "$response" >> "$GITHUB_OUTPUT"
+      # AF-93 PR #85 review (hemnaath04, REV-005). The trust split means what
+      # actually gets built is decided by DEPLOY_SOURCE_DIRECTORY plus
+      # whether infra/compose/runtime.yml (now always the DEFAULT BRANCH's
+      # copy, since cli.mjs resolves it relative to its own trusted checkout)
+      # honours that variable for both services. A partial revert -- one
+      # service's build.context reverted to ../.. -- passes the test suite
+      # unless the test checks both services independently (see REV-003 in
+      # tests/integration/environment-policy.test.ts), and would otherwise
+      # only be discovered by an operator noticing the wrong image running in
+      # production. This is the same check made real, at deploy time, against
+      # the actual resolved config rather than the compose file's source
+      # text. The env values below are placeholders satisfying compose's
+      # required-variable guards for static config resolution only -- this
+      # step never starts a container or connects to anything.
+      - name: Verify the build context resolves to the untrusted checkout
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
+        env:
+          APP_ENV: preview
+          DEPLOYMENT_COMMIT_SHA: 0000000
+          POSTGRES_USER: verify
+          POSTGRES_PASSWORD: verify-only-placeholder-value
+          POSTGRES_DB: verify
+          DATABASE_SCHEMA: verify
+          STORAGE_BUCKET: verify
+          STORAGE_ACCESS_KEY_ID: verify
+          STORAGE_SECRET_ACCESS_KEY: verify-only-placeholder-value
+          SESSION_SECRET: verify-only-placeholder-value
+          DEPLOY_SOURCE_DIRECTORY: ${{ github.workspace }}/pr-source
+        run: |
+          resolved=$(docker compose -f infra/compose/runtime.yml config --format json)
+          node -e '
+            const config = JSON.parse(process.argv[1]);
+            const expected = process.argv[2];
+            for (const service of ["web", "worker"]) {
+              const context = config.services[service]?.build?.context;
+              if (context !== expected) {
+                console.error(`${service} build context resolved to "${context}", expected the untrusted checkout "${expected}"`);
+                process.exit(1);
+              }
+            }
+          ' "$resolved" "$DEPLOY_SOURCE_DIRECTORY"
       - name: Verify and deploy isolated preview
         if: >-
           steps.pr-state.outputs.state == 'open' &&
@@ -109,6 +176,15 @@ jobs:
         run: |
           test "$(git -C pr-source rev-parse HEAD)" = "$TESTED_SHA"
           node scripts/environment/cli.mjs preview up --pr "$PR_NUMBER" --sha "$TESTED_SHA"
+      # AF-93 PR #85 review (hemnaath04, REV-007): pr-source holds the PR's
+      # untrusted source tree and is never executed, but nothing else removed
+      # it either -- it would otherwise persist in the trusted workspace
+      # until the next deploy run happens to reuse this exact path. Removed
+      # unconditionally so untrusted code does not have an unbounded lifetime
+      # on a shared host.
+      - name: Remove the untrusted build-context checkout
+        if: always()
+        run: rm -rf pr-source
 
   cleanup:
     name: Preview / Cleanup
