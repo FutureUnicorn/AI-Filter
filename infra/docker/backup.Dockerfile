@@ -5,6 +5,10 @@ FROM postgres:17.10-alpine3.23
 COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
 COPY --chmod=0555 scripts/backups/backup.sh /usr/local/bin/signal-audit-backup
 
+RUN mkdir -p /var/lib/signal-audit-backup \
+    && chown 70:70 /var/lib/signal-audit-backup \
+    && chmod 0700 /var/lib/signal-audit-backup
+
 ENV HOME=/tmp \
     MC_CONFIG_DIR=/tmp/mc \
     MC_NO_COLOR=1 \

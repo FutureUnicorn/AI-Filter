@@ -2,6 +2,70 @@
 
 set -eu
 
+BACKUP_WORK_DIR=/var/lib/signal-audit-backup
+dump_file=
+manifest_file=
+dump_stderr_file=
+active_pid=
+
+is_lower_hex_length() {
+  value="$1"
+  expected_length="$2"
+  [ "${#value}" -eq "$expected_length" ] || return 1
+  case "$value" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+}
+
+cleanup_run_files() {
+  cleanup_status=0
+  for cleanup_path in "${dump_file-}" "${manifest_file-}" "${dump_stderr_file-}"; do
+    if [ -n "$cleanup_path" ] && ! rm -f "$cleanup_path"; then
+      cleanup_status=1
+    fi
+  done
+  if [ "$cleanup_status" -eq 0 ]; then
+    dump_file=
+    manifest_file=
+    dump_stderr_file=
+  fi
+  return "$cleanup_status"
+}
+
+cleanup_orphaned_dumps() {
+  if ! rm -f "$BACKUP_WORK_DIR"/*.dump; then
+    log_event error run_failed stale_dump_cleanup
+    return 1
+  fi
+}
+
+run_interruptible() {
+  "$@" &
+  active_pid=$!
+  if wait "$active_pid"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  active_pid=
+  return "$command_status"
+}
+
+handle_shutdown() {
+  trap - INT TERM
+  if [ -n "${active_pid-}" ]; then
+    kill -TERM "$active_pid" >/dev/null 2>&1 || true
+    wait "$active_pid" >/dev/null 2>&1 || true
+    active_pid=
+  fi
+  exit 0
+}
+
+install_cleanup_traps() {
+  trap 'cleanup_run_files' 0
+  trap 'handle_shutdown' INT TERM
+}
+
 require_value() {
   variable_name="$1"
   variable_value="$2"
@@ -197,7 +261,7 @@ configure_target() {
 
 mirror_storage() {
   backup_id="$1"
-  if ! mc --quiet mirror \
+  if ! run_interruptible mc --quiet mirror \
     --overwrite \
     --remove \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/storage/current" \
@@ -211,14 +275,37 @@ mirror_storage() {
 
 run_once() {
   validate_configuration || return $?
+  cleanup_orphaned_dumps || return $?
   configure_aliases || return $?
 
-  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  nonce="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-  release_prefix="$(printf '%s' "$DEPLOYMENT_COMMIT_SHA" | cut -c1-12)"
+  if ! timestamp="$(date -u +%Y%m%dT%H%M%SZ)"; then
+    log_event error run_failed backup_timestamp
+    return 1
+  fi
+  if ! nonce_words="$(od -An -N4 -tx1 /dev/urandom)"; then
+    log_event error run_failed backup_id_nonce
+    return 1
+  fi
+  set -- $nonce_words
+  if [ "$#" -ne 4 ]; then
+    log_event error run_failed backup_id_nonce
+    return 1
+  fi
+  nonce="$1$2$3$4"
+  if ! is_lower_hex_length "$nonce" 8; then
+    log_event error run_failed backup_id_nonce
+    return 1
+  fi
+  if ! release_prefix="$(printf '%s' "$DEPLOYMENT_COMMIT_SHA" | cut -c1-12)" || [ -z "$release_prefix" ]; then
+    log_event error run_failed backup_id_release
+    return 1
+  fi
   backup_id="$timestamp-$release_prefix-$nonce"
-  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  dump_file="/tmp/$backup_id.dump"
+  if ! started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+    log_event error run_failed backup_timestamp
+    return 1
+  fi
+  dump_file="$BACKUP_WORK_DIR/$backup_id.dump"
   manifest_file="/tmp/$backup_id.json"
   dump_stderr_file="/tmp/$backup_id-pg-dump.stderr"
   umask 077
@@ -230,7 +317,7 @@ run_once() {
   # pg_dump was running, so database references are not ahead of storage.
   mirror_storage "$backup_id" || return $?
 
-  if ! pg_dump \
+  if ! run_interruptible pg_dump \
     --format=custom \
     --compress=gzip:6 \
     --no-owner \
@@ -238,80 +325,103 @@ run_once() {
     --file="$dump_file" >/dev/null 2>"$dump_stderr_file"
   then
     log_event error run_failed database_dump "$backup_id"
-    rm -f "$dump_file" "$manifest_file" "$dump_stderr_file"
+    cleanup_run_files
     return 1
   fi
   if [ -s "$dump_stderr_file" ]; then
     log_event error run_failed database_dump_warning "$backup_id"
-    rm -f "$dump_file" "$manifest_file" "$dump_stderr_file"
+    cleanup_run_files
     return 1
   fi
-  rm -f "$dump_stderr_file"
-  if ! pg_restore --list "$dump_file" >/dev/null 2>&1; then
+  if ! rm -f "$dump_stderr_file"; then
+    log_event error run_failed local_cleanup "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! run_interruptible pg_restore --list "$dump_file" >/dev/null 2>&1; then
     log_event error run_failed database_archive_validation "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   fi
 
   mirror_storage "$backup_id" || {
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   }
 
-  if ! database_sha256="$(sha256sum "$dump_file" | cut -d ' ' -f1)"; then
+  if ! checksum_output="$(sha256sum "$dump_file")"; then
     log_event error run_failed database_checksum "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
+    return 1
+  fi
+  database_sha256="${checksum_output%% *}"
+  if ! is_lower_hex_length "$database_sha256" 64; then
+    log_event error run_failed database_checksum "$backup_id"
+    cleanup_run_files
     return 1
   fi
   if ! database_bytes="$(stat -c '%s' "$dump_file")"; then
     log_event error run_failed database_size "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   fi
-  completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+    log_event error run_failed backup_timestamp "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
   database_key="$APP_ENV/database/$backup_id.dump"
 
-  cat >"$manifest_file" <<EOF
+  if ! cat >"$manifest_file" <<EOF
 {"schemaVersion":1,"backupId":"$backup_id","environment":"$APP_ENV","release":"$DEPLOYMENT_COMMIT_SHA","startedAt":"$started_at","completedAt":"$completed_at","retentionDays":$BACKUP_RETENTION_DAYS,"database":{"objectKey":"$database_key","sha256":"$database_sha256","bytes":$database_bytes,"format":"postgres-custom"},"storage":{"prefix":"$APP_ENV/storage/current","versioned":true}}
 EOF
+  then
+    log_event error run_failed manifest_write "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
 
-  if ! mc --quiet cp \
+  if ! run_interruptible mc --quiet cp \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" \
     "$dump_file" "target/$BACKUP_BUCKET/$database_key" >/dev/null 2>&1
   then
     log_event error run_failed database_upload "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   fi
-  if ! mc --quiet cp \
+  if ! run_interruptible mc --quiet cp \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/manifests/history" \
     "$manifest_file" "target/$BACKUP_BUCKET/$APP_ENV/manifests/history/$backup_id.json" >/dev/null 2>&1
   then
     log_event error run_failed manifest_history_upload "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   fi
-  if ! mc --quiet cp \
+  if ! run_interruptible mc --quiet cp \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/manifests/latest.json" \
     "$manifest_file" "target/$BACKUP_BUCKET/$APP_ENV/manifests/latest.json" >/dev/null 2>&1
   then
     log_event error run_failed latest_manifest_upload "$backup_id"
-    rm -f "$dump_file" "$manifest_file"
+    cleanup_run_files
     return 1
   fi
 
-  date -u +%s > /tmp/last-success-epoch
-  rm -f "$dump_file" "$manifest_file"
+  if ! cleanup_run_files; then
+    log_event error run_failed local_cleanup "$backup_id"
+    return 1
+  fi
+  if ! date -u +%s > /tmp/last-success-epoch; then
+    log_event error run_failed success_state_write "$backup_id"
+    return 1
+  fi
   log_event info run_succeeded complete "$backup_id"
 }
 
 run_loop() {
   validate_configuration || return $?
-  trap 'exit 0' INT TERM
   while :; do
-    /usr/local/bin/signal-audit-backup once || true
-    sleep "$BACKUP_INTERVAL_SECONDS" &
-    wait $!
+    run_once || true
+    run_interruptible sleep "$BACKUP_INTERVAL_SECONDS"
   done
 }
 
@@ -330,8 +440,8 @@ health_check() {
 
 case "${1-}" in
   configure) configure_target ;;
-  once) run_once ;;
-  loop) run_loop ;;
+  once) install_cleanup_traps; run_once ;;
+  loop) install_cleanup_traps; run_loop ;;
   health) health_check ;;
   *)
     echo "Expected configure, once, loop, or health" >&2

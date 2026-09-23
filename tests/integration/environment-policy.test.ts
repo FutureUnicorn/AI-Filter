@@ -261,6 +261,17 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(backupService!, /cap_drop: \["ALL"\]/u);
   assert.match(backupService!, /no-new-privileges:true/u);
   assert.match(backupService!, /signal-audit-backup", "health/u);
+  assert.match(backupService!, /\/tmp:size=16m/u);
+  assert.match(backupService!, /backup-work:\/var\/lib\/signal-audit-backup/u);
+  assert.doesNotMatch(
+    backupService!,
+    /BACKUP_TEMP_SIZE/u,
+    "database archives must not share the container memory limit through tmpfs"
+  );
+  assert.match(compose, /^ {2}backup-work: \{\}$/mu);
+  const backupDockerfile = read("infra/docker/backup.Dockerfile");
+  assert.match(backupDockerfile, /chown 70:70 \/var\/lib\/signal-audit-backup/u);
+  assert.match(backupDockerfile, /chmod 0700 \/var\/lib\/signal-audit-backup/u);
   assert.match(backupEnvironment!, /BACKUP_CONTROL_OWNER:/u);
   assert.match(backupEnvironment!, /BACKUP_ENCRYPTION_REFERENCE:/u);
   assert.doesNotMatch(webService!, /BACKUP_ACCESS_KEY_ID|BACKUP_SECRET_ACCESS_KEY/u);
@@ -274,6 +285,30 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(script, /pg_dump[\s\S]*?--format=custom/u);
   assert.match(script, /pg_restore --list/u);
   assert.match(script, /sha256sum/u);
+  assert.match(script, /dump_file="\$BACKUP_WORK_DIR\/\$backup_id\.dump"/u);
+  assert.match(script, /checksum_output="\$\(sha256sum "\$dump_file"\)"/u);
+  assert.match(script, /is_lower_hex_length "\$database_sha256" 64/u);
+  assert.doesNotMatch(
+    script,
+    /sha256sum[^\n]*\|/u,
+    "checksum command failure must not be hidden by a successful pipeline tail"
+  );
+  assert.match(script, /nonce_words="\$\(od -An -N4 -tx1 \/dev\/urandom\)"/u);
+  assert.match(script, /is_lower_hex_length "\$nonce" 8/u);
+  assert.match(script, /trap 'cleanup_run_files' 0/u);
+  assert.match(script, /trap 'handle_shutdown' INT TERM/u);
+  assert.match(script, /kill -TERM "\$active_pid"/u);
+  assert.match(script, /run_interruptible pg_dump/u);
+  assert.match(script, /run_interruptible pg_restore/u);
+  assert.match(script, /run_interruptible mc --quiet mirror/u);
+  assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 3);
+  assert.match(script, /cleanup_orphaned_dumps/u);
+  assert.match(script, /run_once \|\| true/u);
+  assert.doesNotMatch(
+    script,
+    /signal-audit-backup once/u,
+    "the signal-owning shell must execute the run so its cleanup trap knows the active paths"
+  );
   assert.match(script, /last-success-epoch/u);
   assert.doesNotMatch(
     script,

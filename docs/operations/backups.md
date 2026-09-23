@@ -87,12 +87,19 @@ When disabled, deployment behavior is unchanged. When enabled:
 4. web, worker, and the long-running backup service start together.
 
 The backup container is non-root, read-only, capability-free, has no published
-port, and receives a bounded in-memory temporary filesystem. It joins the
-private network for PostgreSQL/MinIO and the public network only for encrypted
-egress to the off-host target. Operations must size `BACKUP_TEMP_SIZE` above
-the largest expected compressed database archive and confirm the runner has
-enough memory before enablement; an undersized temporary filesystem makes the
-run fail without publishing a success manifest.
+port, and uses a small in-memory filesystem only for client state, manifests,
+and health state. PostgreSQL archives are staged on the dedicated disk-backed
+`backup-work` volume so archive growth does not compete directly with the
+container memory limit. It joins the private network for PostgreSQL/MinIO and
+the public network only for encrypted egress to the off-host target.
+
+Before enablement, operations must confirm that the Compose host has enough
+free disk for the largest expected compressed database archive plus normal
+host headroom. The work volume is temporary staging, not a backup destination:
+successful and failed runs remove their archive, graceful shutdown removes an
+in-progress archive, and the next run removes any archive left by an abrupt
+container termination. The off-host encrypted bucket remains the only backup
+copy claimed by AF-68.
 
 ## Detection and diagnosis
 
