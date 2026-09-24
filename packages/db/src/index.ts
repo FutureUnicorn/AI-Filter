@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -4266,6 +4266,47 @@ export interface RetentionPurgeProbe {
    * false statement to a candidate.
    */
   readonly permitted: Record<string, number>;
+  /**
+   * REV-004: every migration file the probe applied, in the order it
+   * applied them, so a test can check that it is the whole directory in the
+   * runner's order rather than a hand-picked subset.
+   */
+  readonly appliedMigrations: readonly string[];
+  /**
+   * REV-004: every foreign key in the fully migrated schema, read from
+   * pg_constraint rather than from anyone's memory of the migrations. The
+   * hand-picked migration list is how five blockers on applications were
+   * reported as two: nothing failed when the schema gained a table that
+   * references a planned surface.
+   */
+  readonly foreignKeys: readonly RetentionForeignKey[];
+  /** Column names per table, so an exemption can prove what a table does not hold. */
+  readonly tableColumns: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface RetentionForeignKey {
+  readonly referencing: string;
+  readonly referenced: string;
+  readonly constraint: string;
+}
+
+/**
+ * Every migration, in the order infra/compose/runtime.yml applies them.
+ *
+ * That runner is a shell glob over /migrations/*.sql, which sorts
+ * bytewise, and it replays every file on every run with no manifest. Two
+ * things make a naive "apply everything" wrong. readdirSync's order is the
+ * filesystem's, not sorted: APFS happens to return it sorted and ext4,
+ * which CI runs on, does not, so an unsorted loop passes locally and runs
+ * 0016 before 0015 in CI. And the sort must be the default code-unit sort,
+ * never localeCompare, because bytewise is what the runner does and this
+ * branch has two files sharing the 0009 prefix, which have to run in the
+ * order every environment has run them.
+ */
+export function listMigrationsInRunnerOrder(): readonly string[] {
+  return readdirSync(MIGRATIONS_DIRECTORY)
+    .filter((file) => /^\d{4}_[a-z0-9_]+\.sql$/u.test(file))
+    .sort();
 }
 
 /**
@@ -4405,21 +4446,19 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql",
-      "0019_candidate_decisions.sql",
-      "0020_audit_samples.sql",
-      "0021_review_timing.sql"
-    ]) {
+    // REV-004: the whole schema, as the migrate service builds it, not the
+    // tables someone already thought of. A blocker nobody listed a
+    // migration for is a blocker this probe could never find.
+    const appliedMigrations = listMigrationsInRunnerOrder();
+    for (const file of appliedMigrations) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
+    // Applying every migration brings in 0004_tenant_scoped_rls.sql, which
+    // puts FORCE ROW LEVEL SECURITY on memberships. Seeding a membership
+    // without a tenant then works only because the probe happens to connect
+    // as a superuser, which bypasses RLS. Setting the tenant makes the seed
+    // hold under an ordinary role too, instead of depending on that.
+    await admin.query(`SELECT set_config('app.current_org_id', $1, false)`, [org]);
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
     await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
       userId,
@@ -4696,7 +4735,26 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     if (surviving.rows[0]?.candidate_full_name !== "Jane Doe") {
       throw new Error("assertRetentionPurgeBlockers: expected the candidate row to have survived every purge attempt");
     }
-    return { failures, permitted };
+    const foreignKeys = await admin.query<RetentionForeignKey>(
+      `SELECT rel.relname AS referencing, ref.relname AS referenced, c.conname AS constraint
+         FROM pg_constraint c
+         JOIN pg_class rel ON rel.oid = c.conrelid
+         JOIN pg_class ref ON ref.oid = c.confrelid
+         JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE c.contype = 'f' AND n.nspname = $1
+        ORDER BY 2, 1, 3`,
+      [schema]
+    );
+    const columns = await admin.query<{ table_name: string; column_name: string }>(
+      `SELECT table_name, column_name FROM information_schema.columns
+        WHERE table_schema = $1 ORDER BY table_name, column_name`,
+      [schema]
+    );
+    const tableColumns: Record<string, string[]> = {};
+    for (const row of columns.rows) {
+      (tableColumns[row.table_name] ??= []).push(row.column_name);
+    }
+    return { failures, permitted, appliedMigrations, foreignKeys: foreignKeys.rows, tableColumns };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

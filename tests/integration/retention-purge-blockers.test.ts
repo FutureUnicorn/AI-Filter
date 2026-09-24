@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { assertRetentionPurgeBlockers } from "../../packages/db/src/index.ts";
 import { RETENTION_SURFACES, planRetention } from "../../packages/domain/src/index.ts";
@@ -192,6 +195,131 @@ test("what the database refuses matches what the plan says it refuses, surface b
     assert.ok(
       (RETENTION_SURFACES as readonly string[]).includes(surface),
       `the probe reported on "${surface}", which is not a surface in the plan`
+    );
+  }
+});
+
+// ---- REV-004: prove against the whole schema, and read it from pg_constraint ----
+//
+// The probe used to apply a hand-picked list of migrations, so it could
+// only find blockers in tables someone had already thought of, which is how
+// REV-003's five blockers on applications were reported as two. The
+// cross-check above fails when the PLAN gains a surface without a probe;
+// nothing failed when the SCHEMA gained a table referencing a planned
+// surface. These close that direction.
+
+const MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), "../../packages/db/migrations");
+
+/**
+ * Foreign keys onto a planned surface from a table the plan does not name.
+ *
+ * Self-expiring rather than permanent: every entry is re-proved on every
+ * run, and fails the moment it stops being true -- if the foreign key is
+ * gone, if the plan starts naming the table, or if the table gains any
+ * column not listed here, which is exactly when someone has to look again
+ * at whether it now holds candidate data. AF-63's RETENTION_EXEMPT_TABLES,
+ * further up this stack, is the eventual owner of table exemptions; fold
+ * this into it when that lands rather than keeping two lists.
+ */
+const REFERENCE_EXEMPTIONS: ReadonlyArray<{
+  readonly referencing: string;
+  readonly referenced: RetentionSurface;
+  readonly columns: readonly string[];
+  readonly reason: string;
+}> = [
+  {
+    referencing: "import_finalizations",
+    referenced: "file_intakes",
+    columns: ["created_at", "finalization_id", "idempotency_key", "intake_id", "mapping"],
+    reason:
+      "mapping is CsvColumnMapping[]: the employer's CSV header names and the fields they map to, " +
+      "not candidate content. It cascades away with its file_intake and pins nothing."
+  }
+];
+
+test("the probe applies every migration, in the order the migrate service applies them", async () => {
+  const { appliedMigrations } = await assertRetentionPurgeBlockers(databaseUrl());
+  // Read independently of the probe's own helper, so the two readings have
+  // to agree rather than one checking itself.
+  const onDisk = readdirSync(MIGRATIONS)
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+  assert.deepEqual(appliedMigrations, onDisk, "the probe must apply the whole directory, not a subset");
+  // The duplicate prefix, in the order every environment has run it.
+  const first = appliedMigrations.indexOf("0009_inference_kill_switch_nonblank_reason.sql");
+  const second = appliedMigrations.indexOf("0009_roles.sql");
+  assert.ok(first >= 0 && second >= 0, "both files sharing the 0009 prefix must be applied");
+  assert.ok(first < second, "bytewise order, as the runner's shell glob sorts");
+});
+
+test("pg_constraint is really being read, so the reference check cannot pass vacuously", async () => {
+  const { foreignKeys } = await assertRetentionPurgeBlockers(databaseUrl());
+  const ontoApplications = new Set(
+    foreignKeys.filter((fk) => fk.referenced === "applications").map((fk) => fk.referencing)
+  );
+  for (const table of [
+    "evidence_outcomes",
+    "candidate_decisions",
+    "audit_sample_members",
+    "review_timing_spans",
+    "import_rows"
+  ]) {
+    assert.ok(ontoApplications.has(table), `expected the known ${table} -> applications foreign key`);
+  }
+});
+
+test("every table referencing a planned surface is in the plan or named in that surface's detail", async () => {
+  const { foreignKeys } = await assertRetentionPurgeBlockers(databaseUrl());
+  const plan = planRetention(
+    { organizationId: "11111111-1111-4111-8111-111111111111", windowDays: 30 },
+    new Date("2026-08-29T12:00:00.000Z")
+  );
+  const detailOf = new Map(plan.surfaces.map((surface) => [surface.surface as string, surface.detail]));
+  const planned = new Set<string>(RETENTION_SURFACES);
+
+  const unaccounted = foreignKeys
+    .filter((fk) => planned.has(fk.referenced))
+    .filter((fk) => !planned.has(fk.referencing))
+    .filter((fk) => !new RegExp(`\\b${fk.referencing}\\b`, "u").test(detailOf.get(fk.referenced) ?? ""))
+    .filter(
+      (fk) =>
+        !REFERENCE_EXEMPTIONS.some(
+          (exemption) => exemption.referencing === fk.referencing && exemption.referenced === fk.referenced
+        )
+    )
+    .map((fk) => `${fk.referencing} -> ${fk.referenced} (${fk.constraint})`);
+
+  assert.deepEqual(
+    unaccounted,
+    [],
+    "a table references a planned surface but the plan never mentions it, so its effect on retention is " +
+      "unstated. Name it in that surface's detail, add it to RETENTION_SURFACES, or exempt it with its columns."
+  );
+});
+
+test("every reference exemption is still true, or it has to go", async () => {
+  const { foreignKeys, tableColumns } = await assertRetentionPurgeBlockers(databaseUrl());
+  const plan = planRetention(
+    { organizationId: "11111111-1111-4111-8111-111111111111", windowDays: 30 },
+    new Date("2026-08-29T12:00:00.000Z")
+  );
+  const detailOf = new Map(plan.surfaces.map((surface) => [surface.surface as string, surface.detail]));
+  for (const exemption of REFERENCE_EXEMPTIONS) {
+    const label = `${exemption.referencing} -> ${exemption.referenced}`;
+    assert.ok(
+      foreignKeys.some((fk) => fk.referencing === exemption.referencing && fk.referenced === exemption.referenced),
+      `${label} no longer exists; remove the exemption`
+    );
+    assert.ok(
+      !(RETENTION_SURFACES as readonly string[]).includes(exemption.referencing) &&
+        !new RegExp(`\\b${exemption.referencing}\\b`, "u").test(detailOf.get(exemption.referenced) ?? ""),
+      `${label} is now accounted for by the plan; remove the exemption`
+    );
+    assert.deepEqual(
+      tableColumns[exemption.referencing] ?? [],
+      [...exemption.columns].sort(),
+      `${exemption.referencing} changed shape; re-check that it still holds no candidate data, then update ` +
+        `the exemption (${exemption.reason})`
     );
   }
 });
