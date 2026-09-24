@@ -4,7 +4,10 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { GET as getWebEnvironmentHealth } from "../../apps/web/src/app/health/environment/route.ts";
+import { describeError } from "../../packages/security/src/index.ts";
+
 import {
+  EnvironmentDependencyUnavailableError,
   createWorkerHealthServer,
   createWorkerRuntimeId,
   startWorker
@@ -91,4 +94,60 @@ test("web health failures retain bounded diagnostics without changing the 503 re
     statusCode: 503
   });
   assert.doesNotMatch(JSON.stringify(entry), /invalid-health-test-environment|DATABASE_URL|candidate@example\.test/u);
+});
+
+// ---- AF-103 ----
+//
+// The runbook excludes /health/environment failures from the Sentry error
+// detectors because they "remain visible through the structured
+// *.environment_health_failed log events". That justification only holds
+// if the log can say WHICH dependency died. runEnvironmentSmokeCheck
+// probes Postgres and object storage concurrently, so nothing else can.
+//
+// Binding the error was necessary and not sufficient: an unreachable
+// Postgres and an unreachable object store are both a plain Error with
+// code ECONNREFUSED, so describeError returns the identical
+// {errorName:"Error", errorCode:"econnrefused"} for either. An operator
+// reading the log still could not tell them apart. The dependency now
+// travels on the error and is emitted as entityType.
+
+test("a database failure and a storage failure are distinguishable in the log", () => {
+  const refused = (port: number): Error =>
+    Object.assign(new Error(`connect ECONNREFUSED 127.0.0.1:${port}`), { code: "ECONNREFUSED" });
+
+  // The part that makes the dependency label necessary rather than nice:
+  // the two failures are indistinguishable by everything else the log carries.
+  assert.deepEqual(describeError(refused(5432)), describeError(refused(9000)));
+
+  const databaseDown = new EnvironmentDependencyUnavailableError(["database"], {
+    cause: refused(5432)
+  });
+  const storageDown = new EnvironmentDependencyUnavailableError(["object_storage"], {
+    cause: refused(9000)
+  });
+
+  assert.notDeepEqual(databaseDown.dependencies, storageDown.dependencies);
+  assert.deepEqual(databaseDown.dependencies, ["database"]);
+  assert.deepEqual(storageDown.dependencies, ["object_storage"]);
+
+  // The name survives describeError's allowlist, so the log is not left
+  // reporting UnknownError for the one error that carries the answer.
+  assert.equal(describeError(databaseDown).errorName, "EnvironmentDependencyUnavailableError");
+
+  // Both down is a third distinct value, not a coin flip between the two.
+  assert.deepEqual(
+    new EnvironmentDependencyUnavailableError(["database", "object_storage"]).dependencies,
+    ["database", "object_storage"]
+  );
+});
+
+test("the dependency label carries no connection string, bucket or credential", () => {
+  // It is emitted as entityType, which logStructured validates as a
+  // lowercase machine token. Anything richer would be dropped, so the
+  // label has to stay a closed vocabulary rather than a description.
+  for (const dependency of ["database", "object_storage"] as const) {
+    assert.match(dependency, /^[a-z][a-z0-9._-]{0,63}$/u);
+  }
+  const both = new EnvironmentDependencyUnavailableError(["database", "object_storage"]);
+  assert.match(both.dependencies.join("_and_"), /^[a-z][a-z0-9._-]{0,63}$/u);
 });
