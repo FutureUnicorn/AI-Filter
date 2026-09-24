@@ -70,10 +70,15 @@ export function requireBackupControls(appEnv, source) {
   if (!new Set(["auto", "on", "off"]).has(pathStyle)) {
     throw new Error("BACKUP_PATH_STYLE must be auto, on, or off");
   }
-  const accessKeyId = required(source, "BACKUP_ACCESS_KEY_ID");
-  const secretAccessKey = source.BACKUP_SECRET_ACCESS_KEY;
-  if (secretAccessKey === undefined || secretAccessKey.length < 20) {
-    throw new Error("BACKUP_SECRET_ACCESS_KEY must be at least 20 characters");
+  const adminAccessKeyId = required(source, "BACKUP_ADMIN_ACCESS_KEY_ID");
+  const adminSecretAccessKey = source.BACKUP_ADMIN_SECRET_ACCESS_KEY;
+  if (adminSecretAccessKey === undefined || adminSecretAccessKey.length < 20) {
+    throw new Error("BACKUP_ADMIN_SECRET_ACCESS_KEY must be at least 20 characters");
+  }
+  const writerAccessKeyId = required(source, "BACKUP_WRITER_ACCESS_KEY_ID");
+  const writerSecretAccessKey = source.BACKUP_WRITER_SECRET_ACCESS_KEY;
+  if (writerSecretAccessKey === undefined || writerSecretAccessKey.length < 20) {
+    throw new Error("BACKUP_WRITER_SECRET_ACCESS_KEY must be at least 20 characters");
   }
 
   return {
@@ -83,8 +88,10 @@ export function requireBackupControls(appEnv, source) {
       BACKUP_ENDPOINT: secureEndpoint(source),
       BACKUP_REGION: region,
       BACKUP_BUCKET: bucket,
-      BACKUP_ACCESS_KEY_ID: accessKeyId,
-      BACKUP_SECRET_ACCESS_KEY: secretAccessKey,
+      BACKUP_ADMIN_ACCESS_KEY_ID: adminAccessKeyId,
+      BACKUP_ADMIN_SECRET_ACCESS_KEY: adminSecretAccessKey,
+      BACKUP_WRITER_ACCESS_KEY_ID: writerAccessKeyId,
+      BACKUP_WRITER_SECRET_ACCESS_KEY: writerSecretAccessKey,
       BACKUP_INTERVAL_SECONDS: positiveInteger(source, "BACKUP_INTERVAL_SECONDS"),
       BACKUP_RETENTION_DAYS: positiveInteger(source, "BACKUP_RETENTION_DAYS"),
       BACKUP_PATH_STYLE: pathStyle,

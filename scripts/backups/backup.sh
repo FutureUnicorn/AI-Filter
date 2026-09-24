@@ -2,7 +2,8 @@
 
 set -eu
 
-BACKUP_WORK_DIR=/var/lib/signal-audit-backup
+BACKUP_WORK_DIR=${BACKUP_WORK_DIR:-/var/lib/signal-audit-backup}
+LAST_SUCCESS_FILE="$BACKUP_WORK_DIR/last-success-epoch"
 dump_file=
 manifest_file=
 dump_stderr_file=
@@ -15,6 +16,16 @@ is_lower_hex_length() {
   case "$value" in
     *[!0-9a-f]*) return 1 ;;
   esac
+}
+
+extract_version_id() {
+  stat_json="$1"
+  version_id="${stat_json#*\"versionID\":\"}"
+  [ "$version_id" != "$stat_json" ] || return 1
+  version_id="${version_id%%\"*}"
+  [ -n "$version_id" ] && [ "${#version_id}" -le 200 ] || return 1
+  printf '%s' "$version_id" | grep -Eq '^[A-Za-z0-9._~+/=-]+$' || return 1
+  printf '%s' "$version_id"
 }
 
 cleanup_run_files() {
@@ -87,25 +98,25 @@ validate_positive_integer() {
 }
 
 validate_configuration() {
-  require_value APP_ENV "${APP_ENV-}"
-  require_value DEPLOYMENT_COMMIT_SHA "${DEPLOYMENT_COMMIT_SHA-}"
-  require_value PGHOST "${PGHOST-}"
-  require_value PGDATABASE "${PGDATABASE-}"
-  require_value PGUSER "${PGUSER-}"
-  require_value PGPASSWORD "${PGPASSWORD-}"
-  require_value STORAGE_BUCKET "${STORAGE_BUCKET-}"
-  require_value STORAGE_ACCESS_KEY_ID "${STORAGE_ACCESS_KEY_ID-}"
-  require_value STORAGE_SECRET_ACCESS_KEY "${STORAGE_SECRET_ACCESS_KEY-}"
-  require_value BACKUP_ENDPOINT "${BACKUP_ENDPOINT-}"
-  require_value BACKUP_REGION "${BACKUP_REGION-}"
-  require_value BACKUP_BUCKET "${BACKUP_BUCKET-}"
-  require_value BACKUP_ACCESS_KEY_ID "${BACKUP_ACCESS_KEY_ID-}"
-  require_value BACKUP_SECRET_ACCESS_KEY "${BACKUP_SECRET_ACCESS_KEY-}"
-  require_value BACKUP_INTERVAL_SECONDS "${BACKUP_INTERVAL_SECONDS-}"
-  require_value BACKUP_RETENTION_DAYS "${BACKUP_RETENTION_DAYS-}"
-  require_value BACKUP_PATH_STYLE "${BACKUP_PATH_STYLE-}"
-  require_value BACKUP_CONTROL_OWNER "${BACKUP_CONTROL_OWNER-}"
-  require_value BACKUP_ENCRYPTION_REFERENCE "${BACKUP_ENCRYPTION_REFERENCE-}"
+  require_value APP_ENV "${APP_ENV-}" || return $?
+  require_value DEPLOYMENT_COMMIT_SHA "${DEPLOYMENT_COMMIT_SHA-}" || return $?
+  require_value PGHOST "${PGHOST-}" || return $?
+  require_value PGDATABASE "${PGDATABASE-}" || return $?
+  require_value PGUSER "${PGUSER-}" || return $?
+  require_value PGPASSWORD "${PGPASSWORD-}" || return $?
+  require_value STORAGE_BUCKET "${STORAGE_BUCKET-}" || return $?
+  require_value STORAGE_ACCESS_KEY_ID "${STORAGE_ACCESS_KEY_ID-}" || return $?
+  require_value STORAGE_SECRET_ACCESS_KEY "${STORAGE_SECRET_ACCESS_KEY-}" || return $?
+  require_value BACKUP_ENDPOINT "${BACKUP_ENDPOINT-}" || return $?
+  require_value BACKUP_REGION "${BACKUP_REGION-}" || return $?
+  require_value BACKUP_BUCKET "${BACKUP_BUCKET-}" || return $?
+  require_value BACKUP_ACCESS_KEY_ID "${BACKUP_ACCESS_KEY_ID-}" || return $?
+  require_value BACKUP_SECRET_ACCESS_KEY "${BACKUP_SECRET_ACCESS_KEY-}" || return $?
+  require_value BACKUP_INTERVAL_SECONDS "${BACKUP_INTERVAL_SECONDS-}" || return $?
+  require_value BACKUP_RETENTION_DAYS "${BACKUP_RETENTION_DAYS-}" || return $?
+  require_value BACKUP_PATH_STYLE "${BACKUP_PATH_STYLE-}" || return $?
+  require_value BACKUP_CONTROL_OWNER "${BACKUP_CONTROL_OWNER-}" || return $?
+  require_value BACKUP_ENCRYPTION_REFERENCE "${BACKUP_ENCRYPTION_REFERENCE-}" || return $?
 
   case "$APP_ENV" in
     staging|production) ;;
@@ -144,8 +155,8 @@ validate_configuration() {
     echo "Backup configuration error: BACKUP_SECRET_ACCESS_KEY must be at least 20 characters" >&2
     return 2
   fi
-  validate_positive_integer BACKUP_INTERVAL_SECONDS "$BACKUP_INTERVAL_SECONDS"
-  validate_positive_integer BACKUP_RETENTION_DAYS "$BACKUP_RETENTION_DAYS"
+  validate_positive_integer BACKUP_INTERVAL_SECONDS "$BACKUP_INTERVAL_SECONDS" || return $?
+  validate_positive_integer BACKUP_RETENTION_DAYS "$BACKUP_RETENTION_DAYS" || return $?
 }
 
 log_event() {
@@ -188,11 +199,20 @@ write_lifecycle_configuration() {
 {
   "Rules": [
     {
-      "ID": "af68-database-retention",
+      "ID": "af68-database-history-retention",
       "Status": "Enabled",
-      "Filter": { "Prefix": "$APP_ENV/database/" },
+      "Filter": { "Prefix": "$APP_ENV/database/history/" },
       "Expiration": { "Days": $BACKUP_RETENTION_DAYS },
       "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+    },
+    {
+      "ID": "af68-database-latest-retention",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "$APP_ENV/database/latest.dump" },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": $BACKUP_RETENTION_DAYS,
+        "NewerNoncurrentVersions": 1
+      }
     },
     {
       "ID": "af68-manifest-history-retention",
@@ -205,7 +225,10 @@ write_lifecycle_configuration() {
       "ID": "af68-latest-manifest-history-retention",
       "Status": "Enabled",
       "Filter": { "Prefix": "$APP_ENV/manifests/latest.json" },
-      "NoncurrentVersionExpiration": { "NoncurrentDays": $BACKUP_RETENTION_DAYS }
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": $BACKUP_RETENTION_DAYS,
+        "NewerNoncurrentVersions": 1
+      }
     },
     {
       "ID": "af68-storage-history-retention",
@@ -370,22 +393,36 @@ run_once() {
     cleanup_run_files
     return 1
   fi
-  database_key="$APP_ENV/database/$backup_id.dump"
-
-  if ! cat >"$manifest_file" <<EOF
-{"schemaVersion":1,"backupId":"$backup_id","environment":"$APP_ENV","release":"$DEPLOYMENT_COMMIT_SHA","startedAt":"$started_at","completedAt":"$completed_at","retentionDays":$BACKUP_RETENTION_DAYS,"database":{"objectKey":"$database_key","sha256":"$database_sha256","bytes":$database_bytes,"format":"postgres-custom"},"storage":{"prefix":"$APP_ENV/storage/current","versioned":true}}
-EOF
-  then
-    log_event error run_failed manifest_write "$backup_id"
-    cleanup_run_files
-    return 1
-  fi
+  database_history_key="$APP_ENV/database/history/$backup_id.dump"
+  database_latest_key="$APP_ENV/database/latest.dump"
 
   if ! run_interruptible mc --quiet cp \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" \
-    "$dump_file" "target/$BACKUP_BUCKET/$database_key" >/dev/null 2>&1
+    "$dump_file" "target/$BACKUP_BUCKET/$database_history_key" >/dev/null 2>&1
   then
     log_event error run_failed database_upload "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! run_interruptible mc --quiet cp --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" "$dump_file" "target/$BACKUP_BUCKET/$database_latest_key" >/dev/null 2>&1
+  then
+    log_event error run_failed database_latest_upload "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! latest_database_stat="$(mc --json stat "target/$BACKUP_BUCKET/$database_latest_key" 2>/dev/null)"; then
+    log_event error run_failed database_latest_version "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! latest_database_version_id="$(extract_version_id "$latest_database_stat")"; then
+    log_event error run_failed database_latest_version "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! printf '%s\n' "{\"schemaVersion\":1,\"backupId\":\"$backup_id\",\"environment\":\"$APP_ENV\",\"release\":\"$DEPLOYMENT_COMMIT_SHA\",\"startedAt\":\"$started_at\",\"completedAt\":\"$completed_at\",\"retentionDays\":$BACKUP_RETENTION_DAYS,\"database\":{\"objectKey\":\"$database_latest_key\",\"versionId\":\"$latest_database_version_id\",\"historyObjectKey\":\"$database_history_key\",\"sha256\":\"$database_sha256\",\"bytes\":$database_bytes,\"format\":\"postgres-custom\"},\"storage\":{\"prefix\":\"$APP_ENV/storage/current\",\"versioned\":true}}" >"$manifest_file"
+  then
+    log_event error run_failed manifest_write "$backup_id"
     cleanup_run_files
     return 1
   fi
@@ -410,15 +447,44 @@ EOF
     log_event error run_failed local_cleanup "$backup_id"
     return 1
   fi
-  if ! date -u +%s > /tmp/last-success-epoch; then
+  if ! date -u +%s > "$LAST_SUCCESS_FILE"; then
     log_event error run_failed success_state_write "$backup_id"
     return 1
   fi
   log_event info run_succeeded complete "$backup_id"
 }
 
+seconds_until_next_run() {
+  if [ ! -s "$LAST_SUCCESS_FILE" ]; then
+    printf '0\n'
+    return
+  fi
+  if ! last_success_epoch="$(cat "$LAST_SUCCESS_FILE")"; then
+    return 1
+  fi
+  case "$last_success_epoch" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  if ! now_epoch="$(date -u +%s)"; then
+    return 1
+  fi
+  age="$((now_epoch - last_success_epoch))"
+  if [ "$age" -lt 0 ] || [ "$age" -ge "$BACKUP_INTERVAL_SECONDS" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$((BACKUP_INTERVAL_SECONDS - age))"
+  fi
+}
+
 run_loop() {
   validate_configuration || return $?
+  if ! initial_delay="$(seconds_until_next_run)"; then
+    log_event warn run_failed success_state_read
+    initial_delay=0
+  fi
+  if [ "$initial_delay" -gt 0 ]; then
+    run_interruptible sleep "$initial_delay"
+  fi
   while :; do
     run_once || true
     run_interruptible sleep "$BACKUP_INTERVAL_SECONDS"
@@ -427,8 +493,8 @@ run_loop() {
 
 health_check() {
   validate_configuration >/dev/null 2>&1 || return 1
-  [ -s /tmp/last-success-epoch ] || return 1
-  last_success_epoch="$(cat /tmp/last-success-epoch)"
+  [ -s "$LAST_SUCCESS_FILE" ] || return 1
+  last_success_epoch="$(cat "$LAST_SUCCESS_FILE")"
   case "$last_success_epoch" in
     ""|*[!0-9]*) return 1 ;;
   esac

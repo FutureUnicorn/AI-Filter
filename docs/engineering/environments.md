@@ -167,8 +167,10 @@ Staging and production environment secrets:
 | `POSTGRES_PASSWORD` | environment-only secret, at least 20 characters |
 | `STORAGE_ACCESS_KEY_ID` | environment-only storage identity |
 | `STORAGE_SECRET_ACCESS_KEY` | environment-only secret, at least 20 characters |
-| `BACKUP_ACCESS_KEY_ID` | backup-only identity scoped to the dedicated environment backup bucket |
-| `BACKUP_SECRET_ACCESS_KEY` | backup-only secret, at least 20 characters |
+| `BACKUP_ADMIN_ACCESS_KEY_ID` | short-lived deploy identity for bucket creation, privacy, versioning, and lifecycle controls |
+| `BACKUP_ADMIN_SECRET_ACCESS_KEY` | admin secret, at least 20 characters; supplied only to one-shot `backup-init` |
+| `BACKUP_WRITER_ACCESS_KEY_ID` | long-running identity limited to encrypted object read/write/list and ordinary delete markers |
+| `BACKUP_WRITER_SECRET_ACCESS_KEY` | writer secret, at least 20 characters; explicitly denied bucket administration and version deletion |
 
 Staging and production environment variables:
 

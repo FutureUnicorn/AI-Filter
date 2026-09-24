@@ -2,14 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { requireBackupControls } from "../../scripts/backups/model.mjs";
+import { deployEnvironment } from "../../scripts/environment/cli.mjs";
 
 const approvedControls = {
   BACKUP_ENABLED: "true",
   BACKUP_ENDPOINT: "https://backups.example.test",
   BACKUP_REGION: "ap-south-1",
   BACKUP_BUCKET: "signal-audit-staging-backups",
-  BACKUP_ACCESS_KEY_ID: "staging-backup-writer",
-  BACKUP_SECRET_ACCESS_KEY: "a-backup-secret-longer-than-twenty",
+  BACKUP_ADMIN_ACCESS_KEY_ID: "staging-backup-admin",
+  BACKUP_ADMIN_SECRET_ACCESS_KEY: "an-admin-secret-longer-than-twenty",
+  BACKUP_WRITER_ACCESS_KEY_ID: "staging-backup-writer",
+  BACKUP_WRITER_SECRET_ACCESS_KEY: "a-writer-secret-longer-than-twenty",
   BACKUP_INTERVAL_SECONDS: "86400",
   BACKUP_RETENTION_DAYS: "30",
   BACKUP_PATH_STYLE: "off",
@@ -64,8 +67,10 @@ test("enabled backups require every operational decision", () => {
     "BACKUP_ENDPOINT",
     "BACKUP_REGION",
     "BACKUP_BUCKET",
-    "BACKUP_ACCESS_KEY_ID",
-    "BACKUP_SECRET_ACCESS_KEY",
+    "BACKUP_ADMIN_ACCESS_KEY_ID",
+    "BACKUP_ADMIN_SECRET_ACCESS_KEY",
+    "BACKUP_WRITER_ACCESS_KEY_ID",
+    "BACKUP_WRITER_SECRET_ACCESS_KEY",
     "BACKUP_INTERVAL_SECONDS",
     "BACKUP_RETENTION_DAYS",
     "BACKUP_CONTROL_OWNER",
@@ -124,11 +129,53 @@ test("backup target identifiers and timing values are bounded to safe syntax", (
 
 test("backup credentials are required but never included in validation errors", () => {
   const secret = "short";
-  assert.throws(
-    () => requireBackupControls("staging", { ...approvedControls, BACKUP_SECRET_ACCESS_KEY: secret }),
-    (error: unknown) =>
-      error instanceof Error &&
-      /BACKUP_SECRET_ACCESS_KEY/u.test(error.message) &&
-      !error.message.includes(secret)
+  for (const name of ["BACKUP_ADMIN_SECRET_ACCESS_KEY", "BACKUP_WRITER_SECRET_ACCESS_KEY"] as const) {
+    assert.throws(
+      () => requireBackupControls("staging", { ...approvedControls, [name]: secret }),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message.includes(name) &&
+        !error.message.includes(secret)
+    );
+  }
+});
+
+test("a disabled hosted deploy removes a previously enabled backup before continuing", () => {
+  const calls: Array<{
+    readonly project: string;
+    readonly variables: Readonly<Record<string, string>>;
+    readonly arguments_: readonly string[];
+    readonly local: boolean;
+  }> = [];
+  deployEnvironment(
+    {
+      project: "signal-audit-staging",
+      backupEnabled: false,
+      variables: { APP_ENV: "staging", BACKUP_ENABLED: "false" }
+    },
+    false,
+    (
+      project: string,
+      variables: Readonly<Record<string, string>>,
+      arguments_: readonly string[],
+      local = false
+    ) => {
+      calls.push({ project, variables, arguments_, local });
+    }
+  );
+
+  assert.deepEqual(calls[0]?.arguments_, [
+    "--profile",
+    "backups",
+    "rm",
+    "--stop",
+    "--force",
+    "backup"
+  ]);
+  assert.deepEqual(calls.at(-1)?.arguments_, ["up", "-d", "--build", "web", "worker"]);
+  assert.ok(
+    calls.findIndex(({ arguments_ }) => arguments_[0] === "rm") <
+      calls.findIndex(({ arguments_ }) => arguments_[0] === "up" && arguments_.includes("postgres")),
+    "off-host backup activity must stop before deployment prerequisites run"
   );
 });

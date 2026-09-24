@@ -33,8 +33,6 @@ x-backup-environment: &backup-environment
   BACKUP_ENDPOINT: ${BACKUP_ENDPOINT:-}
   BACKUP_REGION: ${BACKUP_REGION:-}
   BACKUP_BUCKET: ${BACKUP_BUCKET:-}
-  BACKUP_ACCESS_KEY_ID: ${BACKUP_ACCESS_KEY_ID:-}
-  BACKUP_SECRET_ACCESS_KEY: ${BACKUP_SECRET_ACCESS_KEY:-}
   BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-}
   BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
   BACKUP_PATH_STYLE: ${BACKUP_PATH_STYLE:-auto}
@@ -156,6 +154,8 @@ services:
     restart: "no"
     environment:
       <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_ADMIN_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_ADMIN_SECRET_ACCESS_KEY:-}
     networks: [public, private]
     read_only: true
     tmpfs:
@@ -177,6 +177,8 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_WRITER_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_WRITER_SECRET_ACCESS_KEY:-}
     healthcheck:
       test: ["CMD", "/usr/local/bin/signal-audit-backup", "health"]
       interval: 1m

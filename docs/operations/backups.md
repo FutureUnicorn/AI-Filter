@@ -13,16 +13,21 @@ S3-compatible deployment, account, or provider.
 
 ## Backup set
 
-When enabled, the `backup` service runs once immediately and then waits
-`BACKUP_INTERVAL_SECONDS` before the next run. One run performs:
+When enabled for the first time, the `backup` service runs immediately and
+then waits `BACKUP_INTERVAL_SECONDS` before the next run. After a deployment
+or restart it first waits any interval still owed since the persisted last
+success. One run performs:
 
 1. mirror primary object storage to the encrypted, versioned target prefix;
 2. create a consistent PostgreSQL custom-format archive;
 3. verify the archive can be parsed with `pg_restore --list`;
 4. mirror object storage a second time to cover immutable uploads committed
    while the database snapshot was running;
-5. upload the dump, its SHA-256 and a metadata-only success manifest; and
-6. replace `manifests/latest.json` only after every required step succeeds.
+5. upload the dump to immutable history and to the versioned
+   `database/latest.dump` recovery key;
+6. record the exact latest-dump version ID, SHA-256, and immutable history key
+   in a metadata-only success manifest; and
+7. replace `manifests/latest.json` only after every required step succeeds.
 
 The two storage passes make the database snapshot no earlier than the first
 copy and no later than the second. This avoids publishing a successful backup
@@ -42,7 +47,9 @@ and replaces its lifecycle configuration with the AF-68 rules. The bucket must
 not be shared with unrelated data because lifecycle import is intentionally
 authoritative.
 
-- database dumps expire after `BACKUP_RETENTION_DAYS`;
+- immutable database history expires after `BACKUP_RETENTION_DAYS`;
+- the current `database/latest.dump` never expires; older exact versions age
+  out after the same window while the newest noncurrent version is retained;
 - historical manifests expire after the same window;
 - overwritten or deleted object-storage versions expire after that window;
 - current mirrored objects do not expire while they still exist in primary
@@ -66,11 +73,22 @@ must approve:
 - `BACKUP_CONTROL_OWNER`: accountable person or team; and
 - `BACKUP_ENCRYPTION_REFERENCE`: provider encryption/KMS evidence.
 
-Store `BACKUP_ACCESS_KEY_ID` and `BACKUP_SECRET_ACCESS_KEY` as environment
-secrets. The identity is available only to `backup-init` and `backup`, never
-to the web or worker containers. It needs access only to the dedicated bucket,
-including bucket creation/private policy, versioning, lifecycle, encrypted
-object read/write/list/delete, and version inspection.
+Store both credential pairs as environment secrets. Neither is available to
+the web or worker containers.
+
+- `BACKUP_ADMIN_ACCESS_KEY_ID` / `BACKUP_ADMIN_SECRET_ACCESS_KEY` are
+  supplied only to the one-shot `backup-init` container. Scope them to the
+  dedicated environment bucket and allow bucket creation/private policy,
+  versioning, lifecycle configuration, and control verification.
+- `BACKUP_WRITER_ACCESS_KEY_ID` / `BACKUP_WRITER_SECRET_ACCESS_KEY` are
+  supplied to the long-running `backup` container. Allow only encrypted
+  object put/get/head, bucket listing, and ordinary object deletion needed to
+  create mirror delete markers. Explicitly deny version deletion, lifecycle
+  changes, versioning changes, and bucket-policy changes.
+
+Use provider Object Lock in governance mode for database/manifests when the
+approved provider supports it. That is defense in depth; the admin/writer
+split is required regardless.
 
 `BACKUP_PATH_STYLE` is `auto`, `on`, or `off` according to the selected
 provider. No schedule, retention, provider, owner, or notification address is
@@ -79,7 +97,9 @@ hardcoded in the repository.
 ## Deployment behavior
 
 The normal hosted deploy validates backup controls before invoking Docker.
-When disabled, deployment behavior is unchanged. When enabled:
+When disabled, it first stops and removes any previously running `backup`
+container so changing `BACKUP_ENABLED=false` actually stops off-host data
+movement. When enabled:
 
 1. PostgreSQL, primary storage, and migrations start;
 2. the one-shot `backup-init` service applies and verifies target controls;
@@ -90,8 +110,11 @@ The backup container is non-root, read-only, capability-free, has no published
 port, and uses a small in-memory filesystem only for client state, manifests,
 and health state. PostgreSQL archives are staged on the dedicated disk-backed
 `backup-work` volume so archive growth does not compete directly with the
-container memory limit. It joins the private network for PostgreSQL/MinIO and
-the public network only for encrypted egress to the off-host target.
+container memory limit. The volume also keeps the last-success timestamp
+across image recreation; a deploy waits out the remainder of the approved
+interval instead of starting an extra full backup. It joins the private
+network for PostgreSQL/MinIO and the public network only for encrypted egress
+to the off-host target.
 
 Before enablement, operations must confirm that the Compose host has enough
 free disk for the largest expected compressed database archive plus normal
@@ -103,8 +126,9 @@ copy claimed by AF-68.
 
 ## Detection and diagnosis
 
-Successful runs write `/tmp/last-success-epoch`. The container health check is
-healthy only when a success occurred within twice the configured interval.
+Successful runs write
+`/var/lib/signal-audit-backup/last-success-epoch`. The container health check
+is healthy only when a success occurred within twice the configured interval.
 Structured events are:
 
 - `backup.configuration_succeeded`;
@@ -119,10 +143,11 @@ can contain candidate filenames.
 
 ## Recovery and AF-69 handoff
 
-`<environment>/manifests/latest.json` identifies the database archive,
-checksum, release, backup interval, storage prefix, and retention window. AF-69
-must perform a restore into isolated infrastructure, validate the checksum,
-restore with the matching PostgreSQL major version, reconstruct storage at the
+`<environment>/manifests/latest.json` identifies the versioned latest
+database key, its exact version ID, the immutable history key, checksum,
+release, storage prefix, and retention window. AF-69 must fetch the recorded
+object version into isolated infrastructure, validate the checksum, restore
+with the matching PostgreSQL major version, reconstruct storage at the
 manifest completion time from version history, and prove application-level
 records and objects agree.
 

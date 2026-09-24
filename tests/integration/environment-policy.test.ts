@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -75,8 +77,8 @@ test("local Compose explicitly loads .env.local without affecting hosted command
   assert.match(cli, /const localEnvFile = path\.join\(repositoryRoot, "\.env\.local"\);/u);
   assert.match(cli, /if \(!fs\.existsSync\(localEnvFile\)\) \{[\s\S]*?Missing \.env\.local\. Copy \.env\.example to \.env\.local before running local infrastructure\.[\s\S]*?\}/u);
   assert.match(cli, /if \(local\) \{[\s\S]*?files\.push\("--env-file", localEnvFile\);[\s\S]*?\}/u);
-  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "postgres", "storage"\], local\);/u);
-  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "--build", "web", "worker"\]\);/u);
+  assert.match(cli, /dockerRunner\(environment\.project, environment\.variables, \["up", "-d", "postgres", "storage"\], local\);/u);
+  assert.match(cli, /dockerRunner\(environment\.project, environment\.variables, \["up", "-d", "--build", "web", "worker"\]\);/u);
 });
 
 test("staging and production deploy only exact green revisions", () => {
@@ -247,10 +249,12 @@ test("the web server refuses to start without a session secret", () => {
 test("hosted backups leave application credentials isolated and use an off-host encrypted target", () => {
   const compose = read("infra/compose/runtime.yml");
   const backupService = /^ {2}backup:[\s\S]*?(?=\n {2}\S|\nnetworks:)/mu.exec(compose)?.[0];
+  const backupInitService = /^ {2}backup-init:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
   const backupEnvironment = /x-backup-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
   const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
   const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
   assert.ok(backupService);
+  assert.ok(backupInitService);
   assert.ok(backupEnvironment);
   assert.ok(webService);
   assert.ok(workerService);
@@ -274,8 +278,15 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(backupDockerfile, /chmod 0700 \/var\/lib\/signal-audit-backup/u);
   assert.match(backupEnvironment!, /BACKUP_CONTROL_OWNER:/u);
   assert.match(backupEnvironment!, /BACKUP_ENCRYPTION_REFERENCE:/u);
-  assert.doesNotMatch(webService!, /BACKUP_ACCESS_KEY_ID|BACKUP_SECRET_ACCESS_KEY/u);
-  assert.doesNotMatch(workerService!, /BACKUP_ACCESS_KEY_ID|BACKUP_SECRET_ACCESS_KEY/u);
+  assert.doesNotMatch(backupEnvironment!, /BACKUP_(?:ADMIN|WRITER)_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY)/u);
+  assert.match(backupInitService!, /BACKUP_ACCESS_KEY_ID: \$\{BACKUP_ADMIN_ACCESS_KEY_ID:-\}/u);
+  assert.match(backupInitService!, /BACKUP_SECRET_ACCESS_KEY: \$\{BACKUP_ADMIN_SECRET_ACCESS_KEY:-\}/u);
+  assert.doesNotMatch(backupInitService!, /BACKUP_WRITER_/u);
+  assert.match(backupService!, /BACKUP_ACCESS_KEY_ID: \$\{BACKUP_WRITER_ACCESS_KEY_ID:-\}/u);
+  assert.match(backupService!, /BACKUP_SECRET_ACCESS_KEY: \$\{BACKUP_WRITER_SECRET_ACCESS_KEY:-\}/u);
+  assert.doesNotMatch(backupService!, /BACKUP_ADMIN_/u);
+  assert.doesNotMatch(webService!, /BACKUP_(?:ADMIN|WRITER|ACCESS|SECRET)/u);
+  assert.doesNotMatch(workerService!, /BACKUP_(?:ADMIN|WRITER|ACCESS|SECRET)/u);
 
   const script = read("scripts/backups/backup.sh");
   assert.match(script, /BACKUP_ENDPOINT must use https/u);
@@ -301,7 +312,7 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(script, /run_interruptible pg_dump/u);
   assert.match(script, /run_interruptible pg_restore/u);
   assert.match(script, /run_interruptible mc --quiet mirror/u);
-  assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 3);
+  assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 4);
   assert.match(script, /cleanup_orphaned_dumps/u);
   assert.match(script, /run_once \|\| true/u);
   assert.doesNotMatch(
@@ -309,7 +320,8 @@ test("hosted backups leave application credentials isolated and use an off-host 
     /signal-audit-backup once/u,
     "the signal-owning shell must execute the run so its cleanup trap knows the active paths"
   );
-  assert.match(script, /last-success-epoch/u);
+  assert.match(script, /LAST_SUCCESS_FILE="\$BACKUP_WORK_DIR\/last-success-epoch"/u);
+  assert.match(script, /seconds_until_next_run/u);
   assert.doesNotMatch(
     script,
     /\b(?:echo|printf)\b[^\n]*\$\{?(?:STORAGE|BACKUP)_SECRET_ACCESS_KEY/u,
@@ -321,7 +333,8 @@ test("backup retention is reproducible and preserves current source objects", ()
   const script = read("scripts/backups/backup.sh");
   assert.match(script, /mc --quiet version enable/u);
   assert.match(script, /mc --quiet ilm rule import/u);
-  assert.match(script, /af68-database-retention/u);
+  assert.match(script, /af68-database-history-retention/u);
+  assert.match(script, /af68-database-latest-retention/u);
   assert.match(script, /af68-manifest-history-retention/u);
   assert.match(script, /af68-latest-manifest-history-retention/u);
   assert.match(script, /af68-storage-history-retention/u);
@@ -337,7 +350,16 @@ test("backup retention is reproducible and preserves current source objects", ()
     "current mirrored objects must not expire while they still exist in primary storage"
   );
 
-  for (const ruleId of ["af68-database-retention", "af68-manifest-history-retention"]) {
+  const latestDatabaseRule =
+    /"ID": "af68-database-latest-retention"[\s\S]*?\n {4}\}/u.exec(script)?.[0];
+  assert.ok(latestDatabaseRule);
+  assert.doesNotMatch(latestDatabaseRule!, /"Expiration": \{ "Days"/u);
+  assert.match(latestDatabaseRule!, /"NewerNoncurrentVersions": 1/u);
+  assert.match(script, /database_latest_key="\$APP_ENV\/database\/latest\.dump"/u);
+  assert.match(script, /latest_database_version_id="\$\(extract_version_id "\$latest_database_stat"\)"/u);
+  assert.match(script, /versionId/u);
+
+  for (const ruleId of ["af68-database-history-retention", "af68-manifest-history-retention"]) {
     const expiringRule = new RegExp(`"ID": "${ruleId}"[\\s\\S]*?\\n {4}\\}`, "u").exec(script)?.[0];
     assert.ok(expiringRule, `expected ${ruleId}`);
     assert.match(
@@ -357,9 +379,15 @@ test("hosted workflows pass backup policy as variables and credentials as secret
     assert.match(workflow, /BACKUP_ENABLED: \$\{\{ vars\.BACKUP_ENABLED \}\}/u);
     assert.match(workflow, /BACKUP_INTERVAL_SECONDS: \$\{\{ vars\.BACKUP_INTERVAL_SECONDS \}\}/u);
     assert.match(workflow, /BACKUP_RETENTION_DAYS: \$\{\{ vars\.BACKUP_RETENTION_DAYS \}\}/u);
-    assert.match(workflow, /BACKUP_ACCESS_KEY_ID: \$\{\{ secrets\.BACKUP_ACCESS_KEY_ID \}\}/u);
-    assert.match(workflow, /BACKUP_SECRET_ACCESS_KEY: \$\{\{ secrets\.BACKUP_SECRET_ACCESS_KEY \}\}/u);
-    assert.doesNotMatch(workflow, /BACKUP_SECRET_ACCESS_KEY: \$\{\{ vars\./u);
+    for (const name of [
+      "BACKUP_ADMIN_ACCESS_KEY_ID",
+      "BACKUP_ADMIN_SECRET_ACCESS_KEY",
+      "BACKUP_WRITER_ACCESS_KEY_ID",
+      "BACKUP_WRITER_SECRET_ACCESS_KEY"
+    ]) {
+      assert.match(workflow, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`, "u"));
+      assert.doesNotMatch(workflow, new RegExp(`${name}: \\$\\{\\{ vars\\.`, "u"));
+    }
   }
 });
 
@@ -374,4 +402,96 @@ test("hosted backup deployment builds and configures the exact backup image befo
     cli,
     /"up",\s*"-d",\s*"--build",\s*"web",\s*"worker",\s*"backup"/u
   );
+  assert.match(
+    cli,
+    /"--profile",\s*"backups",\s*"rm",\s*"--stop",\s*"--force",\s*"backup"/u,
+    "a disabled deploy must stop and remove an earlier backup container"
+  );
 });
+
+test(
+  "backup runtime rejects missing governance controls and invalid intervals before target access",
+  { skip: process.platform === "win32" ? "POSIX shell behavior runs in Linux CI and container validation" : false },
+  (t) => {
+    const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "af68-backup-validation-"));
+    t.after(() => fs.rmSync(temporaryDirectory, { recursive: true, force: true }));
+    const binDirectory = path.join(temporaryDirectory, "bin");
+    fs.mkdirSync(binDirectory);
+    const mcPath = path.join(binDirectory, "mc");
+    fs.writeFileSync(mcPath, '#!/bin/sh\nprintf \'called\\n\' >>"$MC_CALL_LOG"\n', { mode: 0o700 });
+
+    const validEnvironment = {
+      ...process.env,
+      PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+      APP_ENV: "staging",
+      DEPLOYMENT_COMMIT_SHA: "a".repeat(40),
+      PGHOST: "postgres",
+      PGDATABASE: "signal_audit_staging",
+      PGUSER: "signal_audit_staging",
+      PGPASSWORD: "database-secret-at-least-20",
+      STORAGE_BUCKET: "signal-audit-staging",
+      STORAGE_ACCESS_KEY_ID: "storage-access",
+      STORAGE_SECRET_ACCESS_KEY: "storage-secret-at-least-20",
+      BACKUP_ENDPOINT: "https://backups.example.test",
+      BACKUP_REGION: "ap-south-1",
+      BACKUP_BUCKET: "signal-audit-staging-backups",
+      BACKUP_ACCESS_KEY_ID: "backup-admin",
+      BACKUP_SECRET_ACCESS_KEY: "backup-admin-secret-at-least-20",
+      BACKUP_INTERVAL_SECONDS: "86400",
+      BACKUP_RETENTION_DAYS: "30",
+      BACKUP_PATH_STYLE: "off",
+      BACKUP_CONTROL_OWNER: "platform-operations",
+      BACKUP_ENCRYPTION_REFERENCE: "kms://backup-provider/staging"
+    };
+
+    for (const [name, invalidValue] of [
+      ["PGPASSWORD", ""],
+      ["BACKUP_CONTROL_OWNER", ""],
+      ["BACKUP_ENCRYPTION_REFERENCE", ""],
+      ["BACKUP_INTERVAL_SECONDS", "0"]
+    ] as const) {
+      const callLog = path.join(temporaryDirectory, `${name}.calls`);
+      const result = spawnSync(
+        "sh",
+        [path.join(repositoryRoot, "scripts/backups/backup.sh"), "configure"],
+        {
+          encoding: "utf8",
+          env: { ...validEnvironment, [name]: invalidValue, MC_CALL_LOG: callLog }
+        }
+      );
+      assert.equal(result.status, 2, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, new RegExp(name, "u"));
+      assert.equal(fs.existsSync(callLog), false, `${name} must fail before mc can change the target`);
+    }
+
+    const workDirectory = path.join(temporaryDirectory, "work");
+    fs.mkdirSync(workDirectory);
+    fs.writeFileSync(path.join(workDirectory, "last-success-epoch"), "900\n");
+    const datePath = path.join(binDirectory, "date");
+    fs.writeFileSync(datePath, "#!/bin/sh\nprintf '1000\\n'\n", { mode: 0o700 });
+    const functionsPath = path.join(temporaryDirectory, "backup-functions.sh");
+    fs.writeFileSync(
+      functionsPath,
+      read("scripts/backups/backup.sh").replace(/\ncase "\$\{1-\}" in[\s\S]*$/u, "\n")
+    );
+
+    const schedule = spawnSync(
+      "sh",
+      ["-c", '. "$1"; BACKUP_INTERVAL_SECONDS=300; seconds_until_next_run', "sh", functionsPath],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+          BACKUP_WORK_DIR: workDirectory
+        }
+      }
+    );
+    assert.equal(schedule.status, 0, schedule.stderr);
+    assert.equal(
+      schedule.stdout.trim(),
+      "200",
+      "a recreated container must wait only the remainder of the persisted interval"
+    );
+  }
+);
