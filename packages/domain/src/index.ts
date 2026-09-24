@@ -3304,33 +3304,104 @@ export interface CandidateDataErasureResidue {
   readonly surfaces: readonly CandidateDataErasureStep[];
   /**
    * The sentence that goes on the receipt and, ultimately, to the
-   * candidate. Written from what the workflow can actually do rather than
-   * from what it was asked to do.
+   * candidate. Written from what actually happened on this run, not from
+   * the static plan alone.
    */
   readonly statement: string;
 }
 
+/**
+ * What this erasure run actually did to intake-scoped and object-storage
+ * surfaces. Required so the receipt cannot claim a shared document was
+ * erased while it is still deferred, or claim an object was deleted when
+ * the delete never ran.
+ */
+export interface CandidateDataErasureRunOutcome {
+  readonly intakeErased: boolean;
+  /** True only when the object-storage delete callback ran successfully. */
+  readonly objectStorageDeleted: boolean;
+  readonly applicationsStillReferencingIntake: number;
+}
+
+const INTAKE_SCOPED_SURFACES: ReadonlySet<string> = new Set([
+  "object_storage_documents",
+  "canonical_text_extractions",
+  "import_rows",
+  "file_intakes"
+]);
+
 export function summarizeCandidateDataErasureResidue(
-  plan: CandidateDataErasurePlan
+  plan: CandidateDataErasurePlan,
+  outcome: CandidateDataErasureRunOutcome = {
+    intakeErased: true,
+    objectStorageDeleted: true,
+    applicationsStillReferencingIntake: 0
+  }
 ): CandidateDataErasureResidue {
   const blocked = plan.steps.filter((step) => step.method === "blocked_append_only");
-  if (blocked.length === 0) {
+  const deferredIntake = plan.steps.filter(
+    (step) => INTAKE_SCOPED_SURFACES.has(step.surface) && !outcome.intakeErased
+  );
+  const objectSkippedWhileIntakeErased =
+    outcome.intakeErased && !outcome.objectStorageDeleted
+      ? plan.steps.filter((step) => step.surface === "object_storage_documents")
+      : [];
+
+  const surviving = [...blocked, ...deferredIntake, ...objectSkippedWhileIntakeErased];
+  // Dedupe by surface name while preserving plan order.
+  const seen = new Set<string>();
+  const surfaces: CandidateDataErasureStep[] = [];
+  for (const step of surviving) {
+    if (seen.has(step.surface)) {
+      continue;
+    }
+    seen.add(step.surface);
+    surfaces.push(step);
+  }
+
+  if (surfaces.length === 0) {
     return {
       anyResidue: false,
       surfaces: [],
       statement: "Every surface holding candidate-derived content was erased."
     };
   }
+
+  const parts: string[] = [];
+  if (outcome.intakeErased && outcome.objectStorageDeleted) {
+    parts.push("Original documents, canonical text and candidate identity were erased.");
+  } else if (outcome.intakeErased && !outcome.objectStorageDeleted) {
+    parts.push(
+      "Candidate identity and extracted text were erased in place, but the stored object was not " +
+        "deleted, so its storage_key was left intact and object_storage_documents remains residue."
+    );
+  } else {
+    const others = outcome.applicationsStillReferencingIntake;
+    parts.push(
+      "Candidate identity on this application was erased. The shared source document and its " +
+        "extracted text are retained until the " +
+        String(others) +
+        " other candidate" +
+        (others === 1 ? "" : "s") +
+        " in the same file " +
+        (others === 1 ? "is" : "are") +
+        " erased."
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      "The following candidate-derived content survives because the append-only ledger rejects " +
+        "both DELETE and UPDATE on it, and erasing it requires the per-candidate encryption key " +
+        "design tracked as AF-91: " +
+        blocked.map((step) => step.surface).join("; ") +
+        "."
+    );
+  }
+
   return {
     anyResidue: true,
-    surfaces: blocked,
-    statement:
-      "Original documents, canonical text and candidate identity were erased. The following " +
-      "candidate-derived content survives because the append-only ledger rejects both DELETE and " +
-      "UPDATE on it, and erasing it requires the per-candidate encryption key design tracked as " +
-      "AF-91: " +
-      blocked.map((step) => step.surface).join("; ") +
-      "."
+    surfaces,
+    statement: parts.join(" ")
   };
 }
 

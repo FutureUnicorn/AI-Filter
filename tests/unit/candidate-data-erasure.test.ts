@@ -104,13 +104,46 @@ test("the residue statement names the blocked surfaces and the ticket that unblo
   // The receipt goes to a candidate. Claiming a clean erasure while the
   // verbatim quote is still in the ledger would be the false statement
   // this design exists to avoid.
-  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"));
+  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"), {
+    intakeErased: true,
+    objectStorageDeleted: true,
+    applicationsStillReferencingIntake: 0
+  });
   assert.equal(residue.anyResidue, true);
   const blocked = residue.surfaces.map((step) => step.surface);
   assert.ok(blocked.includes("evidence_outcomes"));
   assert.ok(blocked.includes("candidate_decisions"));
   assert.match(residue.statement, /AF-91/);
   assert.match(residue.statement, /append-only/);
+  assert.match(residue.statement, /Original documents, canonical text and candidate identity were erased/);
+});
+
+test("a deferred intake does not claim the shared document was erased", () => {
+  // REV-005. The first of many candidates on a CSV must not be told the
+  // shared CV text is gone while 199 siblings still hold it open.
+  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"), {
+    intakeErased: false,
+    objectStorageDeleted: false,
+    applicationsStillReferencingIntake: 1
+  });
+  assert.equal(residue.anyResidue, true);
+  const surfaces = residue.surfaces.map((step) => step.surface);
+  assert.ok(surfaces.includes("canonical_text_extractions"));
+  assert.ok(surfaces.includes("object_storage_documents"));
+  assert.ok(surfaces.includes("file_intakes"));
+  assert.doesNotMatch(residue.statement, /Original documents, canonical text and candidate identity were erased/);
+  assert.match(residue.statement, /retained until the 1 other candidate/);
+  assert.match(residue.statement, /AF-91/);
+});
+
+test("skipping object delete while erasing the intake still records object storage as residue", () => {
+  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"), {
+    intakeErased: true,
+    objectStorageDeleted: false,
+    applicationsStillReferencingIntake: 0
+  });
+  assert.ok(residue.surfaces.some((step) => step.surface === "object_storage_documents"));
+  assert.match(residue.statement, /stored object was not deleted/);
 });
 
 test("blocked surfaces are never offered as erasable", () => {
