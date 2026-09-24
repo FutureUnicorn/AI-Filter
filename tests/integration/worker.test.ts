@@ -4,12 +4,28 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { GET as getWebEnvironmentHealth } from "../../apps/web/src/app/health/environment/route.ts";
-import { createWorkerHealthServer, startWorker } from "../../apps/worker/src/index.ts";
+import {
+  createWorkerHealthServer,
+  createWorkerRuntimeId,
+  startWorker
+} from "../../apps/worker/src/index.ts";
 
 test("worker starts without external credentials", () => {
   assert.equal(
     startWorker(),
     "Signal Audit worker ready; dependency center=domain"
+  );
+});
+
+test("worker runtime identities are unique per boot and remain lease-safe", () => {
+  const first = createWorkerRuntimeId("evidence-worker-staging", "boot-a");
+  const second = createWorkerRuntimeId("evidence-worker-staging", "boot-b");
+  assert.notEqual(first, second);
+  assert.equal(first, "evidence-worker-staging:boot-a");
+  assert.match(first, /^[A-Za-z0-9._:-]{1,128}$/u);
+  assert.ok(
+    createWorkerRuntimeId("w".repeat(128), "boot-c").length <= 128,
+    "configured deployment labels must be truncated before adding the unique boot suffix"
   );
 });
 

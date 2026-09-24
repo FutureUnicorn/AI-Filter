@@ -33,6 +33,7 @@ interface WebObservabilityModule {
     getActiveSpan(): TestSpanHandle | undefined;
     startSpan<T>(options: Record<string, unknown>, callback: (span: TestSpanHandle) => T | Promise<T>): T | Promise<T>;
   } | undefined): void;
+  operationForRoute(routePath: string): string;
   withServerOperation<Arguments extends unknown[], Result>(
     operation: string,
     handler: (...args: Arguments) => Promise<Result>
@@ -44,6 +45,7 @@ const {
   sanitizeTelemetryEvent,
   sanitizeTelemetrySpan,
   setWebTelemetryAdapterForTesting,
+  operationForRoute,
   withServerOperation
 } = (await import(webObservabilityUrl)) as WebObservabilityModule;
 const monitoringSource = {
@@ -240,6 +242,17 @@ test("the final event and span allowlists remove request PII and high-cardinalit
   });
 });
 
+test("evidence reads and extraction enqueue use distinct normalized operations", () => {
+  assert.equal(
+    operationForRoute("/api/roles/[roleId]/applications/[applicationId]/evidence"),
+    "application.evidence"
+  );
+  assert.equal(
+    operationForRoute("/api/roles/[roleId]/applications/[applicationId]/evidence-extraction"),
+    "application.evidence_extraction.enqueue"
+  );
+});
+
 test("token-budget telemetry reuses ok, warning, and capped decisions without money", async (t) => {
   const config = { maxTokensPerPeriod: 1000, alertThresholdRatio: 0.8 };
   const values = [
@@ -278,6 +291,7 @@ test("worker event allowlisting drops arbitrary context", () => {
   const clean = sanitizeWorkerEvent({
     tags: {
       operation: "worker.job",
+      failure_code: "provider_transient",
       error_name: "TypeError",
       error_code: "econnreset",
       application_id: "secret-id"
@@ -291,9 +305,19 @@ test("worker event allowlisting drops arbitrary context", () => {
   assert.equal(clean.exception?.values?.[0]?.type, "TypeError");
   assert.deepEqual(
     (clean as typeof clean & { readonly fingerprint?: readonly string[] }).fingerprint,
-    ["worker.job", "TypeError", "econnreset"]
+    ["worker.job", "provider_transient", "TypeError", "econnreset"]
   );
   assert.doesNotMatch(serialized, /candidate@example\.test|private prompt|raw provider response|secret-id/u);
+
+  const invalidFailureCode = sanitizeWorkerEvent({
+    tags: {
+      operation: "worker.job",
+      failure_code: "candidate@example.test",
+      error_name: "TypeError",
+      error_code: "econnreset"
+    }
+  }, workerConfig);
+  assert.equal(invalidFailureCode.tags?.failure_code, undefined);
 });
 
 test("alert definitions require external thresholds and stage blocked producers safely", () => {
