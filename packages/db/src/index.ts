@@ -5988,6 +5988,10 @@ export async function assertAuditReportShareLinkSecurity(
       `share_${suffix}@acme.test`
     ]);
     await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
       `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
        VALUES ($1,$2,'Eng',$4), ($3,$2,'Design',$4)`,
       [roleId, org, otherRoleId, userId]
@@ -6111,6 +6115,147 @@ export async function assertAuditReportShareLinkSecurity(
       viewsUpdateRejection,
       expiryCeilingRejection,
       crossTenantRejection
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface AuditReportShareLinkActorMembershipObservations {
+  /** Error from createAuditReportShareLink when created_by is not a member, or "" if it was accepted. */
+  readonly createByOutsiderRejection: string;
+  /** Error from revokeAuditReportShareLinks when revoked_by is not a member, or "" if it was accepted. */
+  readonly revokeByOutsiderRejection: string;
+  /** Control: a member can still mint a link, so the fixture is not refusing everyone. */
+  readonly memberCreateSucceeded: boolean;
+}
+
+/**
+ * REV-001 / AF-90. An audit-report share link is an accountability record:
+ * who minted a public disclosure of a tenant's report, and who revoked it.
+ * created_by_user_id and revoked_by_user_id must name a member of that
+ * organization, the same standing constraint evidentiary actor columns use
+ * (audit_events, correction attribution, candidate_decisions, audit_samples,
+ * review_timing). Lifecycle columns that only need "a user who exists"
+ * are a different class and are not the claim here.
+ *
+ * Calls the real create/revoke helpers, not raw SQL, so the reachable path
+ * is what is proven.
+ */
+export async function assertAuditReportShareLinkActorMembership(
+  databaseUrl: string
+): Promise<AuditReportShareLinkActorMembershipObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `share_actor_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const memberId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const outsiderId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const hash = (seed: string): string => createHash("sha256").update(seed).digest("hex");
+  const now = new Date("2026-09-01T00:00:00.000Z");
+  const report = {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId: org,
+    roleId,
+    generatedAt: "2026-08-01T00:00:00.000Z",
+    metrics: {},
+    corrections: null,
+    auditSample: null
+  } as unknown as RoleAuditReport;
+
+  const captureRejection = async (run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+      return "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      // 0012 adds UNIQUE (role_id, organization_id) that 0025's composite FK requires.
+      "0012_file_intakes.sql",
+      "0025_audit_report_share_links.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Member'), ($3,$4,'Outsider')`,
+      [memberId, `share_member_${suffix}@acme.test`, outsiderId, `share_out_${suffix}@acme.test`]
+    );
+    // Only the member has standing in the org. The outsider exists as a
+    // users row and nothing else, which is exactly the gap bare REFERENCES
+    // users permits today.
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, memberId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, memberId]
+    );
+
+    const createByOutsiderRejection = await captureRejection(() =>
+      createAuditReportShareLink(databaseUrl, schema, {
+        organizationId: org,
+        roleId,
+        tokenHash: hash("outsider-create"),
+        report,
+        createdByUserId: outsiderId,
+        createdAt: now,
+        days: 30
+      })
+    );
+
+    let memberCreateSucceeded = false;
+    let shareLinkId = "";
+    try {
+      const created = await createAuditReportShareLink(databaseUrl, schema, {
+        organizationId: org,
+        roleId,
+        tokenHash: hash("member-create"),
+        report,
+        createdByUserId: memberId,
+        createdAt: now,
+        days: 30
+      });
+      shareLinkId = created.shareLinkId;
+      memberCreateSucceeded = true;
+    } catch {
+      memberCreateSucceeded = false;
+    }
+
+    const revokeByOutsiderRejection =
+      shareLinkId.length === 0
+        ? "skipped: member create failed, so revoke-by-outsider was not exercised"
+        : await captureRejection(() =>
+            revokeAuditReportShareLinks(databaseUrl, schema, {
+              organizationId: org,
+              roleId,
+              shareLinkId,
+              revokedByUserId: outsiderId
+            })
+          );
+
+    return {
+      createByOutsiderRejection,
+      revokeByOutsiderRejection,
+      memberCreateSucceeded
     };
   } finally {
     try {

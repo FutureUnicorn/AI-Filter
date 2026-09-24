@@ -50,8 +50,15 @@ CREATE TABLE IF NOT EXISTS audit_report_share_links (
   report_generated_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
   revoked_at timestamptz,
-  revoked_by_user_id uuid REFERENCES users (user_id) ON DELETE RESTRICT,
-  created_by_user_id uuid NOT NULL REFERENCES users (user_id) ON DELETE RESTRICT,
+  -- Attribution columns are uuid only here; membership standing is
+  -- enforced by the composite FKs below. An audit-report share link is
+  -- an accountability record (AF-90: outward disclosure with no session
+  -- behind the view), so the actor must be a member of the organization
+  -- the link is minted against -- the same standing rule evidentiary
+  -- actor columns use. This is not a claim that every user_id column in
+  -- the schema is membership-scoped.
+  revoked_by_user_id uuid,
+  created_by_user_id uuid NOT NULL,
   created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
   CONSTRAINT audit_report_share_links_expiry_is_in_the_future
@@ -68,7 +75,14 @@ CREATE TABLE IF NOT EXISTS audit_report_share_links (
   -- 0024 use: referencing role_id alone would let one organization mint a
   -- public link for another organization's role.
   FOREIGN KEY (role_id, organization_id)
-    REFERENCES roles (role_id, organization_id) ON DELETE CASCADE
+    REFERENCES roles (role_id, organization_id) ON DELETE CASCADE,
+  -- Default MATCH SIMPLE: a NULL revoked_by_user_id (unrevoked link)
+  -- satisfies the constraint; only a non-NULL revoker must resolve to a
+  -- real membership. created_by_user_id is NOT NULL, so every mint must.
+  FOREIGN KEY (organization_id, created_by_user_id)
+    REFERENCES memberships (organization_id, user_id),
+  FOREIGN KEY (organization_id, revoked_by_user_id)
+    REFERENCES memberships (organization_id, user_id)
 );
 
 -- The lookup an unauthenticated request performs, and the only one it can.
