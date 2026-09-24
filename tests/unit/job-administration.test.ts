@@ -40,6 +40,43 @@ function stuck(overrides: Partial<StuckJob> = {}): StuckJob {
   return { ...observation(), stuckForMs: 7_200_000, retryable: true, ...overrides };
 }
 
+// ---- REV-004: a malformed timestamp must trip the sweep, not open it ----
+
+test("an unparseable waitingSince is refused loudly, naming the job", () => {
+  // It used to fail open: Date.parse gave NaN, NaN < threshold is false,
+  // and the job was reported stuck and retryable with stuckForMs NaN.
+  for (const waitingSince of ["", "not a date", "2026-13-45T99:00:00Z"]) {
+    assert.throws(
+      () => identifyStuckJobs([observation({ jobId: "job-bad", waitingSince })], NOW),
+      /job job-bad has an unparseable waitingSince/,
+      `${JSON.stringify(waitingSince)} must be refused`
+    );
+  }
+});
+
+test("an invalid now is refused rather than making every job look fresh or stale", () => {
+  assert.throws(() => identifyStuckJobs([observation()], new Date("garbage")), /requires a valid now/);
+});
+
+test("a terminal job's timestamp is not judged, since it decides nothing", () => {
+  assert.deepEqual(identifyStuckJobs([observation({ terminal: true, waitingSince: "" })], NOW), []);
+});
+
+test("valid jobs keep their longest-waiting-first order", () => {
+  const jobs = identifyStuckJobs(
+    [
+      observation({ jobId: "old", waitingSince: "2026-08-28T00:00:00.000Z" }),
+      observation({ jobId: "new", waitingSince: "2026-08-29T10:00:00.000Z" }),
+      observation({ jobId: "oldest", waitingSince: "2026-08-20T00:00:00.000Z" })
+    ],
+    NOW
+  );
+  assert.deepEqual(
+    jobs.map((job) => job.jobId),
+    ["oldest", "old", "new"]
+  );
+});
+
 // REV-001: administration is authorised by a real AF-66 grant, for this
 // tenant and this operator, not by a boolean saying some check passed.
 function grant(overrides: Partial<SupportAccessGrant> = {}): SupportAccessGrant {

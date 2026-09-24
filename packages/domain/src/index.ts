@@ -2388,12 +2388,31 @@ export function identifyStuckJobs(
   now: Date,
   thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
 ): readonly StuckJob[] {
+  // REV-004: a timestamp that does not parse must trip this, not skip it.
+  // Date.parse returns NaN for a malformed value, every comparison against
+  // NaN is false, and "not yet past the threshold" is the false branch, so a
+  // bad waitingSince used to push the job as stuck and retryable with
+  // stuckForMs NaN, and one NaN in the comparator scrambled the triage
+  // order. Thrown rather than skipped: waitingSince comes from database
+  // timestamps, so a malformed one is a bug upstream, and quietly leaving
+  // the job out would hide a job that may really be stuck. Same choice as
+  // summarizeFailedDocuments on bad counts.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("identifyStuckJobs requires a valid now, got an invalid Date");
+  }
   const stuck: StuckJob[] = [];
   for (const observation of observations) {
     if (observation.terminal) {
       continue;
     }
-    const waitedMs = now.getTime() - Date.parse(observation.waitingSince);
+    const waitingSinceMs = Date.parse(observation.waitingSince);
+    if (!Number.isFinite(waitingSinceMs)) {
+      throw new Error(
+        `identifyStuckJobs: job ${observation.jobId} has an unparseable waitingSince: ${JSON.stringify(observation.waitingSince)}`
+      );
+    }
+    const waitedMs = nowMs - waitingSinceMs;
     const threshold =
       observation.kind === "import" ? thresholds.importStuckAfterMs : thresholds.extractionStuckAfterMs;
     if (waitedMs < threshold) {
