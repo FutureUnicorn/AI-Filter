@@ -40,7 +40,7 @@ provider responses, and arbitrary context must never be added to telemetry.
 
 `scripts/observability/sentry-alerts.mjs` renders current Sentry detector API
 payloads without network access by default. It creates definitions for web
-failure rate, P95 for all twelve normalized operations, and worker inference
+failure rate, P95 for all thirteen normalized operations, and worker inference
 token-budget warning/capped events. It never defines a queue-age detector.
 
 The operator must provide thresholds; there are no production defaults:
@@ -62,6 +62,11 @@ or creates them and refuses to apply without an owner and notification
 workflow. Account-specific workflow actions/channels are configured outside
 the repository, so no personal address or channel is committed.
 
+The P95 threshold JSON must include the distinct
+`application.evidence_extraction.enqueue` operation before definitions can be
+rendered or applied. Its production threshold remains an operations decision;
+the repository deliberately supplies no default.
+
 Sentry's detector API currently represents one aggregate threshold per metric
 monitor and cannot express `failure_rate above X AND request count at least Y`
 in this payload. Keep notifications disabled until the configured minimum
@@ -80,23 +85,20 @@ The worker's `executeBudgetedInference` boundary now owns the complete metered
 call: atomic reservation, provider execution, provider-usage settlement,
 committed budget-state calculation, and telemetry publication. Its caller must
 source the ratio, period and cap from approved external operations configuration;
-AF-67 does not invent defaults. AF-102 will deliver durable jobs to this boundary
+AF-67 does not invent defaults. AF-102's durable worker now calls this boundary
 without changing its budget or telemetry semantics.
 
-There is no deployed production caller of `executeBudgetedInference` before
-AF-102. The token-budget detector definition is therefore rendered but disabled
-by default, and it will not emit or alert in the current worker. Set
-`SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY=true` only after AF-102 connects the
-durable job consumer to this boundary and a synthetic staging drill proves the
-warning and capped signals reach Sentry. Until then, do not treat the rendered
-detector as active token-budget coverage.
+The AF-102 worker is the production caller of `executeBudgetedInference`.
+The token-budget detector remains disabled by default because code reachability
+is not a staging alert drill. Set `SENTRY_ALERT_TOKEN_BUDGET_PRODUCER_READY=true`
+only after a synthetic staging job proves warning and capped signals reach
+Sentry. Until then, do not treat the rendered detector as active coverage.
 
 The web detector uses `failure_rate()` because normalized request-operation
-spans provide a denominator. The current worker only serves a health endpoint
-and runs no durable jobs, so there is no honest worker failure-rate denominator
-before AF-102. Its unexpected failures use a separately configurable error
-count detector for now; replace that with a job failure rate only after AF-102
-publishes completed job volume.
+spans provide a denominator. The worker now processes durable jobs, and its
+vendor-neutral queue snapshot publishes completed/failed counts for a future
+rate detector. AF-67's existing unexpected-error count detector remains the
+provisioned Sentry rule until that ratio is explicitly designed and drilled.
 
 Web and worker `/health/environment` failures are deliberately excluded from
 the Sentry application-error detectors. They remain visible through the health
@@ -129,12 +131,14 @@ the HTTP response or worker outcome must remain unchanged.
 
 ## Queue-age boundary
 
-Queue age is blocked on AF-102. Do not use the recruiter review list,
-application creation time, or `evidence_extraction_runs` as a proxy. When
-AF-102 lands, consume its vendor-neutral job timestamps to publish:
+AF-102 now provides the durable, vendor-neutral source. Do not use the recruiter
+review list, application creation time, or `evidence_extraction_runs` as a
+proxy. Consume `getEvidenceExtractionQueueMonitoringSnapshot` and
+`deriveEvidenceExtractionJobTiming` to publish:
 
 - `queue.age.oldest_ready = now - oldest ready enqueued_at`
 - `queue.wait = started_at - enqueued_at`
 - `job.duration = completed_at/failed_at - started_at`
 
-Only then add the queue-age detector with an externally approved threshold.
+Sentry publication and a queue-age detector remain AF-67 follow-up work and
+still require an externally approved threshold.

@@ -249,6 +249,40 @@ export interface EnvironmentConfig {
   };
 }
 
+export type InferenceBudgetPeriod = "day" | "month";
+
+export interface WorkerProcessingConfig {
+  readonly enabled: boolean;
+  readonly workerId?: string;
+  readonly openAi?: {
+    readonly apiKey: string;
+    readonly defaultModel: string;
+    readonly escalationModel: string;
+  };
+  readonly budget?: {
+    readonly maxTokensPerPeriod: number;
+    readonly alertThresholdRatio: number;
+    readonly period: InferenceBudgetPeriod;
+    readonly estimatedOutputTokens: number;
+  };
+  readonly concurrency: number;
+  readonly pollIntervalMs: number;
+  readonly heartbeatIntervalMs: number;
+  readonly leaseDurationMs: number;
+  readonly retryBaseDelayMs: number;
+  readonly maxAttempts: number;
+}
+
+export function loadEvidenceExtractionQueueConfig(source: EnvironmentSource): {
+  readonly maxAttempts: number;
+} {
+  const parsed = optionalPositiveInteger.safeParse(source["WORKER_MAX_ATTEMPTS"]);
+  if (!parsed.success) {
+    throw new Error("Invalid queue configuration: WORKER_MAX_ATTEMPTS must be a positive integer");
+  }
+  return { maxAttempts: parsed.data ?? 3 };
+}
+
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
 
 export const OBSERVABILITY_SERVICES = ["web", "worker"] as const;
@@ -376,6 +410,120 @@ export function loadEnvironmentConfig(source: EnvironmentSource): EnvironmentCon
           }
         }
       : {})
+  };
+}
+
+const optionalNonEmpty = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.string().trim().min(1).optional()
+);
+const optionalPositiveInteger = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.coerce.number().int().positive().optional()
+);
+const optionalWorkerConcurrency = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.coerce.number().int().positive().max(16).optional()
+);
+const optionalRatio = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z.coerce.number().min(0).max(1).optional()
+);
+
+const workerProcessingSchema = z
+  .object({
+    WORKER_PROCESSING_ENABLED: z.preprocess(
+      (value) => (value === "" || value === undefined ? "false" : value),
+      booleanValue
+    ),
+    WORKER_INSTANCE_ID: z.preprocess(
+      (value) => (value === "" || value === undefined ? undefined : value),
+      z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/u).optional()
+    ),
+    OPENAI_API_KEY: optionalNonEmpty,
+    OPENAI_MODEL: optionalNonEmpty,
+    OPENAI_ESCALATION_MODEL: optionalNonEmpty,
+    INFERENCE_MAX_TOKENS_PER_PERIOD: optionalPositiveInteger,
+    INFERENCE_ALERT_THRESHOLD_RATIO: optionalRatio,
+    INFERENCE_BUDGET_PERIOD: z.preprocess(
+      (value) => (value === "" || value === undefined ? undefined : value),
+      z.enum(["day", "month"]).optional()
+    ),
+    INFERENCE_ESTIMATED_OUTPUT_TOKENS: optionalPositiveInteger,
+    WORKER_CONCURRENCY: optionalWorkerConcurrency,
+    WORKER_POLL_INTERVAL_MS: optionalPositiveInteger,
+    WORKER_HEARTBEAT_INTERVAL_MS: optionalPositiveInteger,
+    WORKER_LEASE_DURATION_MS: optionalPositiveInteger,
+    WORKER_RETRY_BASE_DELAY_MS: optionalPositiveInteger,
+    WORKER_MAX_ATTEMPTS: optionalPositiveInteger
+  })
+  .superRefine((value, context) => {
+    if (!value.WORKER_PROCESSING_ENABLED) {
+      return;
+    }
+    for (const field of [
+      "WORKER_INSTANCE_ID",
+      "OPENAI_API_KEY",
+      "OPENAI_MODEL",
+      "OPENAI_ESCALATION_MODEL",
+      "INFERENCE_MAX_TOKENS_PER_PERIOD",
+      "INFERENCE_ALERT_THRESHOLD_RATIO",
+      "INFERENCE_BUDGET_PERIOD"
+    ] as const) {
+      if (value[field] === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required when WORKER_PROCESSING_ENABLED=true`
+        });
+      }
+    }
+    const lease = value.WORKER_LEASE_DURATION_MS ?? 60_000;
+    const heartbeat = value.WORKER_HEARTBEAT_INTERVAL_MS ?? 10_000;
+    if (heartbeat * 2 >= lease) {
+      context.addIssue({
+        code: "custom",
+        path: ["WORKER_HEARTBEAT_INTERVAL_MS"],
+        message: "heartbeat interval must be less than half the lease duration"
+      });
+    }
+  });
+
+export function loadWorkerProcessingConfig(source: EnvironmentSource): WorkerProcessingConfig {
+  const parsed = workerProcessingSchema.safeParse(source);
+  if (!parsed.success) {
+    const details = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "environment"}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`Invalid worker processing configuration: ${details}`);
+  }
+  const value = parsed.data;
+  const base = {
+    enabled: value.WORKER_PROCESSING_ENABLED,
+    concurrency: value.WORKER_CONCURRENCY ?? 1,
+    pollIntervalMs: value.WORKER_POLL_INTERVAL_MS ?? 1_000,
+    heartbeatIntervalMs: value.WORKER_HEARTBEAT_INTERVAL_MS ?? 10_000,
+    leaseDurationMs: value.WORKER_LEASE_DURATION_MS ?? 60_000,
+    retryBaseDelayMs: value.WORKER_RETRY_BASE_DELAY_MS ?? 5_000,
+    maxAttempts: value.WORKER_MAX_ATTEMPTS ?? 3
+  } as const;
+  if (!value.WORKER_PROCESSING_ENABLED) {
+    return base;
+  }
+  return {
+    ...base,
+    workerId: value.WORKER_INSTANCE_ID!,
+    openAi: {
+      apiKey: value.OPENAI_API_KEY!,
+      defaultModel: value.OPENAI_MODEL!,
+      escalationModel: value.OPENAI_ESCALATION_MODEL!
+    },
+    budget: {
+      maxTokensPerPeriod: value.INFERENCE_MAX_TOKENS_PER_PERIOD!,
+      alertThresholdRatio: value.INFERENCE_ALERT_THRESHOLD_RATIO!,
+      period: value.INFERENCE_BUDGET_PERIOD!,
+      estimatedOutputTokens: value.INFERENCE_ESTIMATED_OUTPUT_TOKENS ?? 2_000
+    }
   };
 }
 
