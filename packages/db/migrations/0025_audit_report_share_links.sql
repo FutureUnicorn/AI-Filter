@@ -132,6 +132,16 @@ CREATE TRIGGER audit_report_share_links_pin_created_at
 
 -- One row per view. Append-only: a log of who reached an employer's
 -- report that the holder of the link can trim is not a log.
+--
+-- ON DELETE RESTRICT is deliberate and matches privacy_request_events
+-- (0024): a view row is evidence that a tenant report was disclosed to an
+-- unauthenticated holder, so the log must not vanish because someone
+-- deleted the link, role, or organization. The consequence today is that
+-- once a link has been viewed, cascading delete of that role or
+-- organization fails. Soft-delete versus cascade-with-flag is a product
+-- decision about what tenant offboarding means for audit records; this
+-- migration does not invent one. A probe pins the current refusal so a
+-- future change is a visible decision rather than silent drift.
 CREATE TABLE IF NOT EXISTS audit_report_share_link_views (
   view_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   share_link_id uuid NOT NULL

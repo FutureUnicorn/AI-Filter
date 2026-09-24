@@ -5965,6 +5965,16 @@ export interface AuditReportShareLinkObservations {
    * with the link columns must throw rather than store the mismatched JSON.
    */
   readonly mismatchedReportRejection: string;
+  /**
+   * REV-004: after a link has been viewed, deleting its role must fail
+   * (views ON DELETE RESTRICT). Empty string means the delete was accepted.
+   */
+  readonly viewedLinkBlocksRoleDelete: string;
+  /**
+   * Control for REV-004: a role whose share link was never viewed must
+   * still cascade-delete, so the fixture is not refusing every role delete.
+   */
+  readonly unviewedLinkAllowsRoleDelete: boolean;
 }
 
 /**
@@ -5986,6 +5996,7 @@ export async function assertAuditReportShareLinkSecurity(
   const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const roleId = "33333333-3333-4333-8333-333333333333";
   const otherRoleId = "99999999-9999-4999-8999-999999999999";
+  const unviewedRoleId = "88888888-8888-4888-8888-888888888888";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const hash = (seed: string): string => createHash("sha256").update(seed).digest("hex");
   // Resolutions compare expires_at to this instant. created_at is no longer
@@ -6006,6 +6017,8 @@ export async function assertAuditReportShareLinkSecurity(
 
   const report = reportFor(roleId);
   const otherRoleReport = reportFor(otherRoleId);
+  const unviewedReport = reportFor(unviewedRoleId);
+
   const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
     try {
       await run();
@@ -6042,8 +6055,8 @@ export async function assertAuditReportShareLinkSecurity(
     );
     await admin.query(
       `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
-       VALUES ($1,$2,'Eng',$4), ($3,$2,'Design',$4)`,
-      [roleId, org, otherRoleId, userId]
+       VALUES ($1,$2,'Eng',$4), ($3,$2,'Design',$4), ($5,$2,'Unviewed',$4)`,
+      [roleId, org, otherRoleId, userId, unviewedRoleId]
     );
 
     const link = async (
@@ -6069,6 +6082,7 @@ export async function assertAuditReportShareLinkSecurity(
     const revokedId = await link("revoked", 30, roleId, report);
     const roleWideA = await link("rolewide-a", 30, roleId, report);
     await link("other-role", 30, otherRoleId, otherRoleReport);
+    const unviewedLinkId = await link("unviewed-role", 30, unviewedRoleId, unviewedReport);
 
     await revokeAuditReportShareLinks(databaseUrl, schema, {
       organizationId: org,
@@ -6124,6 +6138,7 @@ export async function assertAuditReportShareLinkSecurity(
     });
     const otherRoleLink = await resolve("other-role");
     void roleWideA;
+    void unviewedLinkId;
 
     const viewsUpdateRejection = await expectRejected("views:update", () =>
       admin.query(`UPDATE audit_report_share_link_views SET viewed_at = CURRENT_TIMESTAMP`)
@@ -6180,6 +6195,20 @@ export async function assertAuditReportShareLinkSecurity(
       })
     );
 
+    // liveId already has a view from resolve("live"). Deleting that role
+    // must fail while views ON DELETE RESTRICT. The unviewed role must
+    // still cascade, so the refusal is about the view log, not roles.
+    const viewedLinkBlocksRoleDelete = await expectRejected("role:delete_with_view", () =>
+      admin.query(`DELETE FROM roles WHERE role_id = $1`, [roleId])
+    );
+    let unviewedLinkAllowsRoleDelete = false;
+    try {
+      await admin.query(`DELETE FROM roles WHERE role_id = $1`, [unviewedRoleId]);
+      unviewedLinkAllowsRoleDelete = true;
+    } catch {
+      unviewedLinkAllowsRoleDelete = false;
+    }
+
     return {
       liveResolution: describe(live),
       liveViewCount: Number.parseInt(liveViews.rows[0]?.count ?? "", 10),
@@ -6197,7 +6226,9 @@ export async function assertAuditReportShareLinkSecurity(
       expiryCeilingRejection,
       crossTenantRejection,
       futureDatedCreatedAtRejection,
-      mismatchedReportRejection
+      mismatchedReportRejection,
+      viewedLinkBlocksRoleDelete,
+      unviewedLinkAllowsRoleDelete
     };
   } finally {
     try {

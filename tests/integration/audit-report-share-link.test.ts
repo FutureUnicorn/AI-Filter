@@ -95,3 +95,12 @@ test("a report that does not match the link organization and role is refused", a
   const observed = await observe();
   assert.match(observed.mismatchedReportRejection, /report is for organization/);
 });
+
+test("a viewed share link blocks deleting its role; an unviewed link does not", async () => {
+  // REV-004. Pins today's ON DELETE RESTRICT behaviour. Soft-delete versus
+  // cascade-with-flag is a product decision; this only records what the
+  // schema does now so a future change is visible.
+  const observed = await observe();
+  assert.match(observed.viewedLinkBlocksRoleDelete, /foreign key|restrict/i);
+  assert.equal(observed.unviewedLinkAllowsRoleDelete, true);
+});
