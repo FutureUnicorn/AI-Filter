@@ -2428,39 +2428,84 @@ export interface JobAdministrationRequest {
 
 export type JobAdministrationRefusal =
   | "job_not_stuck"
+  | "job_mismatch"
   | "job_already_terminal"
   | "retries_exhausted"
   | "reason_required"
   | "not_authorized";
 
 export type JobAdministrationDecision =
-  | { readonly allowed: true; readonly action: JobAdministrationAction; readonly attempt: number }
-  | { readonly allowed: false; readonly refusal: JobAdministrationRefusal };
+  | {
+      readonly allowed: true;
+      readonly action: JobAdministrationAction;
+      readonly attempt: number;
+      /** The AF-66 grant that permitted this, so the admin_action audit event can name it. */
+      readonly grantId: string;
+    }
+  | {
+      readonly allowed: false;
+      readonly refusal: JobAdministrationRefusal;
+      /** Present when the refusal is not_authorized: why AF-66 said no. */
+      readonly supportAccessDenial?: SupportAccessDenialReason;
+    };
 
 /**
- * `supportAccessAllowed` is passed in rather than computed here, because
- * the authority to touch a tenant's jobs is AF-66's decision and this
- * module has no business re-deriving it. Passing `false` is refused
- * outright: an admin action on a tenant's data is a look at that tenant's
- * data plus a write.
+ * The support access an administration request is made under: the grant
+ * the operator holds, if any, and the instant to judge it at.
+ */
+export interface JobAdministrationAccess {
+  readonly grant: SupportAccessGrant | undefined;
+  readonly now: Date;
+}
+
+/**
+ * REV-001: authority is checked against THIS job, not taken on trust.
+ *
+ * The first version took `supportAccessAllowed: boolean`, which said only
+ * that some AF-66 check had passed somewhere, for some tenant and some
+ * operator. A caller holding support access to tenant A could dead-letter
+ * a job in tenant B, and a dead-letter is append-only, so it could not be
+ * undone: the cross-tenant write AF-66 exists to prevent.
+ *
+ * So this takes the grant and calls authorizeSupportAccess itself, with
+ * the request built from the job's own organization and the request's own
+ * operator. A SupportAccessDecision would not do: its allowed branch
+ * carries only a grantId, so nothing here could check what tenant or
+ * operator it was issued for. It still does not re-derive AF-66's rules;
+ * it asks AF-66 the right question. The job id in the request must also be
+ * the job being decided on, or the caller's intent and the job acted on can
+ * differ.
  */
 export function authorizeJobAdministration(
   job: StuckJob | undefined,
   request: JobAdministrationRequest,
-  supportAccessAllowed: boolean,
+  access: JobAdministrationAccess,
   thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
 ): JobAdministrationDecision {
-  if (!supportAccessAllowed) {
-    return { allowed: false, refusal: "not_authorized" };
+  if (job === undefined) {
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (request.jobId !== job.jobId) {
+    return { allowed: false, refusal: "job_mismatch" };
+  }
+  const support = authorizeSupportAccess(
+    access.grant,
+    {
+      organizationId: job.organizationId,
+      operatorUserId: request.operatorUserId,
+      entityType: "job",
+      entityId: job.jobId
+    },
+    access.now
+  );
+  if (!support.allowed) {
+    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
   }
   if (!/[^\s]/u.test(request.reason)) {
     // Same rule as AF-66's grant reason. An unexplained retry is
     // indistinguishable from an accident, and dead-lettering without a
     // reason discards a candidate silently.
     return { allowed: false, refusal: "reason_required" };
-  }
-  if (job === undefined) {
-    return { allowed: false, refusal: "job_not_stuck" };
   }
   if (job.terminal) {
     return { allowed: false, refusal: "job_already_terminal" };
@@ -2469,7 +2514,7 @@ export function authorizeJobAdministration(
     // Always available. Refusing to dead-letter a job that has not yet
     // exhausted its retries would leave an operator with no way to stop a
     // document that is provably never going to parse.
-    return { allowed: true, action: "dead_letter", attempt: job.attempts };
+    return { allowed: true, action: "dead_letter", attempt: job.attempts, grantId: support.grantId };
   }
   if (!job.retryable || job.attempts >= thresholds.maxAttempts) {
     // Bounded, because an unbounded retry on a permanently broken
@@ -2477,7 +2522,7 @@ export function authorizeJobAdministration(
     // never terminates.
     return { allowed: false, refusal: "retries_exhausted" };
   }
-  return { allowed: true, action: "retry", attempt: job.attempts + 1 };
+  return { allowed: true, action: "retry", attempt: job.attempts + 1, grantId: support.grantId };
 }
 
 /**

@@ -8,9 +8,11 @@ import {
   identifyStuckJobs
 } from "../../packages/domain/src/index.ts";
 import type {
+  JobAdministrationAccess,
   JobAdministrationRequest,
   JobObservation,
-  StuckJob
+  StuckJob,
+  SupportAccessGrant
 } from "../../packages/domain/src/index.ts";
 
 // AF-65: "Admin view to retry or dead-letter stuck import/extraction
@@ -35,6 +37,24 @@ function observation(overrides: Partial<JobObservation> = {}): JobObservation {
 function stuck(overrides: Partial<StuckJob> = {}): StuckJob {
   return { ...observation(), stuckForMs: 7_200_000, retryable: true, ...overrides };
 }
+
+// REV-001: administration is authorised by a real AF-66 grant, for this
+// tenant and this operator, not by a boolean saying some check passed.
+function grant(overrides: Partial<SupportAccessGrant> = {}): SupportAccessGrant {
+  return {
+    grantId: "grant-1",
+    organizationId: ORG,
+    operatorUserId: OPERATOR,
+    reason: "customer reported a stuck import",
+    grantedByUserId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    grantedAt: "2026-08-29T11:00:00.000Z",
+    expiresAt: "2026-08-29T13:00:00.000Z",
+    ...overrides
+  };
+}
+
+const LIVE: JobAdministrationAccess = { grant: grant(), now: NOW };
+const NO_GRANT: JobAdministrationAccess = { grant: undefined, now: NOW };
 
 function request(overrides: Partial<JobAdministrationRequest> = {}): JobAdministrationRequest {
   return {
@@ -89,8 +109,47 @@ test("a job at its attempt ceiling is reported as no longer retryable", () => {
 test("no support access means no administration at all", () => {
   // An admin action on a tenant's data is a look at that data plus a
   // write. AF-66's decision is passed in rather than re-derived here.
-  const decision = authorizeJobAdministration(stuck(), request(), false);
+  const decision = authorizeJobAdministration(stuck(), request(), NO_GRANT);
   assert.equal(decision.allowed ? undefined : decision.refusal, "not_authorized");
+});
+
+// ---- REV-001: the grant must cover THIS job ----
+
+test("a request naming a different job than the one decided on is refused", () => {
+  // Pradeep's reproduction: stuck job A, a request for job B. It used to be
+  // allowed, and a dead-letter cannot be undone.
+  const decision = authorizeJobAdministration(stuck(), request({ jobId: "job-B", action: "dead_letter" }), LIVE);
+  assert.equal(decision.allowed ? undefined : decision.refusal, "job_mismatch");
+});
+
+test("a grant for one tenant cannot administer another tenant's job", () => {
+  // The cross-tenant write AF-66 exists to prevent: the grant is live and
+  // the operator matches, but it was issued for a different organization.
+  const otherTenant = { grant: grant({ organizationId: "22222222-2222-4222-8222-222222222222" }), now: NOW };
+  const decision = authorizeJobAdministration(stuck(), request({ action: "dead_letter" }), otherTenant);
+  assert.equal(decision.allowed ? undefined : decision.refusal, "not_authorized");
+  assert.equal(decision.allowed ? undefined : decision.supportAccessDenial, "grant_for_other_organization");
+});
+
+test("another operator's grant does not authorise this operator", () => {
+  const someoneElse = { grant: grant({ operatorUserId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }), now: NOW };
+  const decision = authorizeJobAdministration(stuck(), request(), someoneElse);
+  assert.equal(decision.allowed ? undefined : decision.supportAccessDenial, "grant_for_other_operator");
+});
+
+test("an expired or revoked grant authorises nothing", () => {
+  const expired = { grant: grant({ expiresAt: "2026-08-29T11:59:59.999Z" }), now: NOW };
+  const revoked = { grant: grant({ revokedAt: "2026-08-29T11:30:00.000Z" }), now: NOW };
+  assert.equal(authorizeJobAdministration(stuck(), request(), expired).allowed, false);
+  assert.equal(authorizeJobAdministration(stuck(), request(), revoked).allowed, false);
+});
+
+test("an allowed administration names the grant that permitted it", () => {
+  // So the admin_action audit event can say which grant authorised the write.
+  const retry = authorizeJobAdministration(stuck({ attempts: 1 }), request({ action: "retry" }), LIVE);
+  const deadLetter = authorizeJobAdministration(stuck(), request({ action: "dead_letter" }), LIVE);
+  assert.equal(retry.allowed ? retry.grantId : undefined, "grant-1");
+  assert.equal(deadLetter.allowed ? deadLetter.grantId : undefined, "grant-1");
 });
 
 test("an unexplained action is refused, for retry and dead-letter alike", () => {
@@ -98,7 +157,7 @@ test("an unexplained action is refused, for retry and dead-letter alike", () => 
   // dead-lettering without a reason discards a candidate silently.
   for (const action of ["retry", "dead_letter"] as const) {
     for (const reason of ["", "   ", "\t\n"]) {
-      const decision = authorizeJobAdministration(stuck(), request({ action, reason }), true);
+      const decision = authorizeJobAdministration(stuck(), request({ action, reason }), LIVE);
       assert.equal(decision.allowed ? undefined : decision.refusal, "reason_required");
     }
   }
@@ -110,7 +169,7 @@ test("retrying is refused once attempts are exhausted", () => {
   const decision = authorizeJobAdministration(
     stuck({ attempts: DEFAULT_STUCK_JOB_THRESHOLDS.maxAttempts, retryable: false }),
     request({ action: "retry" }),
-    true
+    LIVE
   );
   assert.equal(decision.allowed ? undefined : decision.refusal, "retries_exhausted");
 });
@@ -118,28 +177,28 @@ test("retrying is refused once attempts are exhausted", () => {
 test("dead-lettering stays available even before retries are exhausted", () => {
   // Otherwise an operator has no way to stop a document that is provably
   // never going to parse.
-  const decision = authorizeJobAdministration(stuck({ attempts: 0 }), request({ action: "dead_letter" }), true);
+  const decision = authorizeJobAdministration(stuck({ attempts: 0 }), request({ action: "dead_letter" }), LIVE);
   assert.equal(decision.allowed, true);
   assert.equal(decision.allowed ? decision.action : undefined, "dead_letter");
 });
 
 test("dead-lettering is available precisely when retrying is not", () => {
   const exhausted = stuck({ attempts: DEFAULT_STUCK_JOB_THRESHOLDS.maxAttempts, retryable: false });
-  assert.equal(authorizeJobAdministration(exhausted, request({ action: "retry" }), true).allowed, false);
-  assert.equal(authorizeJobAdministration(exhausted, request({ action: "dead_letter" }), true).allowed, true);
+  assert.equal(authorizeJobAdministration(exhausted, request({ action: "retry" }), LIVE).allowed, false);
+  assert.equal(authorizeJobAdministration(exhausted, request({ action: "dead_letter" }), LIVE).allowed, true);
 });
 
 test("a successful retry reports the attempt number it will become", () => {
-  const decision = authorizeJobAdministration(stuck({ attempts: 1 }), request({ action: "retry" }), true);
+  const decision = authorizeJobAdministration(stuck({ attempts: 1 }), request({ action: "retry" }), LIVE);
   assert.equal(decision.allowed ? decision.attempt : undefined, 2);
 });
 
 test("administering a job that is not stuck, or already terminal, is refused", () => {
   assert.equal(
-    authorizeJobAdministration(undefined, request(), true).allowed ? undefined : "job_not_stuck",
+    authorizeJobAdministration(undefined, request(), LIVE).allowed ? undefined : "job_not_stuck",
     "job_not_stuck"
   );
-  const decision = authorizeJobAdministration(stuck({ terminal: true }), request(), true);
+  const decision = authorizeJobAdministration(stuck({ terminal: true }), request(), LIVE);
   assert.equal(decision.allowed ? undefined : decision.refusal, "job_already_terminal");
 });
 
