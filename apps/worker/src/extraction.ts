@@ -51,6 +51,8 @@ export interface EvidenceExtractionWorkerDependencies {
   };
   readonly adapterForModel: (model: string) => AiAdapter;
   readonly now?: () => Date;
+  /** Test seam for renewal transport failures; production uses the DB function. */
+  readonly renewLease?: typeof renewEvidenceExtractionJobLease;
 }
 
 function periodStart(now: Date, period: "day" | "month"): string {
@@ -134,24 +136,28 @@ async function withLeaseRenewal<T>(
   dependencies: EvidenceExtractionWorkerDependencies,
   job: EvidenceExtractionJob,
   operation: () => Promise<T>
-): Promise<{ readonly value: T; readonly leaseLost: boolean }> {
-  let leaseLost = false;
+): Promise<T> {
+  let leaseKnownLost = false;
   let renewing = false;
+  const renewLease = dependencies.renewLease ?? renewEvidenceExtractionJobLease;
   const timer = setInterval(() => {
-    if (renewing || leaseLost) return;
+    if (renewing || leaseKnownLost) return;
     renewing = true;
-    void renewEvidenceExtractionJobLease(dependencies.databaseUrl, dependencies.schema, {
+    void renewLease(dependencies.databaseUrl, dependencies.schema, {
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       leaseDurationMs: dependencies.config.leaseDurationMs,
       now: (dependencies.now ?? (() => new Date()))()
     })
       .then((renewed) => {
-        if (!renewed) leaseLost = true;
+        if (!renewed) leaseKnownLost = true;
       })
-      .catch(() => {
-        leaseLost = true;
+      .catch((error: unknown) => {
+        // A transport/query error is not proof that the lease was lost. Keep
+        // retrying renewal; the attempt-fenced completion is authoritative.
+        captureWorkerError(error, "worker.job");
       })
       .finally(() => {
         renewing = false;
@@ -159,7 +165,7 @@ async function withLeaseRenewal<T>(
   }, dependencies.config.heartbeatIntervalMs);
   timer.unref();
   try {
-    return { value: await operation(), leaseLost };
+    return await operation();
   } finally {
     clearInterval(timer);
   }
@@ -168,30 +174,16 @@ async function withLeaseRenewal<T>(
 function fixedOutcomes(
   job: EvidenceExtractionJob,
   criterionIds: readonly string[],
-  kind: "invalid_source" | "failed",
-  code: string
+  kind: "invalid_source"
 ): EvidenceOutcome[] {
-  return criterionIds.map((criterionId) =>
-    kind === "invalid_source"
-      ? {
-          schemaVersion: CONTRACT_SCHEMA_VERSION,
-          kind,
-          organizationId: job.organizationId,
-          candidateId: job.applicationId,
-          criterionId,
-          reason: "The canonical application document contains no usable text."
-        }
-      : {
-          schemaVersion: CONTRACT_SCHEMA_VERSION,
-          kind,
-          organizationId: job.organizationId,
-          candidateId: job.applicationId,
-          criterionId,
-          errorCode: code,
-          message: "Evidence extraction could not be completed.",
-          retryable: false
-        }
-  );
+  return criterionIds.map((criterionId) => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind,
+    organizationId: job.organizationId,
+    candidateId: job.applicationId,
+    criterionId,
+    reason: "The canonical application document contains no usable text."
+  }));
 }
 
 export async function processEvidenceExtractionJob(
@@ -210,6 +202,7 @@ export async function processEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       failureCode: "invalid_job_context",
       retryable: false,
       availableAt: now,
@@ -228,7 +221,8 @@ export async function processEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
-      outcomes: fixedOutcomes(job, criterionIds, "invalid_source", "invalid_source"),
+      attemptCount: job.attemptCount,
+      outcomes: fixedOutcomes(job, criterionIds, "invalid_source"),
       now
     });
   }
@@ -245,6 +239,7 @@ export async function processEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       outcomes,
       now
     });
@@ -283,10 +278,7 @@ export async function processEvidenceExtractionJob(
         }
       )
     );
-    if (execution.leaseLost) {
-      return "lease_lost";
-    }
-    const parsed = parseEvidenceExtractionResponse(execution.value.output);
+    const parsed = parseEvidenceExtractionResponse(execution.output);
     const subject = { organizationId: job.organizationId, candidateId: job.applicationId };
     const mapped = parsed.ok
       ? mapRubricToEvidence(subject, criterionIds, parsed.items)
@@ -298,8 +290,9 @@ export async function processEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       outcomes,
-      run: metadataForRun(execution.value.metadata, context.rubricVersion),
+      run: metadataForRun(execution.metadata, context.rubricVersion),
       now: (dependencies.now ?? (() => new Date()))()
     });
   } catch (error) {
@@ -308,6 +301,7 @@ export async function processEvidenceExtractionJob(
         organizationId: job.organizationId,
         jobId: job.jobId,
         workerId: dependencies.config.workerId,
+        attemptCount: job.attemptCount,
         failureCode: error instanceof InferenceKillSwitchEngagedError ? "inference_paused" : "budget_capped",
         availableAt: new Date(now.getTime() + Math.max(dependencies.config.retryBaseDelayMs, 60_000)),
         now
@@ -332,11 +326,11 @@ export async function processEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       failureCode,
       retryable: failureCode !== "provider_permanent",
       availableAt: retryAt(now, job.attemptCount, dependencies.config.retryBaseDelayMs),
       ...(run === undefined ? {} : { run }),
-      terminalOutcomes: fixedOutcomes(job, criterionIds, "failed", failureCode),
       now
     });
     if (result === "failed") {
@@ -375,6 +369,7 @@ export async function processNextEvidenceExtractionJob(
       organizationId: job.organizationId,
       jobId: job.jobId,
       workerId: dependencies.config.workerId,
+      attemptCount: job.attemptCount,
       failureCode: "unexpected_error",
       retryable: true,
       availableAt: retryAt((dependencies.now ?? (() => new Date()))(), job.attemptCount, dependencies.config.retryBaseDelayMs)
@@ -397,7 +392,10 @@ function waitForPoll(milliseconds: number, signal: AbortSignal): Promise<void> {
 
 export async function runEvidenceExtractionWorker(
   dependencies: EvidenceExtractionWorkerDependencies,
-  signal: AbortSignal
+  signal: AbortSignal,
+  processNext: (
+    dependencies: EvidenceExtractionWorkerDependencies
+  ) => Promise<boolean> = processNextEvidenceExtractionJob
 ): Promise<void> {
   const writeHeartbeat = () =>
     recordWorkerHeartbeat(
@@ -419,14 +417,23 @@ export async function runEvidenceExtractionWorker(
   }, dependencies.config.heartbeatIntervalMs);
   heartbeatTimer.unref();
   try {
-    while (!signal.aborted) {
-      const claimed = await Promise.all(
-        Array.from({ length: dependencies.config.concurrency }, () => processNextEvidenceExtractionJob(dependencies))
-      );
-      if (!claimed.some(Boolean)) {
-        await waitForPoll(dependencies.config.pollIntervalMs, signal);
+    const runSlot = async () => {
+      while (!signal.aborted) {
+        let claimed = false;
+        try {
+          claimed = await processNext(dependencies);
+        } catch (error) {
+          // A transient claim/query failure must not terminate the worker.
+          captureWorkerError(error, "worker.job");
+        }
+        if (!claimed) {
+          await waitForPoll(dependencies.config.pollIntervalMs, signal);
+        }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: dependencies.config.concurrency }, () => runSlot())
+    );
   } finally {
     clearInterval(heartbeatTimer);
   }

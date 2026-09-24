@@ -114,10 +114,22 @@ async function handlePOST(request: NextRequest, context: RouteContext): Promise<
       });
       return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
     }
+    if (outcome.outcome === "source_conflict") {
+      const error = buildApiError({
+        requestId,
+        code: "conflict",
+        message: "This application is already bound to a different evidence source."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
     return Response.json(
-      { job: outcome.job, replayed: outcome.outcome === "replayed" },
       {
-        status: outcome.outcome === "enqueued" ? 201 : 200,
+        job: outcome.job,
+        replayed: outcome.outcome === "replayed",
+        requeued: outcome.outcome === "requeued"
+      },
+      {
+        status: outcome.outcome === "enqueued" ? 201 : outcome.outcome === "requeued" ? 202 : 200,
         headers: withRequestId(undefined, requestId)
       }
     );

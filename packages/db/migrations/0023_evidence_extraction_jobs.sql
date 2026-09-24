@@ -33,6 +33,28 @@ BEGIN
 END;
 $intake_job_key$;
 
+-- Applications arrive from CSV while their resume/document arrives through a
+-- separate intake. The first eligible enqueue binds those two records. A
+-- later request cannot silently substitute another same-role candidate's
+-- document; replacement needs a separate explicit product workflow.
+ALTER TABLE applications
+  ADD COLUMN IF NOT EXISTS evidence_source_intake_id uuid;
+
+DO $application_evidence_source$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.applications', current_schema())::regclass
+       AND conname = 'applications_evidence_source_scope_fkey'
+  ) THEN
+    ALTER TABLE applications
+      ADD CONSTRAINT applications_evidence_source_scope_fkey
+      FOREIGN KEY (evidence_source_intake_id, organization_id, role_id)
+      REFERENCES file_intakes (intake_id, organization_id, role_id);
+  END IF;
+END;
+$application_evidence_source$;
+
 DO $rubric_job_key$
 BEGIN
   IF NOT EXISTS (

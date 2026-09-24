@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildEvidenceExtractionFailureOutcomes,
   deriveEvidenceExtractionJobTiming,
   type EvidenceExtractionJob
 } from "../../packages/domain/src/index.ts";
@@ -47,5 +48,34 @@ test("unresolved jobs omit durations and clock skew cannot create negative telem
       })
     ),
     { queueWaitMs: 0, durationMs: 0 }
+  );
+});
+
+test("terminal queue failures produce one safe failed outcome per rubric criterion", () => {
+  const outcomes = buildEvidenceExtractionFailureOutcomes(
+    {
+      organizationId: "22222222-2222-4222-8222-222222222222",
+      applicationId: "44444444-4444-4444-8444-444444444444"
+    },
+    ["criterion_1", "criterion_2"],
+    "unexpected_error"
+  );
+  assert.equal(outcomes.length, 2);
+  assert.ok(outcomes.every((outcome) =>
+    outcome.kind === "failed" &&
+    outcome.errorCode === "unexpected_error" &&
+    outcome.message === "Evidence extraction could not be completed." &&
+    outcome.retryable === false
+  ));
+  assert.throws(
+    () => buildEvidenceExtractionFailureOutcomes(
+      {
+        organizationId: "22222222-2222-4222-8222-222222222222",
+        applicationId: "44444444-4444-4444-8444-444444444444"
+      },
+      ["criterion_1"],
+      "candidate@example.test"
+    ),
+    /bounded machine-readable code/u
   );
 });

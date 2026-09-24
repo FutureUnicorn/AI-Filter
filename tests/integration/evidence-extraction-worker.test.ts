@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import moduleHooks from "node:module";
 import test from "node:test";
 
-import { processNextEvidenceExtractionJob } from "../../apps/worker/src/extraction.ts";
+import {
+  processNextEvidenceExtractionJob,
+  runEvidenceExtractionWorker
+} from "../../apps/worker/src/extraction.ts";
 import { setWorkerTelemetryAdapterForTesting } from "../../apps/worker/src/observability.ts";
 // Use the built package entrypoint because the worker imports the workspace
 // package entrypoint too; importing src directly would create a second class
@@ -12,6 +15,10 @@ import { EVIDENCE_EXTRACTION_WORKFLOW_VERSION } from "../../packages/contracts/s
 import {
   claimEvidenceExtractionJob,
   completeEvidenceExtractionJob,
+  correctEvidenceOutcome,
+  createCanonicalTextExtraction,
+  createFileIntake,
+  deferEvidenceExtractionJob,
   dropProbeSchema,
   enqueueEvidenceExtractionJob,
   getEvidenceExtractionJob,
@@ -19,11 +26,15 @@ import {
   getInferenceUsage,
   listCurrentEvidenceOutcomesForApplication,
   listEvidenceExtractionRunsForEntities,
+  markFileIntakeUploaded,
   provisionEvidenceExtractionQueueProbeSchema,
+  recordFileValidationResult,
   recordWorkerHeartbeat,
+  renewEvidenceExtractionJobLease,
   retryOrFailEvidenceExtractionJob
 } from "../../packages/db/src/index.ts";
-import type { AiAdapter } from "../../packages/domain/src/index.ts";
+import { CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
+import type { AiAdapter, EvidenceOutcome } from "../../packages/domain/src/index.ts";
 import { SESSION_COOKIE_NAME, createSessionToken } from "../../packages/security/src/index.ts";
 
 function requireDatabase(): string {
@@ -198,6 +209,7 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
       organizationId: probe.organizationId,
       jobId: recovered.jobId,
       workerId: originalOwner,
+      attemptCount: 1,
       outcomes: [],
       now: new Date(claimTime.getTime() + 10_002)
     }),
@@ -210,6 +222,7 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
       organizationId: probe.organizationId,
       jobId: recovered.jobId,
       workerId: "worker-c",
+      attemptCount: recovered.attemptCount,
       failureCode: "provider_transient",
       retryable: true,
       availableAt: retryAt,
@@ -230,6 +243,7 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
       organizationId: probe.organizationId,
       jobId: finalClaim.jobId,
       workerId: "worker-d",
+      attemptCount: finalClaim.attemptCount,
       failureCode: "provider_transient",
       retryable: true,
       availableAt: new Date(retryAt.getTime() + 1_000),
@@ -246,6 +260,275 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
   assert.equal(snapshot.totalAttempts, 3);
   assert.equal(snapshot.lastHeartbeatAt, retryAt.toISOString());
   assert.equal(snapshot.heartbeatAgeMs, 0);
+
+  const requeued = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    ...input,
+    now: new Date(retryAt.getTime() + 1_000)
+  });
+  assert.equal(requeued.outcome, "requeued");
+  if (requeued.outcome !== "requeued") return;
+  assert.equal(requeued.job.jobId, finalClaim.jobId, "operator retry reuses the logical job");
+  assert.equal(requeued.job.state, "ready");
+  assert.equal(requeued.job.attemptCount, 0);
+});
+
+test("attempt fencing rejects a stale claim even when a replacement uses the same worker label", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const queued = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-attempt-fence`,
+    maxAttempts: 3
+  });
+  assert.equal(queued.outcome, "enqueued");
+  if (queued.outcome !== "enqueued") return;
+  const firstAt = new Date(Date.now() + 1_000);
+  const first = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "shared-deployment-label",
+    leaseDurationMs: 10_000,
+    now: firstAt
+  })).job;
+  assert.ok(first !== undefined);
+  const reclaimedAt = new Date(firstAt.getTime() + 10_001);
+  const replacement = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "shared-deployment-label",
+    leaseDurationMs: 10_000,
+    now: reclaimedAt
+  })).job;
+  assert.ok(replacement !== undefined);
+  assert.equal(replacement.attemptCount, first.attemptCount + 1);
+
+  assert.equal(await renewEvidenceExtractionJobLease(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: queued.job.jobId,
+    workerId: "shared-deployment-label",
+    attemptCount: first.attemptCount,
+    leaseDurationMs: 10_000,
+    now: new Date(reclaimedAt.getTime() + 1)
+  }), false);
+  assert.equal(await deferEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: queued.job.jobId,
+    workerId: "shared-deployment-label",
+    attemptCount: first.attemptCount,
+    failureCode: "budget_capped",
+    availableAt: new Date(reclaimedAt.getTime() + 2_000),
+    now: new Date(reclaimedAt.getTime() + 1)
+  }), false);
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: queued.job.jobId,
+    workerId: "shared-deployment-label",
+    attemptCount: first.attemptCount,
+    outcomes: [],
+    now: new Date(reclaimedAt.getTime() + 1)
+  }), "lease_lost");
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: queued.job.jobId,
+    workerId: "shared-deployment-label",
+    attemptCount: replacement.attemptCount,
+    outcomes: [],
+    now: new Date(reclaimedAt.getTime() + 2)
+  }), "completed");
+});
+
+test("an application cannot be queued with a different same-role candidate document", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const first = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-source-binding-a`,
+    maxAttempts: 3
+  });
+  assert.equal(first.outcome, "enqueued");
+
+  const other = await createFileIntake(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    storageKey: "probe/other-candidate.pdf",
+    declaredFilename: "other-candidate.pdf",
+    declaredMimeType: "application/pdf",
+    createdByUserId: probe.userId
+  });
+  assert.equal((await markFileIntakeUploaded(databaseUrl, probe.schema, other.intakeId)).outcome, "uploaded");
+  assert.equal((await recordFileValidationResult(databaseUrl, probe.schema, other.intakeId, {
+    sniffedMimeType: "application/pdf",
+    sizeBytes: 128,
+    sha256Hash: "c".repeat(64),
+    validation: { outcome: "validated" }
+  })).outcome, "recorded");
+  await createCanonicalTextExtraction(databaseUrl, probe.schema, {
+    intakeId: other.intakeId,
+    pages: [{ pageNumber: 1, text: "A different candidate document.", characterCount: 31 }],
+    quality: "full"
+  });
+
+  const conflicting = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: other.intakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-source-binding-b`,
+    maxAttempts: 3
+  });
+  assert.deepEqual(conflicting, { outcome: "source_conflict" });
+});
+
+test("a later machine completion cannot supersede a recruiter correction", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const outcomes = Array.from({ length: 5 }, (_, index): EvidenceOutcome => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "not_found",
+    organizationId: probe.organizationId,
+    candidateId: probe.applicationId,
+    criterionId: `criterion_${index + 1}`
+  }));
+  const first = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-correction-a`,
+    maxAttempts: 3
+  });
+  assert.equal(first.outcome, "enqueued");
+  if (first.outcome !== "enqueued") return;
+  const firstClaim = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-before-correction",
+    leaseDurationMs: 10_000
+  })).job;
+  assert.ok(firstClaim !== undefined);
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: firstClaim.jobId,
+    workerId: "worker-before-correction",
+    attemptCount: firstClaim.attemptCount,
+    outcomes
+  }), "completed");
+
+  const correction = await correctEvidenceOutcome(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    applicationId: probe.applicationId,
+    criterionId: "criterion_1",
+    outcome: {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      kind: "supported",
+      organizationId: probe.organizationId,
+      candidateId: probe.applicationId,
+      criterionId: "criterion_1",
+      citation: {
+        document: "application_document",
+        pageOrSection: "1",
+        offset: 0,
+        quote: "Built and operated PostgreSQL services"
+      }
+    },
+    correctedByUserId: probe.userId,
+    reason: "Recruiter verified the source document."
+  });
+  assert.equal(correction.outcome, "recorded");
+
+  const second = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-correction-b`,
+    maxAttempts: 3
+  });
+  assert.equal(second.outcome, "enqueued");
+  if (second.outcome !== "enqueued") return;
+  const secondClaim = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-after-correction",
+    leaseDurationMs: 10_000
+  })).job;
+  assert.ok(secondClaim !== undefined);
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: secondClaim.jobId,
+    workerId: "worker-after-correction",
+    attemptCount: secondClaim.attemptCount,
+    outcomes
+  }), "completed");
+
+  const current = await listCurrentEvidenceOutcomesForApplication(
+    databaseUrl,
+    probe.schema,
+    probe.organizationId,
+    probe.applicationId
+  );
+  assert.equal(current.length, 5);
+  assert.equal(
+    current.find(({ outcome }) => outcome.criterionId === "criterion_1")?.outcome.kind,
+    "supported"
+  );
+});
+
+test("a transient claim failure is reported and the worker loop keeps polling", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  t.mock.method(console, "error", () => undefined);
+  const captures: Error[] = [];
+  setWorkerTelemetryAdapterForTesting({
+    captureException(error) {
+      captures.push(error);
+    },
+    startSpan(_options, callback) {
+      return callback({ setStatus() { return undefined; }, setAttributes() { return undefined; } });
+    }
+  });
+  t.after(() => setWorkerTelemetryAdapterForTesting(undefined));
+  const controller = new AbortController();
+  let calls = 0;
+  await runEvidenceExtractionWorker({
+    databaseUrl,
+    schema: probe.schema,
+    adapterForModel() {
+      throw new Error("provider must not be reached");
+    },
+    config: {
+      enabled: true,
+      workerId: "worker-claim-recovery",
+      openAi: { apiKey: "not-used", defaultModel: "default-model", escalationModel: "escalation-model" },
+      budget: {
+        maxTokensPerPeriod: 10_000,
+        alertThresholdRatio: 0.8,
+        period: "month",
+        estimatedOutputTokens: 200
+      },
+      concurrency: 1,
+      pollIntervalMs: 1,
+      heartbeatIntervalMs: 1_000,
+      leaseDurationMs: 10_000,
+      retryBaseDelayMs: 100,
+      maxAttempts: 3
+    }
+  }, controller.signal, async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("synthetic claim transport failure");
+    controller.abort();
+    return false;
+  });
+  assert.equal(calls, 2);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0]?.message, "Unexpected worker failure");
 });
 
 test("the production worker reports a crash-exhausted lease exactly once after durable failure", async (t) => {
@@ -261,8 +544,8 @@ test("the production worker reports a crash-exhausted lease exactly once after d
     workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-crash-exhaustion`,
     maxAttempts: 1
   });
-  assert.notEqual(enqueue.outcome, "not_eligible");
-  if (enqueue.outcome === "not_eligible") return;
+  assert.ok("job" in enqueue);
+  if (!("job" in enqueue)) return;
 
   const claimedAt = new Date(Date.now() + 1_000);
   const initialClaim = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
@@ -329,6 +612,14 @@ test("the production worker reports a crash-exhausted lease exactly once after d
   assert.equal(captures[0]?.context.tags.operation, "worker.job");
   assert.equal(captures[0]?.context.tags.failure_code, "lease_expired_exhausted");
   assert.equal(errorLines.filter((line) => line.includes("worker.job_failed")).length, 1);
+  const terminalOutcomes = await listCurrentEvidenceOutcomesForApplication(
+    databaseUrl,
+    probe.schema,
+    probe.organizationId,
+    probe.applicationId
+  );
+  assert.equal(terminalOutcomes.length, 5);
+  assert.ok(terminalOutcomes.every(({ outcome }) => outcome.kind === "failed"));
   const telemetry = JSON.stringify({ captures, errorLines });
   assert.equal(telemetry.includes(probe.organizationId), false);
   assert.equal(telemetry.includes(probe.applicationId), false);
@@ -438,8 +729,8 @@ test("the real worker path calls the provider once and atomically records budget
     workflowVersion: EVIDENCE_EXTRACTION_WORKFLOW_VERSION,
     maxAttempts: 3
   });
-  assert.notEqual(enqueue.outcome, "not_eligible");
-  if (enqueue.outcome === "not_eligible") return;
+  assert.ok("job" in enqueue);
+  if (!("job" in enqueue)) return;
 
   const spans: Array<Record<string, unknown>> = [];
   setWorkerTelemetryAdapterForTesting({
@@ -538,6 +829,99 @@ test("the real worker path calls the provider once and atomically records budget
   assert.doesNotMatch(JSON.stringify(spans), /candidate|application|criterion|PostgreSQL|organization/iu);
 });
 
+test("a renewal query error is reported but does not discard a valid provider result", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const enqueue = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: EVIDENCE_EXTRACTION_WORKFLOW_VERSION,
+    maxAttempts: 3
+  });
+  assert.equal(enqueue.outcome, "enqueued");
+  if (enqueue.outcome !== "enqueued") return;
+  const captures: Error[] = [];
+  t.mock.method(console, "error", () => undefined);
+  setWorkerTelemetryAdapterForTesting({
+    captureException(error) {
+      captures.push(error);
+    },
+    startSpan(_options, callback) {
+      return callback({ setStatus() { return undefined; }, setAttributes() { return undefined; } });
+    }
+  });
+  t.after(() => setWorkerTelemetryAdapterForTesting(undefined));
+
+  let renewalCalls = 0;
+  let allowProviderResult: (() => void) | undefined;
+  const secondRenewal = new Promise<void>((resolve) => {
+    allowProviderResult = resolve;
+  });
+  const adapter: AiAdapter = {
+    async runStructuredCall(input) {
+      await secondRenewal;
+      return {
+        output: {
+          items: Array.from({ length: 5 }, (_, index) => ({
+            criterion_id: `criterion_${index + 1}`,
+            state: "not_found",
+            quote: "",
+            source: { document: "application_document", page_or_section: "", offset: -1 },
+            conflicting: null
+          }))
+        },
+        metadata: {
+          provider: "openai",
+          model: "default-model",
+          promptVersion: input.promptVersion,
+          schemaVersion: input.schemaVersion,
+          schemaName: input.schemaName,
+          usage: { inputTokens: 400, outputTokens: 100 }
+        }
+      };
+    }
+  };
+  const processed = await processNextEvidenceExtractionJob({
+    databaseUrl,
+    schema: probe.schema,
+    adapterForModel: () => adapter,
+    renewLease: async () => {
+      renewalCalls += 1;
+      if (renewalCalls === 1) throw new Error("synthetic renewal transport failure");
+      allowProviderResult?.();
+      return true;
+    },
+    config: {
+      enabled: true,
+      workerId: "worker-renewal-recovery",
+      openAi: { apiKey: "not-used", defaultModel: "default-model", escalationModel: "escalation-model" },
+      budget: {
+        maxTokensPerPeriod: 10_000,
+        alertThresholdRatio: 0.8,
+        period: "month",
+        estimatedOutputTokens: 200
+      },
+      concurrency: 1,
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 1,
+      leaseDurationMs: 10_000,
+      retryBaseDelayMs: 100,
+      maxAttempts: 3
+    }
+  });
+  assert.equal(processed, true);
+  assert.ok(renewalCalls >= 2);
+  assert.equal(captures.length, 1);
+  assert.equal(
+    (await getEvidenceExtractionJob(databaseUrl, probe.schema, probe.organizationId, enqueue.job.jobId))?.state,
+    "completed"
+  );
+});
+
 test("transient provider failures back off, exhaust the bound, and surface safe failed outcomes", async (t) => {
   const databaseUrl = requireDatabase();
   const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
@@ -551,8 +935,8 @@ test("transient provider failures back off, exhaust the bound, and surface safe 
     workflowVersion: EVIDENCE_EXTRACTION_WORKFLOW_VERSION,
     maxAttempts: 2
   });
-  assert.notEqual(enqueue.outcome, "not_eligible");
-  if (enqueue.outcome === "not_eligible") return;
+  assert.ok("job" in enqueue);
+  if (!("job" in enqueue)) return;
   let now = new Date(Date.now() + 1_000);
   let calls = 0;
   const captures: Array<{ readonly error: Error; readonly context: { readonly tags: Record<string, string> } }> = [];
@@ -614,6 +998,15 @@ test("transient provider failures back off, exhaust the bound, and surface safe 
   assert.equal(captures[0]?.context.tags.failure_code, "provider_transient");
   assert.equal(errorLines.filter((line) => line.includes("worker.job_failed")).length, 1);
   assert.doesNotMatch(JSON.stringify({ captures, errorLines }), /candidate@example\.test|provider outage/iu);
+  assert.deepEqual(
+    await getInferenceUsage(databaseUrl, probe.schema, {
+      organizationId: probe.organizationId,
+      model: "default-model",
+      periodStart: `${now.toISOString().slice(0, 7)}-01`
+    }),
+    { inputTokens: 0, outputTokens: 0 },
+    "provider HTTP failures must settle each reservation to zero"
+  );
   const outcomes = await listCurrentEvidenceOutcomesForApplication(
     databaseUrl,
     probe.schema,
@@ -638,8 +1031,8 @@ test("kill-switch pauses defer without consuming attempts or leaking budget rese
     workflowVersion: EVIDENCE_EXTRACTION_WORKFLOW_VERSION,
     maxAttempts: 3
   });
-  assert.notEqual(enqueue.outcome, "not_eligible");
-  if (enqueue.outcome === "not_eligible") return;
+  assert.ok("job" in enqueue);
+  if (!("job" in enqueue)) return;
   const now = new Date(Date.now() + 1_000);
   const paused: AiAdapter = {
     async runStructuredCall() {

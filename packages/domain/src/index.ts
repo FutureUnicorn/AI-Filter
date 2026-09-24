@@ -1363,6 +1363,32 @@ export interface EvidenceExtractionJobTiming {
   readonly durationMs?: number | undefined;
 }
 
+/** Build the privacy-safe terminal result shared by every worker failure path. */
+export function buildEvidenceExtractionFailureOutcomes(
+  subject: { readonly organizationId: string; readonly applicationId: string },
+  criterionIds: readonly string[],
+  failureCode: string
+): EvidenceOutcome[] {
+  if (!/^[a-z][a-z0-9_]{0,63}$/u.test(failureCode)) {
+    throw new Error("failureCode must be a bounded machine-readable code");
+  }
+  return criterionIds.map((criterionId) => {
+    if (criterionId.trim().length === 0) {
+      throw new Error("terminal evidence outcomes require non-empty criterion IDs");
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      kind: "failed",
+      organizationId: subject.organizationId,
+      candidateId: subject.applicationId,
+      criterionId,
+      errorCode: failureCode,
+      message: "Evidence extraction could not be completed.",
+      retryable: false
+    };
+  });
+}
+
 function nonNegativeElapsed(later: string, earlier: string): number {
   const elapsed = new Date(later).getTime() - new Date(earlier).getTime();
   return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;

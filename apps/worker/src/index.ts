@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { pathToFileURL } from "node:url";
 
@@ -94,6 +95,26 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
+/**
+ * Leases and heartbeats identify one running process, not a deployment-wide
+ * label. The configured value remains a recognizable prefix while the boot
+ * suffix prevents two replicas (or a restarted replica) sharing ownership.
+ */
+export function createWorkerRuntimeId(
+  configuredWorkerId: string,
+  bootId: string = randomUUID()
+): string {
+  const safeBootId = bootId.replace(/[^A-Za-z0-9._:-]/gu, "");
+  if (safeBootId.length === 0 || safeBootId.length > 64) {
+    throw new Error("Worker boot identity must contain safe machine-identity characters");
+  }
+  const prefix = configuredWorkerId.slice(0, 128 - safeBootId.length - 1);
+  if (prefix.length === 0) {
+    throw new Error("Configured worker identity cannot be empty");
+  }
+  return `${prefix}:${safeBootId}`;
+}
+
 async function main(): Promise<void> {
   startWorker();
   const environment = loadEnvironmentConfig(process.env);
@@ -116,6 +137,7 @@ async function main(): Promise<void> {
       throw new Error("Enabled worker processing configuration was not fully validated");
     }
     const openAi = processing.openAi;
+    const runtimeWorkerId = createWorkerRuntimeId(processing.workerId);
     const adapters = new Map<string, ReturnType<typeof createOpenAiAdapter>>();
     processingLoop = runEvidenceExtractionWorker(
       {
@@ -124,7 +146,7 @@ async function main(): Promise<void> {
         config: {
           ...processing,
           enabled: true,
-          workerId: processing.workerId,
+          workerId: runtimeWorkerId,
           openAi: processing.openAi,
           budget: processing.budget
         },

@@ -3,7 +3,7 @@ import {
   reserveInferenceBudget,
   settleInferenceReservation
 } from "@signal-audit/db";
-import { InferenceKillSwitchEngagedError } from "@signal-audit/ai";
+import { AiCallNotStartedError, InferenceKillSwitchEngagedError } from "@signal-audit/ai";
 import {
   checkInferenceBudget,
   type AiAdapter,
@@ -60,6 +60,45 @@ function usageFromFailure(error: unknown): AiCallUsage | undefined {
     return undefined;
   }
   return { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens };
+}
+
+function providerStatusFromFailure(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null || !("status" in error)) {
+    return undefined;
+  }
+  const status = error.status;
+  return typeof status === "number" && Number.isInteger(status) ? status : undefined;
+}
+
+/**
+ * Every granted reservation receives one durable settlement.
+ *
+ * A typed pre-provider rejection and an HTTP error response are known not to
+ * have produced a model result, so both release the estimate. A response that
+ * carries usage is settled exactly. Everything else (notably a client-side
+ * timeout or connection loss after dispatch) keeps the conservative estimate
+ * because provider billing is genuinely unknown.
+ */
+function usageToSettleAfterFailure(
+  error: unknown,
+  input: BudgetedInferenceInput
+): AiCallUsage {
+  const reported = usageFromFailure(error);
+  if (reported !== undefined) {
+    return reported;
+  }
+  const status = providerStatusFromFailure(error);
+  if (
+    error instanceof InferenceKillSwitchEngagedError ||
+    error instanceof AiCallNotStartedError ||
+    (status !== undefined && status >= 400 && status <= 599)
+  ) {
+    return { inputTokens: 0, outputTokens: 0 };
+  }
+  return {
+    inputTokens: input.estimatedInputTokens,
+    outputTokens: input.estimatedOutputTokens
+  };
 }
 
 async function publishCommittedBudgetState(
@@ -132,31 +171,12 @@ export async function executeBudgetedInference(
   try {
     result = await adapter.runStructuredCall(input.call);
   } catch (error) {
-    // The real adapter checks the kill switch immediately before touching the
-    // provider. A reservation necessarily exists by then, so release it as a
-    // zero-token settlement; otherwise every paused poll would accumulate an
-    // estimated reservation and eventually turn an operator pause into a
-    // false budget cap without a single provider call.
-    if (error instanceof InferenceKillSwitchEngagedError) {
-      await settleInferenceReservation(databaseUrl, schema, {
-        reservationId: reservation.reservationId,
-        actualInputTokens: 0,
-        actualOutputTokens: 0
-      });
-      await publishCommittedBudgetState(databaseUrl, schema, input);
-      throw error;
-    }
-    // A structured-output parse failure is still a billed provider call. The
-    // AI adapter deliberately carries provider-reported usage on that error,
-    // so settle it before preserving the original failure for retry policy.
-    const usage = usageFromFailure(error);
-    if (usage !== undefined) {
-      await settleInferenceReservation(databaseUrl, schema, {
-        reservationId: reservation.reservationId,
-        actualInputTokens: usage.inputTokens,
-        actualOutputTokens: usage.outputTokens
-      });
-    }
+    const usage = usageToSettleAfterFailure(error, input);
+    await settleInferenceReservation(databaseUrl, schema, {
+      reservationId: reservation.reservationId,
+      actualInputTokens: usage.inputTokens,
+      actualOutputTokens: usage.outputTokens
+    });
     await publishCommittedBudgetState(databaseUrl, schema, input);
     throw error;
   }

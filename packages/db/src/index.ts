@@ -37,6 +37,7 @@ import type {
 } from "@signal-audit/domain";
 import {
   CONTRACT_SCHEMA_VERSION,
+  buildEvidenceExtractionFailureOutcomes,
   canonicalizeCsvColumnMapping,
   classifyCsvImportRow,
   normalizeAppliedAt,
@@ -1692,6 +1693,8 @@ export async function provisionEvidenceExtractionQueueProbeSchema(
       "0015_canonical_text_extractions.sql",
       "0016_applications_and_import_finalization.sql",
       "0017_evidence_outcomes.sql",
+      "0018_evidence_corrections.sql",
+      "0019_correction_attribution.sql",
       "0023_evidence_extraction_jobs.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
@@ -4757,6 +4760,21 @@ export async function correctEvidenceOutcome(
         claimId = claim.claimId;
       }
 
+      // Serialize correction and worker completion for the same application.
+      // Whichever transaction obtains this lock second observes the first one's
+      // append, so a machine result can never become current over a human edit.
+      const application = await client.query(
+        `SELECT application_id
+           FROM "${schema}".applications
+          WHERE organization_id = $1 AND application_id = $2
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId]
+      );
+      if (application.rows[0] === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "nothing_to_correct" };
+      }
+
       // What is actually load-bearing here, measured rather than
       // asserted:
       //
@@ -5723,6 +5741,12 @@ function assertWorkerId(workerId: string): void {
   }
 }
 
+function assertClaimAttempt(attemptCount: number): void {
+  if (!Number.isInteger(attemptCount) || attemptCount < 1) {
+    throw new Error("attemptCount must identify a positive claimed attempt");
+  }
+}
+
 function assertFailureCode(failureCode: string): void {
   if (!/^[a-z][a-z0-9_]{0,63}$/u.test(failureCode)) {
     throw new Error("failureCode must be a bounded machine-readable code");
@@ -5737,16 +5761,18 @@ export interface EnqueueEvidenceExtractionJobInput {
   readonly rubricId: string;
   readonly workflowVersion: string;
   readonly maxAttempts: number;
+  readonly now?: Date;
 }
 
 export type EnqueueEvidenceExtractionJobOutcome =
-  | { readonly outcome: "enqueued" | "replayed"; readonly job: EvidenceExtractionJob }
-  | { readonly outcome: "not_eligible" };
+  | { readonly outcome: "enqueued" | "requeued" | "replayed"; readonly job: EvidenceExtractionJob }
+  | { readonly outcome: "not_eligible" }
+  | { readonly outcome: "source_conflict" };
 
 /**
- * One production enqueue boundary. The INSERT ... SELECT proves, in the same
- * statement, that application, canonical document and published rubric all
- * belong to the same tenant and role.
+ * One production enqueue boundary. The eligibility query proves, in the same
+ * transaction, that application, canonical document and published rubric all
+ * belong to the same tenant and role, then binds the first accepted source.
  */
 export async function enqueueEvidenceExtractionJob(
   databaseUrl: string,
@@ -5757,46 +5783,122 @@ export async function enqueueEvidenceExtractionJob(
   if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
     throw new Error("maxAttempts must be a positive integer");
   }
+  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
-    const inserted = await client.query<EvidenceExtractionJobRow>(
-      `INSERT INTO "${schema}".evidence_extraction_jobs
-         (organization_id, role_id, application_id, source_intake_id, rubric_id, workflow_version, max_attempts)
-       SELECT $1, $2, $3, $4, $5, $6, $7
-         FROM "${schema}".applications a
-         JOIN "${schema}".file_intakes f
-           ON f.intake_id = $4 AND f.organization_id = a.organization_id AND f.role_id = a.role_id
-         JOIN "${schema}".canonical_text_extractions c ON c.intake_id = f.intake_id
-         JOIN "${schema}".rubrics r
-           ON r.rubric_id = $5 AND r.role_id = a.role_id AND r.status = 'published'
-        WHERE a.application_id = $3 AND a.organization_id = $1 AND a.role_id = $2
-          AND f.status = 'validated'
-          AND f.sniffed_mime_type IN ('application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-       ON CONFLICT (application_id, source_intake_id, rubric_id, workflow_version) DO NOTHING
-       RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
-      [
-        input.organizationId,
-        input.roleId,
-        input.applicationId,
-        input.sourceIntakeId,
-        input.rubricId,
-        input.workflowVersion,
-        input.maxAttempts
-      ]
-    );
-    const created = inserted.rows[0];
-    if (created !== undefined) {
+    await client.query("BEGIN");
+    try {
+      // Existing lifecycle writers lock job -> application. Follow the same
+      // order when this logical job already exists so enqueue cannot deadlock
+      // a completion while resetting or replaying it.
+      const preexisting = await client.query<EvidenceExtractionJobRow>(
+        `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+           FROM "${schema}".evidence_extraction_jobs
+          WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
+            AND rubric_id = $4 AND workflow_version = $5
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId, input.sourceIntakeId, input.rubricId, input.workflowVersion]
+      );
+      const eligibility = await client.query<{ evidence_source_intake_id: string | null }>(
+        `SELECT a.evidence_source_intake_id
+           FROM "${schema}".applications a
+           JOIN "${schema}".file_intakes f
+             ON f.intake_id = $4 AND f.organization_id = a.organization_id AND f.role_id = a.role_id
+           JOIN "${schema}".canonical_text_extractions c ON c.intake_id = f.intake_id
+           JOIN "${schema}".rubrics r
+             ON r.rubric_id = $5 AND r.role_id = a.role_id AND r.status = 'published'
+          WHERE a.application_id = $3 AND a.organization_id = $1 AND a.role_id = $2
+            AND f.status = 'validated'
+            AND f.sniffed_mime_type IN ('application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+          FOR UPDATE OF a`,
+        [input.organizationId, input.roleId, input.applicationId, input.sourceIntakeId, input.rubricId]
+      );
+      const eligible = eligibility.rows[0];
+      if (eligible === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "not_eligible" };
+      }
+      if (
+        eligible.evidence_source_intake_id !== null &&
+        eligible.evidence_source_intake_id !== input.sourceIntakeId
+      ) {
+        await client.query("ROLLBACK");
+        return { outcome: "source_conflict" };
+      }
+      if (eligible.evidence_source_intake_id === null) {
+        await client.query(
+          `UPDATE "${schema}".applications
+              SET evidence_source_intake_id = $2
+            WHERE application_id = $1`,
+          [input.applicationId, input.sourceIntakeId]
+        );
+      }
+
+      // If no row existed before the application lock, check again after it:
+      // a concurrent first enqueue may have committed while we waited.
+      const existingRow = preexisting.rows[0] ?? (
+        await client.query<EvidenceExtractionJobRow>(
+          `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
+              AND rubric_id = $4 AND workflow_version = $5
+            FOR UPDATE`,
+          [
+            input.organizationId,
+            input.applicationId,
+            input.sourceIntakeId,
+            input.rubricId,
+            input.workflowVersion
+          ]
+        )
+      ).rows[0];
+      if (existingRow !== undefined) {
+        if (existingRow.state === "failed") {
+          const requeued = await client.query<EvidenceExtractionJobRow>(
+            `UPDATE "${schema}".evidence_extraction_jobs
+                SET state = 'ready', enqueued_at = $2, available_at = $2,
+                    started_at = NULL, completed_at = NULL, failed_at = NULL,
+                    attempt_count = 0, max_attempts = $3,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    failure_code = NULL, updated_at = $2
+              WHERE job_id = $1
+            RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+            [existingRow.job_id, now, input.maxAttempts]
+          );
+          const row = requeued.rows[0];
+          if (row === undefined) throw new Error("failed evidence-extraction job could not be requeued");
+          await client.query("COMMIT");
+          return { outcome: "requeued", job: rowToEvidenceExtractionJob(row) };
+        }
+        await client.query("COMMIT");
+        return { outcome: "replayed", job: rowToEvidenceExtractionJob(existingRow) };
+      }
+
+      const inserted = await client.query<EvidenceExtractionJobRow>(
+        `INSERT INTO "${schema}".evidence_extraction_jobs
+           (organization_id, role_id, application_id, source_intake_id, rubric_id,
+            workflow_version, max_attempts, enqueued_at, available_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8)
+         RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+        [
+          input.organizationId,
+          input.roleId,
+          input.applicationId,
+          input.sourceIntakeId,
+          input.rubricId,
+          input.workflowVersion,
+          input.maxAttempts,
+          now
+        ]
+      );
+      const created = inserted.rows[0];
+      if (created === undefined) throw new Error("evidence-extraction job insert returned no row");
+      await client.query("COMMIT");
       return { outcome: "enqueued", job: rowToEvidenceExtractionJob(created) };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
     }
-    const existing = await client.query<EvidenceExtractionJobRow>(
-      `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
-         FROM "${schema}".evidence_extraction_jobs
-        WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
-          AND rubric_id = $4 AND workflow_version = $5`,
-      [input.organizationId, input.applicationId, input.sourceIntakeId, input.rubricId, input.workflowVersion]
-    );
-    const row = existing.rows[0];
-    return row === undefined ? { outcome: "not_eligible" } : { outcome: "replayed", job: rowToEvidenceExtractionJob(row) };
   } finally {
     client.release();
   }
@@ -5822,6 +5924,106 @@ export async function getEvidenceExtractionJob(
   } finally {
     client.release();
   }
+}
+
+async function lockEvidenceApplication(
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow
+): Promise<void> {
+  const application = await client.query(
+    `SELECT application_id
+       FROM "${schema}".applications
+      WHERE organization_id = $1 AND application_id = $2
+      FOR UPDATE`,
+    [job.organization_id, job.application_id]
+  );
+  if (application.rows[0] === undefined) {
+    throw new Error("evidence-extraction job has no tenant-scoped application");
+  }
+}
+
+/**
+ * A worker result may supersede only the machine state that existed when the
+ * job was enqueued. Application locking is shared with the correction writer,
+ * so a correction racing completion is either observed and preserved, or is
+ * appended after the machine result and remains the current head.
+ */
+async function recordCurrentMachineOutcomes(
+  databaseUrl: string,
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow,
+  outcomes: readonly EvidenceOutcome[],
+  runId?: string
+): Promise<void> {
+  await lockEvidenceApplication(client, schema, job);
+  for (const outcome of outcomes) {
+    if (
+      outcome.organizationId !== job.organization_id ||
+      outcome.candidateId !== job.application_id
+    ) {
+      throw new Error("machine evidence outcome attribution does not match its job");
+    }
+    const head = await client.query<{
+      corrected_by_user_id: string | null;
+      recorded_at: Date;
+    }>(
+      `SELECT corrected_by_user_id, recorded_at
+         FROM "${schema}".evidence_outcomes
+        WHERE organization_id = $1 AND application_id = $2 AND criterion_id = $3
+        ORDER BY recorded_at DESC, evidence_outcome_id DESC
+        LIMIT 1
+        FOR UPDATE`,
+      [job.organization_id, job.application_id, outcome.criterionId]
+    );
+    const current = head.rows[0];
+    if (
+      current?.corrected_by_user_id !== null &&
+      current?.corrected_by_user_id !== undefined
+    ) {
+      continue;
+    }
+    if (current !== undefined && current.recorded_at.getTime() > job.enqueued_at.getTime()) {
+      continue;
+    }
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId: job.organization_id,
+      applicationId: job.application_id,
+      outcome,
+      ...(runId === undefined ? {} : { runId })
+    }, client);
+  }
+}
+
+async function recordTerminalEvidenceFailure(
+  databaseUrl: string,
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow,
+  failureCode: string,
+  runId?: string
+): Promise<void> {
+  const rubric = await client.query<{ criteria: readonly RubricCriterion[] }>(
+    `SELECT criteria FROM "${schema}".rubrics WHERE rubric_id = $1`,
+    [job.rubric_id]
+  );
+  const criteria = rubric.rows[0]?.criteria;
+  if (criteria === undefined) {
+    throw new Error("evidence-extraction job has no rubric criteria");
+  }
+  await recordCurrentMachineOutcomes(
+    databaseUrl,
+    client,
+    schema,
+    job,
+    buildEvidenceExtractionFailureOutcomes(
+      { organizationId: job.organization_id, applicationId: job.application_id },
+      criteria.map((criterion) => criterion.criterionId),
+      failureCode
+    ),
+    runId
+  );
 }
 
 export interface ClaimEvidenceExtractionJobInput {
@@ -5856,14 +6058,25 @@ export async function claimEvidenceExtractionJob(
   try {
     await client.query("BEGIN");
     try {
-      const exhausted = await client.query<{ job_id: string }>(
+      const exhausted = await client.query<EvidenceExtractionJobRow>(
         `UPDATE "${schema}".evidence_extraction_jobs
             SET state = 'failed', failed_at = $1, lease_owner = NULL, lease_expires_at = NULL,
                 failure_code = 'lease_expired_exhausted', updated_at = $1
           WHERE state = 'running' AND lease_expires_at <= $1 AND attempt_count >= max_attempts
-        RETURNING job_id`,
+        RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
         [now]
       );
+      for (const failedJob of [...exhausted.rows].sort((a, b) =>
+        a.application_id.localeCompare(b.application_id) || a.job_id.localeCompare(b.job_id)
+      )) {
+        await recordTerminalEvidenceFailure(
+          databaseUrl,
+          client,
+          schema,
+          failedJob,
+          "lease_expired_exhausted"
+        );
+      }
       const result = await client.query<EvidenceExtractionJobRow>(
         `WITH candidate AS (
            SELECT job_id
@@ -5953,19 +6166,27 @@ export async function getEvidenceExtractionJobContext(
 export async function renewEvidenceExtractionJobLease(
   databaseUrl: string,
   schema: string,
-  input: { readonly organizationId: string; readonly jobId: string; readonly workerId: string; readonly leaseDurationMs: number; readonly now?: Date }
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly attemptCount: number;
+    readonly leaseDurationMs: number;
+    readonly now?: Date;
+  }
 ): Promise<boolean> {
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
   const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     const result = await client.query(
       `UPDATE "${schema}".evidence_extraction_jobs
-          SET lease_expires_at = $4 + ($5::bigint * interval '1 millisecond'), updated_at = $4
+          SET lease_expires_at = $5 + ($6::bigint * interval '1 millisecond'), updated_at = $5
         WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
-          AND lease_expires_at > $4`,
-      [input.organizationId, input.jobId, input.workerId, now, input.leaseDurationMs]
+          AND attempt_count = $4 AND lease_expires_at > $5`,
+      [input.organizationId, input.jobId, input.workerId, input.attemptCount, now, input.leaseDurationMs]
     );
     return result.rowCount === 1;
   } finally {
@@ -5988,15 +6209,16 @@ async function lockOwnedJob(
   organizationId: string,
   jobId: string,
   workerId: string,
+  attemptCount: number,
   now: Date
 ): Promise<EvidenceExtractionJobRow | undefined> {
   const result = await client.query<EvidenceExtractionJobRow>(
     `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
        FROM "${schema}".evidence_extraction_jobs
       WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
-        AND lease_expires_at > $4
+        AND attempt_count = $4 AND lease_expires_at > $5
       FOR UPDATE`,
-    [organizationId, jobId, workerId, now]
+    [organizationId, jobId, workerId, attemptCount, now]
   );
   return result.rows[0];
 }
@@ -6008,6 +6230,7 @@ export async function completeEvidenceExtractionJob(
     readonly organizationId: string;
     readonly jobId: string;
     readonly workerId: string;
+    readonly attemptCount: number;
     readonly outcomes: readonly EvidenceOutcome[];
     readonly run?: EvidenceExtractionRunMetadata;
     readonly now?: Date;
@@ -6015,12 +6238,21 @@ export async function completeEvidenceExtractionJob(
 ): Promise<"completed" | "lease_lost"> {
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
   const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
-      const job = await lockOwnedJob(client, schema, input.organizationId, input.jobId, input.workerId, now);
+      const job = await lockOwnedJob(
+        client,
+        schema,
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        now
+      );
       if (job === undefined) {
         await client.query("ROLLBACK");
         return "lease_lost";
@@ -6038,14 +6270,7 @@ export async function completeEvidenceExtractionJob(
             extractionSchemaName: input.run.extractionSchemaName,
             rubricVersion: input.run.rubricVersion
           }, client);
-      for (const outcome of input.outcomes) {
-        await recordEvidenceOutcome(databaseUrl, schema, {
-          organizationId: input.organizationId,
-          applicationId: job.application_id,
-          outcome,
-          ...(runId === undefined ? {} : { runId })
-        }, client);
-      }
+      await recordCurrentMachineOutcomes(databaseUrl, client, schema, job, input.outcomes, runId);
       await client.query(
         `UPDATE "${schema}".evidence_extraction_jobs
             SET state = 'completed', completed_at = $2, failed_at = NULL,
@@ -6071,23 +6296,32 @@ export async function retryOrFailEvidenceExtractionJob(
     readonly organizationId: string;
     readonly jobId: string;
     readonly workerId: string;
+    readonly attemptCount: number;
     readonly failureCode: string;
     readonly retryable: boolean;
     readonly availableAt: Date;
     readonly run?: EvidenceExtractionRunMetadata;
-    readonly terminalOutcomes?: readonly EvidenceOutcome[];
     readonly now?: Date;
   }
 ): Promise<"retrying" | "failed" | "lease_lost"> {
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
   assertFailureCode(input.failureCode);
   const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
-      const job = await lockOwnedJob(client, schema, input.organizationId, input.jobId, input.workerId, now);
+      const job = await lockOwnedJob(
+        client,
+        schema,
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        now
+      );
       if (job === undefined) {
         await client.query("ROLLBACK");
         return "lease_lost";
@@ -6107,14 +6341,14 @@ export async function retryOrFailEvidenceExtractionJob(
         }, client);
       const retry = input.retryable && job.attempt_count < job.max_attempts;
       if (!retry) {
-        for (const outcome of input.terminalOutcomes ?? []) {
-          await recordEvidenceOutcome(databaseUrl, schema, {
-            organizationId: input.organizationId,
-            applicationId: job.application_id,
-            outcome,
-            ...(runId === undefined ? {} : { runId })
-          }, client);
-        }
+        await recordTerminalEvidenceFailure(
+          databaseUrl,
+          client,
+          schema,
+          job,
+          input.failureCode,
+          runId
+        );
       }
       await client.query(
         `UPDATE "${schema}".evidence_extraction_jobs
@@ -6145,6 +6379,7 @@ export async function deferEvidenceExtractionJob(
     readonly organizationId: string;
     readonly jobId: string;
     readonly workerId: string;
+    readonly attemptCount: number;
     readonly failureCode: string;
     readonly availableAt: Date;
     readonly now?: Date;
@@ -6152,17 +6387,26 @@ export async function deferEvidenceExtractionJob(
 ): Promise<boolean> {
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
   assertFailureCode(input.failureCode);
   const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     const result = await client.query(
       `UPDATE "${schema}".evidence_extraction_jobs
-          SET state = 'ready', available_at = $5, attempt_count = GREATEST(0, attempt_count - 1),
-              lease_owner = NULL, lease_expires_at = NULL, failure_code = $4, updated_at = $6
+          SET state = 'ready', available_at = $6, attempt_count = GREATEST(0, attempt_count - 1),
+              lease_owner = NULL, lease_expires_at = NULL, failure_code = $5, updated_at = $7
         WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
-          AND lease_expires_at > $6`,
-      [input.organizationId, input.jobId, input.workerId, input.failureCode, input.availableAt, now]
+          AND attempt_count = $4 AND lease_expires_at > $7`,
+      [
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        input.failureCode,
+        input.availableAt,
+        now
+      ]
     );
     return result.rowCount === 1;
   } finally {

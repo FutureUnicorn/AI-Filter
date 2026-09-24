@@ -7,9 +7,11 @@ role's latest published rubric. The logical key
 safe without treating the recruiter review list as a processing queue.
 
 The worker is disabled unless `WORKER_PROCESSING_ENABLED=true`. When enabled,
-configure a stable `WORKER_INSTANCE_ID`, provider credentials/models, the
-token cap/warning ratio/period, and the bounded lease/retry values documented in
-`.env.example`. Heartbeats must be less than half the lease duration. The
+configure `WORKER_INSTANCE_ID` as a recognizable deployment/instance label,
+provider credentials/models, the token cap/warning ratio/period, and the bounded
+lease/retry values documented in `.env.example`. Each process appends a unique
+boot ID to that label; replicas and restarted processes therefore own distinct
+leases and heartbeat rows. Heartbeats must be less than half the lease duration. The
 container publishes no worker port to the host; its public network attachment
 exists only for outbound provider calls.
 
@@ -20,7 +22,15 @@ provider usage, validate/map citations, and atomically record the immutable run,
 outcomes, and completed state. Kill-switch and budget-cap pauses return the job
 to ready state without consuming a retry. Provider/parse failures use bounded
 exponential backoff; an expired lease is reclaimable and stale owners cannot
-complete it.
+complete it. Every lifecycle mutation is fenced by both runtime owner and
+claim-attempt number, including when a replacement attempt happens to use the
+same configured label.
+
+The first eligible enqueue durably binds an application to its validated source
+intake. A later request cannot silently substitute another same-role
+candidate's document. A terminal failed job can be deliberately submitted
+again: the same logical row is reset to ready with a fresh retry budget, and the
+endpoint returns `202` with `requeued: true`.
 
 Operationally inspect `getEvidenceExtractionQueueMonitoringSnapshot` for oldest
 ready age, ready/running/completed/failed counts, attempts, and heartbeat age.
@@ -31,8 +41,18 @@ filenames, document text, prompts, quotes, or raw provider responses.
 Retryable attempts do not page as terminal job failures. Once the durable
 retry transition returns `failed`, the worker emits a bounded
 `worker.job_failed` log and Sentry error with only the closed failure code and
-safe diagnostic classification. Failures while recording an unexpected retry
-transition are reported separately without changing worker control flow.
+safe diagnostic classification. Every terminal path, including exhausted crash
+leases and unexpected failures, records safe per-criterion failed outcomes.
+Machine completion never replaces a current recruiter correction. Failures
+while recording an unexpected retry transition are reported separately without
+changing worker control flow.
+
+Every granted inference reservation is settled. Provider responses with actual
+usage settle that usage; typed pre-provider failures and HTTP rejection
+responses release the estimate to zero. Ambiguous connection loss after
+dispatch settles the conservative estimate because provider billing may still
+have occurred. This prevents both phantom open reservations and silent
+under-counting.
 
 Before enabling real data, run `pnpm check`, deploy the exact green SHA to
 staging, enqueue only a synthetic document, and drill: successful completion,
