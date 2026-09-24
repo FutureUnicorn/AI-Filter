@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEAD_LETTER_EXPLANATION,
   DEFAULT_STUCK_JOB_THRESHOLDS,
   authorizeJobAdministration,
   buildDeadLetterOutcome,
+  buildEvidenceCard,
   identifyStuckJobs
 } from "../../packages/domain/src/index.ts";
 import type {
@@ -203,13 +205,13 @@ test("administering a job that is not stuck, or already terminal, is refused", (
 });
 
 test("a dead-letter outcome is not retryable, or the sweep would pick it up again", () => {
-  const outcome = buildDeadLetterOutcome("python_production", "document is password-protected");
+  const outcome = buildDeadLetterOutcome("python_production");
   if (outcome.kind !== "failed") {
     assert.fail(`a dead-letter outcome must be kind "failed", got "${outcome.kind}"`);
   }
   assert.equal(outcome.retryable, false);
   assert.equal(outcome.errorCode, "dead_lettered_by_operator");
-  assert.equal(outcome.message, "document is password-protected");
+  assert.equal(outcome.message, DEAD_LETTER_EXPLANATION);
 });
 
 test("a dead-letter outcome is an operator's terminal failed, never a pipeline extraction_error", () => {
@@ -217,13 +219,46 @@ test("a dead-letter outcome is an operator's terminal failed, never a pipeline e
   // compiler accepts either. evidence_outcomes is append-only, so a
   // dead-letter written as extraction_error would permanently read as a
   // system break rather than an operator decision.
-  const outcome = buildDeadLetterOutcome("python_production", "document is password-protected");
+  const outcome = buildDeadLetterOutcome("python_production");
   assert.equal(outcome.kind, "failed");
   assert.notEqual(outcome.kind, "extraction_error");
 });
 
-test("a dead-letter outcome requires a reason", () => {
-  assert.throws(() => buildDeadLetterOutcome("c", "   "), /non-whitespace reason/);
+// ---- REV-003: the operator's words never reach the candidate ----
+//
+// The reason requirement did not go away: authorizeJobAdministration still
+// refuses a blank one (reason_required, tested above). What went away is the
+// path by which that text reached an append-only evidence row and the
+// candidate's card.
+
+test("an operator's reason never reaches the append-only outcome or the candidate's card", () => {
+  // AF-66's own example of what an operator naturally writes, plus an email
+  // address. Redaction would not save this: a name is not a pattern.
+  const reason = "Looking at Jane Doe's stuck upload, jane.doe@example.test says it never finished";
+  const decision = authorizeJobAdministration(stuck(), request({ action: "dead_letter", reason }), LIVE);
+  assert.equal(decision.allowed, true);
+
+  const outcome = buildDeadLetterOutcome("python_production");
+  const card = buildEvidenceCard(outcome, "2026-08-29T12:00:00.000Z");
+  assert.equal(card.explanation, DEAD_LETTER_EXPLANATION);
+  for (const fragment of ["Jane Doe", "jane.doe@example.test", "stuck upload"]) {
+    assert.ok(!JSON.stringify(outcome).includes(fragment), `the stored outcome must not carry "${fragment}"`);
+    assert.ok(!JSON.stringify(card).includes(fragment), `the evidence card must not show "${fragment}"`);
+  }
+});
+
+test("the dead-letter outcome ignores anything passed after the criterion", () => {
+  // The fix is the absence of a path, so pin the absence behaviourally.
+  // Function.length would not do: a defaulted second parameter does not
+  // count towards it, so `(criterionId, note = "")` would pass that check
+  // while reopening the path. Forcing a second argument through catches a
+  // defaulted parameter and a rest parameter alike.
+  const withText = (buildDeadLetterOutcome as (...args: unknown[]) => ReturnType<typeof buildDeadLetterOutcome>)(
+    "python_production",
+    "Looking at Jane Doe's stuck upload"
+  );
+  assert.ok(!JSON.stringify(withText).includes("Jane Doe"), "a second argument must never reach the outcome");
+  assert.equal(buildEvidenceCard(withText, "2026-08-29T12:00:00.000Z").explanation, DEAD_LETTER_EXPLANATION);
 });
 
 test("the administration request has nowhere to put candidate data", () => {

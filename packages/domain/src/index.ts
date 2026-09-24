@@ -2526,6 +2526,23 @@ export function authorizeJobAdministration(
 }
 
 /**
+ * REV-003: what a hiring reviewer reads on a dead-lettered criterion.
+ *
+ * A fixed system sentence, never the operator's words, redacted or not.
+ * The first version stored the operator's free-text reason as the
+ * outcome's message, and evidence_outcomes is append-only while
+ * buildEvidenceCard renders a failed outcome's message verbatim, so
+ * "Looking at Jane Doe's stuck upload" would have been written permanently
+ * into candidate evidence and shown to everyone reviewing that candidate.
+ *
+ * Redacting the text first would not have fixed it: free text cannot be
+ * sanitised by pattern (redactPii matches email addresses and phone numbers,
+ * so a name passes through untouched). The fix is to remove the path, which
+ * is why buildDeadLetterOutcome takes no reason at all.
+ */
+export const DEAD_LETTER_EXPLANATION = "Processing was stopped by support.";
+
+/**
  * The outcome recorded when a job is dead-lettered.
  *
  * `retryable: false` is the honest signal to every downstream reader
@@ -2540,6 +2557,9 @@ export function authorizeJobAdministration(
  * structurally identical, so only this discriminant tells them apart, and
  * evidence_outcomes is append-only: a mis-tagged row can never be fixed.
  *
+ * It takes no reason, deliberately: there is no parameter through which
+ * operator free text could reach this append-only row (REV-003).
+ *
  * No organizationId/candidateId here, because FailedEvidence on
  * this stack does not carry them: AF-13's review added attribution to
  * every outcome kind on the develop line, which this stack predates. The
@@ -2547,16 +2567,13 @@ export function authorizeJobAdministration(
  * compiling until they are supplied -- which is the correct way to find
  * out, rather than a silently unattributed outcome.
  */
-export function buildDeadLetterOutcome(criterionId: string, reason: string): EvidenceOutcome {
-  if (!/[^\s]/u.test(reason)) {
-    throw new Error("a dead-letter outcome requires a non-whitespace reason");
-  }
+export function buildDeadLetterOutcome(criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     kind: "failed",
     criterionId,
     errorCode: "dead_lettered_by_operator",
-    message: reason,
+    message: DEAD_LETTER_EXPLANATION,
     // Not retryable: that is the whole meaning of dead-lettering, and a
     // retryable dead-letter would be picked up again by the same job
     // sweep that produced it.

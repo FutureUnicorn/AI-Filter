@@ -53,7 +53,7 @@ function citedCards(): readonly EvidenceCard[] {
 
 function deadLetteredCards(): readonly EvidenceCard[] {
   return CRITERIA.map((criterionId) =>
-    buildEvidenceCard(buildDeadLetterOutcome(criterionId, "document is password-protected"), RECORDED_AT)
+    buildEvidenceCard(buildDeadLetterOutcome(criterionId), RECORDED_AT)
   );
 }
 
