@@ -2489,7 +2489,13 @@ export function authorizeJobAdministration(
  * candidate's card set -- a dead-lettered candidate is visible as one the
  * system gave up on, not absent.
  *
- * No organizationId/candidateId here, because ExtractionErrorEvidence on
+ * `failed`, not `extraction_error`: FailedEvidence is "retries are
+ * exhausted or not applicable", which is an operator giving up.
+ * ExtractionErrorEvidence is a raw pipeline break. The two are
+ * structurally identical, so only this discriminant tells them apart, and
+ * evidence_outcomes is append-only: a mis-tagged row can never be fixed.
+ *
+ * No organizationId/candidateId here, because FailedEvidence on
  * this stack does not carry them: AF-13's review added attribution to
  * every outcome kind on the develop line, which this stack predates. The
  * fields arrive when develop merges down, and this call site will stop
@@ -2502,7 +2508,7 @@ export function buildDeadLetterOutcome(criterionId: string, reason: string): Evi
   }
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
-    kind: "extraction_error",
+    kind: "failed",
     criterionId,
     errorCode: "dead_lettered_by_operator",
     message: reason,

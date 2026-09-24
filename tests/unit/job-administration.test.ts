@@ -145,12 +145,22 @@ test("administering a job that is not stuck, or already terminal, is refused", (
 
 test("a dead-letter outcome is not retryable, or the sweep would pick it up again", () => {
   const outcome = buildDeadLetterOutcome("python_production", "document is password-protected");
-  assert.equal(outcome.kind, "extraction_error");
-  if (outcome.kind === "extraction_error") {
-    assert.equal(outcome.retryable, false);
-    assert.equal(outcome.errorCode, "dead_lettered_by_operator");
-    assert.equal(outcome.message, "document is password-protected");
+  if (outcome.kind !== "failed") {
+    assert.fail(`a dead-letter outcome must be kind "failed", got "${outcome.kind}"`);
   }
+  assert.equal(outcome.retryable, false);
+  assert.equal(outcome.errorCode, "dead_lettered_by_operator");
+  assert.equal(outcome.message, "document is password-protected");
+});
+
+test("a dead-letter outcome is an operator's terminal failed, never a pipeline extraction_error", () => {
+  // FailedEvidence and ExtractionErrorEvidence share every field, so the
+  // compiler accepts either. evidence_outcomes is append-only, so a
+  // dead-letter written as extraction_error would permanently read as a
+  // system break rather than an operator decision.
+  const outcome = buildDeadLetterOutcome("python_production", "document is password-protected");
+  assert.equal(outcome.kind, "failed");
+  assert.notEqual(outcome.kind, "extraction_error");
 });
 
 test("a dead-letter outcome requires a reason", () => {
