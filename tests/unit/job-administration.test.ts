@@ -261,10 +261,11 @@ test("a successful retry reports the attempt number it will become", () => {
 });
 
 test("administering a job that is not stuck, or already terminal, is refused", () => {
-  assert.equal(
-    authorizeJobAdministration(undefined, request(), LIVE).allowed ? undefined : "job_not_stuck",
-    "job_not_stuck"
-  );
+  // REV-006: the refusal itself is read. The previous form compared the
+  // literal "job_not_stuck" with itself for every refusal, so it passed
+  // whatever the function returned.
+  const missing = authorizeJobAdministration(undefined, request(), LIVE);
+  assert.equal(missing.allowed ? undefined : missing.refusal, "job_not_stuck");
   const decision = authorizeJobAdministration(stuck({ terminal: true }), request(), LIVE);
   assert.equal(decision.allowed ? undefined : decision.refusal, "job_already_terminal");
 });
