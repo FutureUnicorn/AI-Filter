@@ -197,3 +197,43 @@ BEGIN
   END IF;
 END
 $support_access_grants_operator_fks$;
+
+-- REV-001: an event must name the operator its grant was issued to.
+--
+-- The composite key on support_access_events ties an event to its grant's
+-- tenant but not to its grant's operator, so operator B could log an access
+-- citing operator A's grant, and the log would attribute to B what only A
+-- was authorised to do. A false entry in an access log is worse than a
+-- missing one, because it reads as evidence. authorizeSupportAccess refuses
+-- the mismatch, but only in the application layer, which is what a direct
+-- writer walks around. This makes it a database fact, and because a grant's
+-- operator must be on platform_operators, it makes every event's operator an
+-- allowlisted one too. The key has to exist before the foreign key using it.
+DO $support_access_grants_operator_key$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_id_org_operator_key'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_id_org_operator_key
+      UNIQUE (grant_id, organization_id, operator_user_id);
+  END IF;
+END
+$support_access_grants_operator_key$;
+
+DO $support_access_events_operator_fk$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_events', current_schema())::regclass
+       AND conname = 'support_access_events_operator_matches_grant'
+  ) THEN
+    ALTER TABLE support_access_events
+      ADD CONSTRAINT support_access_events_operator_matches_grant
+      FOREIGN KEY (grant_id, organization_id, operator_user_id)
+      REFERENCES support_access_grants (grant_id, organization_id, operator_user_id);
+  END IF;
+END
+$support_access_events_operator_fk$;

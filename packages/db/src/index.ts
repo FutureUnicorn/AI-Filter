@@ -4737,6 +4737,14 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
        VALUES ('${liveGrant}', '${orgB}', '${operator}', 'application', '44444444-4444-4444-8444-444444444444')`
     );
+    // REV-001: an event naming a different person than the grant it cites.
+    // The log would then attribute to one operator an access that only
+    // another's grant authorised.
+    await expectRejected(
+      "event_operator_not_grant_operator",
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${liveGrant}', '${orgA}', '${authoriser}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
     await expectRejected(
       "event_blank_entity_id",
       `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)

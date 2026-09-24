@@ -105,3 +105,10 @@ test("an operator cannot be authorised by an ordinary account, so dual custody m
   const found = await rejections();
   assert.match(found["grantor_not_allowlisted"] ?? "", /support_access_grants_grantor_is_platform_operator/);
 });
+
+test("an access event must name the operator its grant was issued to", async () => {
+  // Enforced in the domain by authorizeSupportAccess, which a direct writer
+  // walks around. The composite key makes it a database fact.
+  const found = await rejections();
+  assert.match(found["event_operator_not_grant_operator"] ?? "", /support_access_events_operator_matches_grant/);
+});
