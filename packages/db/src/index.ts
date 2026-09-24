@@ -4422,22 +4422,52 @@ export async function observeRetentionResidue(
     // schemas used by other tests apply a subset of migrations, and a
     // missing table there is not residue.
     const present = new Set(observedTables);
+
+    // REV-002: Check for redacted_at on surfaces where candidate text is
+    // erased in place. Redacted rows survive as empty shells to satisfy
+    // foreign keys and audit receipts, but hold no candidate text. Counting
+    // them as residue would report blocked_as_planned forever after correct erasure.
+    const redactedColumns = await client.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.columns
+        WHERE table_schema = $1 AND column_name = 'redacted_at'`,
+      [schema]
+    );
+    const hasRedactedAt = new Set(redactedColumns.rows.map((row) => row.table_name));
+
     const counts: Record<string, number> = {};
     const scoped: ReadonlyArray<readonly [string, string]> = [
-      ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "file_intakes",
+        hasRedactedAt.has("file_intakes")
+          ? `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2 AND redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`
+      ],
       [
         "canonical_text_extractions",
-        `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
-           JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
-          WHERE fi.organization_id = $1 AND cte.created_at <= $2`
+        hasRedactedAt.has("canonical_text_extractions")
+          ? `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+            WHERE fi.organization_id = $1 AND cte.created_at <= $2 AND cte.redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+            WHERE fi.organization_id = $1 AND cte.created_at <= $2`
       ],
       [
         "import_rows",
-        `SELECT count(*) FROM "${schema}".import_rows ir
-           JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
-          WHERE fi.organization_id = $1 AND ir.created_at <= $2`
+        hasRedactedAt.has("import_rows")
+          ? `SELECT count(*) FROM "${schema}".import_rows ir
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+            WHERE fi.organization_id = $1 AND ir.created_at <= $2 AND ir.redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".import_rows ir
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+            WHERE fi.organization_id = $1 AND ir.created_at <= $2`
       ],
-      ["applications", `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "applications",
+        hasRedactedAt.has("applications")
+          ? `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2 AND redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`
+      ],
       [
         "evidence_outcomes",
         `SELECT count(*) FROM "${schema}".evidence_outcomes WHERE organization_id = $1 AND recorded_at <= $2`
@@ -4589,6 +4619,161 @@ export async function probeRetentionReconciliation(
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface ErasedCandidateReconciliationObservations {
+  readonly organizationId: string;
+  readonly cutoff: string;
+  readonly residueBeforeErasure: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  readonly residueAfterErasure: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  readonly residueWithAppendOnlyOutcome: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+}
+
+/**
+ * REV-002: Exercises retention residue observation and reconciliation against
+ * completely erased candidate data and candidate data with append-only residue.
+ */
+export async function probeErasedCandidateReconciliation(
+  databaseUrl: string,
+  now: Date
+): Promise<ErasedCandidateReconciliationObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_erased_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeA = "55555555-5555-4555-8555-555555555555";
+  const intakeB = "66666666-6666-4666-8666-666666666666";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const outcomeId = "88888888-8888-4888-8888-888888888888";
+
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Acme')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'Owner')`, [
+      userId,
+      `recon_erased_${suffix}@acme.test`
+    ]);
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`, [
+      org,
+      userId
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1, $2, 'Eng', $3)`,
+      [roleId, org, userId]
+    );
+
+    const pastTimestamp = new Date(now.getTime() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Scenario A: Candidate A has intake, canonical text, import rows, application (no evidence_outcomes)
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id, created_at)
+       VALUES ($1, $2, $3, $4, 'CandidateA_CV.pdf', 'application/pdf', 'validated', $5, $6)`,
+      [intakeA, org, roleId, `key-a-${suffix}`, userId, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality, created_at)
+       VALUES ($1, '[{"text":"Candidate A text"}]'::jsonb, 1, 'full', $2)`,
+      [intakeA, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email, created_at)
+       VALUES ($1, $2, $3, $4, 1, 'Candidate A', 'a@example.test', $5)`,
+      [applicationA, org, roleId, intakeA, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason, created_at)
+       VALUES ($1, 1, 'processed', $2, NULL, $3)`,
+      [intakeA, applicationA, pastTimestamp]
+    );
+
+    const residueBeforeErasure = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    // Completely erase candidate A
+    await eraseCandidateData(databaseUrl, schema, {
+      organizationId: org,
+      applicationId: applicationA,
+      trigger: "retention_expiry"
+    });
+
+    const residueAfterErasure = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    // Scenario B: Candidate B also has an evidence_outcomes record (append-only)
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id, created_at)
+       VALUES ($1, $2, $3, $4, 'CandidateB_CV.pdf', 'application/pdf', 'validated', $5, $6)`,
+      [intakeB, org, roleId, `key-b-${suffix}`, userId, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality, created_at)
+       VALUES ($1, '[{"text":"Candidate B text"}]'::jsonb, 1, 'full', $2)`,
+      [intakeB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email, created_at)
+       VALUES ($1, $2, $3, $4, 1, 'Candidate B', 'b@example.test', $5)`,
+      [applicationB, org, roleId, intakeB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason, created_at)
+       VALUES ($1, 1, 'processed', $2, NULL, $3)`,
+      [intakeB, applicationB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome, recorded_at)
+       VALUES ($1, $2, $3, 'python', 'supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Candidate B quote"}}'::jsonb, $4)`,
+      [outcomeId, org, applicationB, pastTimestamp]
+    );
+
+    await eraseCandidateData(databaseUrl, schema, {
+      organizationId: org,
+      applicationId: applicationB,
+      trigger: "retention_expiry"
+    });
+
+    const residueWithAppendOnlyOutcome = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    return {
+      organizationId: org,
+      cutoff,
+      residueBeforeErasure,
+      residueAfterErasure,
+      residueWithAppendOnlyOutcome
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup
     }
     await admin.end().catch(() => undefined);
   }
