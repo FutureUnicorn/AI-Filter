@@ -7,6 +7,7 @@ import type {
   Application,
   AuditAction,
   CandidateDecision,
+  CandidateDataErasureTrigger,
   CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -35,11 +36,15 @@ import type {
   User
 } from "@signal-audit/domain";
 import {
+  CANDIDATE_DATA_ERASURE_PLACEHOLDER,
   CONTRACT_SCHEMA_VERSION,
   canonicalizeCsvColumnMapping,
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
+  erasedStorageKey,
   mapCsvRowToApplication,
+  planCandidateDataErasure,
+  summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
@@ -2011,12 +2016,20 @@ export async function listApplicationsForRole(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
+    const hasRedacted = await applicationsHaveRedactedAt(client, schema);
     const result = await client.query<ApplicationRow>(
-      `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
-              candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
-         FROM "${schema}".applications
-        WHERE organization_id = $1 AND role_id = $2
-        ORDER BY created_at, intake_id, source_row_number, application_id`,
+      hasRedacted
+        ? `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+                  candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+             FROM "${schema}".applications
+            WHERE organization_id = $1 AND role_id = $2
+              AND redacted_at IS NULL
+            ORDER BY created_at, intake_id, source_row_number, application_id`
+        : `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+                  candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+             FROM "${schema}".applications
+            WHERE organization_id = $1 AND role_id = $2
+            ORDER BY created_at, intake_id, source_row_number, application_id`,
       [organizationId, roleId]
     );
     return result.rows.map(rowToApplication);
@@ -2423,22 +2436,69 @@ export async function recordEvidenceOutcome(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    await client.query(
-      `INSERT INTO "${schema}".evidence_outcomes
-         (organization_id, application_id, criterion_id, kind, outcome, run_id)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
-      [
-        input.organizationId,
-        input.applicationId,
-        input.outcome.criterionId,
-        input.outcome.kind,
-        JSON.stringify(input.outcome),
-        input.runId ?? null
-      ]
-    );
+    // Refuse erased applications when redacted_at exists (AF-62+). Older
+    // probe schemas that never loaded 0023 keep the unguarded insert.
+    const hasRedacted = await applicationsHaveRedactedAt(client, schema);
+    await client.query("BEGIN");
+    try {
+      if (hasRedacted) {
+        // REV-007: a LOCK, not a snapshot read. The first version checked
+        // EXISTS (... redacted_at IS NULL) inside the INSERT, which reads the
+        // statement snapshot and locks nothing: an erasure that had written
+        // redacted_at but not committed was still invisible to it, the row
+        // inserted, the foreign key then waited on the erasure's row lock
+        // and passed once it committed because the key had not changed, and
+        // a verbatim quote landed in an append-only table after the
+        // candidate's receipt. FOR SHARE conflicts with the erasure's
+        // FOR UPDATE and UPDATE, so either this commits first and the
+        // evidence exists before the erasure (and is reported as residue),
+        // or it waits, re-reads the updated row under READ COMMITTED, finds
+        // redacted_at set, and refuses. recordCandidateDecision uses the
+        // same shape with FOR UPDATE; either lock closes the race.
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
+        );
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `recordEvidenceOutcome: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO "${schema}".evidence_outcomes
+           (organization_id, application_id, criterion_id, kind, outcome, run_id)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.outcome.criterionId,
+          input.outcome.kind,
+          JSON.stringify(input.outcome),
+          input.runId ?? null
+        ]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
+}
+
+async function applicationsHaveRedactedAt(client: Client, schema: string): Promise<boolean> {
+  const found = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = 'applications' AND column_name = 'redacted_at'
+     ) AS exists`,
+    [schema]
+  );
+  return found.rows[0]?.exists === true;
 }
 
 export interface RecordedEvidenceOutcome {
@@ -2499,11 +2559,18 @@ export async function getApplicationById(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
+    const hasRedacted = await applicationsHaveRedactedAt(client, schema);
     const result = await client.query<ApplicationRow>(
-      `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
-              candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
-         FROM "${schema}".applications
-        WHERE organization_id = $1 AND application_id = $2`,
+      hasRedacted
+        ? `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+                  candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+             FROM "${schema}".applications
+            WHERE organization_id = $1 AND application_id = $2
+              AND redacted_at IS NULL`
+        : `SELECT application_id, organization_id, role_id, intake_id, source_row_number,
+                  candidate_full_name, candidate_email, external_reference_id, applied_at, created_at
+             FROM "${schema}".applications
+            WHERE organization_id = $1 AND application_id = $2`,
       [organizationId, applicationId]
     );
     const row = result.rows[0];
@@ -2885,6 +2952,29 @@ export async function correctEvidenceOutcome(
       // Locking a row of an append-only table is safe: SELECT ... FOR
       // UPDATE takes a row lock and does not fire the BEFORE UPDATE
       // trigger. Verified against a real database, not assumed.
+      //
+      // REV-004, the third writer, which the first pass of that fix missed:
+      // a correction inserts a new evidence row with a new quote and a
+      // free-text correction_reason, so it must refuse an erased application
+      // exactly as recordEvidenceOutcome and recordCandidateDecision do. It
+      // needs the lock and not just a check even though it is not usually
+      // racing: the head it supersedes predates any erasure, so its own
+      // FOR UPDATE on that evidence row never waits on one. Taken first, so
+      // the order is application then evidence head. The erasure never
+      // locks evidence rows, so this order cannot close a cycle with it.
+      if (await applicationsHaveRedactedAt(client, schema)) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
+        );
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `correctEvidenceOutcome: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+          );
+        }
+      }
       const head = await client.query<{ evidence_outcome_id: string }>(
         `SELECT evidence_outcome_id
            FROM "${schema}".evidence_outcomes
@@ -3337,6 +3427,20 @@ export async function recordCandidateDecision(
     await client.connect();
     await client.query("BEGIN");
     try {
+      const hasRedacted = await applicationsHaveRedactedAt(client, schema);
+      if (hasRedacted) {
+        const live = await client.query<{ application_id: string }>(
+          `SELECT application_id FROM "${schema}".applications
+            WHERE organization_id = $1 AND application_id = $2 AND redacted_at IS NULL
+            FOR UPDATE`,
+          [input.organizationId, input.applicationId]
+        );
+        if (live.rows[0] === undefined) {
+          throw new Error(
+            `recordCandidateDecision: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+          );
+        }
+      }
       const head = await client.query<{ decision_id: string }>(
         `SELECT d.decision_id
            FROM "${schema}".candidate_decisions d
@@ -4417,22 +4521,52 @@ export async function observeRetentionResidue(
     // schemas used by other tests apply a subset of migrations, and a
     // missing table there is not residue.
     const present = new Set(observedTables);
+
+    // REV-002: Check for redacted_at on surfaces where candidate text is
+    // erased in place. Redacted rows survive as empty shells to satisfy
+    // foreign keys and audit receipts, but hold no candidate text. Counting
+    // them as residue would report blocked_as_planned forever after correct erasure.
+    const redactedColumns = await client.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.columns
+        WHERE table_schema = $1 AND column_name = 'redacted_at'`,
+      [schema]
+    );
+    const hasRedactedAt = new Set(redactedColumns.rows.map((row) => row.table_name));
+
     const counts: Record<string, number> = {};
     const scoped: ReadonlyArray<readonly [string, string]> = [
-      ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "file_intakes",
+        hasRedactedAt.has("file_intakes")
+          ? `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2 AND redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`
+      ],
       [
         "canonical_text_extractions",
-        `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
-           JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
-          WHERE fi.organization_id = $1 AND cte.created_at <= $2`
+        hasRedactedAt.has("canonical_text_extractions")
+          ? `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+            WHERE fi.organization_id = $1 AND cte.created_at <= $2 AND cte.redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+            WHERE fi.organization_id = $1 AND cte.created_at <= $2`
       ],
       [
         "import_rows",
-        `SELECT count(*) FROM "${schema}".import_rows ir
-           JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
-          WHERE fi.organization_id = $1 AND ir.created_at <= $2`
+        hasRedactedAt.has("import_rows")
+          ? `SELECT count(*) FROM "${schema}".import_rows ir
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+            WHERE fi.organization_id = $1 AND ir.created_at <= $2 AND ir.redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".import_rows ir
+             JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+            WHERE fi.organization_id = $1 AND ir.created_at <= $2`
       ],
-      ["applications", `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "applications",
+        hasRedactedAt.has("applications")
+          ? `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2 AND redacted_at IS NULL`
+          : `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`
+      ],
       [
         "evidence_outcomes",
         `SELECT count(*) FROM "${schema}".evidence_outcomes WHERE organization_id = $1 AND recorded_at <= $2`
@@ -4589,6 +4723,173 @@ export async function probeRetentionReconciliation(
   }
 }
 
+export interface ErasedCandidateReconciliationObservations {
+  readonly organizationId: string;
+  readonly cutoff: string;
+  readonly residueBeforeErasure: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  readonly residueAfterErasure: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  readonly residueWithAppendOnlyOutcome: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+}
+
+/**
+ * REV-002: Exercises retention residue observation and reconciliation against
+ * completely erased candidate data and candidate data with append-only residue.
+ */
+/**
+ * REV-006: a stand-in for the object-storage boundary that accepts every
+ * delete. Probes asserting that an intake is COMPLETELY erased must use a
+ * deleter: skip_for_test deliberately leaves the intake unfinished, so a
+ * probe that passed with it was passing only because skip mode used to mark
+ * the intake erased while the object was still stored. Stubbing the storage
+ * boundary, and nothing else, is the rule for probes here.
+ */
+const acceptDelete: CandidateDataObjectStorage = async () => undefined;
+
+export async function probeErasedCandidateReconciliation(
+  databaseUrl: string,
+  now: Date
+): Promise<ErasedCandidateReconciliationObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_erased_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeA = "55555555-5555-4555-8555-555555555555";
+  const intakeB = "66666666-6666-4666-8666-666666666666";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const outcomeId = "88888888-8888-4888-8888-888888888888";
+
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Acme')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'Owner')`, [
+      userId,
+      `recon_erased_${suffix}@acme.test`
+    ]);
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`, [
+      org,
+      userId
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1, $2, 'Eng', $3)`,
+      [roleId, org, userId]
+    );
+
+    const pastTimestamp = new Date(now.getTime() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Scenario A: Candidate A has intake, canonical text, import rows, application (no evidence_outcomes)
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id, created_at)
+       VALUES ($1, $2, $3, $4, 'CandidateA_CV.pdf', 'application/pdf', 'validated', $5, $6)`,
+      [intakeA, org, roleId, `key-a-${suffix}`, userId, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality, created_at)
+       VALUES ($1, '[{"text":"Candidate A text"}]'::jsonb, 1, 'full', $2)`,
+      [intakeA, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email, created_at)
+       VALUES ($1, $2, $3, $4, 1, 'Candidate A', 'a@example.test', $5)`,
+      [applicationA, org, roleId, intakeA, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason, created_at)
+       VALUES ($1, 1, 'processed', $2, NULL, $3)`,
+      [intakeA, applicationA, pastTimestamp]
+    );
+
+    const residueBeforeErasure = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    // Completely erase candidate A
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      acceptDelete
+    );
+
+    const residueAfterErasure = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    // Scenario B: Candidate B also has an evidence_outcomes record (append-only)
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id, created_at)
+       VALUES ($1, $2, $3, $4, 'CandidateB_CV.pdf', 'application/pdf', 'validated', $5, $6)`,
+      [intakeB, org, roleId, `key-b-${suffix}`, userId, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality, created_at)
+       VALUES ($1, '[{"text":"Candidate B text"}]'::jsonb, 1, 'full', $2)`,
+      [intakeB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email, created_at)
+       VALUES ($1, $2, $3, $4, 1, 'Candidate B', 'b@example.test', $5)`,
+      [applicationB, org, roleId, intakeB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason, created_at)
+       VALUES ($1, 1, 'processed', $2, NULL, $3)`,
+      [intakeB, applicationB, pastTimestamp]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome, recorded_at)
+       VALUES ($1, $2, $3, 'python', 'supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Candidate B quote"}}'::jsonb, $4)`,
+      [outcomeId, org, applicationB, pastTimestamp]
+    );
+
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
+      acceptDelete
+    );
+
+    const residueWithAppendOnlyOutcome = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
+
+    return {
+      organizationId: org,
+      cutoff,
+      residueBeforeErasure,
+      residueAfterErasure,
+      residueWithAppendOnlyOutcome
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
 // ---- AF-66: prove the support-access constraints against the real schema ----
 
 /**
@@ -4736,6 +5037,1588 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-62: candidate-data deletion workflow ----
+
+export interface EraseCandidateDataInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly trigger: CandidateDataErasureTrigger;
+  readonly requestedByUserId?: string | undefined;
+}
+
+export interface CandidateDataErasureReceipt {
+  readonly erasureId: string;
+  /** True when the application had already been erased and nothing was rewritten. */
+  readonly alreadyErased: boolean;
+  /** Rows overwritten per surface. A surface deferred to the last candidate reports 0. */
+  readonly rowsBySurface: Readonly<Record<string, number>>;
+  /**
+   * True when the intake-scoped surfaces were erased too, i.e. this was the
+   * last candidate still holding the shared document open.
+   */
+  readonly intakeErased: boolean;
+  /** How many applications on the same intake are still unerased. */
+  readonly applicationsStillReferencingIntake: number;
+  readonly residueStatement: string;
+}
+
+/**
+ * Erases one candidate's data, and records what it could not erase.
+ *
+ * Everything happens in one transaction, including the object-storage
+ * delete, which is deliberate even though it means holding a row lock
+ * across a network call. The alternative orderings are both worse: delete
+ * the object first and a later failure leaves the database describing a
+ * document that is no longer there, while redacting first and failing
+ * leaves bytes in the bucket that nothing can name any more, because
+ * storage_key was the only handle to them. Rolling the whole thing back
+ * and retrying is the only sequence that leaves no unrecoverable state.
+ *
+ * The intake-scoped half is conditional. applications.intake_id is not
+ * unique -- a CSV import produces one intake and many applications -- so
+ * the extracted text, the filename and the stored object are shared by
+ * every candidate in that file. Erasing them on the first candidate's
+ * request would destroy data belonging to candidates who never asked for
+ * anything, so they are erased only once no unerased application is left
+ * on the intake, and reported as deferred until then.
+ *
+ * REV-001: "no unerased application is left" is a check-then-act on rows
+ * other transactions are writing. Under READ COMMITTED the count cannot
+ * see a sibling's uncommitted redaction, so two concurrent erasures on one
+ * intake each counted the other as still open, both deferred, and the
+ * shared CV text survived with every candidate on it erased. The count
+ * and the intake-scoped erasure now run under lockIntakeForErasure, taken
+ * after this transaction's own redaction and before the count, so whoever
+ * takes the intake lock last does so after every other erasure on the
+ * intake has committed, and its count (a fresh READ COMMITTED snapshot)
+ * sees all of them.
+ *
+ * The early return repairs rather than just reporting. An application
+ * already redacted may still sit on an intake that the pre-fix race left
+ * stranded. Writers that accept new append-only candidate text are gated
+ * separately (they refuse redacted applications); repair still re-checks
+ * the intake under the same lock and finishes it while
+ * file_intakes.redacted_at IS NULL, so it never re-erases completed work.
+ *
+ * When the application was already erased, the returned erasureId is the
+ * ORIGINAL erasure's id even if this call completed a stranded intake.
+ * One application has one logical erasure; a repair finishes it rather
+ * than starting another, and a new id would read in the audit trail as a
+ * second erasure. The repair's own receipt is in candidate_data_erasures.
+ * So on that path rowsBySurface describes the repair while erasureId
+ * identifies the original erasure. That pairing is deliberate.
+ */
+/**
+ * Object-storage handling for an erasure. Required: omitting it used to
+ * overwrite storage_key without deleting the object, which is the orphan
+ * trap the workflow exists to prevent. Pass a deleter, or the explicit
+ * test opt-out that leaves storage_key untouched and records the object
+ * as residue.
+ */
+export type CandidateDataObjectStorage =
+  | ((storageKey: string) => Promise<void>)
+  | "skip_for_test";
+
+export async function eraseCandidateData(
+  databaseUrl: string,
+  schema: string,
+  input: EraseCandidateDataInput,
+  objectStorage: CandidateDataObjectStorage
+): Promise<CandidateDataErasureReceipt> {
+  assertSafeSchema(schema);
+  const plan = planCandidateDataErasure(input.trigger, input.requestedByUserId);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const rowsBySurface: Record<string, number> = {};
+
+  const insertReceipt = async (
+    intakeErased: boolean,
+    stillReferencing: number,
+    objectStorageDeleted: boolean
+  ): Promise<string> => {
+    const residue = summarizeCandidateDataErasureResidue(plan, {
+      intakeErased,
+      objectStorageDeleted,
+      applicationsStillReferencingIntake: stillReferencing
+    });
+    const receipt = await client.query<{ erasure_id: string }>(
+      `INSERT INTO "${schema}".candidate_data_erasures
+         (organization_id, application_id, erasure_trigger, requested_by_user_id, surfaces_erased, residue)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+       RETURNING erasure_id`,
+      [
+        input.organizationId,
+        input.applicationId,
+        input.trigger,
+        input.requestedByUserId ?? null,
+        JSON.stringify(rowsBySurface),
+        JSON.stringify({
+          statement: residue.statement,
+          surfaces: residue.surfaces.map((step) => step.surface),
+          intakeDeferred: !intakeErased,
+          applicationsStillReferencingIntake: stillReferencing,
+          objectStorageDeleted
+        })
+      ]
+    );
+    return receipt.rows[0]?.erasure_id ?? "";
+  };
+
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+
+    // Scoped by the pair, not by application_id alone. Reading on the id
+    // by itself would let one organization erase another's application.
+    //
+    // Lock order: this application row, then its intake row. That is the
+    // order this function has always taken them in, and no other code
+    // path holds a lock on an existing application and then waits on a
+    // file_intakes row, so it cannot close a cycle.
+    const application = await client.query<{ intake_id: string; redacted_at: Date | null }>(
+      `SELECT intake_id, redacted_at
+         FROM "${schema}".applications
+        WHERE application_id = $1 AND organization_id = $2
+        FOR UPDATE`,
+      [input.applicationId, input.organizationId]
+    );
+    const found = application.rows[0];
+    if (found === undefined) {
+      throw new Error(
+        `eraseCandidateData: no application ${input.applicationId} in organization ${input.organizationId}`
+      );
+    }
+    const intakeId = found.intake_id;
+
+    if (found.redacted_at !== null) {
+      // Idempotent by design. A retention job that crashes halfway and is
+      // re-run must not append a second receipt claiming a second erasure.
+      //
+      // REV-001: but it must still finish the intake. An application can
+      // be redacted while its shared intake is not -- the race above left
+      // exactly that behind, and any row erased before the fix still sits
+      // in that state -- and returning here without looking made a re-run,
+      // the only recovery a retention job has, unable to repair it. So the
+      // intake is re-checked under the same lock, and a receipt is written
+      // only if that actually erased something.
+      const intake = await lockIntakeForErasure(client, schema, intakeId, input.applicationId);
+      let intakeErased = false;
+      let objectStorageDeleted = false;
+      if (intake.stillReferencing === 0 && !intake.alreadyRedacted) {
+        objectStorageDeleted = await eraseIntakeScopedSurfaces(
+          client,
+          schema,
+          intakeId,
+          intake.storageKey,
+          rowsBySurface,
+          objectStorage
+        );
+        intakeErased = true;
+        // Only a repair that changed something gets a receipt. Since REV-006
+        // a skip-mode erasure leaves the intake unfinished on purpose, so a
+        // repeated skip-mode call reaches this branch with nothing left that
+        // it is allowed to do, and a receipt then would claim a repair that
+        // never happened.
+        const repaired = objectStorageDeleted || Object.values(rowsBySurface).some((rows) => rows > 0);
+        if (repaired) {
+          await insertReceipt(true, 0, objectStorageDeleted);
+        }
+      }
+      const existing = await client.query<{ erasure_id: string }>(
+        `SELECT erasure_id FROM "${schema}".candidate_data_erasures
+          WHERE application_id = $1 AND organization_id = $2
+          ORDER BY executed_at ASC
+          LIMIT 1`,
+        [input.applicationId, input.organizationId]
+      );
+      const residue = summarizeCandidateDataErasureResidue(plan, {
+        intakeErased,
+        objectStorageDeleted,
+        applicationsStillReferencingIntake: intake.stillReferencing
+      });
+      await client.query("COMMIT");
+      return {
+        erasureId: existing.rows[0]?.erasure_id ?? "",
+        alreadyErased: true,
+        rowsBySurface: intakeErased ? rowsBySurface : {},
+        intakeErased,
+        applicationsStillReferencingIntake: intake.stillReferencing,
+        residueStatement: residue.statement
+      };
+    }
+
+    const applications = await client.query(
+      `UPDATE "${schema}".applications
+          SET candidate_full_name = $1,
+              candidate_email = $1,
+              external_reference_id = NULL,
+              redacted_at = CURRENT_TIMESTAMP
+        WHERE application_id = $2 AND organization_id = $3 AND redacted_at IS NULL`,
+      [CANDIDATE_DATA_ERASURE_PLACEHOLDER, input.applicationId, input.organizationId]
+    );
+    rowsBySurface["applications"] = applications.rowCount ?? 0;
+
+    // Anyone else still holding the shared intake open? Asked only once
+    // the intake is locked, never before: see REV-001 above.
+    const intake = await lockIntakeForErasure(client, schema, intakeId, input.applicationId);
+    const stillReferencing = intake.stillReferencing;
+    const intakeErased = stillReferencing === 0;
+    let objectStorageDeleted = false;
+
+    if (intakeErased) {
+      objectStorageDeleted = await eraseIntakeScopedSurfaces(
+        client,
+        schema,
+        intakeId,
+        intake.storageKey,
+        rowsBySurface,
+        objectStorage
+      );
+    }
+
+    const erasureId = await insertReceipt(intakeErased, stillReferencing, objectStorageDeleted);
+    const residue = summarizeCandidateDataErasureResidue(plan, {
+      intakeErased,
+      objectStorageDeleted,
+      applicationsStillReferencingIntake: stillReferencing
+    });
+
+    await client.query("COMMIT");
+    return {
+      erasureId,
+      alreadyErased: false,
+      rowsBySurface,
+      intakeErased,
+      applicationsStillReferencingIntake: stillReferencing,
+      residueStatement: residue.statement
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+interface LockedIntake {
+  readonly storageKey: string;
+  readonly alreadyRedacted: boolean;
+  /** Unerased applications on the intake, counted after the lock was granted. */
+  readonly stillReferencing: number;
+}
+
+/**
+ * Serialises every erasure on one intake, then counts its open siblings.
+ *
+ * The order inside is the fix. The row lock comes first, and the count is
+ * a separate statement after it, so under READ COMMITTED the count takes a
+ * fresh snapshot once the lock is granted, which is after any erasure that
+ * held the lock before us has committed. Counting first and locking
+ * afterwards, as the first version did, reads the siblings from a snapshot
+ * that predates their redaction.
+ *
+ * A row lock on file_intakes rather than pg_advisory_xact_lock: the row is
+ * the thing being protected, the lock is visible in pg_locks against it,
+ * and it also conflicts with the FOR KEY SHARE lock any transaction adding
+ * an application to this intake takes through applications_intake_id_fkey,
+ * which an advisory key would not.
+ */
+async function lockIntakeForErasure(
+  client: Client,
+  schema: string,
+  intakeId: string,
+  applicationId: string
+): Promise<LockedIntake> {
+  const intake = await client.query<{ storage_key: string; redacted_at: Date | null }>(
+    `SELECT storage_key, redacted_at FROM "${schema}".file_intakes WHERE intake_id = $1 FOR UPDATE`,
+    [intakeId]
+  );
+  const row = intake.rows[0];
+  if (row === undefined) {
+    throw new Error(`eraseCandidateData: application ${applicationId} references a missing intake`);
+  }
+  const remaining = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+       FROM "${schema}".applications
+      WHERE intake_id = $1 AND redacted_at IS NULL`,
+    [intakeId]
+  );
+  const stillReferencing = Number.parseInt(remaining.rows[0]?.count ?? "", 10);
+  if (!Number.isSafeInteger(stillReferencing)) {
+    throw new Error("eraseCandidateData: remaining-application count is not a safe integer");
+  }
+  return { storageKey: row.storage_key, alreadyRedacted: row.redacted_at !== null, stillReferencing };
+}
+
+/** The shared half: only ever called with the intake locked and no open sibling left.
+ * Returns whether the object-storage delete actually ran. storage_key is
+ * overwritten only in that case; skip_for_test leaves the key intact. */
+async function eraseIntakeScopedSurfaces(
+  client: Client,
+  schema: string,
+  intakeId: string,
+  storageKey: string,
+  rowsBySurface: Record<string, number>,
+  objectStorage: CandidateDataObjectStorage
+): Promise<boolean> {
+  const skipObjectStorage = objectStorage === "skip_for_test";
+  if (!skipObjectStorage) {
+    // Before the key is overwritten, never after.
+    await objectStorage(storageKey);
+    rowsBySurface["object_storage_documents"] = 1;
+  }
+
+  const extractions = await client.query(
+    `UPDATE "${schema}".canonical_text_extractions
+        SET pages = '[]'::jsonb, redacted_at = CURRENT_TIMESTAMP
+      WHERE intake_id = $1 AND redacted_at IS NULL`,
+    [intakeId]
+  );
+  rowsBySurface["canonical_text_extractions"] = extractions.rowCount ?? 0;
+
+  // failure_reason cannot simply be nulled: CHECK ((outcome = 'failed')
+  // = (failure_reason IS NOT NULL)) makes a null reason on a failed row
+  // a constraint violation. Rows that have a reason get the
+  // placeholder, rows that never had one keep their NULL, so the
+  // invariant holds either way.
+  const importRows = await client.query(
+    `UPDATE "${schema}".import_rows
+        SET failure_reason = CASE WHEN failure_reason IS NULL THEN NULL ELSE $1 END,
+            redacted_at = CURRENT_TIMESTAMP
+      WHERE intake_id = $2 AND redacted_at IS NULL`,
+    [CANDIDATE_DATA_ERASURE_PLACEHOLDER, intakeId]
+  );
+  rowsBySurface["import_rows"] = importRows.rowCount ?? 0;
+
+  // storage_key is NOT NULL UNIQUE and embeds the declared filename, so
+  // it needs a replacement that is both non-colliding and free of
+  // anything about the candidate. Never overwrite it unless the object
+  // delete ran: that is the orphan trap (REV-003).
+  if (skipObjectStorage) {
+    // REV-006: redact what can be redacted, but do NOT set redacted_at.
+    // That column is what every other reader takes to mean "this row holds
+    // no candidate data": observeRetentionResidue counts only rows where it
+    // is NULL, and lockIntakeForErasure treats a set value as finished, so
+    // the repair path would never run again. Here storage_key still embeds
+    // the filename and the object is still in the bucket, so the honest
+    // state is "unfinished". Left NULL, a later call with a real deleter
+    // finds it through the repair path, deletes the object, replaces the key
+    // and only then sets redacted_at. IS DISTINCT FROM keeps a repeated
+    // skip-mode call from counting the same placeholder rewrite as new work.
+    const intakes = await client.query(
+      `UPDATE "${schema}".file_intakes
+          SET declared_filename = $1
+        WHERE intake_id = $2 AND redacted_at IS NULL AND declared_filename IS DISTINCT FROM $1`,
+      [CANDIDATE_DATA_ERASURE_PLACEHOLDER, intakeId]
+    );
+    rowsBySurface["file_intakes"] = intakes.rowCount ?? 0;
+    return false;
+  }
+
+  const intakes = await client.query(
+    `UPDATE "${schema}".file_intakes
+        SET declared_filename = $1, storage_key = $2, redacted_at = CURRENT_TIMESTAMP
+      WHERE intake_id = $3 AND redacted_at IS NULL`,
+    [CANDIDATE_DATA_ERASURE_PLACEHOLDER, erasedStorageKey(intakeId), intakeId]
+  );
+  rowsBySurface["file_intakes"] = intakes.rowCount ?? 0;
+  return true;
+}
+
+export interface CandidateDataErasureObservations {
+  /** Candidate text still readable after only the first of two candidates is erased. */
+  readonly textAfterFirstErasure: string;
+  readonly otherCandidateNameAfterFirstErasure: string;
+  readonly firstErasureIntakeErased: boolean;
+  readonly firstErasureDeferredCount: number;
+  readonly firstResidueStatement: string;
+  /** Objects deleted at the point only the first candidate had been erased. */
+  readonly deletedObjectCountAfterFirstErasure: number;
+  /** After the last candidate on the intake is erased. */
+  readonly textAfterLastErasure: string;
+  readonly filenameAfterLastErasure: string;
+  readonly storageKeyAfterLastErasure: string;
+  readonly erasedNameAfterLastErasure: string;
+  readonly externalReferenceAfterLastErasure: string | null;
+  readonly lastErasureIntakeErased: boolean;
+  /** Keys handed to the object-storage delete, in call order. */
+  readonly deletedObjectKeys: readonly string[];
+  /** The residue: still there, and the reason this ticket is not finished. */
+  readonly evidenceQuoteAfterErasure: string;
+  readonly decisionRationaleAfterErasure: string;
+  /** import_rows keeps its CHECK invariant rather than violating it. */
+  readonly failedRowReasonAfterErasure: string;
+  readonly processedRowReasonAfterErasure: string | null;
+  /** Re-running does not append a second receipt. */
+  readonly secondRunAlreadyErased: boolean;
+  readonly receiptCount: number;
+  /** Negative controls: these must fail, by message. */
+  readonly ledgerUpdateRejection: string;
+  readonly crossTenantRejection: string;
+}
+
+/**
+ * Proves the erasure actually erases, against the real migrations.
+ *
+ * Every claim this workflow makes is a claim made to a candidate, so none
+ * of it is asserted by reading the SQL. The probe builds two candidates
+ * sharing one CSV intake precisely because that is the case where a naive
+ * implementation is wrong in a way nobody notices: it erases the shared
+ * document on the first request and silently destroys the second
+ * candidate's data too.
+ */
+export async function assertCandidateDataErasure(
+  databaseUrl: string
+): Promise<CandidateDataErasureObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `erase_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const otherOrg = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const filename = "Jane_Doe_CV.pdf";
+  const storageKey = `quarantine/${org}/${roleId}/pending/${suffix}-${filename}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const deletedObjectKeys: string[] = [];
+
+  const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`assertCandidateDataErasure: "${label}" SUCCEEDED but must be refused`);
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [
+      org,
+      otherOrg
+    ]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `erase_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,'text/csv','imported',$6)`,
+      [intakeId, org, roleId, storageKey, filename, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    for (const [applicationId, row, name, email] of [
+      [applicationA, 1, "Jane Doe", "jane@example.test"],
+      [applicationB, 2, "Sam Roe", "sam@example.test"]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email, external_reference_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [applicationId, org, roleId, intakeId, row, name, email, `ATS-${row}`]
+      );
+    }
+    // One processed row and one failed row: the failed row is the one whose
+    // failure_reason a naive "SET failure_reason = NULL" would break.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason)
+       VALUES ($1, 1, 'processed', $2, NULL), ($1, 3, 'failed', NULL, 'row 3: bad email for Jane Doe')`,
+      [intakeId, applicationA]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1,$2,$3,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [outcomeId, org, applicationA]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (organization_id, application_id, decided_by_user_id, decision, rationale)
+       VALUES ($1,$2,$3,'advance','Jane Doe interviews well')`,
+      [org, applicationA, userId]
+    );
+
+    const readText = async (): Promise<string> => {
+      const result = await admin.query<{ pages: unknown }>(
+        `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
+        [intakeId]
+      );
+      return JSON.stringify(result.rows[0]?.pages ?? null);
+    };
+
+    // --- first candidate: the intake is shared, so it must survive ---
+    const first = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      {
+        organizationId: org,
+        applicationId: applicationA,
+        trigger: "candidate_request",
+        requestedByUserId: userId
+      },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const deletedObjectCountAfterFirstErasure = deletedObjectKeys.length;
+    const textAfterFirstErasure = await readText();
+    const otherName = await admin.query<{ candidate_full_name: string }>(
+      `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
+      [applicationB]
+    );
+
+    // --- last candidate: now the intake goes too ---
+    const last = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const textAfterLastErasure = await readText();
+    const intakeAfter = await admin.query<{ declared_filename: string; storage_key: string }>(
+      `SELECT declared_filename, storage_key FROM file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+    const erasedApplication = await admin.query<{
+      candidate_full_name: string;
+      external_reference_id: string | null;
+    }>(
+      `SELECT candidate_full_name, external_reference_id FROM applications WHERE application_id = $1`,
+      [applicationA]
+    );
+    const quote = await admin.query<{ outcome: { citation?: { quote?: string } } }>(
+      `SELECT outcome FROM evidence_outcomes WHERE evidence_outcome_id = $1`,
+      [outcomeId]
+    );
+    const rationale = await admin.query<{ rationale: string }>(
+      `SELECT rationale FROM candidate_decisions WHERE application_id = $1`,
+      [applicationA]
+    );
+    const failedRow = await admin.query<{ failure_reason: string }>(
+      `SELECT failure_reason FROM import_rows WHERE intake_id = $1 AND outcome = 'failed'`,
+      [intakeId]
+    );
+    const processedRow = await admin.query<{ failure_reason: string | null }>(
+      `SELECT failure_reason FROM import_rows WHERE intake_id = $1 AND outcome = 'processed'`,
+      [intakeId]
+    );
+
+    // --- idempotency and the negative controls ---
+    const second = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      {
+        organizationId: org,
+        applicationId: applicationA,
+        trigger: "candidate_request",
+        requestedByUserId: userId
+      },
+      "skip_for_test"
+    );
+    const receipts = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_data_erasures`
+    );
+
+    const ledgerUpdateRejection = await expectRejected("candidate_data_erasures:update", () =>
+      admin.query(`UPDATE candidate_data_erasures SET residue = '{}'::jsonb`)
+    );
+    const crossTenantRejection = await expectRejected("erase:cross_tenant", () =>
+      eraseCandidateData(
+        databaseUrl,
+        schema,
+        { organizationId: otherOrg, applicationId: applicationB, trigger: "retention_expiry" },
+        "skip_for_test"
+      )
+    );
+
+    return {
+      textAfterFirstErasure,
+      otherCandidateNameAfterFirstErasure: otherName.rows[0]?.candidate_full_name ?? "",
+      firstErasureIntakeErased: first.intakeErased,
+      firstErasureDeferredCount: first.applicationsStillReferencingIntake,
+      firstResidueStatement: first.residueStatement,
+      deletedObjectCountAfterFirstErasure,
+      textAfterLastErasure,
+      filenameAfterLastErasure: intakeAfter.rows[0]?.declared_filename ?? "",
+      storageKeyAfterLastErasure: intakeAfter.rows[0]?.storage_key ?? "",
+      erasedNameAfterLastErasure: erasedApplication.rows[0]?.candidate_full_name ?? "",
+      externalReferenceAfterLastErasure: erasedApplication.rows[0]?.external_reference_id ?? null,
+      lastErasureIntakeErased: last.intakeErased,
+      deletedObjectKeys,
+      evidenceQuoteAfterErasure: quote.rows[0]?.outcome?.citation?.quote ?? "",
+      decisionRationaleAfterErasure: rationale.rows[0]?.rationale ?? "",
+      failedRowReasonAfterErasure: failedRow.rows[0]?.failure_reason ?? "",
+      processedRowReasonAfterErasure: processedRow.rows[0]?.failure_reason ?? null,
+      secondRunAlreadyErased: second.alreadyErased,
+      receiptCount: Number.parseInt(receipts.rows[0]?.count ?? "", 10),
+      ledgerUpdateRejection,
+      crossTenantRejection
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface CandidateDataErasureIntakeRaceObservations {
+  readonly firstAlreadyErased: boolean;
+  readonly secondAlreadyErased: boolean;
+  readonly firstIntakeErased: boolean;
+  readonly secondIntakeErased: boolean;
+  readonly firstStillReferencing: number;
+  readonly secondStillReferencing: number;
+  readonly textAfterRace: string;
+  readonly intakeRedactedAt: Date | null;
+  readonly recoveryAlreadyErased: boolean;
+  readonly recoveryIntakeErased: boolean;
+  readonly textAfterRecovery: string;
+}
+
+/**
+ * REV-001 probe. Forces both sibling erase transactions to count remaining
+ * applications while each other's redacted_at is still uncommitted.
+ *
+ * Determinism: an AFTER UPDATE trigger takes pg_advisory_lock_shared on a
+ * key the probe already holds exclusively. Both erase calls therefore park
+ * after writing their own redacted_at and before the remaining-application
+ * count. The probe releases the exclusive lock only once both waiters are
+ * visible in pg_locks.
+ */
+export async function assertCandidateDataErasureIntakeRace(
+  databaseUrl: string
+): Promise<CandidateDataErasureIntakeRaceObservations> {
+  const barrierClass = 76;
+  const barrierObj = 1;
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `erase_race_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const filename = "Jane_Doe_CV.pdf";
+  const storageKey = `quarantine/${org}/${roleId}/pending/${suffix}-${filename}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const gate = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const waitForBarrierWaiters = async (minimum: number): Promise<void> => {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const waiting = await gate.query<{ n: number }>(
+        `SELECT count(*)::int AS n
+           FROM pg_locks
+          WHERE locktype = 'advisory'
+            AND classid = $1
+            AND objid = $2
+            AND granted = false`,
+        [barrierClass, barrierObj]
+      );
+      if ((waiting.rows[0]?.n ?? 0) >= minimum) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(
+      `assertCandidateDataErasureIntakeRace: expected at least ${minimum} waiters on advisory (${barrierClass}, ${barrierObj})`
+    );
+  };
+
+  try {
+    await admin.connect();
+    await gate.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      // 0016 adds UNIQUE (application_id, organization_id) that 0023's
+      // composite FK requires. No evidence rows are seeded here.
+      "0016_evidence_outcomes.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `erase_race_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,'text/csv','imported',$6)`,
+      [intakeId, org, roleId, storageKey, filename, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    for (const [applicationId, row, name, email] of [
+      [applicationA, 1, "Jane Doe", "jane@example.test"],
+      [applicationB, 2, "Sam Roe", "sam@example.test"]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [applicationId, org, roleId, intakeId, row, name, email]
+      );
+    }
+
+    await gate.query(`SELECT pg_advisory_lock($1, $2)`, [barrierClass, barrierObj]);
+    await admin.query(`
+      CREATE OR REPLACE FUNCTION "${schema}".erasure_race_barrier() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.redacted_at IS NOT NULL AND OLD.redacted_at IS NULL THEN
+          PERFORM pg_advisory_lock_shared(${barrierClass}, ${barrierObj});
+          PERFORM pg_advisory_unlock_shared(${barrierClass}, ${barrierObj});
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TRIGGER erasure_race_barrier
+        AFTER UPDATE OF redacted_at ON "${schema}".applications
+        FOR EACH ROW EXECUTE FUNCTION "${schema}".erasure_race_barrier();
+    `);
+
+    const eraseA = eraseCandidateData(
+      databaseUrl,
+      schema,
+      {
+        organizationId: org,
+        applicationId: applicationA,
+        trigger: "candidate_request",
+        requestedByUserId: userId
+      },
+      acceptDelete
+    );
+    const eraseB = eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
+      acceptDelete
+    );
+
+    await waitForBarrierWaiters(2);
+    await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
+
+    const [first, second] = await Promise.all([eraseA, eraseB]);
+
+    const textAfterRace = await admin.query<{ pages: unknown }>(
+      `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    const intake = await admin.query<{ redacted_at: Date | null }>(
+      `SELECT redacted_at FROM file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    const recovery = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      {
+        organizationId: org,
+        applicationId: applicationA,
+        trigger: "candidate_request",
+        requestedByUserId: userId
+      },
+      acceptDelete
+    );
+    const textAfterRecovery = await admin.query<{ pages: unknown }>(
+      `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    return {
+      firstAlreadyErased: first.alreadyErased,
+      secondAlreadyErased: second.alreadyErased,
+      firstIntakeErased: first.intakeErased,
+      secondIntakeErased: second.intakeErased,
+      firstStillReferencing: first.applicationsStillReferencingIntake,
+      secondStillReferencing: second.applicationsStillReferencingIntake,
+      textAfterRace: JSON.stringify(textAfterRace.rows[0]?.pages ?? null),
+      intakeRedactedAt: intake.rows[0]?.redacted_at ?? null,
+      recoveryAlreadyErased: recovery.alreadyErased,
+      recoveryIntakeErased: recovery.intakeErased,
+      textAfterRecovery: JSON.stringify(textAfterRecovery.rows[0]?.pages ?? null)
+    };
+  } finally {
+    try {
+      await gate.query(`SELECT pg_advisory_unlock_all()`);
+    } catch {
+      // Gate may already be unlocked or closed.
+    }
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await gate.end().catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface CandidateDataErasureStrandedRepairObservations {
+  readonly originalErasureId: string;
+  readonly repairAlreadyErased: boolean;
+  readonly repairIntakeErased: boolean;
+  readonly repairErasureId: string;
+  readonly repairRowsBySurface: Readonly<Record<string, number>>;
+  readonly textAfterRepair: string;
+  readonly filenameAfterRepair: string;
+  readonly storageKeyAfterRepair: string;
+  readonly intakeRedactedAfterRepair: boolean;
+  readonly deletedObjectKeys: readonly string[];
+  readonly originalStorageKey: string;
+  readonly receiptCountAfterRepair: number;
+  readonly secondAlreadyErased: boolean;
+  readonly secondIntakeErased: boolean;
+  readonly receiptCountAfterSecond: number;
+  readonly secondDeletedObjectCount: number;
+}
+
+/**
+ * REV-001 repair probe. Seeds the stranded end-state the pre-fix race
+ * left (every application redacted, shared intake and text untouched),
+ * then calls eraseCandidateData so the alreadyErased path must finish the
+ * intake rather than return immediately.
+ *
+ * The race test cannot produce this state once the count runs under the
+ * intake lock, so the stranding is inserted directly. That is the only
+ * way to prove the repair half without reinstating the race.
+ */
+export async function assertCandidateDataErasureStrandedRepair(
+  databaseUrl: string
+): Promise<CandidateDataErasureStrandedRepairObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `erase_stranded_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const filename = "Jane_Doe_CV.pdf";
+  const storageKey = `quarantine/${org}/${roleId}/pending/${suffix}-${filename}`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const deletedObjectKeys: string[] = [];
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `erase_stranded_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,'text/csv','imported',$6)`,
+      [intakeId, org, roleId, storageKey, filename, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    // Stranded: every application already redacted, intake and text not.
+    for (const [applicationId, row] of [
+      [applicationA, 1],
+      [applicationB, 2]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email, redacted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$6,CURRENT_TIMESTAMP)`,
+        [applicationId, org, roleId, intakeId, row, CANDIDATE_DATA_ERASURE_PLACEHOLDER]
+      );
+    }
+    // Sibling import_rows exist so the repair UPDATEs them while holding
+    // the intake lock, the path a deadlock would actually take.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id, failure_reason)
+       VALUES ($1, 1, 'processed', $2, NULL), ($1, 2, 'processed', $3, NULL)`,
+      [intakeId, applicationA, applicationB]
+    );
+    const seeded = await admin.query<{ erasure_id: string }>(
+      `INSERT INTO candidate_data_erasures
+         (organization_id, application_id, erasure_trigger, surfaces_erased, residue)
+       VALUES ($1,$2,'retention_expiry','{}'::jsonb,'{}'::jsonb)
+       RETURNING erasure_id`,
+      [org, applicationA]
+    );
+    const originalErasureId = seeded.rows[0]?.erasure_id ?? "";
+
+    const repair = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const textAfterRepair = await admin.query<{ pages: unknown }>(
+      `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    const intakeAfter = await admin.query<{
+      declared_filename: string;
+      storage_key: string;
+      redacted_at: Date | null;
+    }>(`SELECT declared_filename, storage_key, redacted_at FROM file_intakes WHERE intake_id = $1`, [
+      intakeId
+    ]);
+    const receiptsAfterRepair = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_data_erasures`
+    );
+
+    const deletedBeforeSecond = deletedObjectKeys.length;
+    const second = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      async (key) => {
+        deletedObjectKeys.push(key);
+      }
+    );
+    const receiptsAfterSecond = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_data_erasures`
+    );
+
+    return {
+      originalErasureId,
+      repairAlreadyErased: repair.alreadyErased,
+      repairIntakeErased: repair.intakeErased,
+      repairErasureId: repair.erasureId,
+      repairRowsBySurface: repair.rowsBySurface,
+      textAfterRepair: JSON.stringify(textAfterRepair.rows[0]?.pages ?? null),
+      filenameAfterRepair: intakeAfter.rows[0]?.declared_filename ?? "",
+      storageKeyAfterRepair: intakeAfter.rows[0]?.storage_key ?? "",
+      intakeRedactedAfterRepair: intakeAfter.rows[0]?.redacted_at !== null,
+      deletedObjectKeys,
+      originalStorageKey: storageKey,
+      receiptCountAfterRepair: Number.parseInt(receiptsAfterRepair.rows[0]?.count ?? "", 10),
+      secondAlreadyErased: second.alreadyErased,
+      secondIntakeErased: second.intakeErased,
+      receiptCountAfterSecond: Number.parseInt(receiptsAfterSecond.rows[0]?.count ?? "", 10),
+      secondDeletedObjectCount: deletedObjectKeys.length - deletedBeforeSecond
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface CandidateDataErasureGuardObservations {
+  readonly storageKeyAfterSkip: string;
+  readonly originalStorageKey: string;
+  readonly skipErasedIntake: boolean;
+  readonly skipResidueStatement: string;
+  readonly evidenceRejection: string;
+  readonly decisionRejection: string;
+  readonly listedAfterErasure: number;
+  readonly getAfterErasure: boolean;
+  /** REV-004, third writer: a correction against an erased application. */
+  readonly correctionRejection: string;
+  readonly evidenceRowsAfterCorrection: number;
+  /** REV-006: skip mode leaves the intake unfinished rather than marking it erased. */
+  readonly redactedAtAfterSkip: string | null;
+  readonly declaredFilenameAfterSkip: string;
+  readonly skipResidueSurfaces: readonly string[];
+  readonly reconciliationCountsSkippedIntake: number;
+  readonly receiptsAddedBySecondSkip: number;
+  /** A later call with a real deleter finishes what skip mode left. */
+  readonly keysDeletedByLaterRealErasure: readonly string[];
+  readonly storageKeyAfterRealErasure: string;
+  readonly redactedAtAfterRealErasure: string | null;
+  readonly reconciliationAfterRealErasure: number;
+}
+
+/**
+ * REV-003 / REV-004. skip_for_test must leave storage_key intact while still
+ * redacting the intake, and writers must refuse an erased application.
+ */
+export async function assertCandidateDataErasureGuards(
+  databaseUrl: string
+): Promise<CandidateDataErasureGuardObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `erase_guard_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationA = "44444444-4444-4444-8444-444444444444";
+  const applicationB = "77777777-7777-4777-8777-777777777777";
+  const storageKey = `quarantine/${org}/${roleId}/pending/${suffix}-Jane_Doe_CV.pdf`;
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const capture = async (run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+      return "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `erase_guard_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`,
+      [org, userId]
+    );
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','imported',$5)`,
+      [intakeId, org, roleId, storageKey, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, '[{"text":"Jane Doe"}]'::jsonb, 1, 'full')`,
+      [intakeId]
+    );
+    for (const [applicationId, row, name, email] of [
+      [applicationA, 1, "Jane Doe", "jane@example.test"],
+      [applicationB, 2, "Sam Roe", "sam@example.test"]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [applicationId, org, roleId, intakeId, row, name, email]
+      );
+    }
+
+    // REV-004 (the third writer): evidence that existed before the erasure,
+    // so a correction has a head to supersede afterwards.
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, 'python', 'supported',
+         '{"schemaVersion":1,"kind":"supported","criterionId":"python","citation":{"document":"cv.pdf","pageOrSection":"Experience","offset":0,"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [org, applicationA]
+    );
+
+    // Sole remaining application so intake erasure runs under skip_for_test.
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
+      "skip_for_test"
+    );
+    const skip = await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      "skip_for_test"
+    );
+    const keyAfter = await admin.query<{ storage_key: string }>(
+      `SELECT storage_key FROM file_intakes WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    // REV-006: what every reader of this row is told after a skip-mode run.
+    const intakeState = async (): Promise<{ storage_key: string; declared_filename: string; redacted_at: Date | null }> => {
+      const row = await admin.query<{ storage_key: string; declared_filename: string; redacted_at: Date | null }>(
+        `SELECT storage_key, declared_filename, redacted_at FROM file_intakes WHERE intake_id = $1`,
+        [intakeId]
+      );
+      const found = row.rows[0];
+      if (found === undefined) {
+        throw new Error("assertCandidateDataErasureGuards: the intake disappeared");
+      }
+      return found;
+    };
+    const receiptCount = async (): Promise<number> => {
+      const counted = await admin.query<{ count: string }>(`SELECT count(*)::text AS count FROM candidate_data_erasures`);
+      return Number.parseInt(counted.rows[0]?.count ?? "", 10);
+    };
+    const skipReceipt = await admin.query<{ surfaces: string[] }>(
+      `SELECT residue->'surfaces' AS surfaces FROM candidate_data_erasures
+        WHERE application_id = $1 ORDER BY executed_at ASC LIMIT 1`,
+      [applicationA]
+    );
+    const skipResidueSurfaces = skipReceipt.rows[0]?.surfaces ?? [];
+    const farCutoff = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const afterSkip = await intakeState();
+    const residueAfterSkip = await observeRetentionResidue(databaseUrl, schema, org, farCutoff);
+    const receiptsBefore = await receiptCount();
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      "skip_for_test"
+    );
+    const receiptsAddedBySecondSkip = (await receiptCount()) - receiptsBefore;
+    const deletedKeys: string[] = [];
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      async (storageKey) => {
+        deletedKeys.push(storageKey);
+      }
+    );
+    const afterReal = await intakeState();
+    const residueAfterReal = await observeRetentionResidue(databaseUrl, schema, org, farCutoff);
+
+    const evidenceRejection = await capture(() =>
+      recordEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId: applicationA,
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          criterionId: "python",
+          citation: {
+            document: "resume.pdf",
+            pageOrSection: "Experience",
+            offset: 0,
+            quote: "Jane Doe still here"
+          }
+        }
+      })
+    );
+    const decisionRejection = await capture(() =>
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId: org,
+        applicationId: applicationA,
+        decision: "advance",
+        rationale: "still talking about Jane",
+        decidedByUserId: userId
+      })
+    );
+    const correctionRejection = await capture(() =>
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId: applicationA,
+        criterionId: "python",
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          criterionId: "python",
+          citation: {
+            document: "cv.pdf",
+            pageOrSection: "Experience",
+            offset: 0,
+            quote: "Jane Doe only used Python once"
+          }
+        },
+        correctedByUserId: userId,
+        reason: "Jane Doe's CV overstates this"
+      })
+    );
+    const evidenceAfterCorrection = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM evidence_outcomes WHERE application_id = $1`,
+      [applicationA]
+    );
+    const listed = await listApplicationsForRole(databaseUrl, schema, org, roleId);
+    const got = await getApplicationById(databaseUrl, schema, org, applicationA);
+
+    return {
+      storageKeyAfterSkip: keyAfter.rows[0]?.storage_key ?? "",
+      originalStorageKey: storageKey,
+      skipErasedIntake: skip.intakeErased,
+      skipResidueStatement: skip.residueStatement,
+      evidenceRejection,
+      decisionRejection,
+      listedAfterErasure: listed.length,
+      getAfterErasure: got !== undefined,
+      correctionRejection,
+      evidenceRowsAfterCorrection: Number.parseInt(evidenceAfterCorrection.rows[0]?.count ?? "", 10),
+      redactedAtAfterSkip: afterSkip.redacted_at?.toISOString() ?? null,
+      declaredFilenameAfterSkip: afterSkip.declared_filename,
+      skipResidueSurfaces,
+      reconciliationCountsSkippedIntake: residueAfterSkip.rowsPastCutoffBySurface["file_intakes"] ?? 0,
+      receiptsAddedBySecondSkip,
+      keysDeletedByLaterRealErasure: deletedKeys,
+      storageKeyAfterRealErasure: afterReal.storage_key,
+      redactedAtAfterRealErasure: afterReal.redacted_at?.toISOString() ?? null,
+      reconciliationAfterRealErasure: residueAfterReal.rowsPastCutoffBySurface["file_intakes"] ?? 0
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface EvidenceWriteRacingErasureObservations {
+  /** Evidence rows that exist for the erased application once everything has settled. */
+  readonly evidenceRowsAfterErasure: number;
+  /** What recordEvidenceOutcome threw, or null if it succeeded. */
+  readonly evidenceError: string | null;
+  /** What correctEvidenceOutcome threw, or null if it succeeded. */
+  readonly correctionError: string | null;
+  /** What recordCandidateDecision threw, or null if it succeeded: the control. */
+  readonly decisionError: string | null;
+  readonly decisionRowsAfterErasure: number;
+  /**
+   * True when an evidence row was written while the erasure was in flight.
+   * The receipt's executed_at is the erasure's transaction start, so this
+   * cannot say "after the receipt committed"; the row count is the signal.
+   */
+  readonly evidenceRecordedDuringErasure: boolean;
+  /** Lock waiters seen before the erasure was released, so the race was really exercised. */
+  readonly writersBlockedBeforeRelease: number;
+}
+
+/**
+ * REV-007 probe: a writer racing an erasure that has set redacted_at but not
+ * yet committed.
+ *
+ * Same barrier as assertCandidateDataErasureIntakeRace, on its own advisory
+ * key so the two can run in parallel: an AFTER UPDATE trigger on
+ * applications parks the erasure, holding its FOR UPDATE row lock, right
+ * after it writes redacted_at. The evidence and decision writers are then
+ * started, and the erasure is released only once both are seen waiting on a
+ * row lock. That is the interleaving in which a snapshot check reads
+ * redacted_at as still NULL, so the result does not depend on timing.
+ *
+ * recordCandidateDecision is the control: it takes FOR UPDATE ... AND
+ * redacted_at IS NULL, so it must be refused. If the control were not
+ * refused, the harness would be proving nothing about the evidence path.
+ */
+export async function assertEvidenceWriteRacingErasure(
+  databaseUrl: string
+): Promise<EvidenceWriteRacingErasureObservations> {
+  const barrierClass = 76;
+  const barrierObj = 7;
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `evidence_race_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const gate = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const poll = async (label: string, sql: string, params: unknown[], minimum: number): Promise<number> => {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const found = await gate.query<{ n: number }>(sql, params);
+      const n = found.rows[0]?.n ?? 0;
+      if (n >= minimum) {
+        return n;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`assertEvidenceWriteRacingErasure: timed out waiting for ${minimum} ${label}`);
+  };
+
+  try {
+    await admin.connect();
+    await gate.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `evidence_race_${suffix}@acme.test`
+    ]);
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`, [org, userId]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+      [intakeId, org, roleId, `quarantine/${org}/${roleId}/pending/${suffix}-Jane_Doe_CV.pdf`, userId]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, org, roleId, intakeId]
+    );
+
+    // An evidence head from before the erasure, for the correction writer.
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, 'python', 'supported',
+         '{"schemaVersion":1,"kind":"supported","criterionId":"python","citation":{"document":"cv.pdf","pageOrSection":"Experience","offset":0,"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [org, applicationId]
+    );
+    const seededEvidence = 1;
+
+    await gate.query(`SELECT pg_advisory_lock($1, $2)`, [barrierClass, barrierObj]);
+    await admin.query(`
+      CREATE OR REPLACE FUNCTION "${schema}".evidence_race_barrier() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.redacted_at IS NOT NULL AND OLD.redacted_at IS NULL THEN
+          PERFORM pg_advisory_lock_shared(${barrierClass}, ${barrierObj});
+          PERFORM pg_advisory_unlock_shared(${barrierClass}, ${barrierObj});
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TRIGGER evidence_race_barrier
+        AFTER UPDATE OF redacted_at ON "${schema}".applications
+        FOR EACH ROW EXECUTE FUNCTION "${schema}".evidence_race_barrier();
+    `);
+
+    const settle = (work: Promise<unknown>): Promise<string | null> =>
+      work.then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+    const erasure = settle(
+      eraseCandidateData(
+        databaseUrl,
+        schema,
+        { organizationId: org, applicationId, trigger: "candidate_request", requestedByUserId: userId },
+        "skip_for_test"
+      )
+    );
+    // The erasure is parked holding its row lock, redacted_at written, not committed.
+    await poll(
+      "parked erasure",
+      `SELECT count(*)::int AS n FROM pg_locks
+        WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND NOT granted`,
+      [barrierClass, barrierObj],
+      1
+    );
+
+    const evidence = settle(
+      recordEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          criterionId: "python",
+          citation: {
+            document: "cv.pdf",
+            pageOrSection: "Experience",
+            offset: 0,
+            quote: "Jane Doe, Python engineer"
+          }
+        }
+      })
+    );
+    const decision = settle(
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        decision: "decline",
+        rationale: "Jane Doe lacks Python depth",
+        decidedByUserId: userId
+      })
+    );
+
+    const correction = settle(
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        criterionId: "python",
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          criterionId: "python",
+          citation: { document: "cv.pdf", pageOrSection: "Experience", offset: 0, quote: "Jane Doe only used Python once" }
+        },
+        correctedByUserId: userId,
+        reason: "Jane Doe's CV overstates this"
+      })
+    );
+
+    // All three writers are waiting on a row lock held by the parked erasure, so
+    // whatever check they made before the wait was made against a snapshot
+    // in which redacted_at was still NULL.
+    const writersBlockedBeforeRelease = await poll(
+      "blocked writers",
+      `SELECT count(*)::int AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE NOT l.granted AND l.locktype IN ('transactionid', 'tuple')
+          AND a.query LIKE '%' || $1 || '%'`,
+      [`"${schema}".`],
+      3
+    );
+
+    await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
+    const [erasureError, evidenceError, decisionError, correctionError] = await Promise.all([
+      erasure,
+      evidence,
+      decision,
+      correction
+    ]);
+    if (erasureError !== null) {
+      throw new Error(`assertEvidenceWriteRacingErasure: the erasure itself failed: ${erasureError}`);
+    }
+
+    const evidenceRows = await admin.query<{ count: string; last_recorded: Date | null }>(
+      `SELECT count(*)::text AS count, max(recorded_at) AS last_recorded
+         FROM evidence_outcomes WHERE application_id = $1`,
+      [applicationId]
+    );
+    const decisionRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_decisions WHERE application_id = $1`,
+      [applicationId]
+    );
+    const receipt = await admin.query<{ executed_at: Date }>(
+      `SELECT executed_at FROM candidate_data_erasures WHERE application_id = $1 ORDER BY executed_at LIMIT 1`,
+      [applicationId]
+    );
+    const lastEvidence = evidenceRows.rows[0]?.last_recorded ?? null;
+    const executedAt = receipt.rows[0]?.executed_at ?? null;
+
+    return {
+      // The seeded pre-erasure head is not residue grown after the erasure.
+      evidenceRowsAfterErasure: Number.parseInt(evidenceRows.rows[0]?.count ?? "", 10) - seededEvidence,
+      correctionError,
+      evidenceError,
+      decisionError,
+      decisionRowsAfterErasure: Number.parseInt(decisionRows.rows[0]?.count ?? "", 10),
+      evidenceRecordedDuringErasure:
+        lastEvidence !== null && executedAt !== null && lastEvidence.getTime() >= executedAt.getTime(),
+      writersBlockedBeforeRelease
+    };
+  } finally {
+    try {
+      await gate.query(`SELECT pg_advisory_unlock_all()`);
+    } catch {
+      // Gate may already be unlocked or closed.
+    }
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await gate.end().catch(() => undefined);
     await admin.end().catch(() => undefined);
   }
 }
