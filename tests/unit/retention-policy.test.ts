@@ -11,7 +11,7 @@ import {
   summarizeSurvivingCandidateData,
   validateRetentionPolicy
 } from "../../packages/domain/src/index.ts";
-import type { RetentionPolicy } from "../../packages/domain/src/index.ts";
+import type { RetentionEnforcement, RetentionPlan, RetentionPolicy } from "../../packages/domain/src/index.ts";
 
 // AF-61: "Default retention window for raw candidate data (e.g. 30-90
 // days), configurable per contract, applied consistently across object
@@ -19,6 +19,11 @@ import type { RetentionPolicy } from "../../packages/domain/src/index.ts";
 
 const ORG = "11111111-1111-4111-8111-111111111111";
 const NOW = new Date("2026-08-29T12:00:00.000Z");
+
+// The truth today: nothing runs a purge. Stated once, by name, so no test
+// gets the enforced wording by accident.
+const NOT_ENFORCED: RetentionEnforcement = { automatedDeletionActive: false };
+const ENFORCED: RetentionEnforcement = { automatedDeletionActive: true };
 
 function policy(overrides: Partial<RetentionPolicy> = {}): RetentionPolicy {
   return { organizationId: ORG, windowDays: RETENTION_DEFAULT_DAYS, ...overrides };
@@ -166,9 +171,9 @@ test("the survival summary produces a sentence a privacy notice can use truthful
   // The point of the ticket. A privacy notice written from an optimistic
   // retention policy is a false statement to a candidate, which is worse
   // than an honest "we keep quotes indefinitely".
-  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW));
+  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
   assert.equal(summary.anySurvives, true);
-  assert.match(summary.statement, /still\s+retained and cannot currently be deleted/);
+  assert.match(summary.statement, /the following cannot currently be deleted/);
   assert.match(summary.statement, /evidence_outcomes \(citation quotes/);
   assert.match(summary.statement, /applications \(candidate_full_name/);
   assert.ok(
@@ -186,10 +191,76 @@ test("the survival summary lists exactly the surfaces that survive, no more and 
   // understating it is, so the set has to be exact in both directions.
   // Proved against the database in
   // tests/integration/retention-purge-blockers.test.ts.
-  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW));
+  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
   assert.deepEqual(
     summary.surfaces.map((surface) => surface.surface),
     ["file_intakes", "applications", "evidence_outcomes", "candidate_decisions"]
+  );
+});
+
+// ---- REV-005: the statement must describe what actually happens ----
+//
+// Nothing calls planRetention, nothing deletes on a schedule and no
+// policy is stored, so no candidate data is deleted after any window. The
+// old statement said "After the N-day retention window, the following ...
+// is still retained", which tells a data subject that everything NOT
+// listed is gone. The "is deleted" check above was already there and
+// passed against that sentence, so on its own it proved nothing; these
+// are the ones that fail against it.
+
+test("with no deletion process running, the statement says nothing is deleted automatically", () => {
+  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
+  assert.equal(summary.automatedDeletionActive, false);
+  assert.match(summary.statement, /not currently deleted automatically/);
+  // The clause that stops the survivor list reading as the only thing kept.
+  assert.match(summary.statement, /kept after the 30-day retention window until one does/);
+});
+
+test("with no deletion process running, nothing unlisted is implied to be gone", () => {
+  const { statement } = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
+  assert.doesNotMatch(statement, /\bis deleted\b/);
+  assert.doesNotMatch(
+    statement,
+    /After the \d+-day retention window, the following/,
+    "listing survivors after the window implies everything else was deleted at it"
+  );
+});
+
+test("the branch planRetention cannot reach still never claims deletion without an executor", () => {
+  // planRetention always carries blocked surfaces, so nothing survives only
+  // on a hand-built plan. RetentionPlan is exported, so a caller can build
+  // one, and this branch used to say "Raw candidate data is deleted".
+  const reachable = planRetention(policy(), NOW);
+  const nothingBlocked: RetentionPlan = {
+    ...reachable,
+    surfaces: reachable.surfaces.map((surface) => ({ ...surface, disposition: "purge" as const }))
+  };
+  const summary = summarizeSurvivingCandidateData(nothingBlocked, NOT_ENFORCED);
+  assert.equal(summary.anySurvives, false);
+  assert.doesNotMatch(summary.statement, /\bis deleted\b/);
+  assert.match(summary.statement, /not currently deleted automatically/);
+});
+
+test("once deletion is enforced, the survivors are still named as the exception", () => {
+  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), ENFORCED);
+  assert.equal(summary.automatedDeletionActive, true);
+  assert.match(summary.statement, /is deleted 30 days after intake, except the following/);
+  assert.match(summary.statement, /evidence_outcomes \(citation quotes/);
+  assert.deepEqual(
+    summary.surfaces.map((surface) => surface.surface),
+    ["file_intakes", "applications", "evidence_outcomes", "candidate_decisions"]
+  );
+});
+
+test("the unqualified deletion sentence is reachable only when enforced and nothing survives", () => {
+  const reachable = planRetention(policy(), NOW);
+  const nothingBlocked: RetentionPlan = {
+    ...reachable,
+    surfaces: reachable.surfaces.map((surface) => ({ ...surface, disposition: "purge" as const }))
+  };
+  assert.equal(
+    summarizeSurvivingCandidateData(nothingBlocked, ENFORCED).statement,
+    "Raw candidate data is deleted 30 days after intake."
   );
 });
 

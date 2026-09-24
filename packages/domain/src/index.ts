@@ -2571,6 +2571,8 @@ export function planRetention(policy: RetentionPolicy, now: Date): RetentionPlan
 export interface SurvivingCandidateData {
   /** True when at least one surface still holds candidate data after expiry. */
   readonly anySurvives: boolean;
+  /** Echoed from the input, so whoever renders the notice can see which case it is. */
+  readonly automatedDeletionActive: boolean;
   readonly surfaces: readonly RetentionSurfacePlan[];
   /**
    * A sentence a privacy notice can be written from without it becoming a
@@ -2579,27 +2581,59 @@ export interface SurvivingCandidateData {
   readonly statement: string;
 }
 
-export function summarizeSurvivingCandidateData(plan: RetentionPlan): SurvivingCandidateData {
+export interface RetentionEnforcement {
+  /**
+   * Whether a purge executor is actually running for this deployment.
+   * Must be read from deployment configuration, never passed as a literal
+   * true: this decides whether a data subject is told their data is
+   * deleted. Required with no default, so the optimistic sentence cannot be
+   * reached by forgetting an argument, only by stating something false.
+   */
+  readonly automatedDeletionActive: boolean;
+}
+
+/**
+ * REV-005: the statement describes what actually happens, not what the
+ * policy would do if something enforced it. Nothing runs planRetention or
+ * deletes anything on a schedule yet, so with no executor the sentence
+ * says so outright, and says the data is kept past the window, rather
+ * than listing survivors in a way that implies everything unlisted is
+ * gone. Understating what we delete is safe; overstating it is a false
+ * statement to the person whose data it is.
+ *
+ * The anySurvives: false branch cannot be reached through planRetention
+ * today, because the plan always carries blocked surfaces, but
+ * RetentionPlan is exported and a hand-built plan reaches it, so it obeys
+ * the same rule and is tested rather than trusted.
+ */
+export function summarizeSurvivingCandidateData(
+  plan: RetentionPlan,
+  enforcement: RetentionEnforcement
+): SurvivingCandidateData {
+  const { automatedDeletionActive } = enforcement;
   const surviving = plan.surfaces.filter(
     (surface) =>
       surface.disposition === "blocked_append_only" || surface.disposition === "blocked_by_reference"
   );
-  if (surviving.length === 0) {
-    return {
-      anySurvives: false,
-      surfaces: [],
-      statement: `Raw candidate data is deleted ${plan.windowDays} days after intake.`
-    };
+  const survivorList = surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ");
+  const notEnforced =
+    `Candidate data is not currently deleted automatically: no deletion process runs yet, so it is ` +
+    `kept after the ${plan.windowDays}-day retention window until one does.`;
+
+  let statement: string;
+  if (!automatedDeletionActive) {
+    statement =
+      surviving.length === 0
+        ? notEnforced
+        : `${notEnforced} Even once it does, the following cannot currently be deleted: ${survivorList}.`;
+  } else {
+    statement =
+      surviving.length === 0
+        ? `Raw candidate data is deleted ${plan.windowDays} days after intake.`
+        : `Raw candidate data is deleted ${plan.windowDays} days after intake, except the following, ` +
+          `which is retained and cannot currently be deleted: ${survivorList}.`;
   }
-  return {
-    anySurvives: true,
-    surfaces: surviving,
-    statement:
-      `After the ${plan.windowDays}-day retention window, the following candidate data is still ` +
-      `retained and cannot currently be deleted: ` +
-      surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ") +
-      `.`
-  };
+  return { anySurvives: surviving.length > 0, automatedDeletionActive, surfaces: surviving, statement };
 }
 
 // ---- AF-59: role-level audit report ----
