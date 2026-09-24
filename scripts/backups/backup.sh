@@ -185,6 +185,7 @@ configure_aliases() {
     log_event error run_failed source_authentication
     return 1
   fi
+  # Compose supplies the admin or writer key under the same names per service.
   if ! mc --quiet alias set target "$BACKUP_ENDPOINT" \
     "$BACKUP_ACCESS_KEY_ID" "$BACKUP_SECRET_ACCESS_KEY" --api S3v4 --path "$BACKUP_PATH_STYLE" >/dev/null 2>&1
   then
