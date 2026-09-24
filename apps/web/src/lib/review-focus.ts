@@ -18,14 +18,25 @@ export interface RevealableItem {
   scrollIntoView(options?: { readonly block?: "nearest" }): void;
 }
 
+/**
+ * REV-003: why the selection moved. The index changes for reasons that
+ * are not keypresses -- a filter refetch empties the list and the clamp
+ * walks the index to -1 and back to 0, and clicking a row reports its
+ * index back through onFocus -- and none of those may move DOM focus.
+ * The cause is stated by whoever moved the index, because by the time an
+ * effect sees the new index it can no longer tell which of these it was.
+ */
+export type SelectionCause =
+  /** A navigation key the reviewer pressed on this surface. */
+  | "keypress"
+  /** The list was emptied, refetched or shrank and the index was clamped. */
+  | "list-changed"
+  /** The item already took focus (a click or Tab) and the index follows it. */
+  | "focus-followed";
+
 export interface RevealRequest {
   readonly index: number;
-  /**
-   * How many navigation keys the reviewer has pressed on this surface.
-   * Zero means they have pressed none, which is the case on every first
-   * render, including the one after the queue finishes loading.
-   */
-  readonly movementCount: number;
+  readonly cause: SelectionCause;
 }
 
 /**
@@ -34,11 +45,12 @@ export interface RevealRequest {
  *
  * Two refusals, both load-bearing:
  *
- * Nothing is revealed before the reviewer has pressed a navigation key.
- * Selection starts at index 0, so revealing unconditionally would yank
- * DOM focus to the first row as soon as the fetch resolves, throwing away
- * wherever the reviewer had put it and interrupting a screen reader
- * mid-announcement. Focus moves in response to a keypress or not at all.
+ * Nothing is revealed unless the reviewer pressed a navigation key.
+ * Focus moves in response to a keypress or not at all. A list change is
+ * the case that matters: toggling an AF-47 filter refetches the queue,
+ * and revealing on that would throw a keyboard or screen reader user out
+ * of the filter fieldset onto row 0 every time the fetch resolved. The
+ * first render after loading is a list change too, so it steals nothing.
  *
  * `focus` is called with `preventScroll` and the scrolling is left to
  * `scrollIntoView({ block: "nearest" })`. The browser's own focus scroll
@@ -51,7 +63,7 @@ export function revealReviewItem(
   items: ReadonlyMap<number, RevealableItem>,
   request: RevealRequest
 ): boolean {
-  if (request.movementCount <= 0) {
+  if (request.cause !== "keypress") {
     return false;
   }
   if (request.index < 0) {

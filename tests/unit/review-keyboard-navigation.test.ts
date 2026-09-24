@@ -156,7 +156,7 @@ function recordingItem(): RecordingItem {
 
 test("a moved selection is focused and scrolled to, not merely outlined", () => {
   const item = recordingItem();
-  const revealed = revealReviewItem(new Map([[1, item]]), { index: 1, movementCount: 1 });
+  const revealed = revealReviewItem(new Map([[1, item]]), { index: 1, cause: "keypress" });
 
   assert.equal(revealed, true);
   // preventScroll matters: the browser's own focus scroll walks every
@@ -173,7 +173,7 @@ test("only the selected item is revealed", () => {
     [1, second]
   ]);
 
-  revealReviewItem(items, { index: 1, movementCount: 4 });
+  revealReviewItem(items, { index: 1, cause: "keypress" });
 
   assert.deepEqual(first.calls, [], "an unselected row must not be focused out from under the reviewer");
   assert.equal(second.calls.length, 2);
@@ -184,10 +184,11 @@ test("nothing is focused before the reviewer has pressed a navigation key", () =
   // focus to the first row the moment the fetch resolves -- discarding
   // wherever the reviewer had put it and cutting off a screen reader
   // mid-announcement. That is a regression introduced by the fix, not by
-  // the bug, which is why it is pinned here.
+  // the bug, which is why it is pinned here. The first load is a list
+  // change: the clamp takes the index from -1 to 0.
   const item = recordingItem();
 
-  assert.equal(revealReviewItem(new Map([[0, item]]), { index: 0, movementCount: 0 }), false);
+  assert.equal(revealReviewItem(new Map([[0, item]]), { index: 0, cause: "list-changed" }), false);
   assert.deepEqual(item.calls, []);
 });
 
@@ -195,20 +196,79 @@ test("pressing the key again at the end of the list still brings the last item b
   // The clamp means the index stops changing at the end, but `j` is
   // still a request to see that row, and the reviewer may have scrolled
   // away with the mouse. Revealing on index change alone would do
-  // nothing here, so the movement count, not the index, is the trigger.
+  // nothing here, so the keypress, not the index, is the trigger.
   const item = recordingItem();
   const items = new Map([[4, item]]);
 
-  assert.equal(revealReviewItem(items, { index: 4, movementCount: 7 }), true);
-  assert.equal(revealReviewItem(items, { index: 4, movementCount: 8 }), true);
+  assert.equal(revealReviewItem(items, { index: 4, cause: "keypress" }), true);
+  assert.equal(revealReviewItem(items, { index: 4, cause: "keypress" }), true);
   assert.equal(item.calls.length, 4);
 });
 
 test("an empty list and an item that has not rendered reveal nothing rather than throwing", () => {
   // nextReviewIndex reports -1 for an empty queue, and a row can be
   // unregistered for a frame while the filter re-renders the table.
-  assert.equal(revealReviewItem(new Map(), { index: -1, movementCount: 3 }), false);
-  assert.equal(revealReviewItem(new Map([[0, recordingItem()]]), { index: 2, movementCount: 3 }), false);
+  assert.equal(revealReviewItem(new Map(), { index: -1, cause: "keypress" }), false);
+  assert.equal(revealReviewItem(new Map([[0, recordingItem()]]), { index: 2, cause: "keypress" }), false);
+});
+
+// ---- REV-003: a filter refetch pulled focus onto row 0 ----
+//
+// The reveal ran in an effect on every focusedIndex change once any
+// navigation key had ever been pressed. Toggling an AF-47 filter empties
+// the queue while it refetches, so the clamp moves the index to -1 and,
+// when the fetch resolves, back to 0. The effect saw an index change and
+// a non-zero keypress counter and focused row 0, throwing the reviewer
+// out of the filter fieldset on every toggle. The cause of the change is
+// now part of the request, so these replay that sequence.
+
+test("a filter refetch after an earlier keypress moves no focus and scrolls nothing", () => {
+  const first = recordingItem();
+  const second = recordingItem();
+  const items = new Map([
+    [0, first],
+    [1, second]
+  ]);
+
+  // The reviewer pressed `j` once: that one is revealed.
+  assert.equal(revealReviewItem(items, { index: 1, cause: "keypress" }), true);
+  const afterKeypress = second.calls.length;
+
+  // Then tabbed to a filter checkbox and pressed Space. The list empties
+  // (index -1) and refills (index clamped to 0). Neither may reveal.
+  assert.equal(revealReviewItem(new Map(), { index: -1, cause: "list-changed" }), false);
+  assert.equal(revealReviewItem(items, { index: 0, cause: "list-changed" }), false);
+
+  assert.deepEqual(first.calls, [], "row 0 must not take focus from the filter checkbox");
+  assert.equal(second.calls.length, afterKeypress, "a list change must not re-reveal the old row either");
+});
+
+test("a list that shrinks under the cursor clamps without moving focus", () => {
+  const last = recordingItem();
+
+  assert.equal(revealReviewItem(new Map([[2, last]]), { index: 2, cause: "list-changed" }), false);
+  assert.deepEqual(last.calls, []);
+});
+
+test("an item that took focus by click or Tab is followed, not re-focused", () => {
+  // onFocus reports the index back to the hook. Focus is already on the
+  // item, and calling focus() again from a row would pull it off any
+  // control inside that row the reviewer actually clicked.
+  const item = recordingItem();
+
+  assert.equal(revealReviewItem(new Map([[3, item]]), { index: 3, cause: "focus-followed" }), false);
+  assert.deepEqual(item.calls, []);
+});
+
+test("a keypress after a refetch is still revealed", () => {
+  // The repair must not overcorrect into never revealing after a list
+  // change: the next `j` is a keypress like any other.
+  const item = recordingItem();
+  const items = new Map([[0, item]]);
+
+  revealReviewItem(items, { index: 0, cause: "list-changed" });
+  assert.equal(revealReviewItem(items, { index: 0, cause: "keypress" }), true);
+  assert.deepEqual(item.calls, ['focus {"preventScroll":true}', 'scrollIntoView {"block":"nearest"}']);
 });
 
 // ---- REV-002: `s` revealed the wrong thing ----

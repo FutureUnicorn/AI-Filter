@@ -6,7 +6,7 @@ import { nextReviewIndex, resolveReviewKeyAction } from "@signal-audit/domain";
 import type { ReviewKeyAction } from "@signal-audit/domain";
 
 import { revealReviewItem } from "./review-focus";
-import type { RevealableItem } from "./review-focus";
+import type { RevealableItem, SelectionCause } from "./review-focus";
 
 /**
  * AF-53: the thin glue over the decision layer in packages/domain.
@@ -45,6 +45,11 @@ export interface ReviewKeyboardOptions {
 export interface ReviewKeyboardState {
   readonly focusedIndex: number;
   readonly helpVisible: boolean;
+  /**
+   * For an item that has already taken focus (click or Tab). Moves the
+   * selection to it and never moves DOM focus, because focus is already
+   * there.
+   */
   readonly setFocusedIndex: (index: number) => void;
   /**
    * REV-001: the selection has to reach the DOM, not just React state.
@@ -58,12 +63,6 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
   const { itemCount, onOpen, onRevealSource } = options;
   const [focusedIndex, setFocusedIndex] = useState(itemCount > 0 ? 0 : -1);
   const [helpVisible, setHelpVisible] = useState(false);
-  // Counts navigation keypresses rather than index changes, because the
-  // two differ exactly where it matters: on the first render nothing has
-  // been pressed and focus must stay where the reviewer put it, and at
-  // the end of the list the index stops changing while `j` keeps being a
-  // request to show the last row.
-  const [movementCount, setMovementCount] = useState(0);
 
   // Held in a ref as well as in state because key repeat can deliver the
   // next keydown before React has re-rendered; reading the index from
@@ -76,10 +75,21 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
     callbacksRef.current = { onOpen, onRevealSource };
   }, [onOpen, onRevealSource]);
 
-  const select = useCallback((index: number): void => {
+  // REV-003: every index change states its cause, and the reveal happens
+  // here, at the change, rather than in an effect watching focusedIndex.
+  // An effect cannot tell a keypress from a filter refetch clamping the
+  // index to -1 and back to 0, and the old one inferred intent from a
+  // keypress counter that stayed non-zero forever after the first `j`, so
+  // every refetch pulled focus out of the filter fieldset onto row 0.
+  // Revealing at the keypress also covers the end of the list, where the
+  // index does not change but `j` is still a request to see that row.
+  const select = useCallback((index: number, cause: SelectionCause): void => {
     focusedIndexRef.current = index;
     setFocusedIndex(index);
+    revealReviewItem(itemsRef.current, { index, cause });
   }, []);
+
+  const followFocus = useCallback((index: number): void => select(index, "focus-followed"), [select]);
 
   const registerItem = useCallback(
     (index: number) =>
@@ -114,8 +124,7 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
         return;
       }
       const next = nextReviewIndex(action, focusedIndexRef.current, itemCount);
-      select(next);
-      setMovementCount((count) => count + 1);
+      select(next, "keypress");
       // Called here rather than inside a state updater: an updater must
       // be pure, and React invokes it twice in development, which would
       // route the reviewer to a candidate twice.
@@ -134,12 +143,8 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
   useEffect(() => {
     // A list that shrinks under the cursor must not leave focus past the
     // end -- AF-47's filters do exactly that.
-    select(nextReviewIndex("none", focusedIndexRef.current, itemCount));
+    select(nextReviewIndex("none", focusedIndexRef.current, itemCount), "list-changed");
   }, [itemCount, select]);
 
-  useEffect(() => {
-    revealReviewItem(itemsRef.current, { index: focusedIndex, movementCount });
-  }, [focusedIndex, movementCount]);
-
-  return { focusedIndex, helpVisible, setFocusedIndex: select, registerItem };
+  return { focusedIndex, helpVisible, setFocusedIndex: followFocus, registerItem };
 }

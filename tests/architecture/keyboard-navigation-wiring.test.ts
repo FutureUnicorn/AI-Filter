@@ -82,12 +82,75 @@ test("the hook reveals the selected element rather than only re-rendering", () =
     "focus handling belongs in review-focus.ts, where node --test can reach it"
   );
   const call = hook.slice(callIndex, hook.indexOf(");", callIndex));
-  // A hard-coded count would pass the live counter's name but not its
-  // value, and would reveal on the very first render.
+  // REV-003 replaced the keypress counter this used to pin. The reveal
+  // is told why the index moved; a hard-coded cause would reveal on the
+  // first render and on every refetch.
   assert.match(
     call,
-    /movementCount(?!\s*:\s*\d)/u,
-    "the reveal must be keyed on a keypress, or the first render steals focus from wherever the reviewer left it"
+    /\bcause\b(?!\s*:\s*")/u,
+    "the reveal must be told the cause of the change, or the first render steals focus from wherever the reviewer left it"
+  );
+});
+
+// ---- REV-003 ----
+//
+// The reveal ran in an effect keyed on focusedIndex and inferred "was
+// this a keypress" from a counter that stayed non-zero after the first
+// `j`. A filter refetch clamps the index to -1 and back to 0, so every
+// toggle threw focus from the checkbox onto row 0. tests/unit proves the
+// reveal refuses anything but a keypress; these prove the hook actually
+// states each cause truthfully, which is the half a refactor would lose
+// without a unit test noticing.
+
+function handlerSource(): string {
+  const start = hook.indexOf("function handle(");
+  const end = hook.indexOf('window.addEventListener("keydown"', start);
+  assert.ok(start >= 0 && end > start, "the keydown handler must be locatable");
+  return hook.slice(start, end);
+}
+
+test("the reveal is not driven by an effect watching the index", () => {
+  // An effect sees only the new index, never why it moved, which is the
+  // whole defect. The reveal belongs at the change.
+  assert.equal(
+    hook.split("revealReviewItem(").length - 1,
+    1,
+    "exactly one reveal call site, inside the select that every index change goes through"
+  );
+  assert.doesNotMatch(
+    hook,
+    /\}\s*,\s*\[[^\]]*\bfocusedIndex\b[^\]]*\]\s*\)/u,
+    "no effect may depend on focusedIndex: it cannot tell a keypress from a refetch"
+  );
+  assert.doesNotMatch(
+    hook,
+    /movementCount|set[A-Z][A-Za-z]*Count\(/u,
+    "intent must be stated by the caller, not inferred from a keypress counter"
+  );
+});
+
+test("only the keydown handler claims a keypress", () => {
+  assert.equal(
+    hook.split('"keypress"').length - 1,
+    1,
+    "a second keypress cause is a second path that can move DOM focus"
+  );
+  assert.match(handlerSource(), /select\(next, "keypress"\)/u, "the key handler must reveal what it moved to");
+});
+
+test("the clamp and the focus-follow path both say they are not keypresses", () => {
+  // The clamp is what a filter refetch drives; the focus-follow path is
+  // what the pages' onFocus calls. Either one revealing is REV-003.
+  assert.match(
+    hook,
+    /select\(nextReviewIndex\("none", focusedIndexRef\.current, itemCount\), "list-changed"\)/u,
+    "the clamp must declare itself a list change"
+  );
+  assert.match(hook, /select\(index, "focus-followed"\)/u, "following focus must not re-focus");
+  assert.match(
+    hook,
+    /setFocusedIndex: followFocus/u,
+    "the setter the pages call from onFocus must be the non-revealing one"
   );
 });
 
