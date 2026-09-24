@@ -326,10 +326,13 @@ test("the dead-letter outcome ignores anything passed after the criterion", () =
   assert.equal(buildEvidenceCard(withText, "2026-08-29T12:00:00.000Z").explanation, DEAD_LETTER_EXPLANATION);
 });
 
-test("the administration request has nowhere to put candidate data", () => {
-  // The requirement is the clause after "without". This is a property of
-  // the type, not a rule someone has to remember: the only free text is
-  // the reason, and the only identifiers are a job and an operator.
+test("the minimal administration request carries exactly the four fields the type allows", () => {
+  // REV-005. This checks the FIXTURE, which is all a runtime test can see:
+  // it cannot fail when JobAdministrationRequest gains a field. What does
+  // fail then is JobAdministrationRequestKeysAreFixed in
+  // packages/domain/src/index.ts, a compile-time assertion that pnpm
+  // typecheck runs in the gate. Kept so the fixture stays minimal, and
+  // renamed so it no longer claims to prove the property of the type.
   const keys = Object.keys(request()).sort();
   assert.deepEqual(keys, ["action", "jobId", "operatorUserId", "reason"]);
 });

@@ -2445,6 +2445,26 @@ export interface JobAdministrationRequest {
   readonly operatorUserId: string;
 }
 
+/**
+ * REV-005: the key set above is enforced by the compiler, in the gate.
+ *
+ * The earlier "test" read Object.keys of the test's own fixture, so adding a
+ * field here, optional or not, left the fixture and the test unchanged and
+ * green. The claim that adding a field fails a test was false. tests/ are
+ * not type-checked in this repository, but this file is (pnpm typecheck,
+ * part of pnpm check), so the assertion lives here: adding, removing or
+ * renaming any key of JobAdministrationRequest, including an optional one,
+ * is a compile error. If a new key is genuinely needed, the change has to
+ * come here and say why candidate content still has nowhere to go.
+ */
+type ExactlyTheseKeys<T, K extends PropertyKey> = [Exclude<keyof T, K>, Exclude<K, keyof T>] extends [never, never]
+  ? true
+  : false;
+type AssertTrue<T extends true> = T;
+export type JobAdministrationRequestKeysAreFixed = AssertTrue<
+  ExactlyTheseKeys<JobAdministrationRequest, "jobId" | "action" | "reason" | "operatorUserId">
+>;
+
 export type JobAdministrationRefusal =
   | "job_not_stuck"
   | "job_mismatch"
