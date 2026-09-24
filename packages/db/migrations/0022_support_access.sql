@@ -142,3 +142,58 @@ DROP TRIGGER IF EXISTS support_access_grants_reject_truncate ON support_access_g
 CREATE TRIGGER support_access_grants_reject_truncate
   BEFORE TRUNCATE ON support_access_grants
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- REV-001: who counts as an operator.
+--
+-- users is one global table shared by every tenant, so REFERENCES users
+-- on the two actor columns accepted any account at all, including a
+-- customer's own recruiter. Two colluding customer accounts could then
+-- write a grant naming each other and pass every constraint above. The
+-- allowlist is the missing noun: platform staff, as a set the schema can
+-- check.
+--
+-- The grantor is held to it as well as the operator. With the operator
+-- alone on the list, support_access_grants_not_self_granted would be
+-- satisfied by an operator and their own spare customer account, so "a
+-- second person knew" would mean only "a second account existed". Support
+-- access is platform-side approval (it is deliberately not a membership,
+-- see the header), so the second person is platform staff too.
+--
+-- What this cannot prove: that two allowlisted rows are two people. One
+-- human with two allowlisted accounts still satisfies every constraint
+-- here. Who is on the list is a governance decision made outside the
+-- schema, and no constraint can check it.
+--
+-- Rows are expected to be permanent. A grant references its operator and
+-- grantor, and grants are append-only apart from revocation, so a row that
+-- has ever been named cannot be deleted without breaking that history.
+CREATE TABLE IF NOT EXISTS platform_operators (
+  user_id uuid PRIMARY KEY REFERENCES users (user_id) ON DELETE RESTRICT
+);
+
+-- Added by ALTER rather than inline in the support_access_grants
+-- definition, because that statement is skipped wholesale on a database
+-- where the table already exists, and an inline constraint would never
+-- reach it.
+DO $support_access_grants_operator_fks$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_operator_is_platform_operator'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_operator_is_platform_operator
+      FOREIGN KEY (operator_user_id) REFERENCES platform_operators (user_id);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_grantor_is_platform_operator'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_grantor_is_platform_operator
+      FOREIGN KEY (granted_by_user_id) REFERENCES platform_operators (user_id);
+  END IF;
+END
+$support_access_grants_operator_fks$;

@@ -4604,6 +4604,9 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
   const orgB = "22222222-2222-4222-8222-222222222222";
   const operator = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const authoriser = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  // REV-001: an ordinary account, the kind every customer's recruiter has.
+  // Nothing about it says platform staff, which is the point.
+  const outsider = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const rejections: Record<string, string> = {};
 
@@ -4640,9 +4643,22 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
     await admin.query(
-      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Op'), ($3,$4,'Auth')`,
-      [operator, `op_${suffix}@acme.test`, authoriser, `auth_${suffix}@acme.test`]
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Op'), ($3,$4,'Auth'), ($5,$6,'Customer')`,
+      [
+        operator,
+        `op_${suffix}@acme.test`,
+        authoriser,
+        `auth_${suffix}@acme.test`,
+        outsider,
+        `recruiter_${suffix}@customer.test`
+      ]
     );
+
+    // The allowlist, seeded before any grant: with the operator foreign key
+    // in place, a fixture that creates users but no platform_operators row
+    // would have every grant below refused for the wrong reason. The
+    // outsider is deliberately NOT seeded.
+    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2)`, [operator, authoriser]);
 
     const base = `organization_id, operator_user_id, reason, granted_by_user_id, expires_at`;
 
@@ -4676,6 +4692,32 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
         "10000000-0000-4000-8000-000000000004",
         base,
         `'${orgA}', '${operator}', 'time travel', '${authoriser}', clock_timestamp() - interval '1 hour'`
+      )
+    );
+
+    // REV-001: an ordinary user named as the operator. users is global, so
+    // before the allowlist any customer account satisfied the foreign key,
+    // and two colluding accounts could grant each other cross-tenant access
+    // past every other constraint in this migration.
+    await expectRejected(
+      "operator_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000005",
+        base,
+        `'${orgA}', '${outsider}', 'looking into a stuck import', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+
+    // REV-001: an allowlisted operator authorised by an ordinary account.
+    // Without the grantor on the allowlist too, an operator and their own
+    // spare customer account satisfy not_self_granted, so dual custody
+    // would mean only that a second account existed.
+    await expectRejected(
+      "grantor_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000006",
+        base,
+        `'${orgA}', '${operator}', 'looking into a stuck import', '${outsider}', clock_timestamp() + interval '1 hour'`
       )
     );
 

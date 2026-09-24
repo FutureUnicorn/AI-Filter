@@ -83,3 +83,25 @@ test("revocation is permitted once and cannot be undone", async () => {
   const found = await rejections();
   assert.match(found["revocation_undone"] ?? "", /revoked_at cannot be changed once set/);
 });
+
+// ---- REV-001: only platform operators can be named ----
+
+test("an ordinary customer account cannot be named as the operator on a grant", async () => {
+  // users is a single global table, so a bare REFERENCES users let any
+  // customer's recruiter be the "operator", and two colluding accounts could
+  // grant each other cross-tenant access past every other constraint.
+  const found = await rejections();
+  assert.match(
+    found["operator_not_allowlisted"] ?? "",
+    /support_access_grants_operator_is_platform_operator/,
+    "the refusal must come from the platform_operators allowlist, not from some other constraint"
+  );
+});
+
+test("an operator cannot be authorised by an ordinary account, so dual custody means two operators", async () => {
+  // An operator plus their own spare customer account would otherwise pass
+  // not_self_granted: a control one person can satisfy alone is not dual
+  // custody.
+  const found = await rejections();
+  assert.match(found["grantor_not_allowlisted"] ?? "", /support_access_grants_grantor_is_platform_operator/);
+});
