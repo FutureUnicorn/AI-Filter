@@ -23,6 +23,18 @@ export function assertDestructiveEnvironmentAllowed(appEnv, operation) {
   }
 }
 
+/**
+ * AF-94: compose interpolated POSTGRES_USER/POSTGRES_PASSWORD directly into
+ * this URI. A secret-manager-generated password containing a URI delimiter
+ * (`/`, `?`, `#`, `@`) either makes the string invalid or silently changes
+ * how its authority parses (`p@ss` moves everything before the last `@`
+ * into userinfo). Percent-encoding at construction closes that without
+ * constraining what a secret manager is allowed to generate.
+ */
+export function buildDatabaseUrl({ user, password, database, host = "postgres", port = 5432 }) {
+  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}`;
+}
+
 export function requireHostedControls(appEnv, source) {
   if (!hostedEnvironments.has(appEnv)) {
     return;
@@ -54,6 +66,81 @@ export function requireHostedControls(appEnv, source) {
   }
 }
 
+/**
+ * AF-94: the official Postgres image applies POSTGRES_USER/POSTGRES_PASSWORD
+ * only when the data directory is empty -- they are initialisation
+ * variables, not runtime ones. Staging and production use a persistent
+ * volume, so rotating POSTGRES_PASSWORD alone changes what migrate/web/worker
+ * send without changing what the database role accepts. Rotation therefore
+ * requires the outgoing password too, so an explicit ALTER ROLE step can
+ * authenticate with it before the new one takes over.
+ */
+export function requireRotationControls(source) {
+  const previousPassword = source.POSTGRES_PASSWORD_PREVIOUS ?? "";
+  const nextPassword = source.POSTGRES_PASSWORD ?? "";
+  if (previousPassword.trim() === "") {
+    throw new Error("POSTGRES_PASSWORD_PREVIOUS is required to rotate the database password");
+  }
+  if (nextPassword.length < 20) {
+    throw new Error("Hosted infrastructure secrets must be at least 20 characters");
+  }
+  if (nextPassword === previousPassword) {
+    throw new Error("POSTGRES_PASSWORD must differ from POSTGRES_PASSWORD_PREVIOUS to rotate");
+  }
+  return { previousPassword, nextPassword };
+}
+
+/**
+ * The docker argv that runs psql against a hosted environment's database.
+ *
+ * Reaching the database from a throwaway container on the environment's
+ * private network -- rather than `docker exec` into the postgres container
+ * itself -- is what makes the password real. Review (#86, REV-001) showed
+ * the earlier `-h 127.0.0.1` did not: `initdb` generates
+ * `host all all 127.0.0.1/32 trust` and the image's entrypoint *appends*
+ * `host all all all scram-sha-256`, so a loopback connection matches the
+ * trust rule first and the password is accepted and discarded. Verified by
+ * reproduction: over loopback a deliberately wrong password connects; from
+ * a non-loopback address the same wrong password is rejected.
+ *
+ * Takes no password: PGPASSWORD is forwarded by name, so no secret can
+ * reach any process's argv.
+ */
+export function buildRotationCommand({ image, network, user, database, host = "postgres" }) {
+  return [
+    "run",
+    "--rm",
+    "--interactive",
+    "--network",
+    network,
+    "--env",
+    "PGPASSWORD",
+    image,
+    "psql",
+    "--no-psqlrc",
+    "-v",
+    "ON_ERROR_STOP=1",
+    "--host",
+    host,
+    "--username",
+    user,
+    "--dbname",
+    database
+  ];
+}
+
+/**
+ * Built for a statement sent over psql's stdin, never through a shell, so
+ * SQL string-literal quote doubling is the only escaping this needs.
+ */
+export function buildAlterRolePasswordStatement(user, password) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(user ?? "")) {
+    throw new Error("POSTGRES_USER must be a safe PostgreSQL identifier to rotate its password");
+  }
+  const escapedPassword = password.replace(/'/gu, "''");
+  return `ALTER ROLE "${user}" WITH PASSWORD '${escapedPassword}';`;
+}
+
 export function derivePreviewEnvironment(prValue, shaValue, source = process.env) {
   const pr = validatePullRequestNumber(prValue);
   const sha = validateCommitSha(shaValue);
@@ -61,6 +148,9 @@ export function derivePreviewEnvironment(prValue, shaValue, source = process.env
   const port = 10_000 + (pr % 40_000);
   const suffix = crypto.randomBytes(18).toString("base64url");
   const baseDomain = source.PREVIEW_BASE_DOMAIN?.trim();
+  const postgresUser = `preview_${pr}`;
+  const postgresPassword = `preview-db-${suffix}`;
+  const postgresDb = "signal_audit_preview";
 
   return {
     createdAt: new Date().toISOString(),
@@ -76,9 +166,10 @@ export function derivePreviewEnvironment(prValue, shaValue, source = process.env
       DEPLOYMENT_COMMIT_SHA: sha,
       PREVIEW_ID: `pr-${pr}`,
       PREVIEW_COMMIT_SHA: sha,
-      POSTGRES_DB: "signal_audit_preview",
-      POSTGRES_USER: `preview_${pr}`,
-      POSTGRES_PASSWORD: `preview-db-${suffix}`,
+      POSTGRES_DB: postgresDb,
+      POSTGRES_USER: postgresUser,
+      POSTGRES_PASSWORD: postgresPassword,
+      DATABASE_URL: buildDatabaseUrl({ user: postgresUser, password: postgresPassword, database: postgresDb }),
       DATABASE_SCHEMA: `pr_${pr}_${shortSha}`,
       STORAGE_REGION: "us-east-1",
       STORAGE_BUCKET: `signal-audit-preview-pr-${pr}-${shortSha}`,

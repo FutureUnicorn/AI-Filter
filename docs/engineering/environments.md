@@ -179,6 +179,84 @@ Staging and production environment variables:
 Do not copy values between environments. Secret values must never appear in Git,
 Jira, screenshots, workflow output, or shell history.
 
+## Credential rotation
+
+The official Postgres image applies `POSTGRES_USER`/`POSTGRES_PASSWORD` only
+while initialising an empty data directory. Staging and production keep a
+persistent `postgres-data` volume, so replacing `POSTGRES_PASSWORD` in the
+secret store and redeploying changes what `migrate`, `web`, and `worker`
+*send* without changing what the database role *accepts* -- every hosted
+service then fails authentication against a role whose password never moved.
+
+Rotation is an operator action performed on the environment's own host, by a
+member of `ADMIN_ROLE_ALLOWLIST`. **No workflow performs it.** The staging and
+production jobs inject `POSTGRES_PASSWORD` for a deploy and nothing injects
+the outgoing password, so `rotate-password` cannot be driven from them as they
+stand -- see "Automating rotation" below. Putting the outgoing password into
+the GitHub secret store does not make it reachable either; nothing exports it.
+
+1. Replace `POSTGRES_PASSWORD` in the environment's secret store with the new
+   password. That is what the next deploy will send; on its own it changes
+   nothing about what the database accepts.
+2. On the environment's host, supply the outgoing and incoming passwords to a
+   single invocation and rotate. `read -rs` takes each value on stdin, so
+   neither reaches shell history, and `rotate-password` keeps both out of
+   every process's argv:
+
+   ```bash
+   read -rsp 'outgoing password: ' POSTGRES_PASSWORD_PREVIOUS; echo
+   read -rsp 'new password: ' POSTGRES_PASSWORD; echo
+   export POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
+   node scripts/environment/cli.mjs <staging|production> rotate-password
+   unset POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
+   ```
+
+   The command also requires the environment's other hosted controls to be
+   present (`requireHostedControls`: the AF-11 enablement flag, the cost and
+   admin references, `POSTGRES_USER`, and the storage credentials --
+   `PRODUCTION_VALIDATION_ONLY` as well for production). It locates the
+   environment's database through the Compose labels on its running
+   containers and network, connects to it from a throwaway container on that
+   private network -- which is what subjects the connection to the image's
+   `scram-sha-256` host rule, so the outgoing password is genuinely checked
+   -- and issues `ALTER ROLE ... WITH PASSWORD`. It refuses to run if
+   `POSTGRES_PASSWORD_PREVIOUS` is absent or equal to `POSTGRES_PASSWORD`,
+   and fails rather than proceeding if the outgoing password is wrong or the
+   environment is not running.
+
+   **From this point until step 3 finishes, the environment is down.** The
+   role no longer accepts the password `web` and `worker` are still
+   configured with, and the connection pool recycles idle connections within
+   about ten seconds, so every request begins failing authentication. Step 3
+   rebuilds images, so expect minutes, not seconds. Authentication errors
+   during this window are the rotation working, not failing.
+3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
+   redeploy with the new password, which the role now accepts, and the
+   environment recovers.
+
+If step 2 reported success but step 3 failed, do not start over from step 1:
+the role is already on the new password. Rerunning `rotate-password` is safe
+-- it detects that `POSTGRES_PASSWORD` already authenticates and exits
+without changing anything -- but the work left is step 3.
+
+### Automating rotation
+
+Driving this from CI would need a job that injects both the outgoing and the
+incoming password from the environment's secrets. That is deliberately not
+added here: `production-gate.yml` has no manual trigger, and
+`tests/integration/environment-policy.test.ts` asserts it never gains one, so
+introducing a dispatchable job that can act on production is a policy decision
+for the owners of that rule rather than a detail of this change. Until such a
+job exists, treat the host procedure above as the supported path, and record
+the rotation against `ADMIN_AUDIT_REFERENCE` like any other administrative
+action.
+
+Storage credentials (`STORAGE_ACCESS_KEY_ID`/`STORAGE_SECRET_ACCESS_KEY`) are
+MinIO's root user, which MinIO re-reads from the environment on every start
+rather than only at initialisation -- confirm this against the deployed MinIO
+version before relying on it, but it does not need the ALTER-ROLE-style
+rotation step Postgres does.
+
 ## Spend controls
 
 The repository supplies defense in depth through per-service CPU/memory limits,
@@ -242,5 +320,8 @@ Do not mark AF-11 Done if any external provider evidence in steps 4-9 is absent.
   target before removing it.
 - Hosted control missing: configure the named GitHub environment variable or
   secret. Do not bypass `requireHostedControls`.
+- Hosted database authentication fails right after a `POSTGRES_PASSWORD`
+  change: rotation was skipped. See "Credential rotation" above; do not
+  reset the volume to force it, which destroys the environment's state.
 - Production health failure: stop rollout and investigate; never seed or reset
   production to make the check pass.
