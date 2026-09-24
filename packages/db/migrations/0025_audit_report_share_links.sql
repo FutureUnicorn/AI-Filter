@@ -14,8 +14,13 @@
 --
 -- LIFETIME: always bounded. There is no never-expires option, because a
 -- pilot ends and a link outliving the pilot is the failure mode this
--- ticket names. The hard ceiling is enforced here rather than left to the
--- caller.
+-- ticket names. The hard ceiling is 180 days, decided in the domain and
+-- mirrored by the CHECK below. The ceiling is judged against created_at,
+-- so created_at must be the database clock: a caller-writable stamp would
+-- let both CHECKs pass while stretching real elapsed life past 180 days
+-- from mint (the same root shape as a backdated privacy-request extension
+-- or a NaN timestamp that skips a guard). The pin trigger below is what
+-- makes the decided ceiling bind to wall time.
 --
 -- REVOCATION: per link, and immediate. Per-link is what answers "I sent
 -- it to the wrong person"; revoking every link on a role is what answers
@@ -91,6 +96,29 @@ CREATE INDEX IF NOT EXISTS audit_report_share_links_token_idx
 
 CREATE INDEX IF NOT EXISTS audit_report_share_links_role_idx
   ON audit_report_share_links (role_id, created_at DESC);
+
+-- Pin created_at to the database clock on insert, and refuse any later
+-- rewrite. DEFAULT CURRENT_TIMESTAMP alone is not enough: an INSERT that
+-- names the column bypasses the default, which is how a future-dated
+-- stamp would defeat the 180-day ceiling CHECK.
+CREATE OR REPLACE FUNCTION pin_audit_report_share_link_created_at() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.created_at := clock_timestamp();
+    RETURN NEW;
+  END IF;
+  IF NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION
+      'audit_report_share_links: created_at is pinned to the database clock and cannot be rewritten';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_report_share_links_pin_created_at ON audit_report_share_links;
+CREATE TRIGGER audit_report_share_links_pin_created_at
+  BEFORE INSERT OR UPDATE ON audit_report_share_links
+  FOR EACH ROW EXECUTE FUNCTION pin_audit_report_share_link_created_at();
 
 -- One row per view. Append-only: a log of who reached an employer's
 -- report that the holder of the link can trim is not a log.

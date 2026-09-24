@@ -72,6 +72,17 @@ test("a link cannot be minted beyond the expiry ceiling", async () => {
   assert.match(observed.expiryCeilingRejection, /audit_report_share_links_expiry_within_ceiling/);
 });
 
+test("a future-dated created_at cannot stretch the 180-day ceiling past wall time", async () => {
+  // REV-003. The lifetime was decided (30/180); a writable created_at meant
+  // the ceiling did not bind to real elapsed time. Pinning created_at to
+  // the database clock makes the CHECK judge wall time.
+  const observed = await observe();
+  assert.match(
+    observed.futureDatedCreatedAtRejection,
+    /audit_report_share_links_expiry_within_ceiling/
+  );
+});
+
 test("one organization cannot mint a public link for another's role", async () => {
   const observed = await observe();
   assert.match(observed.crossTenantRejection, /violates foreign key constraint/);

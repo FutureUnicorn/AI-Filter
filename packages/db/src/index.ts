@@ -5755,25 +5755,46 @@ export interface CreateAuditReportShareLinkInput {
   readonly tokenHash: string;
   readonly report: RoleAuditReport;
   readonly createdByUserId: string;
-  readonly createdAt: Date;
   readonly days?: number | undefined;
 }
 
+/**
+ * Mints an unauthenticated share link for a frozen role-level audit report.
+ *
+ * There is deliberately no `createdAt` in the input. The 180-day ceiling
+ * CHECK is relative to created_at, and a caller-supplied stamp would
+ * satisfy both CHECKs while stretching real elapsed life past 180 days
+ * from mint -- the same root shape as a backdated privacy-request
+ * extension. created_at is read from the database clock here and pinned
+ * again by the insert trigger, so domain math and the CHECK judge the
+ * same wall time a direct SQL writer cannot rewrite.
+ */
 export async function createAuditReportShareLink(
   databaseUrl: string,
   schema: string,
   input: CreateAuditReportShareLinkInput
 ): Promise<{ readonly shareLinkId: string; readonly expiresAt: string }> {
   assertSafeSchema(schema);
-  const expiresAt = computeShareLinkExpiry(input.createdAt, input.days ?? undefined);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
+    const clock = await client.query<{ now_text: string; now: Date }>(
+      `SELECT now_value::text AS now_text, now_value AS now
+         FROM (SELECT clock_timestamp() AS now_value) AS clock`
+    );
+    const dbNow = clock.rows[0];
+    if (dbNow === undefined) {
+      throw new Error("createAuditReportShareLink: could not read the database clock");
+    }
+    const expiresAt = computeShareLinkExpiry(dbNow.now, input.days ?? undefined);
+    // created_at is omitted on purpose: DEFAULT plus the pin trigger write
+    // the database clock. Passing a bind parameter would re-open the
+    // writable-anchor hole the trigger exists to close.
     const inserted = await client.query<{ share_link_id: string; expires_at: Date }>(
       `INSERT INTO "${schema}".audit_report_share_links
          (organization_id, role_id, token_hash, report, report_generated_at, expires_at,
-          created_by_user_id, created_at)
-       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8)
+          created_by_user_id)
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7)
        RETURNING share_link_id, expires_at`,
       [
         input.organizationId,
@@ -5782,8 +5803,7 @@ export async function createAuditReportShareLink(
         JSON.stringify(input.report),
         input.report.generatedAt,
         expiresAt,
-        input.createdByUserId,
-        input.createdAt.toISOString()
+        input.createdByUserId
       ]
     );
     const row = inserted.rows[0];
@@ -5922,6 +5942,12 @@ export interface AuditReportShareLinkObservations {
   readonly viewsUpdateRejection: string;
   readonly expiryCeilingRejection: string;
   readonly crossTenantRejection: string;
+  /**
+   * REV-003: a future-dated created_at with an expires_at that only looks
+   * valid relative to that stamp must be refused once created_at is pinned
+   * to the database clock (the ceiling CHECK then sees wall time).
+   */
+  readonly futureDatedCreatedAtRejection: string;
 }
 
 /**
@@ -5945,18 +5971,24 @@ export async function assertAuditReportShareLinkSecurity(
   const otherRoleId = "99999999-9999-4999-8999-999999999999";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const hash = (seed: string): string => createHash("sha256").update(seed).digest("hex");
-  const now = new Date("2026-09-01T00:00:00.000Z");
+  // Resolutions compare expires_at to this instant. created_at is no longer
+  // caller-supplied, so expired coverage advances this clock past mint
+  // rather than backdating the row.
+  const resolveNow = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
 
-  const report = {
-    schemaVersion: CONTRACT_SCHEMA_VERSION,
-    organizationId: org,
-    roleId,
-    generatedAt: "2026-08-01T00:00:00.000Z",
-    metrics: {},
-    corrections: null,
-    auditSample: null
-  } as unknown as RoleAuditReport;
+  const reportFor = (targetRoleId: string): RoleAuditReport =>
+    ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      organizationId: org,
+      roleId: targetRoleId,
+      generatedAt: "2026-08-01T00:00:00.000Z",
+      metrics: {},
+      corrections: null,
+      auditSample: null
+    }) as unknown as RoleAuditReport;
 
+  const report = reportFor(roleId);
+  const otherRoleReport = reportFor(otherRoleId);
   const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
     try {
       await run();
@@ -5997,32 +6029,29 @@ export async function assertAuditReportShareLinkSecurity(
       [roleId, org, otherRoleId, userId]
     );
 
-    const link = async (seed: string, days: number, createdAt: Date): Promise<string> =>
+    const link = async (
+      seed: string,
+      days: number,
+      targetRoleId: string,
+      targetReport: RoleAuditReport
+    ): Promise<string> =>
       (
         await createAuditReportShareLink(databaseUrl, schema, {
           organizationId: org,
-          roleId,
+          roleId: targetRoleId,
           tokenHash: hash(seed),
-          report,
+          report: targetReport,
           createdByUserId: userId,
-          createdAt,
           days
         })
       ).shareLinkId;
 
-    const liveId = await link("live", 30, now);
-    await link("expired", 1, new Date("2026-01-01T00:00:00.000Z"));
-    const revokedId = await link("revoked", 30, now);
-    const roleWideA = await link("rolewide-a", 30, now);
-    await createAuditReportShareLink(databaseUrl, schema, {
-      organizationId: org,
-      roleId: otherRoleId,
-      tokenHash: hash("other-role"),
-      report,
-      createdByUserId: userId,
-      createdAt: now,
-      days: 30
-    });
+    const liveId = await link("live", 30, roleId, report);
+    // One day of life from the database clock; resolveNow is two days ahead.
+    await link("expired", 1, roleId, report);
+    const revokedId = await link("revoked", 30, roleId, report);
+    const roleWideA = await link("rolewide-a", 30, roleId, report);
+    await link("other-role", 30, otherRoleId, otherRoleReport);
 
     await revokeAuditReportShareLinks(databaseUrl, schema, {
       organizationId: org,
@@ -6048,7 +6077,7 @@ export async function assertAuditReportShareLinkSecurity(
     );
 
     const resolve = async (seed: string): Promise<ShareLinkResolution> =>
-      resolveAuditReportShareLink(databaseUrl, schema, hash(seed), now);
+      resolveAuditReportShareLink(databaseUrl, schema, hash(seed), resolveNow);
 
     const live = await resolve("live");
     const expired = await resolve("expired");
@@ -6086,18 +6115,43 @@ export async function assertAuditReportShareLinkSecurity(
       admin.query(
         `INSERT INTO audit_report_share_links
            (organization_id, role_id, token_hash, report, report_generated_at, expires_at, created_by_user_id)
-         VALUES ($1,$2,$3,'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '200 days', $4)`,
-        [org, roleId, hash("too-long"), userId]
+         VALUES ($1,$2,$3,$4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '200 days', $5)`,
+        [org, roleId, hash("too-long"), JSON.stringify(report), userId]
       )
     );
     const crossTenantRejection = await expectRejected("mint:cross_tenant", () =>
       admin.query(
         `INSERT INTO audit_report_share_links
            (organization_id, role_id, token_hash, report, report_generated_at, expires_at, created_by_user_id)
-         VALUES ($1,$2,$3,'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '30 days', $4)`,
-        [otherOrg, roleId, hash("cross-tenant"), userId]
+         VALUES ($1,$2,$3,$4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '30 days', $5)`,
+        [
+          otherOrg,
+          roleId,
+          hash("cross-tenant"),
+          JSON.stringify({ ...report, organizationId: otherOrg }),
+          userId
+        ]
       )
     );
+
+    // Future-dated created_at + expires_at that only looks valid relative
+    // to that stamp. Once the pin trigger rewrites created_at to wall
+    // time, the ceiling CHECK refuses the row.
+    const futureDatedCreatedAtRejection = await expectRejected("mint:future_created_at", () =>
+      admin.query(
+        `INSERT INTO audit_report_share_links
+           (organization_id, role_id, token_hash, report, report_generated_at,
+            expires_at, created_by_user_id, created_at)
+         VALUES (
+           $1,$2,$3,$4::jsonb, CURRENT_TIMESTAMP,
+           CURRENT_TIMESTAMP + INTERVAL '2 years' + INTERVAL '30 days',
+           $5,
+           CURRENT_TIMESTAMP + INTERVAL '2 years'
+         )`,
+        [org, roleId, hash("future-created"), JSON.stringify(report), userId]
+      )
+    );
+
 
     return {
       liveResolution: describe(live),
@@ -6114,7 +6168,8 @@ export async function assertAuditReportShareLinkSecurity(
       otherRoleLinkStillLive: otherRoleLink.status === "available",
       viewsUpdateRejection,
       expiryCeilingRejection,
-      crossTenantRejection
+      crossTenantRejection,
+      futureDatedCreatedAtRejection
     };
   } finally {
     try {
@@ -6158,7 +6213,6 @@ export async function assertAuditReportShareLinkActorMembership(
   const roleId = "33333333-3333-4333-8333-333333333333";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const hash = (seed: string): string => createHash("sha256").update(seed).digest("hex");
-  const now = new Date("2026-09-01T00:00:00.000Z");
   const report = {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     organizationId: org,
@@ -6217,7 +6271,6 @@ export async function assertAuditReportShareLinkActorMembership(
         tokenHash: hash("outsider-create"),
         report,
         createdByUserId: outsiderId,
-        createdAt: now,
         days: 30
       })
     );
@@ -6231,7 +6284,6 @@ export async function assertAuditReportShareLinkActorMembership(
         tokenHash: hash("member-create"),
         report,
         createdByUserId: memberId,
-        createdAt: now,
         days: 30
       });
       shareLinkId = created.shareLinkId;
