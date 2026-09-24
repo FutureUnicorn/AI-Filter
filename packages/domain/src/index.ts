@@ -3854,7 +3854,17 @@ export function renderShareLinkResolution(
   resolution: ShareLinkResolution
 ): { readonly httpStatus: 200 | 404; readonly body: string } {
   if (resolution.status === "available") {
-    return { httpStatus: 200, body: renderRoleAuditReport(resolution.report) };
+    // The disclosure notice is the framing sentence an unauthenticated
+    // viewer otherwise has no session to supply: no candidates named, and
+    // the seed is a reconstruction key for anyone who already holds the
+    // eligible application set. renderRoleAuditReport alone still prints
+    // its in-report seed warning when a sample exists; this is the
+    // sentence that sits above the report so forwarding is decided with
+    // the caveat in view.
+    return {
+      httpStatus: 200,
+      body: `${shareLinkDisclosureNotice()}\n\n${renderRoleAuditReport(resolution.report)}`
+    };
   }
   // 404 for every failure, including revoked and expired. A 410 Gone would
   // be more descriptive and would leak precisely the fact being withheld.

@@ -5,6 +5,7 @@ import {
   SHARE_LINK_DEFAULT_DAYS,
   SHARE_LINK_MAX_DAYS,
   SHARE_LINK_UNAVAILABLE_MESSAGE,
+  buildRoleAuditReport,
   computeShareLinkExpiry,
   renderShareLinkResolution,
   shareLinkDisclosureNotice
@@ -93,4 +94,29 @@ test("the disclosure notice states the reconstruction-key caveat", () => {
   assert.match(notice, /does not name candidates/iu);
   assert.match(notice, /seed/iu);
   assert.match(notice, /which ones were sampled/iu);
+});
+
+test("an available share-link render carries the disclosure notice above the report", () => {
+  // REV-005. The notice existed and was unit-tested in isolation, but
+  // renderShareLinkResolution never put it in the 200 body. An
+  // unauthenticated viewer has no session to supply that framing.
+  const report = buildRoleAuditReport({
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    roleId: "33333333-3333-4333-8333-333333333333",
+    generatedAt: "2026-08-01T00:00:00.000Z",
+    metrics: {
+      review_time_reduction: null,
+      qualified_candidate_preservation: null,
+      evidence_precision_live_pilot: null,
+      failed_document_rate: null
+    },
+    corrections: null,
+    auditSample: null
+  });
+  const { httpStatus, body } = renderShareLinkResolution({ status: "available", report });
+  assert.equal(httpStatus, 200);
+  const notice = shareLinkDisclosureNotice();
+  assert.ok(body.startsWith(notice), "disclosure notice must lead the 200 body");
+  assert.match(body, /Evidence audit report/);
+  assert.ok(body.indexOf(notice) < body.indexOf("Evidence audit report"));
 });
