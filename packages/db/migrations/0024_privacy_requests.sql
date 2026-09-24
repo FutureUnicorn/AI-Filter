@@ -112,3 +112,73 @@ DROP TRIGGER IF EXISTS privacy_request_events_reject_truncate ON privacy_request
 CREATE TRIGGER privacy_request_events_reject_truncate
   BEFORE TRUNCATE ON privacy_request_events
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- REV-001: the extension record.
+--
+-- Article 12(3) lets a controller take two further months, and the columns
+-- on privacy_requests (extended_at, extension_reason, due_at) say that it
+-- happened. They cannot say who did it, and due_at is overwritten in place,
+-- so on their own they are the kind of record a late response has a motive
+-- to rewrite. privacy_request_events cannot hold it either: that ledger is
+-- a status history, and an extension changes no status, which its
+-- is_a_transition CHECK rightly refuses.
+--
+-- So an extension gets its own append-only row: who granted it, why, and
+-- the deadline before and after. UNIQUE (request_id) makes "a request is
+-- extended at most once" a fact the database enforces rather than a check a
+-- future caller might skip, and the months CHECK mirrors the domain's 1..2
+-- so neither layer is the only thing refusing a meaningless extension.
+-- extended_at defaults to the database clock; extendPrivacyRequest writes
+-- the same instant it validated, so the timeliness judgement and the record
+-- cannot disagree about when the extension was granted.
+-- request_id is already the primary key, so this adds no new restriction.
+-- It exists so privacy_request_extensions can name the pair in a composite
+-- foreign key and make a cross-tenant extension unrepresentable.
+ALTER TABLE privacy_requests
+  DROP CONSTRAINT IF EXISTS privacy_requests_id_org_key;
+ALTER TABLE privacy_requests
+  ADD CONSTRAINT privacy_requests_id_org_key UNIQUE (request_id, organization_id);
+
+CREATE TABLE IF NOT EXISTS privacy_request_extensions (
+  extension_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id uuid NOT NULL UNIQUE REFERENCES privacy_requests (request_id) ON DELETE RESTRICT,
+  organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+  extension_months integer NOT NULL CHECK (extension_months BETWEEN 1 AND 2),
+  reason text NOT NULL CHECK (reason ~ '[^[:space:]]'),
+  previous_due_at timestamptz NOT NULL,
+  new_due_at timestamptz NOT NULL,
+  actor_user_id uuid NOT NULL REFERENCES users (user_id) ON DELETE RESTRICT,
+  extended_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  CONSTRAINT privacy_request_extensions_moves_the_deadline_later
+    CHECK (new_due_at > previous_due_at)
+);
+
+-- The pair, not the two columns independently: an extension must belong to the
+-- same tenant as the request it extends. Without this a raw writer could file
+-- one organization's extension against another's request and every column
+-- would still satisfy its own foreign key. Matches the (grant_id,
+-- organization_id) shape 0022_support_access.sql uses.
+--
+-- Added by ALTER rather than written inline in the table definition above.
+-- This file is re-applied on every migrate, and the existence guard on that
+-- definition skips the whole statement on a database that already has the
+-- table, so a constraint declared inline would never reach an existing
+-- deployment. Prose here deliberately avoids spelling out the creation
+-- keywords: tests/architecture/retention-classification.test.ts scans this
+-- file with a regex and would read them as declaring a table.
+ALTER TABLE privacy_request_extensions
+  DROP CONSTRAINT IF EXISTS privacy_request_extensions_request_org_fkey;
+ALTER TABLE privacy_request_extensions
+  ADD CONSTRAINT privacy_request_extensions_request_org_fkey
+  FOREIGN KEY (request_id, organization_id)
+  REFERENCES privacy_requests (request_id, organization_id) ON DELETE RESTRICT;
+
+DROP TRIGGER IF EXISTS privacy_request_extensions_append_only ON privacy_request_extensions;
+CREATE TRIGGER privacy_request_extensions_append_only
+  BEFORE UPDATE OR DELETE ON privacy_request_extensions
+  FOR EACH ROW EXECUTE FUNCTION reject_append_only_mutation();
+
+DROP TRIGGER IF EXISTS privacy_request_extensions_reject_truncate ON privacy_request_extensions;
+CREATE TRIGGER privacy_request_extensions_reject_truncate
+  BEFORE TRUNCATE ON privacy_request_extensions
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();

@@ -2730,7 +2730,13 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // exemption is false the moment someone pastes a candidate's details
   // into one, the same caveat that applies to support_access_grants.
   "privacy_requests",
-  "privacy_request_events"
+  "privacy_request_events",
+  // REV-001. Who extended a request's deadline, why, and from when to when.
+  // Exempt on the same basis as privacy_request_events: it is the evidence
+  // that a response was on time, and reason carries the same caveat as
+  // extension_reason -- operator-written, and this exemption is false the
+  // moment a candidate's details are pasted into it.
+  "privacy_request_extensions"
 ]);
 
 export type RetentionClassification = "planned" | "exempt" | "unclassified";
@@ -3446,6 +3452,31 @@ export function canExtendPrivacyRequest(receivedAt: Date, now: Date): boolean {
   return now.getTime() <= addCalendarMonths(receivedAt, PRIVACY_REQUEST_RESPONSE_MONTHS).getTime();
 }
 
+/** The least an extension can be. Zero further months is not an extension. */
+export const PRIVACY_REQUEST_MIN_EXTENSION_MONTHS = 1;
+
+/**
+ * REV-001: the months an extension grants, which must be 1 or 2.
+ *
+ * computePrivacyRequestDueDate accepts 0, because an unextended request is
+ * due after 0 extra months. An extension of 0 is different: it would record
+ * that a deadline was extended without moving it. The same range is a CHECK
+ * on privacy_request_extensions in 0024_privacy_requests.sql, so neither
+ * layer is the only thing refusing it.
+ */
+export function validatePrivacyRequestExtensionMonths(extensionMonths: number): void {
+  if (
+    !Number.isInteger(extensionMonths) ||
+    extensionMonths < PRIVACY_REQUEST_MIN_EXTENSION_MONTHS ||
+    extensionMonths > PRIVACY_REQUEST_MAX_EXTENSION_MONTHS
+  ) {
+    throw new Error(
+      `a privacy request extension must be a whole number of months from ` +
+        `${PRIVACY_REQUEST_MIN_EXTENSION_MONTHS} to ${PRIVACY_REQUEST_MAX_EXTENSION_MONTHS}, got: ${extensionMonths}`
+    );
+  }
+}
+
 /**
  * The legal transitions. Written as a map rather than checked inline so
  * that adding a status forces a decision about what may reach it.
@@ -3461,6 +3492,11 @@ const PRIVACY_REQUEST_TRANSITIONS: Readonly<Record<PrivacyRequestStatus, readonl
     completed: [],
     refused: []
   };
+
+/** Whether a status has no onward transition: once there, the request is answered. */
+export function isPrivacyRequestTerminal(status: PrivacyRequestStatus): boolean {
+  return PRIVACY_REQUEST_TRANSITIONS[status].length === 0;
+}
 
 export function validatePrivacyRequestTransition(
   from: PrivacyRequestStatus,

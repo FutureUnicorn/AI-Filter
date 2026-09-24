@@ -10,8 +10,10 @@ import {
   describeDeletionRequestOutcome,
   describeExportRequestOutcome,
   isPrivacyRequestOverdue,
+  isPrivacyRequestTerminal,
   planCandidateDataErasure,
   summarizeCandidateDataErasureResidue,
+  validatePrivacyRequestExtensionMonths,
   validatePrivacyRequestTransition
 } from "../../packages/domain/src/index.ts";
 
@@ -78,6 +80,24 @@ test("an extension is only available inside the original month", () => {
   assert.equal(canExtendPrivacyRequest(received, new Date("2026-02-20T09:00:00.000Z")), true);
   assert.equal(canExtendPrivacyRequest(received, new Date("2026-02-28T09:00:00.000Z")), true);
   assert.equal(canExtendPrivacyRequest(received, new Date("2026-03-01T09:00:00.000Z")), false);
+});
+
+test("an extension grants one or two further months, never zero and never three", () => {
+  // REV-001. computePrivacyRequestDueDate accepts 0, because an unextended
+  // request is due after 0 extra months. An extension of 0 would record that
+  // a deadline moved without moving it, and 3 is past Article 12(3)'s cap.
+  assert.doesNotThrow(() => validatePrivacyRequestExtensionMonths(1));
+  assert.doesNotThrow(() => validatePrivacyRequestExtensionMonths(PRIVACY_REQUEST_MAX_EXTENSION_MONTHS));
+  for (const months of [0, 3, -1, 1.5, Number.NaN]) {
+    assert.throws(() => validatePrivacyRequestExtensionMonths(months), /from 1 to 2/, `${months} must be refused`);
+  }
+});
+
+test("only a resolved request is terminal, so only an open one can be extended", () => {
+  assert.equal(isPrivacyRequestTerminal("received"), false);
+  assert.equal(isPrivacyRequestTerminal("in_progress"), false);
+  assert.equal(isPrivacyRequestTerminal("completed"), true);
+  assert.equal(isPrivacyRequestTerminal("refused"), true);
 });
 
 test("resolved requests are terminal", () => {
