@@ -1,12 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { nextReviewIndex, resolveReviewKeyAction } from "@signal-audit/domain";
-import type { ReviewKeyAction } from "@signal-audit/domain";
+import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
 
-import { revealReviewItem } from "./review-focus";
-import type { RevealableItem, SelectionCause } from "./review-focus";
+import {
+  filterSupportedShortcuts,
+  isActionHandled,
+  revealReviewItem
+} from "./review-focus";
+import type {
+  RevealableItem,
+  ReviewKeyboardCallbacks,
+  SelectionCause
+} from "./review-focus";
+
+export { filterSupportedShortcuts, isActionHandled };
+export type { ReviewKeyboardCallbacks };
 
 /**
  * AF-53: the thin glue over the decision layer in packages/domain.
@@ -46,6 +57,10 @@ export interface ReviewKeyboardState {
   readonly focusedIndex: number;
   readonly helpVisible: boolean;
   /**
+   * REV-005: the shortcuts supported and wired on this surface.
+   */
+  readonly shortcuts: readonly ReviewShortcut[];
+  /**
    * For an item that has already taken focus (click or Tab). Moves the
    * selection to it and never moves DOM focus, because focus is already
    * there.
@@ -70,6 +85,11 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
   const focusedIndexRef = useRef(focusedIndex);
   const itemsRef = useRef(new Map<number, RevealableItem>());
   const callbacksRef = useRef({ onOpen, onRevealSource });
+
+  const shortcuts = useMemo(
+    () => filterSupportedShortcuts({ onOpen, onRevealSource }),
+    [onOpen, onRevealSource]
+  );
 
   useEffect(() => {
     callbacksRef.current = { onOpen, onRevealSource };
@@ -115,6 +135,11 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
       if (action === "none") {
         return;
       }
+      // REV-005: an action with no handler on this surface must return
+      // without calling preventDefault, so the key is not swallowed.
+      if (!isActionHandled(action, callbacksRef.current)) {
+        return;
+      }
       // preventDefault only for keys actually claimed. Calling it
       // unconditionally would break scrolling and form submission for
       // every key this feature does not use.
@@ -146,5 +171,5 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
     select(nextReviewIndex("none", focusedIndexRef.current, itemCount), "list-changed");
   }, [itemCount, select]);
 
-  return { focusedIndex, helpVisible, setFocusedIndex: followFocus, registerItem };
+  return { focusedIndex, helpVisible, shortcuts, setFocusedIndex: followFocus, registerItem };
 }

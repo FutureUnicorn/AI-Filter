@@ -6,6 +6,7 @@ import { useParams } from "next/navigation";
 import { revealedCriterionId } from "@signal-audit/domain";
 
 import { ShortcutHelp } from "../../../../../lib/ShortcutHelp";
+import { buildSourceContextAnnouncement } from "../../../../../lib/review-focus";
 import { useReviewKeyboard } from "../../../../../lib/review-keyboard";
 
 interface SourceCitation {
@@ -101,11 +102,16 @@ export default function EvidenceCardPage() {
   const cards = state.kind === "ready" ? state.cards.cards : [];
   // AF-53: "navigation between cards and source context" -- j/k moves
   // between criterion cards, s reveals the sources for the focused one.
-  const { focusedIndex, helpVisible, registerItem, setFocusedIndex } = useReviewKeyboard({
+  const { focusedIndex, helpVisible, shortcuts, registerItem, setFocusedIndex } = useReviewKeyboard({
     itemCount: cards.length,
     onRevealSource: (index) =>
       setRevealedCriterion(revealedCriterionId(cards.map((card) => card.criterionId), index))
   });
+  const revealedCard = cards.find((card) => card.criterionId === revealedCriterion);
+  const sourceContextAnnouncement = buildSourceContextAnnouncement(
+    revealedCard?.criterionId,
+    revealedCard?.citations
+  );
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {
@@ -165,7 +171,28 @@ export default function EvidenceCardPage() {
       <p>
         <small>Keyboard: j/k to move between criteria, s to reveal the source, ? for all shortcuts.</small>
       </p>
-      <ShortcutHelp visible={helpVisible} />
+      <ShortcutHelp visible={helpVisible} shortcuts={shortcuts} />
+
+      {/* REV-006: persistent live region for screen-reader source announcements.
+          Must be in the DOM before any reveal occurs, so mutations inside it
+          are reliably announced by screen readers. Exactly one per page. */}
+      <p
+        aria-live="polite"
+        aria-atomic="true"
+        style={{
+          position: "absolute",
+          width: "1px",
+          height: "1px",
+          padding: 0,
+          margin: "-1px",
+          overflow: "hidden",
+          clip: "rect(0, 0, 0, 0)",
+          whiteSpace: "nowrap",
+          border: 0
+        }}
+      >
+        {sourceContextAnnouncement}
+      </p>
 
       {workflow !== undefined && (
         <p>
@@ -273,10 +300,10 @@ export default function EvidenceCardPage() {
                       </small>
                     </p>
                     {revealedCriterion === card.criterionId && (
-                      <p aria-live="polite">
+                      <p aria-hidden="true">
                         <small>
                           Source context: {entry.citation.document}, {entry.citation.pageOrSection}, starting at
-                          character {entry.citation.offset}. The document itself is not rendered here — nothing links
+                          character {entry.citation.offset}. The document itself is not rendered here - nothing links
                           an application to its source file yet.
                         </small>
                       </p>

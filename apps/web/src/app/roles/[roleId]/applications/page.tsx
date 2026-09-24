@@ -85,7 +85,7 @@ export default function ApplicationReviewQueuePage() {
   const entries = state.kind === "ready" ? state.queue.entries : [];
   // AF-53: keyboard navigation over the rows actually shown, so the
   // count follows AF-47's filters rather than the whole role.
-  const { focusedIndex, helpVisible, registerItem, setFocusedIndex } = useReviewKeyboard({
+  const { focusedIndex, helpVisible, shortcuts, registerItem, setFocusedIndex } = useReviewKeyboard({
     itemCount: entries.length,
     onOpen: (index) => {
       const target = entries[index];
@@ -150,7 +150,7 @@ export default function ApplicationReviewQueuePage() {
       <p>
         <small>Keyboard: j/k to move, Enter to open, ? for all shortcuts.</small>
       </p>
-      <ShortcutHelp visible={helpVisible} />
+      <ShortcutHelp visible={helpVisible} shortcuts={shortcuts} />
 
       {state.kind === "loading" && <p>Loading applications…</p>}
       {state.kind === "error" && <p role="alert">Could not load the review queue: {state.message}</p>}

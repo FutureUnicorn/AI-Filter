@@ -9,7 +9,12 @@ import {
 } from "../../packages/domain/src/index.ts";
 import type { ReviewKeyAction } from "../../packages/domain/src/index.ts";
 
-import { revealReviewItem } from "../../apps/web/src/lib/review-focus.ts";
+import {
+  buildSourceContextAnnouncement,
+  filterSupportedShortcuts,
+  isActionHandled,
+  revealReviewItem
+} from "../../apps/web/src/lib/review-focus.ts";
 import type { RevealableItem } from "../../apps/web/src/lib/review-focus.ts";
 
 // AF-53: "Recruiters reviewing hundreds of applications need
@@ -315,4 +320,102 @@ test("the revealed value is a criterion id, so it cannot be a citation position"
   const revealed = revealedCriterionId(["communication", "system-design"], 1);
   assert.equal(typeof revealed, "string");
   assert.notEqual(revealed, 1);
+});
+
+// ---- REV-005: advertised shortcuts match wired callbacks in both directions ----
+
+test("the queue page advertised shortcuts omit source reveal", () => {
+  const queueCallbacks = { onOpen: () => {} };
+  const shortcuts = filterSupportedShortcuts(queueCallbacks);
+  assert.ok(shortcuts.some((s) => s.keys.includes("Enter")), "Enter must be advertised when onOpen is wired");
+  assert.ok(!shortcuts.some((s) => s.keys.includes("s")), "s must not be advertised when onRevealSource is not wired");
+});
+
+test("the evidence page advertised shortcuts omit open", () => {
+  const evidenceCallbacks = { onRevealSource: () => {} };
+  const shortcuts = filterSupportedShortcuts(evidenceCallbacks);
+  assert.ok(shortcuts.some((s) => s.keys.includes("s")), "s must be advertised when onRevealSource is wired");
+  assert.ok(!shortcuts.some((s) => s.keys.includes("Enter")), "Enter must not be advertised when onOpen is not wired");
+});
+
+test("unwired actions are not handled and do not swallow keys", () => {
+  // on a surface with no onRevealSource, reveal-source must not be handled
+  assert.equal(isActionHandled("reveal-source", {}), false);
+  assert.equal(isActionHandled("reveal-source", { onOpen: () => {} }), false);
+  assert.equal(isActionHandled("reveal-source", { onRevealSource: () => {} }), true);
+
+  // on a surface with no onOpen, open must not be handled
+  assert.equal(isActionHandled("open", {}), false);
+  assert.equal(isActionHandled("open", { onRevealSource: () => {} }), false);
+  assert.equal(isActionHandled("open", { onOpen: () => {} }), true);
+
+  // common actions are always handled
+  assert.equal(isActionHandled("next", {}), true);
+  assert.equal(isActionHandled("previous", {}), true);
+  assert.equal(isActionHandled("first", {}), true);
+  assert.equal(isActionHandled("last", {}), true);
+  assert.equal(isActionHandled("help", {}), true);
+  assert.equal(isActionHandled("none", {}), false);
+});
+
+test("two-direction check: every advertised shortcut is handled and every handled shortcut is advertised", () => {
+  const cases = [
+    { name: "queue surface", callbacks: { onOpen: () => {} } },
+    { name: "evidence surface", callbacks: { onRevealSource: () => {} } },
+    { name: "neither wired", callbacks: {} },
+    { name: "both wired", callbacks: { onOpen: () => {}, onRevealSource: () => {} } }
+  ];
+
+  for (const { name, callbacks } of cases) {
+    const shortcuts = filterSupportedShortcuts(callbacks);
+    const displayed: Readonly<Record<string, string>> = { "↓": "ArrowDown", "↑": "ArrowUp" };
+    // Direction 1: every advertised shortcut must be handled
+    for (const shortcut of shortcuts) {
+      for (const label of shortcut.keys) {
+        const key = displayed[label] ?? label;
+        const action = resolveReviewKeyAction({ key });
+        assert.equal(
+          isActionHandled(action, callbacks),
+          true,
+          `${name}: key ${key} (${shortcut.description}) is advertised but not handled`
+        );
+      }
+    }
+
+    // Direction 2: every key handled must appear in the advertised shortcuts
+    const allActions: ReviewKeyAction[] = ["next", "previous", "first", "last", "open", "reveal-source", "help"];
+    for (const action of allActions) {
+      const handled = isActionHandled(action, callbacks);
+      const advertised = shortcuts.some((s) => s.keys.some((k) => resolveReviewKeyAction({ key: k }) === action));
+      assert.equal(
+        advertised,
+        handled,
+        `${name}: action ${action} handled=${handled} but advertised=${advertised}`
+      );
+    }
+  }
+});
+
+// ---- REV-006: screen reader source context announcement ----
+
+test("source context announcement produces unified text for multiple citations and handles zero citations", () => {
+  assert.equal(buildSourceContextAnnouncement(undefined, undefined), "");
+  assert.equal(buildSourceContextAnnouncement("python_experience", []), "Nothing to verify for python_experience.");
+
+  const singleCitation = [
+    { citation: { document: "resume.pdf", pageOrSection: "page 2", offset: 120 } }
+  ];
+  assert.equal(
+    buildSourceContextAnnouncement("python_experience", singleCitation),
+    "Source context for python_experience: resume.pdf, page 2, starting at character 120."
+  );
+
+  const multipleCitations = [
+    { citation: { document: "cv.pdf", pageOrSection: "section 1", offset: 50 } },
+    { citation: { document: "cv.pdf", pageOrSection: "section 3", offset: 200 } }
+  ];
+  const multiText = buildSourceContextAnnouncement("lead_experience", multipleCitations);
+  assert.ok(multiText.includes("section 1"));
+  assert.ok(multiText.includes("section 3"));
+  assert.equal(multiText.split("Source context for lead_experience:").length - 1, 2);
 });

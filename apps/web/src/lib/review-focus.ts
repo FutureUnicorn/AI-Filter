@@ -1,3 +1,6 @@
+import { resolveReviewKeyAction, REVIEW_SHORTCUTS } from "@signal-audit/domain";
+import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
+
 /**
  * AF-53 / REV-001: moving an index is not moving a reviewer.
  *
@@ -16,6 +19,79 @@
 export interface RevealableItem {
   focus(options?: { readonly preventScroll?: boolean }): void;
   scrollIntoView(options?: { readonly block?: "nearest" }): void;
+}
+
+export interface ReviewKeyboardCallbacks {
+  readonly onOpen?: unknown;
+  readonly onRevealSource?: unknown;
+}
+
+/**
+ * REV-005: whether this action has a handler wired on this surface.
+ * Actions with no handler must not swallow their key or be advertised.
+ */
+export function isActionHandled(
+  action: ReviewKeyAction,
+  callbacks: ReviewKeyboardCallbacks
+): boolean {
+  if (action === "none") {
+    return false;
+  }
+  if (action === "open" && callbacks.onOpen === undefined) {
+    return false;
+  }
+  if (action === "reveal-source" && callbacks.onRevealSource === undefined) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * REV-005: filter the advertised shortcut list to match what is actually wired.
+ */
+export function filterSupportedShortcuts(
+  callbacks: ReviewKeyboardCallbacks
+): readonly ReviewShortcut[] {
+  const displayed: Readonly<Record<string, string>> = { "↓": "ArrowDown", "↑": "ArrowUp" };
+  return REVIEW_SHORTCUTS.filter((shortcut) => {
+    const firstKey = shortcut.keys[0];
+    if (firstKey === undefined) {
+      return false;
+    }
+    const key = displayed[firstKey] ?? firstKey;
+    const action = resolveReviewKeyAction({ key });
+    return isActionHandled(action, callbacks);
+  });
+}
+
+export interface CardCitationSummary {
+  readonly document: string;
+  readonly pageOrSection: string;
+  readonly offset: number;
+}
+
+/**
+ * REV-006: construct the screen-reader announcement for revealed source context.
+ *
+ * One announcement per card, never one per citation, so a card with multiple
+ * citations does not queue competing announcements.
+ */
+export function buildSourceContextAnnouncement(
+  criterionId: string | undefined,
+  citations: readonly { readonly citation: CardCitationSummary }[] | undefined
+): string {
+  if (criterionId === undefined || citations === undefined) {
+    return "";
+  }
+  if (citations.length === 0) {
+    return `Nothing to verify for ${criterionId}.`;
+  }
+  return citations
+    .map(
+      (entry) =>
+        `Source context for ${criterionId}: ${entry.citation.document}, ${entry.citation.pageOrSection}, starting at character ${entry.citation.offset}.`
+    )
+    .join(" ");
 }
 
 /**

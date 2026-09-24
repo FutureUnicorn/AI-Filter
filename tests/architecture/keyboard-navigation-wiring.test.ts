@@ -231,3 +231,61 @@ test("no loop in the evidence card page is named index, because two of them nest
     "name it cardIndex or citationIndex: a shared name is what hid REV-002"
   );
 });
+
+// ---- REV-005 ----
+//
+// Shortcuts displayed must reflect wired callbacks, not hard-coded defaults.
+// Unwired actions must not swallow keys before returning.
+
+test("unwired actions return before calling preventDefault in the keyboard hook", () => {
+  const unhandledGuard = hook.indexOf("!isActionHandled(action");
+  const preventIndex = hook.indexOf("event.preventDefault()");
+  assert.ok(unhandledGuard >= 0, "the hook must guard unhandled actions");
+  assert.ok(
+    preventIndex > unhandledGuard,
+    "unhandled actions must bail out before preventDefault is called"
+  );
+});
+
+test("both review surfaces pass filtered shortcuts to ShortcutHelp", () => {
+  for (const page of [
+    "apps/web/src/app/roles/[roleId]/applications/page.tsx",
+    "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"
+  ]) {
+    const source = readFileSync(join(repositoryRoot, page), "utf8");
+    assert.match(
+      source,
+      /<ShortcutHelp[^>]*shortcuts=\{shortcuts\}/u,
+      `${page} must pass filtered shortcuts to ShortcutHelp`
+    );
+  }
+});
+
+// ---- REV-006 ----
+//
+// Screen reader announcements for source context require a persistent
+// polite live region in the DOM before any reveal occurs, and citations
+// must not individually carry aria-live.
+
+test("evidence page has exactly one persistent polite live region outside citation loops", () => {
+  const page = readFileSync(
+    join(repositoryRoot, "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"),
+    "utf8"
+  );
+  assert.equal(
+    page.split('aria-live="polite"').length - 1,
+    1,
+    "evidence page must have exactly one polite live region"
+  );
+  const liveIndex = page.indexOf('aria-live="polite"');
+  const cardMapIndex = page.indexOf("state.cards.cards.map");
+  assert.ok(
+    liveIndex >= 0 && cardMapIndex > liveIndex,
+    "the live region must be mounted persistently before the card list"
+  );
+  assert.doesNotMatch(
+    page.slice(cardMapIndex),
+    /aria-live/u,
+    "neither card nor citation loops may contain aria-live"
+  );
+});
