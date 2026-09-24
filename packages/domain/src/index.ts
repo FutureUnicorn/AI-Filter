@@ -2475,7 +2475,9 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
   },
   file_intakes: {
     disposition: "blocked_by_reference",
-    holds: "declared_filename, which routinely contains the candidate's name",
+    holds:
+      "declared_filename, which routinely contains the candidate's name, and " +
+      "storage_key, which embeds that same filename",
     detail:
       "DELETE fails with a foreign key violation from applications. The filename is easy to " +
       "overlook as PII and is often exactly 'Firstname_Lastname_CV.pdf'."
@@ -2523,7 +2525,9 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
   },
   evidence_outcomes: {
     disposition: "blocked_append_only",
-    holds: "citation quotes, which are verbatim candidate text",
+    holds:
+      "citation quotes, which are verbatim candidate text, and correction_reason, " +
+      "free text a reviewer wrote about the candidate's evidence",
     detail:
       "Both DELETE and UPDATE are rejected by the append-only trigger, so the quote cannot be " +
       "removed and cannot be redacted in place either. It is one of four append-only tables " +

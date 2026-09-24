@@ -182,6 +182,40 @@ test("the survival summary produces a sentence a privacy notice can use truthful
   );
 });
 
+// REV-006: holds is what the privacy notice is built from, so a surface
+// that understates what it keeps understates the notice. Enumerated from
+// the columns each table actually has rather than from the existing
+// wording, the same method that found five blockers rather than two.
+
+test("every surface's holds names everything that surface keeps about the candidate", () => {
+  const plan = planRetention(policy(), NOW);
+  const holdsFor = (surface: string): string =>
+    plan.surfaces.find((entry) => entry.surface === surface)?.holds ?? "";
+
+  // 0017_evidence_corrections.sql adds correction_reason to
+  // evidence_outcomes. It is free text a reviewer writes about the
+  // candidate's evidence and the append-only trigger covers it, so it is
+  // exactly as undeletable as the quote beside it.
+  assert.match(holdsFor("evidence_outcomes"), /citation quotes/);
+  assert.match(holdsFor("evidence_outcomes"), /correction_reason/);
+
+  // storage_key is built as ".../pending/<uuid>-<declaredFilename>", so
+  // redacting declared_filename alone leaves the candidate's filename in
+  // the row. Found by sweeping holds against the columns, not reported.
+  assert.match(holdsFor("file_intakes"), /declared_filename/);
+  assert.match(holdsFor("file_intakes"), /storage_key/);
+});
+
+test("the notice names the reviewer free text on both surfaces that carry it", () => {
+  // candidate_decisions.rationale was already named; evidence_outcomes'
+  // correction_reason is the same kind of content and was not. A candidate
+  // told their quoted CV text is kept, but not that reviewers' written
+  // remarks about them are kept too, has been given a partial answer.
+  const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
+  assert.match(summary.statement, /correction_reason/);
+  assert.match(summary.statement, /rationale/);
+});
+
 test("the survival summary lists exactly the surfaces that survive, no more and no fewer", () => {
   // deepEqual, not a list of includes checks. The earlier version
   // asserted four surfaces were present and said nothing about a fifth,
