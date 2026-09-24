@@ -193,6 +193,33 @@ configure_aliases() {
   fi
 }
 
+choose_recovery_key() {
+  # Never overwrite the slot named by the last published manifest. Repeated
+  # failures after this copy can then only create versions of the other slot.
+  if ! manifest_listing="$(MC_QUIET=0 mc --json ls "target/$BACKUP_BUCKET/$APP_ENV/manifests/latest.json" 2>/dev/null)"; then
+    log_event error run_failed recovery_slot_lookup "$backup_id"
+    return 1
+  fi
+  if [ -z "$manifest_listing" ]; then
+    database_latest_key="$APP_ENV/database/latest-a.dump"
+    return 0
+  fi
+  if ! published_manifest="$(mc cat "target/$BACKUP_BUCKET/$APP_ENV/manifests/latest.json" 2>/dev/null)"; then
+    log_event error run_failed recovery_slot_lookup "$backup_id"
+    return 1
+  fi
+  case "$published_manifest" in
+    *"\"objectKey\":\"$APP_ENV/database/latest-a.dump\""*)
+      database_latest_key="$APP_ENV/database/latest-b.dump" ;;
+    *"\"objectKey\":\"$APP_ENV/database/latest-b.dump\""*|*"\"objectKey\":\"$APP_ENV/database/latest.dump\""*)
+      database_latest_key="$APP_ENV/database/latest-a.dump" ;;
+    *)
+      log_event error run_failed recovery_slot_lookup "$backup_id"
+      return 1
+      ;;
+  esac
+}
+
 write_lifecycle_configuration() {
   lifecycle_file="$1"
   cat >"$lifecycle_file" <<EOF
@@ -208,7 +235,7 @@ write_lifecycle_configuration() {
     {
       "ID": "af68-database-latest-retention",
       "Status": "Enabled",
-      "Filter": { "Prefix": "$APP_ENV/database/latest.dump" },
+      "Filter": { "Prefix": "$APP_ENV/database/latest-" },
       "NoncurrentVersionExpiration": {
         "NoncurrentDays": $BACKUP_RETENTION_DAYS,
         "NewerNoncurrentVersions": 1
@@ -334,6 +361,7 @@ run_once() {
   umask 077
 
   log_event info run_started begin "$backup_id"
+  choose_recovery_key || return $?
 
   # The first pass captures every object that existed before the database
   # snapshot. The second pass captures immutable uploads committed while
@@ -394,7 +422,6 @@ run_once() {
     return 1
   fi
   database_history_key="$APP_ENV/database/history/$backup_id.dump"
-  database_latest_key="$APP_ENV/database/latest.dump"
 
   if ! run_interruptible mc --quiet cp \
     --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" \
@@ -404,7 +431,7 @@ run_once() {
     cleanup_run_files
     return 1
   fi
-  if ! run_interruptible mc --quiet cp --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" "$dump_file" "target/$BACKUP_BUCKET/$database_latest_key" >/dev/null 2>&1
+  if ! run_interruptible mc --quiet cp --enc-s3 "target/$BACKUP_BUCKET/$APP_ENV/database" "target/$BACKUP_BUCKET/$database_history_key" "target/$BACKUP_BUCKET/$database_latest_key" >/dev/null 2>&1
   then
     log_event error run_failed database_latest_upload "$backup_id"
     cleanup_run_files

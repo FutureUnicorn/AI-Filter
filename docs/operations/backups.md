@@ -23,9 +23,10 @@ success. One run performs:
 3. verify the archive can be parsed with `pg_restore --list`;
 4. mirror object storage a second time to cover immutable uploads committed
    while the database snapshot was running;
-5. upload the dump to immutable history and to the versioned
-   `database/latest.dump` recovery key;
-6. record the exact latest-dump version ID, SHA-256, and immutable history key
+5. upload the dump to immutable history, then copy it within the destination
+   store to the inactive versioned recovery slot (`database/latest-a.dump`
+   or `database/latest-b.dump`);
+6. record the exact recovery-slot key and version ID, SHA-256, and immutable history key
    in a metadata-only success manifest; and
 7. replace `manifests/latest.json` only after every required step succeeds.
 
@@ -48,13 +49,22 @@ not be shared with unrelated data because lifecycle import is intentionally
 authoritative.
 
 - immutable database history expires after `BACKUP_RETENTION_DAYS`;
-- the current `database/latest.dump` never expires; older exact versions age
-  out after the same window while the newest noncurrent version is retained;
+- the two recovery-slot keys never expire while current; older exact versions
+  age out after the same window while the newest noncurrent version is retained;
 - historical manifests expire after the same window;
 - overwritten or deleted object-storage versions expire after that window;
 - current mirrored objects do not expire while they still exist in primary
   storage; and
 - expired delete markers are cleaned up.
+
+The published manifest names one recovery slot. Every run writes only to the
+other slot, so repeated failures after the database copy cannot age out the
+archive named by the last successful manifest. Each slot may hold one current
+full archive; include both in off-host capacity planning. The database history
+copy still follows the approved retention window. A bucket from an earlier
+AF-68 build may also contain `database/latest.dump`; the first successful
+run with this build moves the manifest to a slot, after which operations can
+remove the legacy object once recovery is verified.
 
 The backup client requests SSE-S3 on every mirrored or uploaded object.
 `BACKUP_ENDPOINT` must be HTTPS. `BACKUP_ENCRYPTION_REFERENCE` records the
@@ -69,7 +79,8 @@ must approve:
 - `BACKUP_INTERVAL_SECONDS`: recovery-point schedule;
 - `BACKUP_RETENTION_DAYS`: recovery window;
 - `BACKUP_ENDPOINT`, `BACKUP_REGION`, and `BACKUP_BUCKET`: a dedicated,
-  off-host target per environment;
+  off-host target per environment, verified to support versioning, lifecycle
+  rules, exact-key listing, and encrypted server-side object copy;
 - `BACKUP_CONTROL_OWNER`: accountable person or team; and
 - `BACKUP_ENCRYPTION_REFERENCE`: provider encryption/KMS evidence.
 
@@ -143,8 +154,8 @@ can contain candidate filenames.
 
 ## Recovery and AF-69 handoff
 
-`<environment>/manifests/latest.json` identifies the versioned latest
-database key, its exact version ID, the immutable history key, checksum,
+`<environment>/manifests/latest.json` identifies the active versioned
+database recovery slot, its exact version ID, the immutable history key, checksum,
 release, storage prefix, and retention window. AF-69 must fetch the recorded
 object version into isolated infrastructure, validate the checksum, restore
 with the matching PostgreSQL major version, reconstruct storage at the

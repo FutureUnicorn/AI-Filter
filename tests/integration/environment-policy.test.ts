@@ -313,6 +313,11 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(script, /run_interruptible pg_restore/u);
   assert.match(script, /run_interruptible mc --quiet mirror/u);
   assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 4);
+  assert.match(
+    script,
+    /"target\/\$BACKUP_BUCKET\/\$database_history_key" "target\/\$BACKUP_BUCKET\/\$database_latest_key"/u,
+    "the recovery slot must be copied inside the destination rather than uploaded twice from the host"
+  );
   assert.match(script, /cleanup_orphaned_dumps/u);
   assert.match(script, /run_once \|\| true/u);
   assert.doesNotMatch(
@@ -355,7 +360,9 @@ test("backup retention is reproducible and preserves current source objects", ()
   assert.ok(latestDatabaseRule);
   assert.doesNotMatch(latestDatabaseRule!, /"Expiration": \{ "Days"/u);
   assert.match(latestDatabaseRule!, /"NewerNoncurrentVersions": 1/u);
-  assert.match(script, /database_latest_key="\$APP_ENV\/database\/latest\.dump"/u);
+  assert.match(latestDatabaseRule!, /"Prefix": "\$APP_ENV\/database\/latest-"/u);
+  assert.match(script, /database_latest_key="\$APP_ENV\/database\/latest-a\.dump"/u);
+  assert.match(script, /database_latest_key="\$APP_ENV\/database\/latest-b\.dump"/u);
   assert.match(script, /latest_database_version_id="\$\(extract_version_id "\$latest_database_stat"\)"/u);
   assert.match(script, /versionId/u);
 
@@ -493,5 +500,58 @@ test(
       "200",
       "a recreated container must wait only the remainder of the persisted interval"
     );
+
+    fs.writeFileSync(
+      mcPath,
+      '#!/bin/sh\n[ "$1" != "--json" ] || shift\ncase "$1" in\n  ls)\n    [ "${MC_LIST_ERROR-}" != "1" ] || exit 1\n    [ -z "${MC_MANIFEST-}" ] || printf \'{"status":"success"}\\n\'\n    ;;\n  cat)\n    [ -n "${MC_MANIFEST-}" ] || exit 1\n    printf \'%s\\n\' "$MC_MANIFEST"\n    ;;\nesac\n',
+      { mode: 0o700 }
+    );
+    const selectRecoverySlot = (manifest: string, listError = false) =>
+      spawnSync(
+        "sh",
+        [
+          "-c",
+          '. "$1"; choose_recovery_key; printf "%s\\n" "$database_latest_key"',
+          "sh",
+          functionsPath
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...validEnvironment,
+            MC_MANIFEST: manifest,
+            MC_LIST_ERROR: listError ? "1" : "0",
+            PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+            backup_id: "safe-test-id"
+          }
+        }
+      );
+    const manifestFor = (key: string) =>
+      JSON.stringify({ database: { objectKey: `staging/database/${key}` } });
+    assert.equal(
+      selectRecoverySlot("").stdout.trim(),
+      "staging/database/latest-a.dump",
+      "a new bucket must start with the first recovery slot"
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const failedAttempt = selectRecoverySlot(manifestFor("latest-a.dump"));
+      assert.equal(failedAttempt.status, 0, failedAttempt.stderr);
+      assert.equal(
+        failedAttempt.stdout.trim(),
+        "staging/database/latest-b.dump",
+        "a failed publication must never make the current manifest's slot writable"
+      );
+    }
+    assert.equal(
+      selectRecoverySlot(manifestFor("latest-b.dump")).stdout.trim(),
+      "staging/database/latest-a.dump"
+    );
+    assert.equal(
+      selectRecoverySlot(manifestFor("latest.dump")).stdout.trim(),
+      "staging/database/latest-a.dump",
+      "existing manifests must migrate without overwriting the legacy recovery key"
+    );
+    assert.equal(selectRecoverySlot('{"database":{}}').status, 1);
+    assert.equal(selectRecoverySlot("", true).status, 1);
   }
 );
