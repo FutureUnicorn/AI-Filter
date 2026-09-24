@@ -33,6 +33,23 @@ function positiveInteger(source, name, { allowZero = false } = {}) {
   return value;
 }
 
+/**
+ * Unset means "not decided yet", which is different from zero and
+ * different from a default. A detector whose threshold is missing is
+ * provisioned disabled rather than provisioned with a guess.
+ */
+function optionalPositiveInteger(source, name) {
+  const raw = source[name]?.trim();
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer when set`);
+  }
+  return value;
+}
+
 function optionalBoolean(source, name) {
   const raw = source[name]?.trim();
   if (raw === undefined || raw === "") {
@@ -115,6 +132,15 @@ export function buildDetectorDefinitions(source) {
   const workerErrorCountThreshold = positiveInteger(
     source,
     "SENTRY_ALERT_WORKER_ERROR_COUNT_THRESHOLD"
+  );
+  // AF-67 queue age, over AF-102's durable queue. Deliberately optional:
+  // an unset value leaves the detector provisioned and disabled rather
+  // than inventing a number. How long a candidate may wait for extraction
+  // is a product decision, and a detector that fires on a guess trains
+  // people to ignore it.
+  const queueAgeThresholdMs = optionalPositiveInteger(
+    source,
+    "SENTRY_ALERT_QUEUE_AGE_THRESHOLD_MS"
   );
   const p95Thresholds = parseP95Thresholds(source);
   const workflowIds = (source.SENTRY_ALERT_WORKFLOW_IDS ?? "")
@@ -213,6 +239,33 @@ export function buildDetectorDefinitions(source) {
         timeWindow
       }),
       condition_group: conditions(tokenBudgetEventThreshold)
+    }
+  });
+
+  definitions.push({
+    project: workerProject,
+    payload: {
+      ...common,
+      // Disabled until a threshold is approved and configured. Provisioned
+      // regardless so the detector exists, is reviewable, and does not have
+      // to be remembered later.
+      enabled: queueAgeThresholdMs !== undefined,
+      name: `[AF-67][${environment}] evidence extraction queue age`,
+      description:
+        "The oldest ready evidence-extraction job has been waiting longer than the approved threshold. " +
+        "Published on the worker heartbeat rather than on dequeue, so a stalled worker still reports a growing backlog. " +
+        "Set SENTRY_ALERT_QUEUE_AGE_THRESHOLD_MS to enable; no threshold is assumed.",
+      data_sources: spanDataSource({
+        aggregate: "max(monitor.queue.oldest_ready_age_ms)",
+        environment,
+        // -1 is the empty-queue sentinel and must never alert. Excluding it
+        // here rather than relying on the threshold keeps the rule correct
+        // even if someone later configures a very small threshold.
+        query:
+          "monitor.operation:evidence_extraction.queue !monitor.queue.oldest_ready_age_ms:-1",
+        timeWindow
+      }),
+      condition_group: conditions(queueAgeThresholdMs ?? 0)
     }
   });
 
