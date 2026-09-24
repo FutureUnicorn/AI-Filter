@@ -1,4 +1,4 @@
-import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
+import type { ReviewKeyAction, ReviewShortcut } from "./review-keys";
 
 /**
  * AF-53 / REV-001: moving an index is not moving a reviewer.
@@ -47,7 +47,7 @@ export function isActionHandled(
 
 /**
  * REV-005 / REV-008: filter the advertised shortcut list to match what is actually wired.
- * Injects shortcuts and resolver so review-focus has no runtime value imports from @signal-audit/domain.
+ * Injects shortcuts and resolver so review-focus has no runtime value imports from @signal-audit/domain or ./review-keys.
  */
 export function filterSupportedShortcuts(
   shortcuts: readonly ReviewShortcut[],

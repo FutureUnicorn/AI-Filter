@@ -6,8 +6,8 @@ import {
   nextReviewIndex,
   resolveReviewKeyAction,
   revealedCriterionId
-} from "../../packages/domain/src/index.ts";
-import type { ReviewKeyAction } from "../../packages/domain/src/index.ts";
+} from "../../apps/web/src/lib/review-keys.ts";
+import type { ReviewKeyAction } from "../../apps/web/src/lib/review-keys.ts";
 
 import {
   buildSourceContextAnnouncement,

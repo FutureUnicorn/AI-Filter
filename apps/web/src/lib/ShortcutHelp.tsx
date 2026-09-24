@@ -1,7 +1,7 @@
 "use client";
 
-import { REVIEW_SHORTCUTS } from "@signal-audit/domain";
-import type { ReviewShortcut } from "@signal-audit/domain";
+import { REVIEW_SHORTCUTS } from "./review-keys";
+import type { ReviewShortcut } from "./review-keys";
 
 /**
  * AF-53 / REV-005: rendered from the supported shortcut list wired on

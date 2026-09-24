@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 
-import { revealedCriterionId } from "@signal-audit/domain";
+import { revealedCriterionId } from "../../../../../lib/review-keys";
 
 import { ShortcutHelp } from "../../../../../lib/ShortcutHelp";
 import { buildSourceContextAnnouncement } from "../../../../../lib/review-focus";

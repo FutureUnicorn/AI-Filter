@@ -13,8 +13,13 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const hook = readFileSync(join(repositoryRoot, "apps/web/src/lib/review-keyboard.ts"), "utf8");
 
-test("the hook decides nothing itself: every binding comes from the domain resolver", () => {
+test("the hook decides nothing itself: every binding comes from the resolver", () => {
   assert.ok(hook.includes("resolveReviewKeyAction"), "key handling must delegate to the tested resolver");
+  assert.match(
+    hook,
+    /from "\.\/review-keys"/u,
+    "the resolver is apps/web's, not the domain package's: REV-004 moved it"
+  );
   assert.ok(hook.includes("nextReviewIndex"), "movement must delegate to the tested clamp");
   // A literal key comparison in the hook is a binding that no unit test
   // covers, because the resolver is where they are all enumerated.
@@ -328,5 +333,45 @@ test("evidence page does not hide visible inline source context behind aria-hidd
     page,
     /<p aria-hidden="true">\s*<small>\s*Source context:/u,
     "visible source context must not be hidden from the accessibility tree"
+  );
+});
+
+// ---- REV-004 ----
+//
+// These bindings are DOM key names, help-panel copy and cursor maths, so
+// they live in apps/web rather than packages/domain. Nothing stops a
+// future edit putting them back, and the cost of that is not obvious at
+// the call site: every package importing @signal-audit/domain would
+// re-export keyboard bindings again, and a shortcut label change would
+// need a packages/*/dist rebuild before the typecheck and integration
+// gates would run.
+
+test("the review key bindings are not exported from packages/domain", () => {
+  const domain = readFileSync(join(repositoryRoot, "packages/domain/src/index.ts"), "utf8");
+  for (const symbol of [
+    "resolveReviewKeyAction",
+    "nextReviewIndex",
+    "REVIEW_SHORTCUTS",
+    "revealedCriterionId",
+    "ReviewKeyAction",
+    "ReviewShortcut",
+    "ReviewKeyEvent"
+  ]) {
+    assert.ok(
+      !domain.includes(symbol),
+      `${symbol} belongs in apps/web/src/lib/review-keys.ts, not in the domain package`
+    );
+  }
+});
+
+test("review-keys carries no runtime import of a workspace package", () => {
+  // Same reason as review-focus.ts: tests/unit imports this module
+  // directly and test:unit:ts runs with no prior build, so a value import
+  // of @signal-audit/* would fail the CI unit job on a clean checkout.
+  const keys = readFileSync(join(repositoryRoot, "apps/web/src/lib/review-keys.ts"), "utf8");
+  assert.doesNotMatch(
+    keys,
+    /^import\s+(?!type\b)[^;]*from\s+"@signal-audit\//mu,
+    "review-keys.ts must not have a runtime value import of a workspace package"
   );
 });

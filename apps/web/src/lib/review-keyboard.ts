@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { nextReviewIndex, resolveReviewKeyAction, REVIEW_SHORTCUTS } from "@signal-audit/domain";
-import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
+import { nextReviewIndex, resolveReviewKeyAction, REVIEW_SHORTCUTS } from "./review-keys";
+import type { ReviewKeyAction, ReviewShortcut } from "./review-keys";
 
 import {
   filterSupportedShortcuts,
