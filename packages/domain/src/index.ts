@@ -2332,8 +2332,13 @@ export function describeFailedDocumentRate(
 //   UPDATE evidence_outcomes   -> append-only trigger rejects UPDATE too,
 //                                 so the quote cannot even be redacted
 //   DELETE candidate_decisions -> append-only, DELETE and UPDATE both
-//   DELETE applications        -> FK violation, from evidence_outcomes
-//                                 and independently candidate_decisions
+//   DELETE applications        -> refused by five independent constraints,
+//                                 any one of which is enough: the FKs from
+//                                 evidence_outcomes, candidate_decisions,
+//                                 audit_sample_members and
+//                                 review_timing_spans (23503), and
+//                                 import_rows_check, which the FK's
+//                                 ON DELETE SET NULL trips (23514)
 //   DELETE file_intakes        -> FK violation from applications
 //
 //   DELETE canonical_text_extractions -> permitted, the row goes
@@ -2359,8 +2364,9 @@ export function describeFailedDocumentRate(
 // it deliberately has no ON DELETE CASCADE because a cascade issues a
 // DELETE that the very same trigger rejects (the AF-20 defect).
 // 0019_candidate_decisions.sql repeats both decisions for the same
-// stated reasons. Each is right on its own terms and together they make
-// a complete purge unimplementable.
+// stated reasons, and so do 0020_audit_samples.sql and
+// 0021_review_timing.sql. Each is right on its own terms and together
+// they make a complete purge unimplementable.
 //
 // So this module does NOT pretend to purge. It produces a plan in which
 // every surface carries an explicit disposition, blocked ones say why,
@@ -2494,26 +2500,35 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "nothing references it and no trigger guards it. The cascade from file_intakes is " +
       "blocked, but it is not the only route. Purging it drops rows from the per-row import " +
       "ledger, so AF-32's 'every input row is accounted for' stops holding once an intake " +
-      "has expired."
+      "has expired. Its processed rows are also one of the five things that pin applications, " +
+      "so any purge that reaches applications has to purge import_rows first."
   },
   applications: {
     disposition: "blocked_by_reference",
     holds: "candidate_full_name, candidate_email, external_reference_id",
     detail:
-      "DELETE fails with a foreign key violation, and two uncascaded foreign keys point here, " +
-      "either one of which is enough on its own: evidence_outcomes " +
-      "(0016_evidence_outcomes.sql) and candidate_decisions (0019_candidate_decisions.sql). " +
-      "Neither carries ON DELETE CASCADE, deliberately, since a " +
-      "cascade issues a DELETE the append-only trigger would reject anyway. Postgres names " +
-      "only the first one it finds, so unblocking that surface independently leaves this one " +
-      "blocked by the other."
+      "DELETE is refused by five independent constraints, any one of which is enough on its " +
+      "own. Four are uncascaded foreign keys from append-only tables, each refused with a " +
+      "foreign key violation: evidence_outcomes (0016_evidence_outcomes.sql), " +
+      "candidate_decisions (0019_candidate_decisions.sql), audit_sample_members " +
+      "(0020_audit_samples.sql) and review_timing_spans (0021_review_timing.sql). None carries " +
+      "ON DELETE CASCADE, deliberately, since a cascade issues a DELETE the append-only trigger " +
+      "would reject anyway, and the same trigger stops those rows being deleted first. The " +
+      "fifth is import_rows (0015_applications_and_import_finalization.sql): its foreign key " +
+      "is ON DELETE SET NULL, but import_rows_check requires a processed row to keep its " +
+      "application_id, so the SET NULL is refused with a check violation. Every CSV-imported " +
+      "application has a processed import row, so this applies to all of them, and import_rows " +
+      "must be purged before applications. Postgres names only the first refusal it meets, so " +
+      "unblocking any one of these independently leaves this surface blocked by the others."
   },
   evidence_outcomes: {
     disposition: "blocked_append_only",
     holds: "citation quotes, which are verbatim candidate text",
     detail:
       "Both DELETE and UPDATE are rejected by the append-only trigger, so the quote cannot be " +
-      "removed and cannot be redacted in place either. This is the root blocker."
+      "removed and cannot be redacted in place either. It is one of four append-only tables " +
+      "whose foreign keys pin applications, alongside candidate_decisions, " +
+      "audit_sample_members and review_timing_spans, so unblocking it alone frees nothing."
   },
   candidate_decisions: {
     disposition: "blocked_append_only",

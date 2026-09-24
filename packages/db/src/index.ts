@@ -4307,6 +4307,17 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
   // On the first application the evidence_outcomes constraint is checked
   // first and is all the error names, which is how it stayed hidden.
   const decidedApplicationId = "44444444-4444-4444-8444-444444444445";
+  // REV-003: three more, one per remaining blocker, each pinned by that
+  // dependent and nothing else. The detail once named two blockers
+  // because nobody enumerated the schema; there are five, and a blocker
+  // without its own application is one this probe cannot tell apart.
+  const sampledApplicationId = "44444444-4444-4444-8444-444444444446";
+  const timedApplicationId = "44444444-4444-4444-8444-444444444447";
+  // On its own intake, so its processed ledger row does not change what
+  // "import_rows:delete" removes from the first intake.
+  const importedIntakeId = "55555555-5555-4555-8555-555555555557";
+  const importedApplicationId = "44444444-4444-4444-8444-444444444448";
+  const auditSampleId = "88888888-8888-4888-8888-888888888888";
   const outcomeId = "66666666-6666-4666-8666-666666666666";
   const decisionId = "77777777-7777-4777-8777-777777777777";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
@@ -4403,7 +4414,9 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       "0014_canonical_text_extractions.sql",
       "0015_applications_and_import_finalization.sql",
       "0016_evidence_outcomes.sql",
-      "0019_candidate_decisions.sql"
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
@@ -4421,6 +4434,12 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     await admin.query(
       `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
       [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'candidates.csv','text/csv','imported',$5)`,
+      [importedIntakeId, org, roleId, `key-${suffix}-imported`, userId]
     );
     for (const intake of [intakeId, freeIntakeId]) {
       await admin.query(
@@ -4453,6 +4472,46 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
          candidate_full_name, candidate_email)
        VALUES ($1,$2,$3,$4,2,'Jo Roe','jo@example.test')`,
       [decidedApplicationId, org, roleId, intakeId]
+    );
+    for (const [pinnedId, row] of [
+      [sampledApplicationId, 3],
+      [timedApplicationId, 4]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email)
+         VALUES ($1,$2,$3,$4,$5,'Pat Poe','pat${row}@example.test')`,
+        [pinnedId, org, roleId, intakeId, row]
+      );
+    }
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Sam Soe','sam@example.test')`,
+      [importedApplicationId, org, roleId, importedIntakeId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size, eligible_count,
+         drawn_by_user_id)
+       VALUES ($1,$2,$3,'ret-probe',1,1,$4)`,
+      [auditSampleId, org, roleId, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, org, sampledApplicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at, ended_at,
+         active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-08-29T12:00:00Z','2026-08-29T12:01:00Z',60000,false)`,
+      [org, timedApplicationId, userId]
+    );
+    // What every CSV import writes: the processed ledger row for the
+    // application it created. Its FK is ON DELETE SET NULL, and the CHECK
+    // that a processed row keeps its application_id is what refuses.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id) VALUES ($1,1,'processed',$2)`,
+      [importedIntakeId, importedApplicationId]
     );
     await admin.query(
       `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
@@ -4492,10 +4551,10 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     );
 
     // 2. The referential blockers, each named by the constraint that
-    //    refused rather than by a substring of the message. Two separate
-    //    applications because Postgres reports only the first constraint
-    //    it checks, so one row carrying both dependents would prove one
-    //    of them and hide the other.
+    //    refused rather than by a substring of the message. One
+    //    application per blocker because Postgres reports only the first
+    //    constraint it checks, so one row carrying several dependents
+    //    would prove one of them and hide the rest.
     await expectRejected(
       "applications:delete",
       { sqlstate: "23503", constraint: "evidence_outcomes_application_id_organization_id_fkey" },
@@ -4505,6 +4564,53 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       "applications:delete_pinned_only_by_a_decision",
       { sqlstate: "23503", constraint: "candidate_decisions_application_id_organization_id_fkey" },
       `DELETE FROM applications WHERE application_id = '${decidedApplicationId}'`
+    );
+    // REV-003: the other three, each on an application nothing else
+    // pins. Proved to be single-dependent first, because a second
+    // dependent would let the refusal come from the wrong constraint and
+    // still name the right one only by the luck of check order.
+    const pinnedBy: ReadonlyArray<readonly [string, string]> = [
+      [applicationId, "evidence_outcomes"],
+      [decidedApplicationId, "candidate_decisions"],
+      [sampledApplicationId, "audit_sample_members"],
+      [timedApplicationId, "review_timing_spans"],
+      [importedApplicationId, "import_rows"]
+    ];
+    for (const [pinnedId, onlyDependent] of pinnedBy) {
+      const dependents = await admin.query<{ source: string; count: string }>(
+        `SELECT source, count(*)::text AS count FROM (
+           SELECT 'evidence_outcomes' AS source FROM evidence_outcomes WHERE application_id = $1
+           UNION ALL SELECT 'candidate_decisions' FROM candidate_decisions WHERE application_id = $1
+           UNION ALL SELECT 'audit_sample_members' FROM audit_sample_members WHERE application_id = $1
+           UNION ALL SELECT 'review_timing_spans' FROM review_timing_spans WHERE application_id = $1
+           UNION ALL SELECT 'import_rows' FROM import_rows WHERE application_id = $1
+         ) AS d GROUP BY source ORDER BY source`,
+        [pinnedId]
+      );
+      const found = dependents.rows.map((row) => `${row.source}=${row.count}`).join(", ");
+      if (found !== `${onlyDependent}=1`) {
+        throw new Error(
+          `assertRetentionPurgeBlockers: application ${pinnedId} must be pinned only by one ${onlyDependent} row, ` +
+            `found: ${found || "none"}`
+        );
+      }
+    }
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_audit_sample",
+      { sqlstate: "23503", constraint: "audit_sample_members_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "applications:delete_pinned_only_by_a_timing_span",
+      { sqlstate: "23503", constraint: "review_timing_spans_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${timedApplicationId}'`
+    );
+    // 23514, not 23503: the FK itself would allow the delete by nulling
+    // the reference, and it is the ledger's CHECK that refuses the null.
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_import_row",
+      { sqlstate: "23514", constraint: "import_rows_check" },
+      `DELETE FROM applications WHERE application_id = '${importedApplicationId}'`
     );
     await expectRejected(
       "file_intakes:delete",
@@ -4527,6 +4633,24 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       `DELETE FROM import_rows WHERE intake_id = $1`,
       `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
       [intakeId]
+    );
+
+    // 3b. The ordering the plan states: purge import_rows, and the
+    //     application it was the only thing pinning then goes. Without
+    //     this, "import_rows must be purged before applications" is a
+    //     claim no test walks, and it doubles as the control that the
+    //     import-row application was pinned by nothing else.
+    await expectPermitted(
+      "import_rows:delete_processed_row",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [importedIntakeId]
+    );
+    await expectPermitted(
+      "applications:delete_after_import_rows_purged",
+      `DELETE FROM applications WHERE application_id = $1`,
+      `SELECT count(*)::text AS count FROM applications WHERE application_id = $1`,
+      [importedApplicationId]
     );
 
     // 4. The cascade the plan describes is real, shown on the intake

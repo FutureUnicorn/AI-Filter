@@ -68,6 +68,38 @@ test("candidate_decisions blocks deleting an application on its own, not only al
   );
 });
 
+test("each of the five blockers refuses deleting an application on its own", async () => {
+  // REV-003. The plan once said two uncascaded FKs pin applications;
+  // pg_constraint over every migration shows five blockers. Each case
+  // here is an application the probe has first proved carries exactly
+  // one dependent, so the refusal cannot be borrowed from another.
+  const { failures } = await assertRetentionPurgeBlockers(databaseUrl());
+  const cases = [
+    ["applications:delete", "evidence_outcomes_application_id_organization_id_fkey"],
+    ["applications:delete_pinned_only_by_a_decision", "candidate_decisions_application_id_organization_id_fkey"],
+    ["applications:delete_pinned_only_by_an_audit_sample", "audit_sample_members_application_id_organization_id_fkey"],
+    ["applications:delete_pinned_only_by_a_timing_span", "review_timing_spans_application_id_organization_id_fkey"]
+  ] as const;
+  for (const [label, constraint] of cases) {
+    const refusal = failures[label] ?? "";
+    assert.match(refusal, /violates foreign key constraint/, `${label} must be refused by a foreign key`);
+    assert.ok(refusal.includes(constraint), `${label} must be refused by ${constraint}, got: ${refusal}`);
+  }
+  // Not a foreign key violation: the FK is ON DELETE SET NULL and would
+  // allow it. The ledger's CHECK is what refuses the null.
+  const imported = failures["applications:delete_pinned_only_by_an_import_row"] ?? "";
+  assert.match(imported, /violates check constraint "import_rows_check"/);
+  assert.doesNotMatch(imported, /foreign key/);
+});
+
+test("purging import_rows first is what lets an import-pinned application go", async () => {
+  // The ordering the plan states, walked rather than asserted: once the
+  // processed ledger row is gone, nothing else pins that application.
+  const { permitted } = await assertRetentionPurgeBlockers(databaseUrl());
+  assert.equal(permitted["import_rows:delete_processed_row"], 1);
+  assert.equal(permitted["applications:delete_after_import_rows_purged"], 1);
+});
+
 test("the quote cannot even be redacted in place, which is why this is not a small fix", async () => {
   // Worth its own assertion: if UPDATE were allowed, retention could
   // blank the quote and keep the audit row, and the whole problem would

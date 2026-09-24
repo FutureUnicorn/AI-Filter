@@ -89,32 +89,64 @@ test("every blocked surface says why, in words a non-engineer can act on", () =>
   }
 });
 
-test("the append-only evidence store is named as the root blocker", () => {
+test("the append-only evidence store cannot be redacted, and is not the only root blocker", () => {
   // Both DELETE and UPDATE are rejected, so the quote can be neither
-  // removed nor redacted in place. Everything else is downstream of it.
+  // removed nor redacted in place. REV-003: it was called "the root
+  // blocker", but three other append-only tables pin applications just
+  // as hard, so unblocking it alone frees nothing.
   const plan = planRetention(policy(), NOW);
   const evidence = plan.surfaces.find((surface) => surface.surface === "evidence_outcomes");
   assert.equal(evidence?.disposition, "blocked_append_only");
   assert.match(evidence?.detail ?? "", /cannot be redacted in place/);
+  assert.doesNotMatch(evidence?.detail ?? "", /\bthe root blocker\b/);
+  for (const sibling of ["candidate_decisions", "audit_sample_members", "review_timing_spans"]) {
+    assert.match(evidence?.detail ?? "", new RegExp(`\\b${sibling}\\b`), `the detail must name ${sibling}`);
+  }
 });
 
-test("the applications blocker names both foreign keys, not only the one Postgres reports", () => {
-  // Two independent uncascaded FKs reference applications: one from
-  // evidence_outcomes (0016) and one from candidate_decisions (0019).
-  // A DELETE reports whichever it checks first, so a detail written from
-  // one error message reads as "fix evidence_outcomes and this unblocks",
-  // which is false. Proved by probe in the integration test: an
-  // application pinned only by candidate_decisions is refused by
-  // candidate_decisions_application_id_organization_id_fkey.
+test("the applications blocker names all five blockers, not only the one Postgres reports", () => {
+  // REV-003. Enumerated from pg_constraint over every migration, and each
+  // proved by probe in the integration test on an application pinned by
+  // that dependent alone. Four append-only tables hold an uncascaded FK
+  // (23503), and import_rows' FK is ON DELETE SET NULL but its CHECK
+  // refuses a processed row without an application_id (23514). A DELETE
+  // reports whichever it checks first, so a detail written from error
+  // messages rather than the schema understates the work.
   const plan = planRetention(policy(), NOW);
-  const applications = plan.surfaces.find((surface) => surface.surface === "applications");
-  assert.match(applications?.detail ?? "", /evidence_outcomes/);
-  assert.match(applications?.detail ?? "", /candidate_decisions/);
+  const detail = plan.surfaces.find((surface) => surface.surface === "applications")?.detail ?? "";
+  for (const [table, migration] of [
+    ["evidence_outcomes", "0016_evidence_outcomes.sql"],
+    ["candidate_decisions", "0019_candidate_decisions.sql"],
+    ["audit_sample_members", "0020_audit_samples.sql"],
+    ["review_timing_spans", "0021_review_timing.sql"],
+    ["import_rows", "0015_applications_and_import_finalization.sql"]
+  ] as const) {
+    assert.match(detail, new RegExp(`\\b${table}\\b`), `the detail must name ${table}`);
+    // By filename, never bare number: this branch has two 0009 files.
+    assert.ok(detail.includes(migration), `the detail must cite ${table}'s migration as ${migration}`);
+  }
+  assert.match(detail, /\bfive\b/, "the count has to be stated, so a reader cannot take it as a sample");
+  assert.doesNotMatch(detail, /\btwo\b/, "the old understated count must not survive anywhere in the text");
+  assert.match(detail, /import_rows_check/, "the import_rows blocker is a CHECK, not the FK, and must say so");
   assert.match(
-    applications?.detail ?? "",
-    /independently/,
-    "naming both is not enough; the detail has to say that removing one leaves the other"
+    detail,
+    /import_rows must be purged before applications/,
+    "the ordering is the actionable part: the SET NULL trips the CHECK otherwise"
   );
+  assert.match(
+    detail,
+    /independently/,
+    "naming them is not enough; the detail has to say that removing one leaves the others"
+  );
+});
+
+test("import_rows says it must go before applications, from its own side too", () => {
+  // A reader of the import_rows entry alone would otherwise see "purge"
+  // and no hint that it gates another surface.
+  const plan = planRetention(policy(), NOW);
+  const rows = plan.surfaces.find((surface) => surface.surface === "import_rows");
+  assert.equal(rows?.disposition, "purge");
+  assert.match(rows?.detail ?? "", /purge import_rows first/);
 });
 
 test("the candidate's filename is recognised as PII, not just a label", () => {
