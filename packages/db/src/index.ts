@@ -2439,43 +2439,51 @@ export async function recordEvidenceOutcome(
     // Refuse erased applications when redacted_at exists (AF-62+). Older
     // probe schemas that never loaded 0023 keep the unguarded insert.
     const hasRedacted = await applicationsHaveRedactedAt(client, schema);
-    const result = hasRedacted
-      ? await client.query(
-          `INSERT INTO "${schema}".evidence_outcomes
-             (organization_id, application_id, criterion_id, kind, outcome, run_id)
-           SELECT $1, $2, $3, $4, $5::jsonb, $6
-            WHERE EXISTS (
-              SELECT 1 FROM "${schema}".applications
-               WHERE application_id = $2
-                 AND organization_id = $1
-                 AND redacted_at IS NULL
-            )`,
-          [
-            input.organizationId,
-            input.applicationId,
-            input.outcome.criterionId,
-            input.outcome.kind,
-            JSON.stringify(input.outcome),
-            input.runId ?? null
-          ]
-        )
-      : await client.query(
-          `INSERT INTO "${schema}".evidence_outcomes
-             (organization_id, application_id, criterion_id, kind, outcome, run_id)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
-          [
-            input.organizationId,
-            input.applicationId,
-            input.outcome.criterionId,
-            input.outcome.kind,
-            JSON.stringify(input.outcome),
-            input.runId ?? null
-          ]
+    await client.query("BEGIN");
+    try {
+      if (hasRedacted) {
+        // REV-007: a LOCK, not a snapshot read. The first version checked
+        // EXISTS (... redacted_at IS NULL) inside the INSERT, which reads the
+        // statement snapshot and locks nothing: an erasure that had written
+        // redacted_at but not committed was still invisible to it, the row
+        // inserted, the foreign key then waited on the erasure's row lock
+        // and passed once it committed because the key had not changed, and
+        // a verbatim quote landed in an append-only table after the
+        // candidate's receipt. FOR SHARE conflicts with the erasure's
+        // FOR UPDATE and UPDATE, so either this commits first and the
+        // evidence exists before the erasure (and is reported as residue),
+        // or it waits, re-reads the updated row under READ COMMITTED, finds
+        // redacted_at set, and refuses. recordCandidateDecision uses the
+        // same shape with FOR UPDATE; either lock closes the race.
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
         );
-    if (hasRedacted && (result.rowCount ?? 0) === 0) {
-      throw new Error(
-        `recordEvidenceOutcome: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `recordEvidenceOutcome: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO "${schema}".evidence_outcomes
+           (organization_id, application_id, criterion_id, kind, outcome, run_id)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.outcome.criterionId,
+          input.outcome.kind,
+          JSON.stringify(input.outcome),
+          input.runId ?? null
+        ]
       );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
     }
   } finally {
     await client.end().catch(() => undefined);
@@ -6190,6 +6198,235 @@ export async function assertCandidateDataErasureGuards(
     } catch {
       // Best-effort cleanup.
     }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface EvidenceWriteRacingErasureObservations {
+  /** Evidence rows that exist for the erased application once everything has settled. */
+  readonly evidenceRowsAfterErasure: number;
+  /** What recordEvidenceOutcome threw, or null if it succeeded. */
+  readonly evidenceError: string | null;
+  /** What recordCandidateDecision threw, or null if it succeeded: the control. */
+  readonly decisionError: string | null;
+  readonly decisionRowsAfterErasure: number;
+  /**
+   * True when an evidence row was written while the erasure was in flight.
+   * The receipt's executed_at is the erasure's transaction start, so this
+   * cannot say "after the receipt committed"; the row count is the signal.
+   */
+  readonly evidenceRecordedDuringErasure: boolean;
+  /** Lock waiters seen before the erasure was released, so the race was really exercised. */
+  readonly writersBlockedBeforeRelease: number;
+}
+
+/**
+ * REV-007 probe: a writer racing an erasure that has set redacted_at but not
+ * yet committed.
+ *
+ * Same barrier as assertCandidateDataErasureIntakeRace, on its own advisory
+ * key so the two can run in parallel: an AFTER UPDATE trigger on
+ * applications parks the erasure, holding its FOR UPDATE row lock, right
+ * after it writes redacted_at. The evidence and decision writers are then
+ * started, and the erasure is released only once both are seen waiting on a
+ * row lock. That is the interleaving in which a snapshot check reads
+ * redacted_at as still NULL, so the result does not depend on timing.
+ *
+ * recordCandidateDecision is the control: it takes FOR UPDATE ... AND
+ * redacted_at IS NULL, so it must be refused. If the control were not
+ * refused, the harness would be proving nothing about the evidence path.
+ */
+export async function assertEvidenceWriteRacingErasure(
+  databaseUrl: string
+): Promise<EvidenceWriteRacingErasureObservations> {
+  const barrierClass = 76;
+  const barrierObj = 7;
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `evidence_race_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const gate = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const poll = async (label: string, sql: string, params: unknown[], minimum: number): Promise<number> => {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const found = await gate.query<{ n: number }>(sql, params);
+      const n = found.rows[0]?.n ?? 0;
+      if (n >= minimum) {
+        return n;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`assertEvidenceWriteRacingErasure: timed out waiting for ${minimum} ${label}`);
+  };
+
+  try {
+    await admin.connect();
+    await gate.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0019_candidate_decisions.sql",
+      "0023_candidate_data_erasure.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `evidence_race_${suffix}@acme.test`
+    ]);
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'owner')`, [org, userId]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+      [intakeId, org, roleId, `quarantine/${org}/${roleId}/pending/${suffix}-Jane_Doe_CV.pdf`, userId]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, org, roleId, intakeId]
+    );
+
+    await gate.query(`SELECT pg_advisory_lock($1, $2)`, [barrierClass, barrierObj]);
+    await admin.query(`
+      CREATE OR REPLACE FUNCTION "${schema}".evidence_race_barrier() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.redacted_at IS NOT NULL AND OLD.redacted_at IS NULL THEN
+          PERFORM pg_advisory_lock_shared(${barrierClass}, ${barrierObj});
+          PERFORM pg_advisory_unlock_shared(${barrierClass}, ${barrierObj});
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TRIGGER evidence_race_barrier
+        AFTER UPDATE OF redacted_at ON "${schema}".applications
+        FOR EACH ROW EXECUTE FUNCTION "${schema}".evidence_race_barrier();
+    `);
+
+    const settle = (work: Promise<unknown>): Promise<string | null> =>
+      work.then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+    const erasure = settle(
+      eraseCandidateData(
+        databaseUrl,
+        schema,
+        { organizationId: org, applicationId, trigger: "candidate_request", requestedByUserId: userId },
+        "skip_for_test"
+      )
+    );
+    // The erasure is parked holding its row lock, redacted_at written, not committed.
+    await poll(
+      "parked erasure",
+      `SELECT count(*)::int AS n FROM pg_locks
+        WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND NOT granted`,
+      [barrierClass, barrierObj],
+      1
+    );
+
+    const evidence = settle(
+      recordEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          criterionId: "python",
+          citation: {
+            document: "cv.pdf",
+            pageOrSection: "Experience",
+            offset: 0,
+            quote: "Jane Doe, Python engineer"
+          }
+        }
+      })
+    );
+    const decision = settle(
+      recordCandidateDecision(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        decision: "decline",
+        rationale: "Jane Doe lacks Python depth",
+        decidedByUserId: userId
+      })
+    );
+
+    // Both writers are waiting on a row lock held by the parked erasure, so
+    // whatever check they made before the wait was made against a snapshot
+    // in which redacted_at was still NULL.
+    const writersBlockedBeforeRelease = await poll(
+      "blocked writers",
+      `SELECT count(*)::int AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE NOT l.granted AND l.locktype IN ('transactionid', 'tuple')
+          AND a.query LIKE '%' || $1 || '%'`,
+      [`"${schema}".`],
+      2
+    );
+
+    await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
+    const [erasureError, evidenceError, decisionError] = await Promise.all([erasure, evidence, decision]);
+    if (erasureError !== null) {
+      throw new Error(`assertEvidenceWriteRacingErasure: the erasure itself failed: ${erasureError}`);
+    }
+
+    const evidenceRows = await admin.query<{ count: string; last_recorded: Date | null }>(
+      `SELECT count(*)::text AS count, max(recorded_at) AS last_recorded
+         FROM evidence_outcomes WHERE application_id = $1`,
+      [applicationId]
+    );
+    const decisionRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM candidate_decisions WHERE application_id = $1`,
+      [applicationId]
+    );
+    const receipt = await admin.query<{ executed_at: Date }>(
+      `SELECT executed_at FROM candidate_data_erasures WHERE application_id = $1 ORDER BY executed_at LIMIT 1`,
+      [applicationId]
+    );
+    const lastEvidence = evidenceRows.rows[0]?.last_recorded ?? null;
+    const executedAt = receipt.rows[0]?.executed_at ?? null;
+
+    return {
+      evidenceRowsAfterErasure: Number.parseInt(evidenceRows.rows[0]?.count ?? "", 10),
+      evidenceError,
+      decisionError,
+      decisionRowsAfterErasure: Number.parseInt(decisionRows.rows[0]?.count ?? "", 10),
+      evidenceRecordedDuringErasure:
+        lastEvidence !== null && executedAt !== null && lastEvidence.getTime() >= executedAt.getTime(),
+      writersBlockedBeforeRelease
+    };
+  } finally {
+    try {
+      await gate.query(`SELECT pg_advisory_unlock_all()`);
+    } catch {
+      // Gate may already be unlocked or closed.
+    }
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await gate.end().catch(() => undefined);
     await admin.end().catch(() => undefined);
   }
 }
