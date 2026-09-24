@@ -4712,6 +4712,16 @@ export interface ErasedCandidateReconciliationObservations {
  * REV-002: Exercises retention residue observation and reconciliation against
  * completely erased candidate data and candidate data with append-only residue.
  */
+/**
+ * REV-006: a stand-in for the object-storage boundary that accepts every
+ * delete. Probes asserting that an intake is COMPLETELY erased must use a
+ * deleter: skip_for_test deliberately leaves the intake unfinished, so a
+ * probe that passed with it was passing only because skip mode used to mark
+ * the intake erased while the object was still stored. Stubbing the storage
+ * boundary, and nothing else, is the rule for probes here.
+ */
+const acceptDelete: CandidateDataObjectStorage = async () => undefined;
+
 export async function probeErasedCandidateReconciliation(
   databaseUrl: string,
   now: Date
@@ -4796,7 +4806,7 @@ export async function probeErasedCandidateReconciliation(
       databaseUrl,
       schema,
       { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
-      "skip_for_test"
+      acceptDelete
     );
 
     const residueAfterErasure = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
@@ -4835,7 +4845,7 @@ export async function probeErasedCandidateReconciliation(
       databaseUrl,
       schema,
       { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
-      "skip_for_test"
+      acceptDelete
     );
 
     const residueWithAppendOnlyOutcome = await observeRetentionResidue(databaseUrl, schema, org, cutoff);
@@ -5184,7 +5194,15 @@ export async function eraseCandidateData(
           objectStorage
         );
         intakeErased = true;
-        await insertReceipt(true, 0, objectStorageDeleted);
+        // Only a repair that changed something gets a receipt. Since REV-006
+        // a skip-mode erasure leaves the intake unfinished on purpose, so a
+        // repeated skip-mode call reaches this branch with nothing left that
+        // it is allowed to do, and a receipt then would claim a repair that
+        // never happened.
+        const repaired = objectStorageDeleted || Object.values(rowsBySurface).some((rows) => rows > 0);
+        if (repaired) {
+          await insertReceipt(true, 0, objectStorageDeleted);
+        }
       }
       const existing = await client.query<{ erasure_id: string }>(
         `SELECT erasure_id FROM "${schema}".candidate_data_erasures
@@ -5357,10 +5375,20 @@ async function eraseIntakeScopedSurfaces(
   // anything about the candidate. Never overwrite it unless the object
   // delete ran: that is the orphan trap (REV-003).
   if (skipObjectStorage) {
+    // REV-006: redact what can be redacted, but do NOT set redacted_at.
+    // That column is what every other reader takes to mean "this row holds
+    // no candidate data": observeRetentionResidue counts only rows where it
+    // is NULL, and lockIntakeForErasure treats a set value as finished, so
+    // the repair path would never run again. Here storage_key still embeds
+    // the filename and the object is still in the bucket, so the honest
+    // state is "unfinished". Left NULL, a later call with a real deleter
+    // finds it through the repair path, deletes the object, replaces the key
+    // and only then sets redacted_at. IS DISTINCT FROM keeps a repeated
+    // skip-mode call from counting the same placeholder rewrite as new work.
     const intakes = await client.query(
       `UPDATE "${schema}".file_intakes
-          SET declared_filename = $1, redacted_at = CURRENT_TIMESTAMP
-        WHERE intake_id = $2 AND redacted_at IS NULL`,
+          SET declared_filename = $1
+        WHERE intake_id = $2 AND redacted_at IS NULL AND declared_filename IS DISTINCT FROM $1`,
       [CANDIDATE_DATA_ERASURE_PLACEHOLDER, intakeId]
     );
     rowsBySurface["file_intakes"] = intakes.rowCount ?? 0;
@@ -5796,13 +5824,13 @@ export async function assertCandidateDataErasureIntakeRace(
         trigger: "candidate_request",
         requestedByUserId: userId
       },
-      "skip_for_test"
+      acceptDelete
     );
     const eraseB = eraseCandidateData(
       databaseUrl,
       schema,
       { organizationId: org, applicationId: applicationB, trigger: "retention_expiry" },
-      "skip_for_test"
+      acceptDelete
     );
 
     await waitForBarrierWaiters(2);
@@ -5828,7 +5856,7 @@ export async function assertCandidateDataErasureIntakeRace(
         trigger: "candidate_request",
         requestedByUserId: userId
       },
-      "skip_for_test"
+      acceptDelete
     );
     const textAfterRecovery = await admin.query<{ pages: unknown }>(
       `SELECT pages FROM canonical_text_extractions WHERE intake_id = $1`,
@@ -6052,6 +6080,17 @@ export interface CandidateDataErasureGuardObservations {
   readonly decisionRejection: string;
   readonly listedAfterErasure: number;
   readonly getAfterErasure: boolean;
+  /** REV-006: skip mode leaves the intake unfinished rather than marking it erased. */
+  readonly redactedAtAfterSkip: string | null;
+  readonly declaredFilenameAfterSkip: string;
+  readonly skipResidueSurfaces: readonly string[];
+  readonly reconciliationCountsSkippedIntake: number;
+  readonly receiptsAddedBySecondSkip: number;
+  /** A later call with a real deleter finishes what skip mode left. */
+  readonly keysDeletedByLaterRealErasure: readonly string[];
+  readonly storageKeyAfterRealErasure: string;
+  readonly redactedAtAfterRealErasure: string | null;
+  readonly reconciliationAfterRealErasure: number;
 }
 
 /**
@@ -6153,6 +6192,51 @@ export async function assertCandidateDataErasureGuards(
       [intakeId]
     );
 
+    // REV-006: what every reader of this row is told after a skip-mode run.
+    const intakeState = async (): Promise<{ storage_key: string; declared_filename: string; redacted_at: Date | null }> => {
+      const row = await admin.query<{ storage_key: string; declared_filename: string; redacted_at: Date | null }>(
+        `SELECT storage_key, declared_filename, redacted_at FROM file_intakes WHERE intake_id = $1`,
+        [intakeId]
+      );
+      const found = row.rows[0];
+      if (found === undefined) {
+        throw new Error("assertCandidateDataErasureGuards: the intake disappeared");
+      }
+      return found;
+    };
+    const receiptCount = async (): Promise<number> => {
+      const counted = await admin.query<{ count: string }>(`SELECT count(*)::text AS count FROM candidate_data_erasures`);
+      return Number.parseInt(counted.rows[0]?.count ?? "", 10);
+    };
+    const skipReceipt = await admin.query<{ surfaces: string[] }>(
+      `SELECT residue->'surfaces' AS surfaces FROM candidate_data_erasures
+        WHERE application_id = $1 ORDER BY executed_at ASC LIMIT 1`,
+      [applicationA]
+    );
+    const skipResidueSurfaces = skipReceipt.rows[0]?.surfaces ?? [];
+    const farCutoff = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const afterSkip = await intakeState();
+    const residueAfterSkip = await observeRetentionResidue(databaseUrl, schema, org, farCutoff);
+    const receiptsBefore = await receiptCount();
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      "skip_for_test"
+    );
+    const receiptsAddedBySecondSkip = (await receiptCount()) - receiptsBefore;
+    const deletedKeys: string[] = [];
+    await eraseCandidateData(
+      databaseUrl,
+      schema,
+      { organizationId: org, applicationId: applicationA, trigger: "retention_expiry" },
+      async (storageKey) => {
+        deletedKeys.push(storageKey);
+      }
+    );
+    const afterReal = await intakeState();
+    const residueAfterReal = await observeRetentionResidue(databaseUrl, schema, org, farCutoff);
+
     const evidenceRejection = await capture(() =>
       recordEvidenceOutcome(databaseUrl, schema, {
         organizationId: org,
@@ -6190,7 +6274,16 @@ export async function assertCandidateDataErasureGuards(
       evidenceRejection,
       decisionRejection,
       listedAfterErasure: listed.length,
-      getAfterErasure: got !== undefined
+      getAfterErasure: got !== undefined,
+      redactedAtAfterSkip: afterSkip.redacted_at?.toISOString() ?? null,
+      declaredFilenameAfterSkip: afterSkip.declared_filename,
+      skipResidueSurfaces,
+      reconciliationCountsSkippedIntake: residueAfterSkip.rowsPastCutoffBySurface["file_intakes"] ?? 0,
+      receiptsAddedBySecondSkip,
+      keysDeletedByLaterRealErasure: deletedKeys,
+      storageKeyAfterRealErasure: afterReal.storage_key,
+      redactedAtAfterRealErasure: afterReal.redacted_at?.toISOString() ?? null,
+      reconciliationAfterRealErasure: residueAfterReal.rowsPastCutoffBySurface["file_intakes"] ?? 0
     };
   } finally {
     try {

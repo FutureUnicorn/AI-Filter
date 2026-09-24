@@ -128,6 +128,35 @@ test("skip_for_test leaves storage_key intact and records object storage as resi
   assert.match(observed.skipResidueStatement, /stored object was not deleted/);
 });
 
+// ---- REV-006: skip mode must not tell any reader the intake is finished ----
+
+test("skip mode leaves the intake unfinished, so reconciliation still counts it as residue", async () => {
+  // file_intakes.redacted_at means "this row holds no candidate data" to
+  // every reader. After skip mode storage_key still embeds the filename and
+  // the object is still stored, so the row must not carry that marker.
+  const observed = await assertCandidateDataErasureGuards(requireDatabase());
+  assert.equal(observed.redactedAtAfterSkip, null, "redacted_at must stay NULL while the object is still stored");
+  assert.equal(observed.declaredFilenameAfterSkip, "[erased]", "what can be redacted in place still is");
+  assert.ok(observed.reconciliationCountsSkippedIntake >= 1, "observeRetentionResidue must count the unfinished intake");
+  assert.ok(observed.skipResidueSurfaces.includes("file_intakes"), "the receipt must list file_intakes as residue");
+  assert.ok(observed.skipResidueSurfaces.includes("object_storage_documents"));
+});
+
+test("a later erasure with a real deleter finishes what skip mode left", async () => {
+  // Before REV-006 this was unrecoverable: redacted_at was set, so the
+  // repair branch never ran and the object and key stayed forever.
+  const observed = await assertCandidateDataErasureGuards(requireDatabase());
+  assert.deepEqual(observed.keysDeletedByLaterRealErasure, [observed.originalStorageKey]);
+  assert.match(observed.storageKeyAfterRealErasure, /^erased:/);
+  assert.ok(observed.redactedAtAfterRealErasure !== null, "the real erasure sets redacted_at");
+  assert.equal(observed.reconciliationAfterRealErasure, 0, "and reconciliation now reads it as clean");
+});
+
+test("repeating skip mode writes no receipt for a repair that did nothing", async () => {
+  const observed = await assertCandidateDataErasureGuards(requireDatabase());
+  assert.equal(observed.receiptsAddedBySecondSkip, 0);
+});
+
 test("erased applications refuse new evidence and decisions and leave the review queue", async () => {
   // REV-004. Append-only writers must not grow residue after the receipt.
   const observed = await assertCandidateDataErasureGuards(requireDatabase());

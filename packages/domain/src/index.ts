@@ -3342,9 +3342,14 @@ export function summarizeCandidateDataErasureResidue(
   const deferredIntake = plan.steps.filter(
     (step) => INTAKE_SCOPED_SURFACES.has(step.surface) && !outcome.intakeErased
   );
+  // REV-006: when the object was not deleted, file_intakes is residue too,
+  // because its storage_key still embeds the declared filename and is left
+  // intact on purpose, so the key keeps naming the object.
   const objectSkippedWhileIntakeErased =
     outcome.intakeErased && !outcome.objectStorageDeleted
-      ? plan.steps.filter((step) => step.surface === "object_storage_documents")
+      ? plan.steps.filter(
+          (step) => step.surface === "object_storage_documents" || step.surface === "file_intakes"
+        )
       : [];
 
   const surviving = [...blocked, ...deferredIntake, ...objectSkippedWhileIntakeErased];
@@ -3373,7 +3378,8 @@ export function summarizeCandidateDataErasureResidue(
   } else if (outcome.intakeErased && !outcome.objectStorageDeleted) {
     parts.push(
       "Candidate identity and extracted text were erased in place, but the stored object was not " +
-        "deleted, so its storage_key was left intact and object_storage_documents remains residue."
+        "deleted, so its storage_key was left intact: object_storage_documents and file_intakes remain " +
+        "residue until a later erasure deletes the object."
     );
   } else {
     const others = outcome.applicationsStillReferencingIntake;
