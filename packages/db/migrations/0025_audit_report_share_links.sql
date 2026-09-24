@@ -75,6 +75,16 @@ CREATE TABLE IF NOT EXISTS audit_report_share_links (
   -- A revocation names who did it, or it is not a record of anything.
   CONSTRAINT audit_report_share_links_revocation_is_attributed
     CHECK ((revoked_at IS NULL) = (revoked_by_user_id IS NULL)),
+  -- The composite FK proves (role_id, organization_id) is a real pair. It
+  -- says nothing about the JSON in report. Without this CHECK a link can
+  -- be filed under role A of org X while serving role B's report from
+  -- org Y -- a cross-tenant disclosure on an unauthenticated URL, and a
+  -- revocation keyed on the link columns would never find it.
+  CONSTRAINT audit_report_share_links_report_matches_tenant
+    CHECK (
+      report->>'organizationId' = organization_id::text
+      AND report->>'roleId' = role_id::text
+    ),
 
   -- Tenant scoping through the pair, the shape 0012, 0016, 0019, 0023 and
   -- 0024 use: referencing role_id alone would let one organization mint a

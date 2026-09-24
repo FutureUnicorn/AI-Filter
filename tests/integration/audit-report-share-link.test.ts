@@ -87,3 +87,11 @@ test("one organization cannot mint a public link for another's role", async () =
   const observed = await observe();
   assert.match(observed.crossTenantRejection, /violates foreign key constraint/);
 });
+
+test("a report that does not match the link organization and role is refused", async () => {
+  // REV-002. The composite FK proves the link columns are a real role pair;
+  // without this check the JSON blob can serve another tenant on an
+  // unauthenticated URL.
+  const observed = await observe();
+  assert.match(observed.mismatchedReportRejection, /report is for organization/);
+});

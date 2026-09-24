@@ -5775,6 +5775,16 @@ export async function createAuditReportShareLink(
   input: CreateAuditReportShareLinkInput
 ): Promise<{ readonly shareLinkId: string; readonly expiresAt: string }> {
   assertSafeSchema(schema);
+  if (
+    input.report.organizationId !== input.organizationId ||
+    input.report.roleId !== input.roleId
+  ) {
+    throw new Error(
+      `createAuditReportShareLink: report is for organization ${input.report.organizationId} ` +
+        `role ${input.report.roleId}, but the link is being filed under organization ` +
+        `${input.organizationId} role ${input.roleId}`
+    );
+  }
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
@@ -5823,7 +5833,9 @@ export async function createAuditReportShareLink(
  * it to, because the caller is unauthenticated and naming one would just
  * be a parameter an attacker also controls. Tenant integrity comes from
  * the row itself: the link was minted against a (role_id, organization_id)
- * pair that the schema forced to be real.
+ * pair that the schema forced to be real, and createAuditReportShareLink
+ * (plus the report_matches_tenant CHECK) refused any report JSON that did
+ * not agree with that pair.
  *
  * A view is logged only when the report is actually served. A refused
  * attempt disclosed nothing, and recording it here would make
@@ -5948,6 +5960,11 @@ export interface AuditReportShareLinkObservations {
    * to the database clock (the ceiling CHECK then sees wall time).
    */
   readonly futureDatedCreatedAtRejection: string;
+  /**
+   * REV-002: minting with a report whose organizationId/roleId disagree
+   * with the link columns must throw rather than store the mismatched JSON.
+   */
+  readonly mismatchedReportRejection: string;
 }
 
 /**
@@ -6152,6 +6169,16 @@ export async function assertAuditReportShareLinkSecurity(
       )
     );
 
+    const mismatchedReportRejection = await expectRejected("mint:mismatched_report", () =>
+      createAuditReportShareLink(databaseUrl, schema, {
+        organizationId: org,
+        roleId,
+        tokenHash: hash("mismatched-report"),
+        report: otherRoleReport,
+        createdByUserId: userId,
+        days: 30
+      })
+    );
 
     return {
       liveResolution: describe(live),
@@ -6169,7 +6196,8 @@ export async function assertAuditReportShareLinkSecurity(
       viewsUpdateRejection,
       expiryCeilingRejection,
       crossTenantRejection,
-      futureDatedCreatedAtRejection
+      futureDatedCreatedAtRejection,
+      mismatchedReportRejection
     };
   } finally {
     try {
