@@ -289,3 +289,44 @@ test("evidence page has exactly one persistent polite live region outside citati
     "neither card nor citation loops may contain aria-live"
   );
 });
+
+// ---- REV-008 ----
+//
+// apps/web/src/lib/review-focus.ts must not have runtime value imports
+// from @signal-audit packages. tests/unit/review-keyboard-navigation.test.ts
+// imports review-focus.ts directly, and test:unit runs without a package build.
+// Runtime imports of @signal-audit/* resolve to ./dist/index.js, which fails
+// when dist has not been generated. Type imports are erased and remain safe.
+
+test("review-focus.ts has no runtime value imports of @signal-audit packages", () => {
+  const source = readFileSync(join(repositoryRoot, "apps/web/src/lib/review-focus.ts"), "utf8");
+  const valueImports = source.match(/import\s+(?!type\b)[^;]+from\s+["']@signal-audit\/[^"']+["']/gu);
+  assert.equal(
+    valueImports,
+    null,
+    `review-focus.ts must not have runtime value imports of @signal-audit packages (found: ${valueImports?.join(", ")})`
+  );
+  const bareImports = source.match(/import\s+["']@signal-audit\/[^"']+["']/gu);
+  assert.equal(
+    bareImports,
+    null,
+    `review-focus.ts must not have bare imports of @signal-audit packages (found: ${bareImports?.join(", ")})`
+  );
+});
+
+// ---- REV-009 ----
+//
+// Inline source context must not have aria-hidden="true" (WCAG 1.3.1),
+// so visible context is not hidden from the accessibility tree.
+
+test("evidence page does not hide visible inline source context behind aria-hidden", () => {
+  const page = readFileSync(
+    join(repositoryRoot, "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx"),
+    "utf8"
+  );
+  assert.doesNotMatch(
+    page,
+    /<p aria-hidden="true">\s*<small>\s*Source context:/u,
+    "visible source context must not be hidden from the accessibility tree"
+  );
+});

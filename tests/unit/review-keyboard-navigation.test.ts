@@ -326,14 +326,14 @@ test("the revealed value is a criterion id, so it cannot be a citation position"
 
 test("the queue page advertised shortcuts omit source reveal", () => {
   const queueCallbacks = { onOpen: () => {} };
-  const shortcuts = filterSupportedShortcuts(queueCallbacks);
+  const shortcuts = filterSupportedShortcuts(REVIEW_SHORTCUTS, resolveReviewKeyAction, queueCallbacks);
   assert.ok(shortcuts.some((s) => s.keys.includes("Enter")), "Enter must be advertised when onOpen is wired");
   assert.ok(!shortcuts.some((s) => s.keys.includes("s")), "s must not be advertised when onRevealSource is not wired");
 });
 
 test("the evidence page advertised shortcuts omit open", () => {
   const evidenceCallbacks = { onRevealSource: () => {} };
-  const shortcuts = filterSupportedShortcuts(evidenceCallbacks);
+  const shortcuts = filterSupportedShortcuts(REVIEW_SHORTCUTS, resolveReviewKeyAction, evidenceCallbacks);
   assert.ok(shortcuts.some((s) => s.keys.includes("s")), "s must be advertised when onRevealSource is wired");
   assert.ok(!shortcuts.some((s) => s.keys.includes("Enter")), "Enter must not be advertised when onOpen is not wired");
 });
@@ -367,7 +367,7 @@ test("two-direction check: every advertised shortcut is handled and every handle
   ];
 
   for (const { name, callbacks } of cases) {
-    const shortcuts = filterSupportedShortcuts(callbacks);
+    const shortcuts = filterSupportedShortcuts(REVIEW_SHORTCUTS, resolveReviewKeyAction, callbacks);
     const displayed: Readonly<Record<string, string>> = { "↓": "ArrowDown", "↑": "ArrowUp" };
     // Direction 1: every advertised shortcut must be handled
     for (const shortcut of shortcuts) {

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { nextReviewIndex, resolveReviewKeyAction } from "@signal-audit/domain";
+import { nextReviewIndex, resolveReviewKeyAction, REVIEW_SHORTCUTS } from "@signal-audit/domain";
 import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
 
 import {
@@ -87,7 +87,7 @@ export function useReviewKeyboard(options: ReviewKeyboardOptions): ReviewKeyboar
   const callbacksRef = useRef({ onOpen, onRevealSource });
 
   const shortcuts = useMemo(
-    () => filterSupportedShortcuts({ onOpen, onRevealSource }),
+    () => filterSupportedShortcuts(REVIEW_SHORTCUTS, resolveReviewKeyAction, { onOpen, onRevealSource }),
     [onOpen, onRevealSource]
   );
 

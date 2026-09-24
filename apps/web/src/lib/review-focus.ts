@@ -1,4 +1,3 @@
-import { resolveReviewKeyAction, REVIEW_SHORTCUTS } from "@signal-audit/domain";
 import type { ReviewKeyAction, ReviewShortcut } from "@signal-audit/domain";
 
 /**
@@ -47,19 +46,22 @@ export function isActionHandled(
 }
 
 /**
- * REV-005: filter the advertised shortcut list to match what is actually wired.
+ * REV-005 / REV-008: filter the advertised shortcut list to match what is actually wired.
+ * Injects shortcuts and resolver so review-focus has no runtime value imports from @signal-audit/domain.
  */
 export function filterSupportedShortcuts(
+  shortcuts: readonly ReviewShortcut[],
+  resolve: (event: { readonly key: string }) => ReviewKeyAction,
   callbacks: ReviewKeyboardCallbacks
 ): readonly ReviewShortcut[] {
   const displayed: Readonly<Record<string, string>> = { "↓": "ArrowDown", "↑": "ArrowUp" };
-  return REVIEW_SHORTCUTS.filter((shortcut) => {
+  return shortcuts.filter((shortcut) => {
     const firstKey = shortcut.keys[0];
     if (firstKey === undefined) {
       return false;
     }
     const key = displayed[firstKey] ?? firstKey;
-    const action = resolveReviewKeyAction({ key });
+    const action = resolve({ key });
     return isActionHandled(action, callbacks);
   });
 }

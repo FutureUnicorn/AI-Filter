@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 
 import { revealedCriterionId } from "@signal-audit/domain";
@@ -99,19 +99,42 @@ export default function EvidenceCardPage() {
   // position by accident: TypeScript rejects string === number, so the
   // bug this replaced is now a build failure rather than a convention.
   const [revealedCriterion, setRevealedCriterion] = useState<string | undefined>(undefined);
+  const [announcement, setAnnouncement] = useState("");
+  const revealTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    return () => {
+      if (revealTimeoutRef.current !== undefined) {
+        clearTimeout(revealTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const cards = state.kind === "ready" ? state.cards.cards : [];
   // AF-53: "navigation between cards and source context" -- j/k moves
   // between criterion cards, s reveals the sources for the focused one.
   const { focusedIndex, helpVisible, shortcuts, registerItem, setFocusedIndex } = useReviewKeyboard({
     itemCount: cards.length,
-    onRevealSource: (index) =>
-      setRevealedCriterion(revealedCriterionId(cards.map((card) => card.criterionId), index))
+    onRevealSource: (index) => {
+      const criterionId = revealedCriterionId(cards.map((card) => card.criterionId), index);
+      setRevealedCriterion(criterionId);
+      const targetCard = cards.find((card) => card.criterionId === criterionId);
+      const nextAnnouncement = buildSourceContextAnnouncement(
+        targetCard?.criterionId,
+        targetCard?.citations
+      );
+      // REV-009: clear first, then refill on next tick (50ms) so DOM mutation
+      // triggers assistive technology announcement even when repeating on the
+      // same card or returning to it.
+      setAnnouncement("");
+      if (revealTimeoutRef.current !== undefined) {
+        clearTimeout(revealTimeoutRef.current);
+      }
+      revealTimeoutRef.current = setTimeout(() => {
+        setAnnouncement(nextAnnouncement);
+      }, 50);
+    }
   });
-  const revealedCard = cards.find((card) => card.criterionId === revealedCriterion);
-  const sourceContextAnnouncement = buildSourceContextAnnouncement(
-    revealedCard?.criterionId,
-    revealedCard?.citations
-  );
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {
@@ -191,7 +214,7 @@ export default function EvidenceCardPage() {
           border: 0
         }}
       >
-        {sourceContextAnnouncement}
+        {announcement}
       </p>
 
       {workflow !== undefined && (
@@ -300,7 +323,7 @@ export default function EvidenceCardPage() {
                       </small>
                     </p>
                     {revealedCriterion === card.criterionId && (
-                      <p aria-hidden="true">
+                      <p>
                         <small>
                           Source context: {entry.citation.document}, {entry.citation.pageOrSection}, starting at
                           character {entry.citation.offset}. The document itself is not rendered here - nothing links
