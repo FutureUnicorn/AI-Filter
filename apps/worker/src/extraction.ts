@@ -132,6 +132,13 @@ function retryAt(now: Date, attempt: number, baseMs: number): Date {
   return new Date(now.getTime() + baseMs * 2 ** exponent);
 }
 
+function queueClockOverride(
+  dependencies: EvidenceExtractionWorkerDependencies
+): { readonly now?: Date } {
+  const injectedNow = dependencies.now?.();
+  return injectedNow === undefined ? {} : { now: injectedNow };
+}
+
 async function withLeaseRenewal<T>(
   dependencies: EvidenceExtractionWorkerDependencies,
   job: EvidenceExtractionJob,
@@ -149,7 +156,7 @@ async function withLeaseRenewal<T>(
       workerId: dependencies.config.workerId,
       attemptCount: job.attemptCount,
       leaseDurationMs: dependencies.config.leaseDurationMs,
-      now: (dependencies.now ?? (() => new Date()))()
+      ...queueClockOverride(dependencies)
     })
       .then((renewed) => {
         if (!renewed) leaseKnownLost = true;
@@ -206,7 +213,7 @@ export async function processEvidenceExtractionJob(
       failureCode: "invalid_job_context",
       retryable: false,
       availableAt: now,
-      now
+      ...(dependencies.now === undefined ? {} : { now })
     });
     if (result === "failed") {
       captureWorkerJobFailure(new Error("Evidence-extraction job context is invalid"), "invalid_job_context");
@@ -223,7 +230,7 @@ export async function processEvidenceExtractionJob(
       workerId: dependencies.config.workerId,
       attemptCount: job.attemptCount,
       outcomes: fixedOutcomes(job, criterionIds, "invalid_source"),
-      now
+      ...(dependencies.now === undefined ? {} : { now })
     });
   }
 
@@ -241,7 +248,7 @@ export async function processEvidenceExtractionJob(
       workerId: dependencies.config.workerId,
       attemptCount: job.attemptCount,
       outcomes,
-      now
+      ...(dependencies.now === undefined ? {} : { now })
     });
   }
 
@@ -293,7 +300,7 @@ export async function processEvidenceExtractionJob(
       attemptCount: job.attemptCount,
       outcomes,
       run: metadataForRun(execution.metadata, context.rubricVersion),
-      now: (dependencies.now ?? (() => new Date()))()
+      ...queueClockOverride(dependencies)
     });
   } catch (error) {
     if (error instanceof InferenceKillSwitchEngagedError || error instanceof InferenceBudgetCappedError) {
@@ -304,7 +311,7 @@ export async function processEvidenceExtractionJob(
         attemptCount: job.attemptCount,
         failureCode: error instanceof InferenceKillSwitchEngagedError ? "inference_paused" : "budget_capped",
         availableAt: new Date(now.getTime() + Math.max(dependencies.config.retryBaseDelayMs, 60_000)),
-        now
+        ...(dependencies.now === undefined ? {} : { now })
       });
       return deferred ? "deferred" : "lease_lost";
     }
@@ -331,7 +338,7 @@ export async function processEvidenceExtractionJob(
       retryable: failureCode !== "provider_permanent",
       availableAt: retryAt(now, job.attemptCount, dependencies.config.retryBaseDelayMs),
       ...(run === undefined ? {} : { run }),
-      now
+      ...(dependencies.now === undefined ? {} : { now })
     });
     if (result === "failed") {
       captureWorkerJobFailure(error, failureCode);
@@ -346,7 +353,7 @@ export async function processNextEvidenceExtractionJob(
   const claim = await claimEvidenceExtractionJob(dependencies.databaseUrl, dependencies.schema, {
     workerId: dependencies.config.workerId,
     leaseDurationMs: dependencies.config.leaseDurationMs,
-    now: (dependencies.now ?? (() => new Date()))()
+    ...queueClockOverride(dependencies)
   });
   // The database returns these only after the transaction that made the jobs
   // terminal has committed. Emit one detector-compatible signal per durable

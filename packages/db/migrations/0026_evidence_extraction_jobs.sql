@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS evidence_extraction_jobs (
   source_intake_id uuid NOT NULL,
   rubric_id uuid NOT NULL,
   workflow_version text NOT NULL CHECK (workflow_version ~ '^[A-Za-z0-9._-]{1,64}$'),
+  -- Serialized per application by its row lock. Unlike timestamps, this is a
+  -- stable precedence rule when several rubric/workflow versions are queued.
+  enqueue_generation bigint,
   state text NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'running', 'completed', 'failed')),
   enqueued_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -109,6 +112,42 @@ CREATE TABLE IF NOT EXISTS evidence_extraction_jobs (
   CHECK (state <> 'completed' OR failure_code IS NULL)
 );
 
+-- Keep the migration replayable for preview databases that applied an
+-- earlier AF-102 revision before enqueue_generation existed.
+ALTER TABLE evidence_extraction_jobs
+  ADD COLUMN IF NOT EXISTS enqueue_generation bigint;
+
+WITH ranked_jobs AS (
+  SELECT job_id,
+         row_number() OVER (
+           PARTITION BY organization_id, application_id
+           ORDER BY enqueued_at, created_at, job_id
+         ) AS enqueue_generation
+    FROM evidence_extraction_jobs
+)
+UPDATE evidence_extraction_jobs AS job
+   SET enqueue_generation = ranked.enqueue_generation
+  FROM ranked_jobs AS ranked
+ WHERE job.job_id = ranked.job_id
+   AND job.enqueue_generation IS NULL;
+
+ALTER TABLE evidence_extraction_jobs
+  ALTER COLUMN enqueue_generation SET NOT NULL;
+
+DO $enqueue_generation_positive$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.evidence_extraction_jobs', current_schema())::regclass
+       AND conname = 'evidence_extraction_jobs_enqueue_generation_positive'
+  ) THEN
+    ALTER TABLE evidence_extraction_jobs
+      ADD CONSTRAINT evidence_extraction_jobs_enqueue_generation_positive
+      CHECK (enqueue_generation > 0);
+  END IF;
+END;
+$enqueue_generation_positive$;
+
 CREATE INDEX IF NOT EXISTS evidence_extraction_jobs_claim_idx
   ON evidence_extraction_jobs (available_at, enqueued_at, job_id)
   WHERE state = 'ready';
@@ -120,6 +159,8 @@ CREATE INDEX IF NOT EXISTS evidence_extraction_jobs_oldest_ready_idx
   WHERE state = 'ready';
 CREATE INDEX IF NOT EXISTS evidence_extraction_jobs_application_idx
   ON evidence_extraction_jobs (organization_id, application_id, enqueued_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS evidence_extraction_jobs_application_generation_key
+  ON evidence_extraction_jobs (organization_id, application_id, enqueue_generation);
 
 CREATE TABLE IF NOT EXISTS worker_heartbeats (
   worker_id text PRIMARY KEY CHECK (worker_id ~ '^[A-Za-z0-9._:-]{1,128}$'),

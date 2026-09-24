@@ -27,11 +27,13 @@ import {
   listCurrentEvidenceOutcomesForApplication,
   listEvidenceExtractionRunsForEntities,
   markFileIntakeUploaded,
+  publishRubric,
   provisionEvidenceExtractionQueueProbeSchema,
   recordFileValidationResult,
   recordWorkerHeartbeat,
   renewEvidenceExtractionJobLease,
-  retryOrFailEvidenceExtractionJob
+  retryOrFailEvidenceExtractionJob,
+  upsertDraftRubric
 } from "../../packages/db/src/index.ts";
 import { CONTRACT_SCHEMA_VERSION } from "../../packages/domain/src/index.ts";
 import type { AiAdapter, EvidenceOutcome } from "../../packages/domain/src/index.ts";
@@ -477,6 +479,149 @@ test("a later machine completion cannot supersede a recruiter correction", async
   assert.equal(
     current.find(({ outcome }) => outcome.criterionId === "criterion_1")?.outcome.kind,
     "supported"
+  );
+});
+
+test("a newer logical job wins when an older rubric job completes after it was enqueued", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const baseTime = Date.now() - 60_000;
+  const v1Outcomes = Array.from({ length: 5 }, (_, index): EvidenceOutcome => ({
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "not_found",
+    organizationId: probe.organizationId,
+    candidateId: probe.applicationId,
+    criterionId: `criterion_${index + 1}`
+  }));
+
+  const v1 = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-rubric-v1`,
+    maxAttempts: 3,
+    now: new Date(baseTime)
+  });
+  assert.equal(v1.outcome, "enqueued");
+  if (v1.outcome !== "enqueued") return;
+  const v1Claim = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-rubric-v1",
+    leaseDurationMs: 120_000,
+    now: new Date(baseTime + 1_000)
+  })).job;
+  assert.ok(v1Claim !== undefined);
+
+  const v2CriterionIds = [
+    "criterion_1",
+    "rubric_v2_criterion_2",
+    "rubric_v2_criterion_3",
+    "rubric_v2_criterion_4",
+    "rubric_v2_criterion_5"
+  ] as const;
+  const draft = await upsertDraftRubric(
+    databaseUrl,
+    probe.schema,
+    probe.roleId,
+    v2CriterionIds.map((criterionId) => ({
+      criterionId,
+      description: `Version 2 ${criterionId}`,
+      evidenceGuidance: `Find version 2 evidence for ${criterionId}`
+    }))
+  );
+  assert.equal(draft.outcome, "saved");
+  if (draft.outcome !== "saved") return;
+  const published = await publishRubric(databaseUrl, probe.schema, draft.rubric.rubricId, probe.userId);
+  assert.equal(published.outcome, "published");
+  if (published.outcome !== "published") return;
+
+  const v2 = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: published.rubric.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-rubric-v2`,
+    maxAttempts: 3,
+    now: new Date(baseTime + 2_000)
+  });
+  assert.equal(v2.outcome, "enqueued");
+  if (v2.outcome !== "enqueued") return;
+
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: v1Claim.jobId,
+    workerId: "worker-rubric-v1",
+    attemptCount: v1Claim.attemptCount,
+    outcomes: v1Outcomes,
+    now: new Date(baseTime + 3_000)
+  }), "completed");
+  assert.deepEqual(
+    await listCurrentEvidenceOutcomesForApplication(
+      databaseUrl,
+      probe.schema,
+      probe.organizationId,
+      probe.applicationId
+    ),
+    [],
+    "the stale v1 job must not publish any current outcomes once v2 is queued"
+  );
+
+  const v2Claim = (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-rubric-v2",
+    leaseDurationMs: 120_000,
+    now: new Date(baseTime + 4_000)
+  })).job;
+  assert.ok(v2Claim !== undefined);
+  const v2Outcomes = v2CriterionIds.map((criterionId): EvidenceOutcome =>
+    criterionId === "criterion_1"
+      ? {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "supported",
+          organizationId: probe.organizationId,
+          candidateId: probe.applicationId,
+          criterionId,
+          citation: {
+            document: "application_document",
+            pageOrSection: "1",
+            offset: 0,
+            quote: "Built and operated PostgreSQL services"
+          }
+        }
+      : {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "not_found",
+          organizationId: probe.organizationId,
+          candidateId: probe.applicationId,
+          criterionId
+        }
+  );
+  assert.equal(await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    jobId: v2Claim.jobId,
+    workerId: "worker-rubric-v2",
+    attemptCount: v2Claim.attemptCount,
+    outcomes: v2Outcomes,
+    now: new Date(baseTime + 5_000)
+  }), "completed");
+
+  const current = await listCurrentEvidenceOutcomesForApplication(
+    databaseUrl,
+    probe.schema,
+    probe.organizationId,
+    probe.applicationId
+  );
+  assert.deepEqual(
+    current.map(({ outcome }) => outcome.criterionId).sort(),
+    [...v2CriterionIds].sort(),
+    "the current evidence set must contain only the newer rubric's criteria"
+  );
+  assert.equal(
+    current.find(({ outcome }) => outcome.criterionId === "criterion_1")?.outcome.kind,
+    "supported",
+    "the shared criterion must carry v2's result rather than v1's late result"
   );
 });
 

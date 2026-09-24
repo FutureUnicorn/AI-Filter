@@ -1695,7 +1695,7 @@ export async function provisionEvidenceExtractionQueueProbeSchema(
       "0017_evidence_outcomes.sql",
       "0018_evidence_corrections.sql",
       "0019_correction_attribution.sql",
-      "0023_evidence_extraction_jobs.sql"
+      "0026_evidence_extraction_jobs.sql"
     ]) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
     }
@@ -5692,6 +5692,7 @@ interface EvidenceExtractionJobRow {
   readonly source_intake_id: string;
   readonly rubric_id: string;
   readonly workflow_version: string;
+  readonly enqueue_generation: string;
   readonly state: EvidenceExtractionJob["state"];
   readonly enqueued_at: Date;
   readonly available_at: Date;
@@ -5708,7 +5709,7 @@ interface EvidenceExtractionJobRow {
 
 const EVIDENCE_EXTRACTION_JOB_COLUMNS =
   "job_id, organization_id, role_id, application_id, source_intake_id, rubric_id, workflow_version, " +
-  "state, enqueued_at, available_at, started_at, completed_at, failed_at, attempt_count, max_attempts, " +
+  "enqueue_generation, state, enqueued_at, available_at, started_at, completed_at, failed_at, attempt_count, max_attempts, " +
   "lease_owner, lease_expires_at, failure_code, updated_at";
 
 function rowToEvidenceExtractionJob(row: EvidenceExtractionJobRow): EvidenceExtractionJob {
@@ -5783,7 +5784,10 @@ export async function enqueueEvidenceExtractionJob(
   if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
     throw new Error("maxAttempts must be a positive integer");
   }
-  const now = input.now ?? new Date();
+  // Production enqueue timestamps come from PostgreSQL so queue-age and job
+  // ordering are not affected by web/DB host clock skew. Tests may inject a
+  // deterministic timestamp through the existing seam.
+  const requestedEnqueueAt = input.now ?? null;
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
@@ -5855,15 +5859,31 @@ export async function enqueueEvidenceExtractionJob(
       if (existingRow !== undefined) {
         if (existingRow.state === "failed") {
           const requeued = await client.query<EvidenceExtractionJobRow>(
-            `UPDATE "${schema}".evidence_extraction_jobs
-                SET state = 'ready', enqueued_at = $2, available_at = $2,
+            `WITH next_enqueue AS (
+               SELECT COALESCE(MAX(enqueue_generation), 0) + 1 AS next_generation,
+                      COALESCE($2::timestamptz, clock_timestamp()) AS next_enqueued_at
+                 FROM "${schema}".evidence_extraction_jobs
+                WHERE organization_id = $4 AND application_id = $5
+             )
+             UPDATE "${schema}".evidence_extraction_jobs AS job
+                SET state = 'ready',
+                    enqueue_generation = next_enqueue.next_generation,
+                    enqueued_at = next_enqueue.next_enqueued_at,
+                    available_at = next_enqueue.next_enqueued_at,
                     started_at = NULL, completed_at = NULL, failed_at = NULL,
                     attempt_count = 0, max_attempts = $3,
                     lease_owner = NULL, lease_expires_at = NULL,
-                    failure_code = NULL, updated_at = $2
-              WHERE job_id = $1
+                    failure_code = NULL, updated_at = next_enqueue.next_enqueued_at
+               FROM next_enqueue
+              WHERE job.job_id = $1
             RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
-            [existingRow.job_id, now, input.maxAttempts]
+            [
+              existingRow.job_id,
+              requestedEnqueueAt,
+              input.maxAttempts,
+              input.organizationId,
+              input.applicationId
+            ]
           );
           const row = requeued.rows[0];
           if (row === undefined) throw new Error("failed evidence-extraction job could not be requeued");
@@ -5875,10 +5895,19 @@ export async function enqueueEvidenceExtractionJob(
       }
 
       const inserted = await client.query<EvidenceExtractionJobRow>(
-        `INSERT INTO "${schema}".evidence_extraction_jobs
+        `WITH next_enqueue AS (
+           SELECT COALESCE(MAX(enqueue_generation), 0) + 1 AS enqueue_generation,
+                  COALESCE($8::timestamptz, clock_timestamp()) AS enqueued_at
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE organization_id = $1 AND application_id = $3
+         )
+         INSERT INTO "${schema}".evidence_extraction_jobs
            (organization_id, role_id, application_id, source_intake_id, rubric_id,
-            workflow_version, max_attempts, enqueued_at, available_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8)
+            workflow_version, max_attempts, enqueue_generation,
+            enqueued_at, available_at, updated_at)
+         SELECT $1, $2, $3, $4, $5, $6, $7, next_enqueue.enqueue_generation,
+                next_enqueue.enqueued_at, next_enqueue.enqueued_at, next_enqueue.enqueued_at
+           FROM next_enqueue
          RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
         [
           input.organizationId,
@@ -5888,7 +5917,7 @@ export async function enqueueEvidenceExtractionJob(
           input.rubricId,
           input.workflowVersion,
           input.maxAttempts,
-          now
+          requestedEnqueueAt
         ]
       );
       const created = inserted.rows[0];
@@ -5944,10 +5973,12 @@ async function lockEvidenceApplication(
 }
 
 /**
- * A worker result may supersede only the machine state that existed when the
- * job was enqueued. Application locking is shared with the correction writer,
- * so a correction racing completion is either observed and preserved, or is
- * appended after the machine result and remains the current head.
+ * A worker result may become current only when no newer logical job has been
+ * enqueued for the application. enqueue_generation is allocated while holding
+ * the application row lock, so machine precedence is explicit and independent
+ * of completion order or host clocks. Application locking is also shared with
+ * the correction writer, so a correction racing completion is either observed
+ * and preserved, or is appended after the machine result and remains current.
  */
 async function recordCurrentMachineOutcomes(
   databaseUrl: string,
@@ -5958,6 +5989,17 @@ async function recordCurrentMachineOutcomes(
   runId?: string
 ): Promise<void> {
   await lockEvidenceApplication(client, schema, job);
+  const newerJob = await client.query(
+    `SELECT 1
+       FROM "${schema}".evidence_extraction_jobs
+      WHERE organization_id = $1 AND application_id = $2
+        AND enqueue_generation > $3
+      LIMIT 1`,
+    [job.organization_id, job.application_id, job.enqueue_generation]
+  );
+  if (newerJob.rows[0] !== undefined) {
+    return;
+  }
   for (const outcome of outcomes) {
     if (
       outcome.organizationId !== job.organization_id ||
@@ -5965,11 +6007,8 @@ async function recordCurrentMachineOutcomes(
     ) {
       throw new Error("machine evidence outcome attribution does not match its job");
     }
-    const head = await client.query<{
-      corrected_by_user_id: string | null;
-      recorded_at: Date;
-    }>(
-      `SELECT corrected_by_user_id, recorded_at
+    const head = await client.query<{ corrected_by_user_id: string | null }>(
+      `SELECT corrected_by_user_id
          FROM "${schema}".evidence_outcomes
         WHERE organization_id = $1 AND application_id = $2 AND criterion_id = $3
         ORDER BY recorded_at DESC, evidence_outcome_id DESC
@@ -5982,9 +6021,6 @@ async function recordCurrentMachineOutcomes(
       current?.corrected_by_user_id !== null &&
       current?.corrected_by_user_id !== undefined
     ) {
-      continue;
-    }
-    if (current !== undefined && current.recorded_at.getTime() > job.enqueued_at.getTime()) {
       continue;
     }
     await recordEvidenceOutcome(databaseUrl, schema, {
@@ -6043,6 +6079,26 @@ export interface ClaimEvidenceExtractionJobOutcome {
   readonly exhaustedLeaseFailures: number;
 }
 
+async function resolveQueueClock(
+  client: ClientBase,
+  requestedNow: Date | undefined
+): Promise<Date | string> {
+  if (requestedNow !== undefined) {
+    return requestedNow;
+  }
+  // Keep PostgreSQL's sub-millisecond precision. Parsing this as a JavaScript
+  // Date truncates microseconds and can make an immediate completion appear
+  // earlier than started_at under load.
+  const result = await client.query<{ current_time: string }>(
+    "SELECT clock_timestamp()::text AS current_time"
+  );
+  const currentTime = result.rows[0]?.current_time;
+  if (currentTime === undefined) {
+    throw new Error("database clock query returned no row");
+  }
+  return currentTime;
+}
+
 export async function claimEvidenceExtractionJob(
   databaseUrl: string,
   schema: string,
@@ -6053,11 +6109,14 @@ export async function claimEvidenceExtractionJob(
   if (!Number.isInteger(input.leaseDurationMs) || input.leaseDurationMs < 1) {
     throw new Error("leaseDurationMs must be a positive integer");
   }
-  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
+      // Enqueue availability is stamped by PostgreSQL in production. Use the
+      // same clock for an immediate claim so host skew cannot make a freshly
+      // enqueued job appear to be from the future.
+      const now = await resolveQueueClock(client, input.now);
       const exhausted = await client.query<EvidenceExtractionJobRow>(
         `UPDATE "${schema}".evidence_extraction_jobs
             SET state = 'failed', failed_at = $1, lease_owner = NULL, lease_expires_at = NULL,
@@ -6178,9 +6237,9 @@ export async function renewEvidenceExtractionJobLease(
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
   assertClaimAttempt(input.attemptCount);
-  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
+    const now = await resolveQueueClock(client, input.now);
     const result = await client.query(
       `UPDATE "${schema}".evidence_extraction_jobs
           SET lease_expires_at = $5 + ($6::bigint * interval '1 millisecond'), updated_at = $5
@@ -6210,7 +6269,7 @@ async function lockOwnedJob(
   jobId: string,
   workerId: string,
   attemptCount: number,
-  now: Date
+  now: Date | string
 ): Promise<EvidenceExtractionJobRow | undefined> {
   const result = await client.query<EvidenceExtractionJobRow>(
     `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
@@ -6239,11 +6298,11 @@ export async function completeEvidenceExtractionJob(
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
   assertClaimAttempt(input.attemptCount);
-  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
+      const now = await resolveQueueClock(client, input.now);
       const job = await lockOwnedJob(
         client,
         schema,
@@ -6308,11 +6367,11 @@ export async function retryOrFailEvidenceExtractionJob(
   assertWorkerId(input.workerId);
   assertClaimAttempt(input.attemptCount);
   assertFailureCode(input.failureCode);
-  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
     try {
+      const now = await resolveQueueClock(client, input.now);
       const job = await lockOwnedJob(
         client,
         schema,
@@ -6389,9 +6448,9 @@ export async function deferEvidenceExtractionJob(
   assertWorkerId(input.workerId);
   assertClaimAttempt(input.attemptCount);
   assertFailureCode(input.failureCode);
-  const now = input.now ?? new Date();
   const client = await acquireConnection(databaseUrl);
   try {
+    const now = await resolveQueueClock(client, input.now);
     const result = await client.query(
       `UPDATE "${schema}".evidence_extraction_jobs
           SET state = 'ready', available_at = $6, attempt_count = GREATEST(0, attempt_count - 1),
