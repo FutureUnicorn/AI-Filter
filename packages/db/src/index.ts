@@ -5830,11 +5830,22 @@ export interface ClaimEvidenceExtractionJobInput {
   readonly now?: Date;
 }
 
+export interface ClaimEvidenceExtractionJobOutcome {
+  readonly job: EvidenceExtractionJob | undefined;
+  /**
+   * Jobs made durably terminal by this claim transaction because their last
+   * lease expired. The caller may publish one failure signal per transition
+   * after this function returns; no signal is owed when the transaction rolls
+   * back.
+   */
+  readonly exhaustedLeaseFailures: number;
+}
+
 export async function claimEvidenceExtractionJob(
   databaseUrl: string,
   schema: string,
   input: ClaimEvidenceExtractionJobInput
-): Promise<EvidenceExtractionJob | undefined> {
+): Promise<ClaimEvidenceExtractionJobOutcome> {
   assertSafeSchema(schema);
   assertWorkerId(input.workerId);
   if (!Number.isInteger(input.leaseDurationMs) || input.leaseDurationMs < 1) {
@@ -5845,11 +5856,12 @@ export async function claimEvidenceExtractionJob(
   try {
     await client.query("BEGIN");
     try {
-      await client.query(
+      const exhausted = await client.query<{ job_id: string }>(
         `UPDATE "${schema}".evidence_extraction_jobs
             SET state = 'failed', failed_at = $1, lease_owner = NULL, lease_expires_at = NULL,
                 failure_code = 'lease_expired_exhausted', updated_at = $1
-          WHERE state = 'running' AND lease_expires_at <= $1 AND attempt_count >= max_attempts`,
+          WHERE state = 'running' AND lease_expires_at <= $1 AND attempt_count >= max_attempts
+        RETURNING job_id`,
         [now]
       );
       const result = await client.query<EvidenceExtractionJobRow>(
@@ -5879,7 +5891,10 @@ export async function claimEvidenceExtractionJob(
       );
       await client.query("COMMIT");
       const row = result.rows[0];
-      return row === undefined ? undefined : rowToEvidenceExtractionJob(row);
+      return {
+        job: row === undefined ? undefined : rowToEvidenceExtractionJob(row),
+        exhaustedLeaseFailures: exhausted.rows.length
+      };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;

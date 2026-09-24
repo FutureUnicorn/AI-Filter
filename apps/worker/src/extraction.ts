@@ -349,11 +349,21 @@ export async function processEvidenceExtractionJob(
 export async function processNextEvidenceExtractionJob(
   dependencies: EvidenceExtractionWorkerDependencies
 ): Promise<boolean> {
-  const job = await claimEvidenceExtractionJob(dependencies.databaseUrl, dependencies.schema, {
+  const claim = await claimEvidenceExtractionJob(dependencies.databaseUrl, dependencies.schema, {
     workerId: dependencies.config.workerId,
     leaseDurationMs: dependencies.config.leaseDurationMs,
     now: (dependencies.now ?? (() => new Date()))()
   });
+  // The database returns these only after the transaction that made the jobs
+  // terminal has committed. Emit one detector-compatible signal per durable
+  // transition without carrying job, organization, or candidate identifiers.
+  for (let index = 0; index < claim.exhaustedLeaseFailures; index += 1) {
+    captureWorkerJobFailure(
+      new Error("Evidence-extraction lease expired after maximum attempts"),
+      "lease_expired_exhausted"
+    );
+  }
+  const job = claim.job;
   if (job === undefined) {
     return false;
   }

@@ -14,6 +14,7 @@ export const WORKER_JOB_FAILURE_CODES = [
   "provider_usage_missing",
   "provider_transient",
   "provider_permanent",
+  "lease_expired_exhausted",
   "unexpected_error"
 ] as const;
 export type WorkerJobFailureCode = (typeof WORKER_JOB_FAILURE_CODES)[number];

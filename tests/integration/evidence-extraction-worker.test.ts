@@ -172,25 +172,26 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
       now: claimTime
     })
   ]);
-  assert.equal(claims.filter((claim) => claim !== undefined).length, 1, "one job may have only one active owner");
+  assert.equal(claims.filter((claim) => claim.job !== undefined).length, 1, "one job may have only one active owner");
   assert.equal(
-    await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    (await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
       workerId: "worker-c",
       leaseDurationMs: 10_000,
       now: new Date(claimTime.getTime() + 9_000)
-    }),
+    })).job,
     undefined,
     "a live lease must not be stolen"
   );
-  const recovered = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+  const recoveredClaim = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
     workerId: "worker-c",
     leaseDurationMs: 10_000,
     now: new Date(claimTime.getTime() + 10_001)
   });
+  const recovered = recoveredClaim.job;
   assert.ok(recovered !== undefined);
   assert.equal(recovered.attemptCount, 2);
   assert.equal(recovered.leaseOwner, "worker-c");
-  const originalOwner = claims.find((claim) => claim !== undefined)?.leaseOwner;
+  const originalOwner = claims.find((claim) => claim.job !== undefined)?.job?.leaseOwner;
   assert.ok(originalOwner !== undefined);
   assert.equal(
     await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
@@ -216,11 +217,12 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
     }),
     "retrying"
   );
-  const finalClaim = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+  const finalClaimOutcome = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
     workerId: "worker-d",
     leaseDurationMs: 10_000,
     now: retryAt
   });
+  const finalClaim = finalClaimOutcome.job;
   assert.ok(finalClaim !== undefined);
   assert.equal(finalClaim.attemptCount, 3);
   assert.equal(
@@ -244,6 +246,97 @@ test("enqueue is idempotent, claims are exclusive, leases recover, and retry exh
   assert.equal(snapshot.totalAttempts, 3);
   assert.equal(snapshot.lastHeartbeatAt, retryAt.toISOString());
   assert.equal(snapshot.heartbeatAgeMs, 0);
+});
+
+test("the production worker reports a crash-exhausted lease exactly once after durable failure", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const enqueue = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: `${EVIDENCE_EXTRACTION_WORKFLOW_VERSION}-crash-exhaustion`,
+    maxAttempts: 1
+  });
+  assert.notEqual(enqueue.outcome, "not_eligible");
+  if (enqueue.outcome === "not_eligible") return;
+
+  const claimedAt = new Date(Date.now() + 1_000);
+  const initialClaim = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+    workerId: "worker-that-crashes",
+    leaseDurationMs: 10_000,
+    now: claimedAt
+  });
+  assert.equal(initialClaim.job?.jobId, enqueue.job.jobId);
+  assert.equal(initialClaim.exhaustedLeaseFailures, 0);
+
+  const captures: Array<{ readonly error: Error; readonly context: { readonly tags: Record<string, string> } }> = [];
+  const errorLines: string[] = [];
+  t.mock.method(console, "error", (line?: unknown) => {
+    errorLines.push(String(line));
+  });
+  setWorkerTelemetryAdapterForTesting({
+    captureException(error, context) {
+      captures.push({ error, context });
+    },
+    startSpan(_options, callback) {
+      return callback({ setStatus() { return undefined; }, setAttributes() { return undefined; } });
+    }
+  });
+  t.after(() => setWorkerTelemetryAdapterForTesting(undefined));
+
+  const afterLeaseExpiry = new Date(claimedAt.getTime() + 10_001);
+  const dependencies = {
+    databaseUrl,
+    schema: probe.schema,
+    now: () => afterLeaseExpiry,
+    adapterForModel: () => {
+      throw new Error("provider must not run for an exhausted lease");
+    },
+    config: {
+      enabled: true as const,
+      workerId: "worker-recovery",
+      openAi: { apiKey: "not-used", defaultModel: "default-model", escalationModel: "escalation-model" },
+      budget: {
+        maxTokensPerPeriod: 10_000,
+        alertThresholdRatio: 0.8,
+        period: "month" as const,
+        estimatedOutputTokens: 200
+      },
+      concurrency: 1,
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 1_000,
+      leaseDurationMs: 10_000,
+      retryBaseDelayMs: 100,
+      maxAttempts: 1
+    }
+  };
+
+  assert.equal(await processNextEvidenceExtractionJob(dependencies), false);
+  const failed = await getEvidenceExtractionJob(
+    databaseUrl,
+    probe.schema,
+    probe.organizationId,
+    enqueue.job.jobId
+  );
+  assert.equal(failed?.state, "failed");
+  assert.equal(failed?.failureCode, "lease_expired_exhausted");
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0]?.error.message, "Unexpected worker failure");
+  assert.equal(captures[0]?.context.tags.operation, "worker.job");
+  assert.equal(captures[0]?.context.tags.failure_code, "lease_expired_exhausted");
+  assert.equal(errorLines.filter((line) => line.includes("worker.job_failed")).length, 1);
+  const telemetry = JSON.stringify({ captures, errorLines });
+  assert.equal(telemetry.includes(probe.organizationId), false);
+  assert.equal(telemetry.includes(probe.applicationId), false);
+  assert.equal(telemetry.includes(enqueue.job.jobId), false);
+
+  assert.equal(await processNextEvidenceExtractionJob(dependencies), false);
+  assert.equal(captures.length, 1, "a durable terminal transition must not be reported twice");
+  assert.equal(errorLines.filter((line) => line.includes("worker.job_failed")).length, 1);
 });
 
 test("queue monitoring snapshot selects the oldest recoverable backlog with a fixed clock", async (t) => {
@@ -294,11 +387,12 @@ test("queue monitoring snapshot selects the oldest recoverable backlog with a fi
   assert.equal(readySnapshot.runningJobs, 0);
   assert.equal(readySnapshot.oldestReadyAgeMs, readyObservedAt.getTime() - Math.min(...allEnqueued));
 
-  const claimed = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
+  const claimedOutcome = await claimEvidenceExtractionJob(databaseUrl, probe.schema, {
     workerId: "worker-monitoring",
     leaseDurationMs: 10_000,
     now: readyObservedAt
   });
+  const claimed = claimedOutcome.job;
   assert.ok(claimed !== undefined);
 
   const remainingEnqueued = jobs
