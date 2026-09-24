@@ -2,13 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  authorizeJobAdministration,
   buildDeadLetterOutcome,
   buildEvidenceCard,
   describeQualifiedPreservation,
+  identifyStuckJobs,
   summarizeEvidenceStrength,
+  summarizeFailedDocuments,
   summarizeQualifiedPreservation
 } from "../../packages/domain/src/index.ts";
-import type { CandidateAdjudication, EvidenceCard, SurfacedCandidate } from "../../packages/domain/src/index.ts";
+import type {
+  CandidateAdjudication,
+  EvidenceCard,
+  FailedDocumentCounts,
+  SurfacedCandidate
+} from "../../packages/domain/src/index.ts";
 
 // AF-65 x AF-56. The tempting implementation of dead-lettering excludes
 // those candidates from the safety metric's denominator -- "we could not
@@ -126,4 +134,57 @@ test("a dead-lettered candidate is visible as given-up-on, not absent", () => {
   ]);
   assert.equal(result.missedWithoutEvidence, 1);
   assert.equal(result.missedAbsent, 0);
+});
+
+// ---- REV-002: the failed-document rate ----
+//
+// This suite covered AF-56 preservation only, so it said nothing about the
+// failed-document rate, which is the metric an import dead-letter would
+// have touched. A stuck import is a validated intake with no canonical
+// text: neither failed nor succeeded, so it is inFlight. Dead-lettering an
+// import is now refused, and this proves the refusal does not move the
+// rate either way. It is NOT a proof that the rate is right: a stuck upload
+// sitting in inFlight forever, dead-lettered or not, is its own defect and
+// its own ticket. Do not read this test as "the metric is fixed".
+
+test("a stuck import stays inFlight whether or not a dead-letter was attempted", () => {
+  const now = new Date("2026-08-29T12:00:00.000Z");
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  // One upload that validated and never produced canonical text.
+  const counts: FailedDocumentCounts = {
+    uploaded: 1,
+    quarantined: 0,
+    rejected: 0,
+    extractionEmpty: 0,
+    extractionSucceeded: 0
+  };
+  const before = summarizeFailedDocuments(organizationId, "role-1", counts);
+
+  const [job] = identifyStuckJobs(
+    [{ jobId: "intake-1", kind: "import", organizationId, terminal: false, attempts: 3, waitingSince: "2026-08-29T08:00:00.000Z" }],
+    now
+  );
+  const decision = authorizeJobAdministration(
+    job,
+    { jobId: "intake-1", action: "dead_letter", reason: "file is corrupt and will never parse", operatorUserId: "op-1" },
+    {
+      grant: {
+        grantId: "grant-1",
+        organizationId,
+        operatorUserId: "op-1",
+        reason: "customer reported a stuck upload",
+        grantedByUserId: "op-2",
+        grantedAt: "2026-08-29T11:00:00.000Z",
+        expiresAt: "2026-08-29T13:00:00.000Z"
+      },
+      now
+    }
+  );
+  assert.equal(decision.allowed ? undefined : decision.refusal, "dead_letter_unsupported_for_import");
+
+  // Nothing was written, so the counts the rate is computed from are unchanged.
+  const after = summarizeFailedDocuments(organizationId, "role-1", counts);
+  assert.deepEqual(after, before);
+  assert.equal(after.inFlight, 1, "the stuck import is still in flight");
+  assert.equal(after.failed, 0, "and it is still not counted as failed, which is ticket (b), not fixed here");
 });

@@ -2429,6 +2429,7 @@ export interface JobAdministrationRequest {
 export type JobAdministrationRefusal =
   | "job_not_stuck"
   | "job_mismatch"
+  | "dead_letter_unsupported_for_import"
   | "job_already_terminal"
   | "retries_exhausted"
   | "reason_required"
@@ -2510,10 +2511,23 @@ export function authorizeJobAdministration(
   if (job.terminal) {
     return { allowed: false, refusal: "job_already_terminal" };
   }
+  if (request.action === "dead_letter" && job.kind === "import") {
+    // REV-002: refused, because it cannot be done honestly yet. An import
+    // job is stuck because a validated intake has no canonical text, and a
+    // dead-letter here would only write a per-criterion evidence outcome,
+    // which changes nothing about the intake: the next sweep finds it stuck
+    // again, and summarizeFailedDocuments keeps it inFlight rather than
+    // failed. Returning allowed would claim the work was terminated when it
+    // was not. This is not a permanent product decision: import
+    // dead-lettering needs a terminal "abandoned" intake state that AF-57's
+    // failed-document rate counts as failed, which is its own ticket.
+    // Retrying an import is still allowed, bounded as below.
+    return { allowed: false, refusal: "dead_letter_unsupported_for_import" };
+  }
   if (request.action === "dead_letter") {
-    // Always available. Refusing to dead-letter a job that has not yet
-    // exhausted its retries would leave an operator with no way to stop a
-    // document that is provably never going to parse.
+    // Always available for extraction jobs. Refusing to dead-letter one
+    // that has not yet exhausted its retries would leave an operator with
+    // no way to stop a document that is provably never going to parse.
     return { allowed: true, action: "dead_letter", attempt: job.attempts, grantId: support.grantId };
   }
   if (!job.retryable || job.attempts >= thresholds.maxAttempts) {

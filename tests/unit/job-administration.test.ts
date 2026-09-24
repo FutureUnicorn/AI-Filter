@@ -184,6 +184,34 @@ test("dead-lettering stays available even before retries are exhausted", () => {
   assert.equal(decision.allowed ? decision.action : undefined, "dead_letter");
 });
 
+// ---- REV-002: an import cannot be dead-lettered until it can be terminated ----
+
+test("dead-lettering an import job is refused, because nothing would terminate it", () => {
+  // A dead-letter writes an evidence outcome, which leaves a validated
+  // intake with no canonical text exactly as stuck as before. Allowing it
+  // would report work as terminated that was not.
+  for (const attempts of [0, DEFAULT_STUCK_JOB_THRESHOLDS.maxAttempts]) {
+    const decision = authorizeJobAdministration(
+      stuck({ kind: "import", attempts, retryable: attempts < DEFAULT_STUCK_JOB_THRESHOLDS.maxAttempts }),
+      request({ action: "dead_letter" }),
+      LIVE
+    );
+    assert.equal(decision.allowed ? undefined : decision.refusal, "dead_letter_unsupported_for_import");
+  }
+});
+
+test("an import can still be retried, and an extraction can still be dead-lettered", () => {
+  // The refusal is scoped to exactly the case that cannot be done honestly.
+  const retryImport = authorizeJobAdministration(stuck({ kind: "import", attempts: 1 }), request({ action: "retry" }), LIVE);
+  assert.equal(retryImport.allowed ? retryImport.action : undefined, "retry");
+  const deadLetterExtraction = authorizeJobAdministration(
+    stuck({ kind: "extraction" }),
+    request({ action: "dead_letter" }),
+    LIVE
+  );
+  assert.equal(deadLetterExtraction.allowed ? deadLetterExtraction.action : undefined, "dead_letter");
+});
+
 test("dead-lettering is available precisely when retrying is not", () => {
   const exhausted = stuck({ attempts: DEFAULT_STUCK_JOB_THRESHOLDS.maxAttempts, retryable: false });
   assert.equal(authorizeJobAdministration(exhausted, request({ action: "retry" }), LIVE).allowed, false);
