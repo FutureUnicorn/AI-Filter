@@ -237,3 +237,52 @@ BEGIN
   END IF;
 END
 $support_access_events_operator_fk$;
+
+-- REV-001: offboarding.
+--
+-- An allowlist nobody can be removed from is not least privilege, and a
+-- row here can never be deleted once it has been named on a grant. So
+-- leaving is recorded, not deleted: revoked_at stops the person being
+-- named on a NEW grant, as operator or as grantor. Existing grants and
+-- their events are left exactly as they are. Someone leaving does not
+-- retroactively unauthorise access they legitimately performed, and
+-- history must not change. To cut off a live session as well, revoke the
+-- grant itself, which support_access_grants already allows.
+ALTER TABLE platform_operators ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
+
+-- A trigger rather than a CHECK, because the rule reads another table and a
+-- CHECK cannot. Both operator rows are share-locked before they are read,
+-- so a revocation committing concurrently is either seen here or waits for
+-- this grant, rather than both passing under READ COMMITTED. search_path is
+-- pinned to the schema this migration ran in, so the unqualified table
+-- name resolves the same way whatever search_path the inserting session
+-- happens to have.
+CREATE OR REPLACE FUNCTION reject_grant_naming_revoked_operator() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path FROM CURRENT
+AS $$
+BEGIN
+  PERFORM 1 FROM platform_operators
+    WHERE user_id IN (NEW.operator_user_id, NEW.granted_by_user_id)
+    ORDER BY user_id
+    FOR SHARE;
+  IF EXISTS (
+    SELECT 1 FROM platform_operators WHERE user_id = NEW.operator_user_id AND revoked_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'support_access_grants: operator % has been revoked from platform_operators and cannot be granted access',
+      NEW.operator_user_id;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM platform_operators WHERE user_id = NEW.granted_by_user_id AND revoked_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'support_access_grants: grantor % has been revoked from platform_operators and cannot authorise access',
+      NEW.granted_by_user_id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS support_access_grants_operators_not_revoked ON support_access_grants;
+CREATE TRIGGER support_access_grants_operators_not_revoked
+  BEFORE INSERT ON support_access_grants
+  FOR EACH ROW EXECUTE FUNCTION reject_grant_naming_revoked_operator();

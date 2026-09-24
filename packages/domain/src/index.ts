@@ -2518,10 +2518,10 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "support_access_grants",
   "support_access_events",
   // AF-66 REV-001. The allowlist of platform staff who may be named on a
-  // support grant. It holds a user_id and nothing else: no tenant, no
-  // candidate, no free text. Exempt because it is access-control
-  // configuration, and purging it would make every historical grant name
-  // an operator the schema no longer recognises.
+  // support grant. It holds a user_id and when that person was revoked,
+  // nothing else: no tenant, no candidate, no free text. Exempt because it
+  // is access-control configuration, and purging it would make every
+  // historical grant name an operator the schema no longer recognises.
   "platform_operators"
 ]);
 

@@ -112,3 +112,28 @@ test("an access event must name the operator its grant was issued to", async () 
   const found = await rejections();
   assert.match(found["event_operator_not_grant_operator"] ?? "", /support_access_events_operator_matches_grant/);
 });
+
+// ---- REV-001: offboarding ----
+
+test("a revoked operator cannot be named on a new grant, as operator or as grantor", async () => {
+  // An allowlist nobody can be removed from is not least privilege.
+  const found = await rejections();
+  assert.match(found["revoked_operator_new_grant"] ?? "", /operator .* has been revoked from platform_operators/);
+  assert.match(found["revoked_grantor_new_grant"] ?? "", /grantor .* has been revoked from platform_operators/);
+});
+
+test("revoking an operator leaves grants issued before they left untouched and usable", async () => {
+  // Leaving does not retroactively unauthorise access that was legitimate
+  // when it happened, and history must not change. The probe throws if the
+  // earlier grant's row differs at all after the revocation.
+  const found = await rejections();
+  assert.equal(found["accepted:event_under_grant_issued_before_leaving"], "accepted");
+});
+
+test("the revocation check works from a session whose search_path is not the schema", async () => {
+  // The application schema-qualifies its tables and leaves search_path
+  // alone, so a trigger resolving platform_operators through the caller's
+  // search_path would refuse every real grant with "relation does not exist".
+  const found = await rejections();
+  assert.equal(found["accepted:grant_inserted_with_another_search_path"], "accepted");
+});

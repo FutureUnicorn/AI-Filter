@@ -4607,6 +4607,9 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
   // REV-001: an ordinary account, the kind every customer's recruiter has.
   // Nothing about it says platform staff, which is the point.
   const outsider = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  // REV-001 offboarding: two more operators, both revoked partway through.
+  const departingOperator = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const departingGrantor = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const rejections: Record<string, string> = {};
 
@@ -4653,12 +4656,23 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
         `recruiter_${suffix}@customer.test`
       ]
     );
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Leaving'), ($3,$4,'Leaving')`, [
+      departingOperator,
+      `leaving_op_${suffix}@acme.test`,
+      departingGrantor,
+      `leaving_auth_${suffix}@acme.test`
+    ]);
 
     // The allowlist, seeded before any grant: with the operator foreign key
     // in place, a fixture that creates users but no platform_operators row
     // would have every grant below refused for the wrong reason. The
     // outsider is deliberately NOT seeded.
-    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2)`, [operator, authoriser]);
+    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2), ($3), ($4)`, [
+      operator,
+      authoriser,
+      departingOperator,
+      departingGrantor
+    ]);
 
     const base = `organization_id, operator_user_id, reason, granted_by_user_id, expires_at`;
 
@@ -4761,6 +4775,68 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       "event_update",
       `UPDATE support_access_events SET entity_id = 'something-else' WHERE support_access_event_id = '${eventId}'`
     );
+
+    // REV-001 offboarding. A grant issued while the operator was active,
+    // then the operator leaves. The old grant must be untouched and still
+    // usable within its window; only NEW grants naming them are refused.
+    const grantBeforeLeaving = "10000000-0000-4000-8000-00000000000b";
+    await admin.query(
+      insertGrant(
+        grantBeforeLeaving,
+        base,
+        `'${orgA}', '${departingOperator}', 'handover of a stuck import', '${departingGrantor}', clock_timestamp() + interval '2 hours'`
+      )
+    );
+    const before = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    await admin.query(`UPDATE platform_operators SET revoked_at = clock_timestamp() WHERE user_id IN ($1, $2)`, [
+      departingOperator,
+      departingGrantor
+    ]);
+    await expectRejected(
+      "revoked_operator_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000007",
+        base,
+        `'${orgA}', '${departingOperator}', 'one last look', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "revoked_grantor_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000008",
+        base,
+        `'${orgA}', '${operator}', 'approved on the way out', '${departingGrantor}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    const after = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    if (before.rows[0]?.row === undefined || before.rows[0].row !== after.rows[0]?.row) {
+      throw new Error("assertSupportAccessIntegrity: revoking an operator changed a grant issued before they left");
+    }
+    // Recorded under an "accepted:" key: this is a path that must SUCCEED,
+    // and the probe throws above if the grant itself was altered.
+    await admin.query(
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${grantBeforeLeaving}', '${orgA}', '${departingOperator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    rejections["accepted:event_under_grant_issued_before_leaving"] = "accepted";
+
+    // The application qualifies every table with its schema and does not set
+    // search_path, so the trigger's own lookup must not depend on the
+    // inserting session's. Inserted here from a session pointed elsewhere.
+    await admin.query(`SET search_path TO public`);
+    await admin.query(
+      `INSERT INTO "${schema}".support_access_grants (grant_id, ${base})
+       VALUES ('10000000-0000-4000-8000-00000000000c', '${orgA}', '${operator}', 'qualified insert',
+               '${authoriser}', clock_timestamp() + interval '1 hour')`
+    );
+    await admin.query(`SET search_path TO "${schema}"`);
+    rejections["accepted:grant_inserted_with_another_search_path"] = "accepted";
 
     await expectRejected("grant_delete", `DELETE FROM support_access_grants WHERE grant_id = '${liveGrant}'`);
     await expectRejected(
