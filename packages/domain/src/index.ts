@@ -2317,6 +2317,323 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-65: retry / dead-letter administration ----
+//
+// "Admin view to retry or dead-letter stuck import/extraction jobs
+// without manually editing underlying candidate data."
+//
+// The clause after "without" is the requirement, not a caveat. An admin
+// tool that can reach candidate rows is the most dangerous surface in
+// the product: it is used rarely, by whoever is on call, under time
+// pressure, on the one tenant already having a bad day. So
+// JobAdministrationRequest carries a job id, an action and a reason and
+// has NO field into which candidate content could be placed. That is
+// what makes "without editing candidate data" a property of the type
+// rather than a rule someone has to keep.
+//
+// There is deliberately no new queue table. Stuckness is derived from
+// state that already exists -- a validated intake with no canonical
+// text, or an application whose current outcome is still processing or
+// retrying -- and dead-lettering records a terminal `failed` outcome
+// through the existing append-only evidence store. Inventing a job table
+// would create a second copy of "what happened to this document" that
+// could disagree with the first.
+//
+// **The property that matters most: dead-lettering must not improve any
+// metric.** The tempting implementation excludes dead-lettered
+// candidates from AF-56's denominator -- "we could not process them, so
+// they do not count" -- which would let the North Star safety number be
+// raised by dead-lettering everything difficult. A dead-lettered
+// candidate is precisely a candidate the workflow failed to surface, and
+// must keep counting as one.
+
+export type StuckJobKind = "import" | "extraction";
+export type JobAdministrationAction = "retry" | "dead_letter";
+
+export interface JobObservation {
+  readonly jobId: string;
+  readonly kind: StuckJobKind;
+  readonly organizationId: string;
+  /** Terminal jobs are never stuck, whatever their age. */
+  readonly terminal: boolean;
+  readonly attempts: number;
+  /** When the job entered its current non-terminal state. */
+  readonly waitingSince: string;
+}
+
+export interface StuckJobThresholds {
+  readonly importStuckAfterMs: number;
+  readonly extractionStuckAfterMs: number;
+  /** Attempts after which retrying is refused and dead-lettering is the only move. */
+  readonly maxAttempts: number;
+}
+
+export const DEFAULT_STUCK_JOB_THRESHOLDS: StuckJobThresholds = {
+  // Generous on purpose. A job flagged stuck while it is merely slow
+  // invites a retry that duplicates work still in flight, and the
+  // operator has no way to tell the two apart from the outside.
+  importStuckAfterMs: 30 * 60 * 1000,
+  extractionStuckAfterMs: 60 * 60 * 1000,
+  maxAttempts: 3
+};
+
+export interface StuckJob extends JobObservation {
+  readonly stuckForMs: number;
+  /** False once attempts have been exhausted: dead-letter is then the only action. */
+  readonly retryable: boolean;
+}
+
+export function identifyStuckJobs(
+  observations: readonly JobObservation[],
+  now: Date,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): readonly StuckJob[] {
+  // REV-004: a timestamp that does not parse must trip this, not skip it.
+  // Date.parse returns NaN for a malformed value, every comparison against
+  // NaN is false, and "not yet past the threshold" is the false branch, so a
+  // bad waitingSince used to push the job as stuck and retryable with
+  // stuckForMs NaN, and one NaN in the comparator scrambled the triage
+  // order. Thrown rather than skipped: waitingSince comes from database
+  // timestamps, so a malformed one is a bug upstream, and quietly leaving
+  // the job out would hide a job that may really be stuck. Same choice as
+  // summarizeFailedDocuments on bad counts.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("identifyStuckJobs requires a valid now, got an invalid Date");
+  }
+  const stuck: StuckJob[] = [];
+  for (const observation of observations) {
+    if (observation.terminal) {
+      continue;
+    }
+    const waitingSinceMs = Date.parse(observation.waitingSince);
+    if (!Number.isFinite(waitingSinceMs)) {
+      throw new Error(
+        `identifyStuckJobs: job ${observation.jobId} has an unparseable waitingSince: ${JSON.stringify(observation.waitingSince)}`
+      );
+    }
+    const waitedMs = nowMs - waitingSinceMs;
+    const threshold =
+      observation.kind === "import" ? thresholds.importStuckAfterMs : thresholds.extractionStuckAfterMs;
+    if (waitedMs < threshold) {
+      continue;
+    }
+    stuck.push({
+      ...observation,
+      stuckForMs: waitedMs,
+      retryable: observation.attempts < thresholds.maxAttempts
+    });
+  }
+  // Longest-waiting first: the operator working down this list is
+  // triaging, and the oldest job is the one a customer has been staring
+  // at.
+  return stuck.sort((left, right) => right.stuckForMs - left.stuckForMs);
+}
+
+/**
+ * Everything an operator may say about a stuck job.
+ *
+ * Note what is absent: there is no field for a candidate name, a quote,
+ * a corrected value or arbitrary SQL. The admin path cannot edit
+ * candidate data because there is nowhere to put it, not because a
+ * reviewer remembered to check.
+ */
+export interface JobAdministrationRequest {
+  readonly jobId: string;
+  readonly action: JobAdministrationAction;
+  readonly reason: string;
+  readonly operatorUserId: string;
+}
+
+/**
+ * REV-005: the key set above is enforced by the compiler, in the gate.
+ *
+ * The earlier "test" read Object.keys of the test's own fixture, so adding a
+ * field here, optional or not, left the fixture and the test unchanged and
+ * green. The claim that adding a field fails a test was false. tests/ are
+ * not type-checked in this repository, but this file is (pnpm typecheck,
+ * part of pnpm check), so the assertion lives here: adding, removing or
+ * renaming any key of JobAdministrationRequest, including an optional one,
+ * is a compile error. If a new key is genuinely needed, the change has to
+ * come here and say why candidate content still has nowhere to go.
+ */
+type ExactlyTheseKeys<T, K extends PropertyKey> = [Exclude<keyof T, K>, Exclude<K, keyof T>] extends [never, never]
+  ? true
+  : false;
+type AssertTrue<T extends true> = T;
+export type JobAdministrationRequestKeysAreFixed = AssertTrue<
+  ExactlyTheseKeys<JobAdministrationRequest, "jobId" | "action" | "reason" | "operatorUserId">
+>;
+
+export type JobAdministrationRefusal =
+  | "job_not_stuck"
+  | "job_mismatch"
+  | "dead_letter_unsupported_for_import"
+  | "job_already_terminal"
+  | "retries_exhausted"
+  | "reason_required"
+  | "not_authorized";
+
+export type JobAdministrationDecision =
+  | {
+      readonly allowed: true;
+      readonly action: JobAdministrationAction;
+      readonly attempt: number;
+      /** The AF-66 grant that permitted this, so the admin_action audit event can name it. */
+      readonly grantId: string;
+    }
+  | {
+      readonly allowed: false;
+      readonly refusal: JobAdministrationRefusal;
+      /** Present when the refusal is not_authorized: why AF-66 said no. */
+      readonly supportAccessDenial?: SupportAccessDenialReason;
+    };
+
+/**
+ * The support access an administration request is made under: the grant
+ * the operator holds, if any, and the instant to judge it at.
+ */
+export interface JobAdministrationAccess {
+  readonly grant: SupportAccessGrant | undefined;
+  readonly now: Date;
+}
+
+/**
+ * REV-001: authority is checked against THIS job, not taken on trust.
+ *
+ * The first version took `supportAccessAllowed: boolean`, which said only
+ * that some AF-66 check had passed somewhere, for some tenant and some
+ * operator. A caller holding support access to tenant A could dead-letter
+ * a job in tenant B, and a dead-letter is append-only, so it could not be
+ * undone: the cross-tenant write AF-66 exists to prevent.
+ *
+ * So this takes the grant and calls authorizeSupportAccess itself, with
+ * the request built from the job's own organization and the request's own
+ * operator. A SupportAccessDecision would not do: its allowed branch
+ * carries only a grantId, so nothing here could check what tenant or
+ * operator it was issued for. It still does not re-derive AF-66's rules;
+ * it asks AF-66 the right question. The job id in the request must also be
+ * the job being decided on, or the caller's intent and the job acted on can
+ * differ.
+ */
+export function authorizeJobAdministration(
+  job: StuckJob | undefined,
+  request: JobAdministrationRequest,
+  access: JobAdministrationAccess,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): JobAdministrationDecision {
+  if (job === undefined) {
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (request.jobId !== job.jobId) {
+    return { allowed: false, refusal: "job_mismatch" };
+  }
+  const support = authorizeSupportAccess(
+    access.grant,
+    {
+      organizationId: job.organizationId,
+      operatorUserId: request.operatorUserId,
+      entityType: "job",
+      entityId: job.jobId
+    },
+    access.now
+  );
+  if (!support.allowed) {
+    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
+  }
+  if (!/[^\s]/u.test(request.reason)) {
+    // Same rule as AF-66's grant reason. An unexplained retry is
+    // indistinguishable from an accident, and dead-lettering without a
+    // reason discards a candidate silently.
+    return { allowed: false, refusal: "reason_required" };
+  }
+  if (job.terminal) {
+    return { allowed: false, refusal: "job_already_terminal" };
+  }
+  if (request.action === "dead_letter" && job.kind === "import") {
+    // REV-002: refused, because it cannot be done honestly yet. An import
+    // job is stuck because a validated intake has no canonical text, and a
+    // dead-letter here would only write a per-criterion evidence outcome,
+    // which changes nothing about the intake: the next sweep finds it stuck
+    // again, and summarizeFailedDocuments keeps it inFlight rather than
+    // failed. Returning allowed would claim the work was terminated when it
+    // was not. This is not a permanent product decision: import
+    // dead-lettering needs a terminal "abandoned" intake state that AF-57's
+    // failed-document rate counts as failed, which is its own ticket.
+    // Retrying an import is still allowed, bounded as below.
+    return { allowed: false, refusal: "dead_letter_unsupported_for_import" };
+  }
+  if (request.action === "dead_letter") {
+    // Always available for extraction jobs. Refusing to dead-letter one
+    // that has not yet exhausted its retries would leave an operator with
+    // no way to stop a document that is provably never going to parse.
+    return { allowed: true, action: "dead_letter", attempt: job.attempts, grantId: support.grantId };
+  }
+  if (!job.retryable || job.attempts >= thresholds.maxAttempts) {
+    // Bounded, because an unbounded retry on a permanently broken
+    // document burns the inference budget AF-41 exists to protect and
+    // never terminates.
+    return { allowed: false, refusal: "retries_exhausted" };
+  }
+  return { allowed: true, action: "retry", attempt: job.attempts + 1, grantId: support.grantId };
+}
+
+/**
+ * REV-003: what a hiring reviewer reads on a dead-lettered criterion.
+ *
+ * A fixed system sentence, never the operator's words, redacted or not.
+ * The first version stored the operator's free-text reason as the
+ * outcome's message, and evidence_outcomes is append-only while
+ * buildEvidenceCard renders a failed outcome's message verbatim, so
+ * "Looking at Jane Doe's stuck upload" would have been written permanently
+ * into candidate evidence and shown to everyone reviewing that candidate.
+ *
+ * Redacting the text first would not have fixed it: free text cannot be
+ * sanitised by pattern (redactPii matches email addresses and phone numbers,
+ * so a name passes through untouched). The fix is to remove the path, which
+ * is why buildDeadLetterOutcome takes no reason at all.
+ */
+export const DEAD_LETTER_EXPLANATION = "Processing was stopped by support.";
+
+/**
+ * The outcome recorded when a job is dead-lettered.
+ *
+ * `retryable: false` is the honest signal to every downstream reader
+ * that this will not resolve itself. It is still an EvidenceOutcome, so
+ * it still lands in the append-only store and still appears in the
+ * candidate's card set -- a dead-lettered candidate is visible as one the
+ * system gave up on, not absent.
+ *
+ * `failed`, not `extraction_error`: FailedEvidence is "retries are
+ * exhausted or not applicable", which is an operator giving up.
+ * ExtractionErrorEvidence is a raw pipeline break. The two are
+ * structurally identical, so only this discriminant tells them apart, and
+ * evidence_outcomes is append-only: a mis-tagged row can never be fixed.
+ *
+ * It takes no reason, deliberately: there is no parameter through which
+ * operator free text could reach this append-only row (REV-003).
+ *
+ * No organizationId/candidateId here, because FailedEvidence on
+ * this stack does not carry them: AF-13's review added attribution to
+ * every outcome kind on the develop line, which this stack predates. The
+ * fields arrive when develop merges down, and this call site will stop
+ * compiling until they are supplied -- which is the correct way to find
+ * out, rather than a silently unattributed outcome.
+ */
+export function buildDeadLetterOutcome(criterionId: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "failed",
+    criterionId,
+    errorCode: "dead_lettered_by_operator",
+    message: DEAD_LETTER_EXPLANATION,
+    // Not retryable: that is the whole meaning of dead-lettering, and a
+    // retryable dead-letter would be picked up again by the same job
+    // sweep that produced it.
+    retryable: false
+  };
+}
+
 // ---- AF-66: support-access logging ----
 //
 // "Any time a founder/operator looks at a specific tenant's data for
