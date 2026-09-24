@@ -3330,13 +3330,19 @@ const INTAKE_SCOPED_SURFACES: ReadonlySet<string> = new Set([
   "file_intakes"
 ]);
 
+/**
+ * REV-008: `outcome` is REQUIRED, with no default. It used to default to
+ * "everything erased", so a caller that left it out got the full-erasure
+ * sentence whatever had actually happened: the optimistic statement reached
+ * by forgetting an argument. That is the defect #70 REV-005 removed from the
+ * retention statement, and the same rule applies to every statement made to
+ * a data subject: a false claim must need someone to pass a false value.
+ * tests/architecture/data-subject-statements-require-their-facts.test.ts
+ * holds it, because tsc is the only other thing that would.
+ */
 export function summarizeCandidateDataErasureResidue(
   plan: CandidateDataErasurePlan,
-  outcome: CandidateDataErasureRunOutcome = {
-    intakeErased: true,
-    objectStorageDeleted: true,
-    applicationsStillReferencingIntake: 0
-  }
+  outcome: CandidateDataErasureRunOutcome
 ): CandidateDataErasureResidue {
   const blocked = plan.steps.filter((step) => step.method === "blocked_append_only");
   const deferredIntake = plan.steps.filter(
