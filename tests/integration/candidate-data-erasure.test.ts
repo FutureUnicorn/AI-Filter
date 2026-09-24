@@ -157,6 +157,16 @@ test("repeating skip mode writes no receipt for a repair that did nothing", asyn
   assert.equal(observed.receiptsAddedBySecondSkip, 0);
 });
 
+test("an erased application refuses an evidence correction too, the third append-only writer", async () => {
+  // REV-004 guarded recordEvidenceOutcome and recordCandidateDecision and
+  // missed this one. It is not a race: after the erasure, a correction
+  // superseding the surviving head used to insert a new row carrying a new
+  // quote and a free-text correction_reason, residue grown after the receipt.
+  const observed = await assertCandidateDataErasureGuards(requireDatabase());
+  assert.match(observed.correctionRejection, /is erased or missing/);
+  assert.equal(observed.evidenceRowsAfterCorrection, 1, "only the evidence from before the erasure may remain");
+});
+
 test("erased applications refuse new evidence and decisions and leave the review queue", async () => {
   // REV-004. Append-only writers must not grow residue after the receipt.
   const observed = await assertCandidateDataErasureGuards(requireDatabase());

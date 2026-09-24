@@ -23,9 +23,9 @@ async function observe(): Promise<Awaited<ReturnType<typeof assertEvidenceWriteR
   return assertEvidenceWriteRacingErasure(DATABASE_URL);
 }
 
-test("the race was really exercised: both writers were blocked on the erasure's lock", async () => {
+test("the race was really exercised: all three writers were blocked on the erasure's lock", async () => {
   const observed = await observe();
-  assert.ok(observed.writersBlockedBeforeRelease >= 2, `expected 2 blocked writers, saw ${observed.writersBlockedBeforeRelease}`);
+  assert.ok(observed.writersBlockedBeforeRelease >= 3, `expected 3 blocked writers, saw ${observed.writersBlockedBeforeRelease}`);
 });
 
 test("the decision path, the control, refuses an application erased under it", async () => {
@@ -45,4 +45,13 @@ test("an evidence write racing an erasure is refused, and no quote lands after i
   );
   assert.equal(observed.evidenceRowsAfterErasure, 0, "no evidence row may exist for the erased application");
   assert.equal(observed.evidenceRecordedDuringErasure, false);
+});
+
+test("an evidence correction racing an erasure is refused as well", async () => {
+  // The correction supersedes a head from before the erasure, so its own
+  // FOR UPDATE on that evidence row does not wait on the erasure; only a
+  // lock on the application does.
+  const observed = await observe();
+  assert.match(observed.correctionError ?? "", /is erased or missing/, "the correction must be refused");
+  assert.equal(observed.evidenceRowsAfterErasure, 0, "no evidence row may be added after the erasure");
 });

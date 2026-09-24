@@ -2952,6 +2952,29 @@ export async function correctEvidenceOutcome(
       // Locking a row of an append-only table is safe: SELECT ... FOR
       // UPDATE takes a row lock and does not fire the BEFORE UPDATE
       // trigger. Verified against a real database, not assumed.
+      //
+      // REV-004, the third writer, which the first pass of that fix missed:
+      // a correction inserts a new evidence row with a new quote and a
+      // free-text correction_reason, so it must refuse an erased application
+      // exactly as recordEvidenceOutcome and recordCandidateDecision do. It
+      // needs the lock and not just a check even though it is not usually
+      // racing: the head it supersedes predates any erasure, so its own
+      // FOR UPDATE on that evidence row never waits on one. Taken first, so
+      // the order is application then evidence head. The erasure never
+      // locks evidence rows, so this order cannot close a cycle with it.
+      if (await applicationsHaveRedactedAt(client, schema)) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
+        );
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `correctEvidenceOutcome: application ${input.applicationId} in organization ${input.organizationId} is erased or missing`
+          );
+        }
+      }
       const head = await client.query<{ evidence_outcome_id: string }>(
         `SELECT evidence_outcome_id
            FROM "${schema}".evidence_outcomes
@@ -6080,6 +6103,9 @@ export interface CandidateDataErasureGuardObservations {
   readonly decisionRejection: string;
   readonly listedAfterErasure: number;
   readonly getAfterErasure: boolean;
+  /** REV-004, third writer: a correction against an erased application. */
+  readonly correctionRejection: string;
+  readonly evidenceRowsAfterCorrection: number;
   /** REV-006: skip mode leaves the intake unfinished rather than marking it erased. */
   readonly redactedAtAfterSkip: string | null;
   readonly declaredFilenameAfterSkip: string;
@@ -6133,6 +6159,8 @@ export async function assertCandidateDataErasureGuards(
       "0014_canonical_text_extractions.sql",
       "0015_applications_and_import_finalization.sql",
       "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
       "0019_candidate_decisions.sql",
       "0023_candidate_data_erasure.sql"
     ]) {
@@ -6173,6 +6201,15 @@ export async function assertCandidateDataErasureGuards(
         [applicationId, org, roleId, intakeId, row, name, email]
       );
     }
+
+    // REV-004 (the third writer): evidence that existed before the erasure,
+    // so a correction has a head to supersede afterwards.
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, 'python', 'supported',
+         '{"schemaVersion":1,"kind":"supported","criterionId":"python","citation":{"document":"cv.pdf","pageOrSection":"Experience","offset":0,"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [org, applicationA]
+    );
 
     // Sole remaining application so intake erasure runs under skip_for_test.
     await eraseCandidateData(
@@ -6263,6 +6300,30 @@ export async function assertCandidateDataErasureGuards(
         decidedByUserId: userId
       })
     );
+    const correctionRejection = await capture(() =>
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId: applicationA,
+        criterionId: "python",
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          criterionId: "python",
+          citation: {
+            document: "cv.pdf",
+            pageOrSection: "Experience",
+            offset: 0,
+            quote: "Jane Doe only used Python once"
+          }
+        },
+        correctedByUserId: userId,
+        reason: "Jane Doe's CV overstates this"
+      })
+    );
+    const evidenceAfterCorrection = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM evidence_outcomes WHERE application_id = $1`,
+      [applicationA]
+    );
     const listed = await listApplicationsForRole(databaseUrl, schema, org, roleId);
     const got = await getApplicationById(databaseUrl, schema, org, applicationA);
 
@@ -6275,6 +6336,8 @@ export async function assertCandidateDataErasureGuards(
       decisionRejection,
       listedAfterErasure: listed.length,
       getAfterErasure: got !== undefined,
+      correctionRejection,
+      evidenceRowsAfterCorrection: Number.parseInt(evidenceAfterCorrection.rows[0]?.count ?? "", 10),
       redactedAtAfterSkip: afterSkip.redacted_at?.toISOString() ?? null,
       declaredFilenameAfterSkip: afterSkip.declared_filename,
       skipResidueSurfaces,
@@ -6300,6 +6363,8 @@ export interface EvidenceWriteRacingErasureObservations {
   readonly evidenceRowsAfterErasure: number;
   /** What recordEvidenceOutcome threw, or null if it succeeded. */
   readonly evidenceError: string | null;
+  /** What correctEvidenceOutcome threw, or null if it succeeded. */
+  readonly correctionError: string | null;
   /** What recordCandidateDecision threw, or null if it succeeded: the control. */
   readonly decisionError: string | null;
   readonly decisionRowsAfterErasure: number;
@@ -6370,6 +6435,8 @@ export async function assertEvidenceWriteRacingErasure(
       "0014_canonical_text_extractions.sql",
       "0015_applications_and_import_finalization.sql",
       "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
       "0019_candidate_decisions.sql",
       "0023_candidate_data_erasure.sql"
     ]) {
@@ -6397,6 +6464,15 @@ export async function assertEvidenceWriteRacingErasure(
        VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
       [applicationId, org, roleId, intakeId]
     );
+
+    // An evidence head from before the erasure, for the correction writer.
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, 'python', 'supported',
+         '{"schemaVersion":1,"kind":"supported","criterionId":"python","citation":{"document":"cv.pdf","pageOrSection":"Experience","offset":0,"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [org, applicationId]
+    );
+    const seededEvidence = 1;
 
     await gate.query(`SELECT pg_advisory_lock($1, $2)`, [barrierClass, barrierObj]);
     await admin.query(`
@@ -6465,7 +6541,23 @@ export async function assertEvidenceWriteRacingErasure(
       })
     );
 
-    // Both writers are waiting on a row lock held by the parked erasure, so
+    const correction = settle(
+      correctEvidenceOutcome(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        criterionId: "python",
+        outcome: {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          kind: "contradicted",
+          criterionId: "python",
+          citation: { document: "cv.pdf", pageOrSection: "Experience", offset: 0, quote: "Jane Doe only used Python once" }
+        },
+        correctedByUserId: userId,
+        reason: "Jane Doe's CV overstates this"
+      })
+    );
+
+    // All three writers are waiting on a row lock held by the parked erasure, so
     // whatever check they made before the wait was made against a snapshot
     // in which redacted_at was still NULL.
     const writersBlockedBeforeRelease = await poll(
@@ -6474,11 +6566,16 @@ export async function assertEvidenceWriteRacingErasure(
         WHERE NOT l.granted AND l.locktype IN ('transactionid', 'tuple')
           AND a.query LIKE '%' || $1 || '%'`,
       [`"${schema}".`],
-      2
+      3
     );
 
     await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
-    const [erasureError, evidenceError, decisionError] = await Promise.all([erasure, evidence, decision]);
+    const [erasureError, evidenceError, decisionError, correctionError] = await Promise.all([
+      erasure,
+      evidence,
+      decision,
+      correction
+    ]);
     if (erasureError !== null) {
       throw new Error(`assertEvidenceWriteRacingErasure: the erasure itself failed: ${erasureError}`);
     }
@@ -6500,7 +6597,9 @@ export async function assertEvidenceWriteRacingErasure(
     const executedAt = receipt.rows[0]?.executed_at ?? null;
 
     return {
-      evidenceRowsAfterErasure: Number.parseInt(evidenceRows.rows[0]?.count ?? "", 10),
+      // The seeded pre-erasure head is not residue grown after the erasure.
+      evidenceRowsAfterErasure: Number.parseInt(evidenceRows.rows[0]?.count ?? "", 10) - seededEvidence,
+      correctionError,
       evidenceError,
       decisionError,
       decisionRowsAfterErasure: Number.parseInt(decisionRows.rows[0]?.count ?? "", 10),
