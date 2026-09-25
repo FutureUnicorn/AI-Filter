@@ -5788,9 +5788,15 @@ export async function createAuditReportShareLink(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    const clock = await client.query<{ now_text: string; now: Date }>(
-      `SELECT now_value::text AS now_text, now_value AS now
-         FROM (SELECT clock_timestamp() AS now_value) AS clock`
+    // Only the Date form is needed here. extendPrivacyRequest on AF-64
+    // also reads the clock as text, deliberately, because it writes that
+    // exact value into two tables and text keeps the microseconds a JS
+    // Date truncates to milliseconds. Nothing is written from here:
+    // created_at comes from the column DEFAULT and the pin trigger, so
+    // the text form was carried over from a place whose reason for it
+    // does not apply.
+    const clock = await client.query<{ now: Date }>(
+      `SELECT clock_timestamp() AS now`
     );
     const dbNow = clock.rows[0];
     if (dbNow === undefined) {
