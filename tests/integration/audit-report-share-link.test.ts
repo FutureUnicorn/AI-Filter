@@ -104,3 +104,41 @@ test("a viewed share link blocks deleting its role; an unviewed link does not", 
   assert.match(observed.viewedLinkBlocksRoleDelete, /foreign key|restrict/i);
   assert.equal(observed.unviewedLinkAllowsRoleDelete, true);
 });
+
+// REV-006. Revocation is described as "per-link, immediate", which is the
+// whole point of "I sent it to the wrong person". The resolve read the row
+// without a lock, so under READ COMMITTED it neither blocked on nor
+// re-checked an in-flight revoke: a resolve beginning microseconds earlier
+// still returned the full report after the operator believed the link was
+// dead. The link is unauthenticated, so there is no second lookup to catch
+// it.
+
+test("a revoke landing mid-resolve is not raced past", async () => {
+  const observations = await observe();
+  // The lock is the mechanism: the resolve must wait rather than read a
+  // stale snapshot. If it settles while the revoke is still uncommitted,
+  // it never waited, which is the defect regardless of what it returned.
+  assert.equal(
+    observations.resolveBlockedOnRevoke,
+    true,
+    "the resolve must block behind an uncommitted revoke instead of reading past it"
+  );
+  assert.notEqual(
+    observations.raceResolutionStatus,
+    "available",
+    "a link revoked before the resolve committed must never serve its report"
+  );
+  // "unavailable", not "revoked". This endpoint collapses revoked, expired
+  // and unknown into one indistinguishable answer so an unauthenticated
+  // caller cannot use it as an oracle for which tokens ever existed.
+  // Asserting "revoked" here would quietly require that property be broken.
+  assert.equal(observations.raceResolutionStatus, "unavailable");
+  // The public status is uniform; the internal reason is what actually
+  // diagnoses it. Both matter: a caller must not be able to tell a revoked
+  // link from an expired or unknown one, while the system must still know.
+  assert.equal(
+    observations.raceResolutionReason,
+    observations.revokedResolution,
+    "the raced revoke must be diagnosed exactly as an ordinary revoked link"
+  );
+});

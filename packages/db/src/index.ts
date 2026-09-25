@@ -5862,9 +5862,20 @@ export async function resolveAuditReportShareLink(
       expires_at: Date;
       revoked_at: Date | null;
     }>(
+      // REV-006: FOR UPDATE, because this is a read-then-act on a row a
+      // concurrent revoke is writing. Without it the SELECT takes its own
+      // READ COMMITTED snapshot and neither blocks on nor re-checks an
+      // in-flight `UPDATE ... SET revoked_at`, so a resolve that began
+      // microseconds earlier still returns the full report after the
+      // revocation an operator was told was immediate. The link is
+      // unauthenticated and there is no second lookup to catch it.
+      // Matches redeemMagicLinkToken, the file-intake claim and the
+      // import-finalization idempotency check, which all lock the row
+      // they are about to act on.
       `SELECT share_link_id, report, expires_at, revoked_at
          FROM "${schema}".audit_report_share_links
-        WHERE token_hash = $1`,
+        WHERE token_hash = $1
+        FOR UPDATE`,
       [tokenHash]
     );
     const link = found.rows[0];
@@ -5937,6 +5948,12 @@ export async function revokeAuditReportShareLinks(
 }
 
 export interface AuditReportShareLinkObservations {
+  /** REV-006: did the resolve wait behind an in-flight revoke rather than racing past it. */
+  readonly resolveBlockedOnRevoke: boolean;
+  /** The public status the resolve returned once that revoke committed. */
+  readonly raceResolutionStatus: string;
+  /** The internal reason behind that status, which callers never see. */
+  readonly raceResolutionReason: string;
   readonly liveResolution: string;
   readonly liveViewCount: number;
   readonly expiredResolution: string;
@@ -6209,7 +6226,51 @@ export async function assertAuditReportShareLinkSecurity(
       unviewedLinkAllowsRoleDelete = false;
     }
 
+    // REV-006: a revoke landing while a resolve is in flight. Without
+    // FOR UPDATE on the resolve's SELECT, the resolve reads revoked_at as
+    // NULL a moment before the revoke commits and still serves the report.
+    // This drives that interleaving deterministically rather than racing:
+    // the revoke holds its row lock uncommitted, the resolve is started and
+    // must block on it, and only then is the revoke committed.
+    const raceId = await link("revoke-race", 30, roleId, report);
+    const blocker = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    let raceResolutionStatus = "";
+    let raceResolutionReason = "";
+    let resolveBlockedOnRevoke = false;
+    try {
+      await blocker.connect();
+      await blocker.query(`SET search_path TO "${schema}"`);
+      await blocker.query("BEGIN");
+      await blocker.query(
+        `UPDATE "${schema}".audit_report_share_links
+            SET revoked_at = CURRENT_TIMESTAMP, revoked_by_user_id = $2
+          WHERE share_link_id = $1`,
+        [raceId, userId]
+      );
+      const pending = resolveAuditReportShareLink(
+        databaseUrl,
+        schema,
+        hash("revoke-race"),
+        resolveNow
+      );
+      // Settled first means it never waited, which is the defect.
+      const raced = await Promise.race([
+        pending.then(() => "resolved-without-waiting"),
+        new Promise((settle) => setTimeout(() => settle("still-blocked"), 750))
+      ]);
+      resolveBlockedOnRevoke = raced === "still-blocked";
+      await blocker.query("COMMIT");
+      const settled = await pending;
+      raceResolutionStatus = settled.status;
+      raceResolutionReason = describe(settled);
+    } finally {
+      await blocker.end().catch(() => undefined);
+    }
+
     return {
+      resolveBlockedOnRevoke,
+      raceResolutionStatus,
+      raceResolutionReason,
       liveResolution: describe(live),
       liveViewCount: Number.parseInt(liveViews.rows[0]?.count ?? "", 10),
       expiredResolution: describe(expired),
