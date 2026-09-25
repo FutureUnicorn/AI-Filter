@@ -682,3 +682,18 @@ Saikrishnaa-vr approved with both fixed, leaving one further finding, non-blocki
 **Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
 (176), `pnpm test:integration` against a real scratch Postgres (427),
 `pnpm check:architecture` (35) and `pnpm build` all clean.
+
+### AF-97 — merging develop (AF-68 automated backups) into PR #88
+
+`develop` moved again while round 4 was in flight: PR #93 (AF-68, automated
+off-host backups) merged in as `4b889e2`.
+
+| | |
+|---|---|
+| Conflict | `package.json`, same shape as the two earlier merges -- both sides registered a new test file in `test:unit:ts` (this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `backup-controls`) and `test:integration` (no new file from develop's side this time). Resolved as a union; `tests/architecture/test-registration.test.ts` confirms the result is complete and duplicate-free. |
+| Conflict | `infra/compose/runtime.yml` -- a real content conflict, not textual noise: this branch's round-2 fix (REV-001) added a `bootstrap:` service at the same insertion point AF-68 added `backup-init:` and `backup:`. All three are disjoint, additive services with no shared state, so the resolution is keeping all three. One trap: git's conflict-marker rendering coalesced the two branches' identical trailing `security_opt: ["no-new-privileges:true"]` lines into a single shared copy positioned after the whole conflict, which silently would have left `bootstrap:` without its own copy -- caught by byte-comparing each reconstructed service block against `git show :2:`/`:3:` of the file before trusting the merge, not by the diff output alone. |
+| Checked and clean | AF-68 does not touch any file this branch's invite/redemption work touches (`packages/db/src/index.ts`, the auth routes, `packages/security`), so there was no second AF-67-style semantic break to look for this time. No new migration from AF-68 -- backups are operational, not schema. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(185), `pnpm test:integration` against a real scratch Postgres (432),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
