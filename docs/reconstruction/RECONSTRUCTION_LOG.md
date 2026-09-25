@@ -669,3 +669,16 @@ Two findings from Saikrishnaa-vr, both blocking. Verified as real before fixing.
 **Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
 (176), `pnpm test:integration` against a real scratch Postgres (425),
 `pnpm check:architecture` (35) and `pnpm build` all clean.
+
+Saikrishnaa-vr approved with both fixed, leaving one further finding, non-blocking.
+
+| | |
+|---|---|
+| Finding (REV-012, MEDIUM, non-blocking) | The REV-010 fix above locks the target membership row `FOR UPDATE` before the pre-existing owner-set `FOR UPDATE` query. Two concurrent redemptions demoting two *different* owners of the same organization could each hold the row the other needs next -- transaction A locks A's row then waits on B's, transaction B locks B's row then waits on A's -- a lock cycle Postgres breaks by aborting one with a deadlock error, rather than the last-owner refusal this scenario is actually supposed to produce. |
+| Fix | A `pg_advisory_xact_lock(hashtext(organizationId))`, the same pattern `bootstrapOrganizationOwner` already uses (there, on organization name), taken in `provisionInvitedMembership` before either row lock. It serializes every redemption for one organization, so only one is ever inside the section that takes the two row locks at a time -- the cross-wait cannot form regardless of which row either happens to lock first. |
+| Regression | Two cases. First, a deterministic one: naturally-timed concurrent redemptions did not reliably land in the exact interleaving that deadlocks -- three attempts against the reverted fix all passed by accident, one transaction consistently finishing before the other's conflicting query was even issued on this fast a local connection. So `assertUnserializedOwnerDemotionsCanDeadlock` (packages/db) forces the interleaving by hand across two raw connections, proving the hazard is real rather than theoretical, independent of the fix's own state. Second, the realistic one: two owners, two invites demoting each concurrently, redeemed via `Promise.allSettled` directly against `redeemMagicLinkToken` so the raw thrown error is inspectable -- asserts exactly one succeeds, the other is refused with the last-owner message (explicitly not a `40P01` Postgres deadlock code), and the organization ends with exactly one owner. |
+| Control | The deterministic probe (which does not exercise the fix at all, by design -- an advisory lock's serialization is a structural guarantee, not something worth re-proving empirically) was confirmed to reproduce a genuine deadlock every time it was run against the hazardous lock order. The realistic scenario's fix was then reverted, rebuilt, and confirmed to pass regardless (since natural timing does not reliably hit the window either way) -- which is exactly why the deterministic probe exists: it is the one that actually distinguishes fixed from unfixed. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(176), `pnpm test:integration` against a real scratch Postgres (427),
+`pnpm check:architecture` (35) and `pnpm build` all clean.

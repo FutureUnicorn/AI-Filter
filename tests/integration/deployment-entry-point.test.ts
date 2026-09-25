@@ -4,12 +4,14 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import {
+  assertUnserializedOwnerDemotionsCanDeadlock,
   bootstrapOrganizationOwner,
   dropProbeSchema,
   getMembershipIdForEmail,
   listAuditEventsForEntity,
   listOrganizationsForUser,
   provisionRouteProbeSchema,
+  redeemMagicLinkToken,
   seedOrganizationMembership
 } from "../../packages/db/src/index.ts";
 import { REQUEST_ID_HEADER } from "../../packages/contracts/src/index.ts";
@@ -875,6 +877,134 @@ test("an invite issued before a later role grant cannot silently overwrite that 
     assert.deepEqual(
       (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
       ["auditor"]
+    );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88, REV-012 (Saikrishnaa-vr, non-blocking). The REV-010 fix above
+// locks the target membership row FOR UPDATE before the pre-existing
+// owner-set FOR UPDATE query. Two concurrent redemptions demoting two
+// different owners of the same organization could each hold the row the
+// other needs next: transaction A locks A's row then waits on B's (held by
+// B), transaction B locks B's row then waits on A's (held by A) -- a lock
+// cycle Postgres breaks by aborting one with a deadlock error, rather than
+// the last-owner refusal this scenario is actually supposed to produce.
+//
+// The hazard this proves is real, deterministically: naturally-timed
+// concurrent redemptions (the test below) do not reliably land in that
+// exact interleaving on a fast local connection, so this forces the two
+// connections into the hazardous lock order by hand before racing the
+// query that would deadlock without a serializing lock ahead of it.
+test("the lock order REV-010 introduced deadlocks without a serializing lock ahead of it", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  try {
+    const deadlocked = await assertUnserializedOwnerDemotionsCanDeadlock(databaseUrl, schema);
+    assert.equal(
+      deadlocked,
+      true,
+      "forcing the target-row-then-owner-set lock order across two connections must deadlock without a " +
+        "serializing lock ahead of it, or this is not exercising the hazard REV-012 fixes"
+    );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Redeemed directly against packages/db rather than through the route, so
+// the raw thrown error -- not the route's generic sanitized 500 -- is
+// inspectable for exactly what refused it.
+test("concurrent redemptions demoting two different owners do not deadlock", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerAEmail = `deadlock-owner-a-${Date.now()}@acme.test`;
+  const ownerBEmail = `deadlock-owner-b-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const ownerA = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Deadlock Co",
+      email: ownerAEmail,
+      displayName: "Dana Ops"
+    });
+    // A second owner, so the organization has two to demote concurrently.
+    const ownerB = await seedMemberThroughInvite(
+      databaseUrl,
+      schema,
+      ownerA,
+      ownerBEmail,
+      "owner",
+      "deadlock-second-owner"
+    );
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+
+    // Two invites, issued while both are still owners, each demoting a
+    // DIFFERENT owner to admin -- both real role changes against an
+    // existing membership, so both opt in.
+    const emittedA = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: ownerAEmail, organizationId: ownerA.organizationId, role: "admin", replaceExistingRole: true },
+          "deadlock-demote-a",
+          ownerA.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const emittedB = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: ownerBEmail, organizationId: ownerA.organizationId, role: "admin", replaceExistingRole: true },
+          "deadlock-demote-b",
+          ownerA.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const tokenA = extractToken(emittedA);
+    const tokenB = extractToken(emittedB);
+
+    const [resultA, resultB] = await Promise.allSettled([
+      redeemMagicLinkToken(databaseUrl, schema, hashMagicLinkToken(tokenA)),
+      redeemMagicLinkToken(databaseUrl, schema, hashMagicLinkToken(tokenB))
+    ]);
+    const outcomes = [resultA, resultB];
+
+    const succeededCount = outcomes.filter((outcome) => outcome.status === "fulfilled").length;
+    assert.equal(
+      succeededCount,
+      1,
+      `expected exactly one redemption to succeed, got: ${JSON.stringify(outcomes)}`
+    );
+    const failedOutcome = outcomes.find((outcome) => outcome.status === "rejected");
+    assert.ok(
+      failedOutcome !== undefined,
+      `expected exactly one redemption to be refused, got: ${JSON.stringify(outcomes)}`
+    );
+    if (failedOutcome !== undefined && failedOutcome.status === "rejected") {
+      const reason = failedOutcome.reason;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      // The safe, expected refusal: stranding the organization, not
+      // Postgres detecting a lock cycle.
+      assert.match(message, /would demote the last owner/u);
+      const code =
+        reason !== null && typeof reason === "object" && "code" in reason
+          ? (reason as { code?: unknown }).code
+          : undefined;
+      assert.notEqual(code, "40P01", `a Postgres deadlock leaked through: ${message}`);
+    }
+
+    // Exactly one owner remains, whichever redemption lost the race.
+    const rolesA = (await listOrganizationsForUser(databaseUrl, schema, ownerA.userId)).map((o) => o.role);
+    const rolesB = (await listOrganizationsForUser(databaseUrl, schema, ownerB.userId)).map((o) => o.role);
+    assert.equal(
+      [rolesA, rolesB].filter((roles) => roles.includes("owner")).length,
+      1,
+      `expected exactly one remaining owner, got A=${JSON.stringify(rolesA)} B=${JSON.stringify(rolesB)}`
     );
   } finally {
     await dropProbeSchema(databaseUrl, schema);

@@ -454,6 +454,20 @@ async function provisionInvitedMembership(
   // sharing the connection.
   await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
 
+  // Review #88, REV-012: serializes every redemption for this organization
+  // before either row lock below is taken. Without it, two concurrent
+  // redemptions demoting two different owners could each hold the row this
+  // check locks next while waiting on the other's -- the membership row
+  // REV-010 locks first, then the owner-set query below locks every owner
+  // row, so two transactions taking those two locks in the opposite order
+  // (each already holding its own target row, each then blocking on the
+  // other's) deadlock. An advisory lock keyed on the organization, taken
+  // before any row lock, makes the order moot: only one redemption for
+  // this organization is ever inside the critical section below at a time.
+  // Same pattern bootstrapOrganizationOwner already uses for the same
+  // reason, on organization name rather than id.
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationId]);
+
   // Review #88, REV-010: replaceExistingRole was only ever checked against
   // the membership state previewInviteEffect saw at invite CREATION. An
   // invite issued while this address had no membership carries
@@ -513,6 +527,107 @@ async function provisionInvitedMembership(
      ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
+}
+
+/**
+ * Review #88, REV-012. Deterministically forces the lock order that made a
+ * concurrent demotion race able to deadlock: two connections each already
+ * hold the OTHER's target row (REV-010's lock, above) before either asks
+ * for the full owner set (the pre-existing last-owner guard's lock, also
+ * above). Two genuinely concurrent redemptions do not reliably land in
+ * that exact window on a fast local connection -- one commonly finishes
+ * before the other starts, which is why the integration-level regression
+ * test for this same scenario passed even before this fix existed -- so
+ * this constructs the interleaving by hand rather than hoping for it,
+ * proving the hazard is real rather than theoretical.
+ *
+ * The fix itself (the pg_advisory_xact_lock now taken before either row
+ * lock, above) is not raced here because it does not need to be: an
+ * advisory lock fully serializes every caller holding the same key, so
+ * only one transaction is ever inside the section this probe exercises at
+ * a time, which makes the cross-wait this forces structurally impossible
+ * rather than merely unlikely. The real call path's safety under genuine
+ * concurrency is exercised end to end by
+ * "concurrent redemptions demoting two different owners do not deadlock"
+ * in deployment-entry-point.test.ts instead.
+ */
+export async function assertUnserializedOwnerDemotionsCanDeadlock(
+  databaseUrl: string,
+  schema: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const organizationId = randomUUID();
+  const ownerAId = randomUUID();
+  const ownerBId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  await admin.connect();
+  try {
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Lock Order Probe')`, [
+      organizationId
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'A'), ($3, $4, 'B')`,
+      [ownerAId, `lockorder-a-${organizationId}@acme.test`, ownerBId, `lockorder-b-${organizationId}@acme.test`]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'owner')`,
+      [organizationId, ownerAId, ownerBId]
+    );
+
+    const clientA = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    const clientB = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    await clientA.connect();
+    await clientB.connect();
+    try {
+      await clientA.query(`SET search_path TO "${schema}"`);
+      await clientB.query(`SET search_path TO "${schema}"`);
+      await clientA.query("BEGIN");
+      await clientB.query("BEGIN");
+
+      // Each locks its own target row first -- exactly REV-010's lock,
+      // taken without REV-012's advisory lock ahead of it -- so both
+      // already hold one of the two rows the very next query needs before
+      // either issues it. Sequential awaits here are the point: this is
+      // what pins the order, rather than leaving it to scheduling chance.
+      await clientA.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerAId]
+      );
+      await clientB.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerBId]
+      );
+
+      const results = await Promise.allSettled([
+        clientA.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        ),
+        clientB.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        )
+      ]);
+      await clientA.query("ROLLBACK").catch(() => undefined);
+      await clientB.query("ROLLBACK").catch(() => undefined);
+      return results.some(
+        (result) =>
+          result.status === "rejected" &&
+          (result.reason as { code?: string } | undefined)?.code === "40P01"
+      );
+    } finally {
+      await clientA.end().catch(() => undefined);
+      await clientB.end().catch(() => undefined);
+    }
+  } finally {
+    await admin
+      .query(`DELETE FROM memberships WHERE organization_id = $1`, [organizationId])
+      .catch(() => undefined);
+    await admin.query(`DELETE FROM users WHERE user_id = ANY($1)`, [[ownerAId, ownerBId]]).catch(() => undefined);
+    await admin.query(`DELETE FROM organizations WHERE organization_id = $1`, [organizationId]).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export async function createMagicLinkToken(
