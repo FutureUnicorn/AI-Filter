@@ -228,6 +228,30 @@ The `production` GitHub environment must:
 - record deployment approvals and runs in GitHub; and
 - link to the hosting provider's audit log for host/console administration.
 
+Production deployments are serialised by a constant `production` concurrency
+group with `cancel-in-progress: false`, so no two runs deploy at once against
+the same Compose project, volume, and database. Concurrency groups are
+repository-wide, so this holds only if *every* workflow that can reach the
+production environment joins that group; the architecture suite enforces that
+across `.github/workflows/`, not just for `production-gate.yml`.
+
+What it guarantees precisely: one run deploys, at most one revision waits, and a
+later green revision replaces the waiting one — the evicted revision never
+deploys. That is GitHub's default `queue: single`, and it is the intended trade
+for an empty validation environment, where putting every intermediate revision
+through it buys nothing. `queue: max` is the documented opt-in if every green
+revision must reach production.
+
+The cost, worth knowing before an approval sits unactioned: because the
+`production` environment requires a named approving reviewer, a run parked on
+that approval holds the group for the whole approval window, and no newer
+revision advances — not even its cheap `ubuntu-latest` eligibility job.
+
+Do not key the group on the revision. That gives each push its own group and
+serialises nothing, leaving the guarantee to rest on there being exactly one
+`signal-audit-production` runner. Adding a second production runner for capacity
+is safe on this axis only while the group stays constant.
+
 Production does not run the synthetic seed command. Reset, seed, and destructive
 local commands reject `APP_ENV=production`.
 
