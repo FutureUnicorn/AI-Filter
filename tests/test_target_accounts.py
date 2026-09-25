@@ -358,6 +358,54 @@ def test_a_non_string_company_or_claim_source_is_a_register_error():
     )
 
 
+def test_an_empty_or_whitespace_only_claim_source_is_a_register_error():
+    """REV-001 (round 4): _require_str previously checked only that a claim's
+    source was a string, not that it said anything. A blank or
+    whitespace-only source is type-valid but is not a citation anyone could
+    check, so before this fix it satisfied _evidence_gaps exactly as well as
+    a real one."""
+    for source in ("", "   ", "\t\n"):
+        _assert_register_error(
+            lambda source=source: parse_account(
+                _record(claims=[{"claim": "headcount", "source": source, "observed_on": "2026-09-10"}])
+            ),
+            "empty or whitespace-only source",
+        )
+
+
+def test_a_register_of_blank_sourced_claims_cannot_reach_qualification():
+    """The bug this closes was end-to-end: a register (JSON in, the only
+    surface AF-74's check actually validates) with four fresh, blank-source
+    claims fully qualified at tier A with zero real provenance. Goes through
+    load_register rather than hand-built Account/Claim objects, since
+    building those directly bypasses parse_account's validation entirely and
+    would prove nothing about the fix."""
+    register = json.dumps(
+        [
+            {
+                **_record(),
+                "claims": [
+                    {"claim": name, "source": "", "observed_on": "2026-09-10"}
+                    for name in ("headcount", "hiring_volume", "ats", "buyer")
+                ],
+            }
+        ]
+    )
+    _assert_register_error(lambda: load_register(register), "empty or whitespace-only source")
+
+
+def test_the_empty_string_check_is_scoped_to_claim_source_only():
+    """non_empty is opt-in on _require_str, deliberately not applied to
+    company or a claim's name: a blank one of those is not a false "this is
+    sourced" claim the way a blank source is. Confirms the fix didn't widen
+    past what the review asked for."""
+    account = parse_account(
+        _record(company="", claims=[{"claim": "", "source": "s", "observed_on": "2026-09-10"}])
+    )
+    assert account.company == ""
+    assert account.claims[0].claim == ""
+
+
 def test_a_non_string_observed_on_is_a_register_error():
     for bad in (None, [], 20260910):
         _assert_register_error(

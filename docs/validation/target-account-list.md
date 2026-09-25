@@ -156,7 +156,10 @@ Booleans must be real JSON booleans — a quoted `"false"` is refused rather
 than coerced, because `bool("false")` is `True` and a register exported from
 a spreadsheet is exactly where a quoted boolean comes from. One qualifier
 gets one claim: two `headcount` claims are refused rather than resolved by
-array order, so a contradiction is settled by a human.
+array order, so a contradiction is settled by a human. A claim's `source`
+must say something: an empty or whitespace-only string is refused, because
+type-valid and evidence-free are not the same thing, and this check exists
+to require the second one.
 
 ## Running the check
 

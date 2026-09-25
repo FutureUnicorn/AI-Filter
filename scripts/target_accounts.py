@@ -368,7 +368,7 @@ def _require_bool(value, field: str, account_id: str) -> bool:
     return value
 
 
-def _require_str(value, field: str, account_id: str) -> str:
+def _require_str(value, field: str, account_id: str, *, non_empty: bool = False) -> str:
     # A list or dict here is not just the wrong shape, it is unhashable --
     # buyer_title and a claim's name both end up in set/frozenset membership
     # checks (BUYER_TITLES, seen_claims), and an unhashable value there
@@ -378,6 +378,17 @@ def _require_str(value, field: str, account_id: str) -> str:
     if not isinstance(value, str):
         raise RegisterError(
             f"account {account_id!r} has {field}={value!r}; expected a string"
+        )
+    # A claim's source is the one field this whole check exists to require:
+    # an evidence-free "" or "   " is type-valid and would otherwise satisfy
+    # _evidence_gaps exactly as well as a real citation, qualifying an
+    # account with no provenance at all. Not applied to every string field --
+    # a blank company or claim name is not a false "this is sourced" claim
+    # the way a blank source is.
+    if non_empty and not value.strip():
+        raise RegisterError(
+            f"account {account_id!r} has an empty or whitespace-only {field}; "
+            "a claim needs a source someone else could actually check"
         )
     return value
 
@@ -424,7 +435,7 @@ def parse_account(record: dict) -> Account:
         # is a set, and an unhashable claim name (a list, a dict) must fail
         # here as RegisterError, not as a bare TypeError once it is hashed.
         claim_name = _require_str(raw_claim_name, "claim", account_id)
-        claim_source = _require_str(raw_claim_source, "source", account_id)
+        claim_source = _require_str(raw_claim_source, "source", account_id, non_empty=True)
 
         try:
             claim = Claim(
