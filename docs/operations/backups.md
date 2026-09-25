@@ -177,6 +177,15 @@ and injects wrong-checksum, missing-archive-version, missing-manifest, and
 unsafe-environment failures. The test cleans up only its exact project and
 temporary certificate directory. It never uses hosted credentials.
 
+The Compose MinIO server/client and backup image use the same upstream MinIO
+release versions as AF-68, downloaded from official GitHub release assets with
+published SHA-256 checksums enforced by Docker BuildKit. This replaces Quay
+tags that no longer permit an anonymous pull on a clean CI host. The build
+selects the matching Linux `amd64` or `arm64` binary; other CPU architectures
+are not supported by these Dockerfiles. GitHub release availability remains a
+build-time dependency, so cache or mirror the verified artifacts under an
+approved internal distribution policy for offline deployment.
+
 ### Hosted restore drill
 
 This is a **read-only source / isolated destination** drill, not a production

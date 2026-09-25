@@ -60,7 +60,10 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   storage:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    build:
+      context: ../..
+      dockerfile: infra/docker/minio.Dockerfile
+      target: server
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -74,7 +77,10 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   storage-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    build:
+      context: ../..
+      dockerfile: infra/docker/minio.Dockerfile
+      target: client
     restart: "no"
     depends_on:
       storage:

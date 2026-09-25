@@ -17,7 +17,10 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   restore-storage:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    build:
+      context: ../..
+      dockerfile: infra/docker/minio.Dockerfile
+      target: server
     command: server /data
     environment:
       MINIO_ROOT_USER: ${RESTORE_STORAGE_ACCESS_KEY_ID:?required}

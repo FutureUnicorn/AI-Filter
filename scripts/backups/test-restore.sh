@@ -8,6 +8,13 @@ project="af69-drill-$(date +%s)-$$"
 cert_dir="$(mktemp -d "$repository_root/.af69-cert.XXXXXX")"
 case "$cert_dir" in "$repository_root"/.af69-cert.*) ;; *) exit 2 ;; esac
 cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    docker compose --project-name "$project" \
+      -f "$repository_root/infra/compose/restore.yml" \
+      -f "$repository_root/tests/fixtures/backups/compose.yml" \
+      logs --no-color source-seed source-storage-seed backup-init backup-once restore 2>/dev/null || true
+  fi
   docker compose --project-name "$project" \
     -f "$repository_root/infra/compose/restore.yml" \
     -f "$repository_root/tests/fixtures/backups/compose.yml" \

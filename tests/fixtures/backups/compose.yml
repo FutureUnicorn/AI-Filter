@@ -38,7 +38,10 @@ services:
     networks: [test-source]
 
   source-storage:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    build: &minio-server-build
+      context: ../..
+      dockerfile: infra/docker/minio.Dockerfile
+      target: server
     command: server /data
     environment:
       MINIO_ROOT_USER: af69-source
@@ -48,7 +51,10 @@ services:
         aliases: [storage]
 
   source-storage-seed:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    build:
+      context: ../..
+      dockerfile: infra/docker/minio.Dockerfile
+      target: client
     depends_on: [source-storage]
     entrypoint:
       - /bin/sh
@@ -62,7 +68,7 @@ services:
     networks: [test-source]
 
   backup-target:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    build: *minio-server-build
     command: server /data
     environment:
       MINIO_ROOT_USER: af69-target

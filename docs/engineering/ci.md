@@ -47,6 +47,7 @@ read-only repository permission and does not receive production secrets.
 | `CI / Typecheck` | `pnpm typecheck` | Web, worker, and every TypeScript package |
 | `CI / Unit` | `pnpm test:unit` | Deterministic citation-validation unit tests |
 | `CI / Integration` | `pnpm test:integration` | Worker-to-domain workspace integration |
+| `CI / Backup restore` | `pnpm test:restore` | Isolated synthetic PostgreSQL/object-storage recovery and negative controls |
 | `CI / Architecture` | `pnpm check:architecture` | Dependency direction, workspace structure, and CI policy |
 | `CI / Build` | `pnpm build` | Next.js production build, worker, and buildable packages |
 | `CI / Required` | `pnpm check` | Fail-closed aggregate of all required categories |
@@ -64,10 +65,10 @@ installed by pnpm with `--frozen-lockfile`. `.nvmrc`, `packageManager` in
 `package.json`, `[tool.uv].required-version`, `pnpm-lock.yaml`, and `uv.lock`
 make runtime and dependency changes reviewable.
 
-The current integration boundary has no database dependency, so CI does not
-start an unused service. When an integration test genuinely requires Postgres
-or another service, add a disposable, per-run service with synthetic data. It
-must never connect to staging, production, or real applicant information.
+The integration job uses a disposable PostgreSQL service for database-backed
+checks. The separate backup-restore job uses a unique, disposable Compose
+project with synthetic data and no production credentials. Neither job may
+connect to staging, production, or real applicant information.
 
 ## Aggregate merge gate
 

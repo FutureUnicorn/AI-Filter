@@ -14,8 +14,13 @@ function read(relativePath: string): string {
 
 test("runtime infrastructure is isolated, private, bounded, and pinned", () => {
   const compose = read("infra/compose/runtime.yml");
+  const minioImage = read("infra/docker/minio.Dockerfile");
+  const backupImage = read("infra/docker/backup.Dockerfile");
   assert.match(compose, /postgres:17\.10-alpine3\.23/u);
-  assert.match(compose, /minio\/minio:RELEASE\.2025-09-07T16-13-09Z/u);
+  assert.match(compose, /dockerfile: infra\/docker\/minio\.Dockerfile/u);
+  assert.match(minioImage, /ADD --checksum=sha256:[a-f0-9]{64} https:\/\/github\.com\/minio\/minio\/releases\/download\/RELEASE\.2025-09-07T16-13-09Z\/minio\.linux-amd64/u);
+  assert.match(minioImage, /ADD --checksum=sha256:[a-f0-9]{64} https:\/\/github\.com\/minio\/mc\/releases\/download\/RELEASE\.2025-08-13T08-35-41Z\/mc\.linux-amd64/u);
+  assert.match(backupImage, /ADD --checksum=sha256:[a-f0-9]{64} https:\/\/github\.com\/minio\/mc\/releases\/download\/RELEASE\.2025-08-13T08-35-41Z\/mc\.linux-amd64/u);
   assert.match(compose, /internal: true/u);
   assert.match(compose, /mem_limit:/u);
   assert.match(compose, /cpus:/u);
