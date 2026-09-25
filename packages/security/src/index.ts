@@ -573,3 +573,35 @@ export function logStructured(level: LogLevel, message: string, context?: LogCon
     console.log(line);
   }
 }
+
+// ---- AF-90: audit report share links ----
+//
+// Deliberately the same shape as the magic-link rule above: 32 random
+// bytes from a CSPRNG, base64url for the URL, and only the SHA-256 hash
+// ever persisted. OWASP puts the floor for a reference token at 128 bits
+// of entropy; 256 leaves room without costing anything, and matching the
+// existing rule means there is one token discipline in this codebase to
+// audit rather than two.
+//
+// Separate functions rather than a reuse of hashMagicLinkToken, because
+// these are different secrets with different lifetimes reaching different
+// endpoints, and a shared helper invites someone to later "unify" the
+// TTLs. The algorithm is intentionally identical; the naming keeps the
+// two decisions independent.
+
+const SHARE_TOKEN_BYTES = 32;
+
+export interface GeneratedShareToken {
+  /** Raw secret. It goes in the URL and is never persisted as-is. */
+  readonly token: string;
+  readonly tokenHash: string;
+}
+
+export function hashAuditReportShareToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export function generateAuditReportShareToken(): GeneratedShareToken {
+  const token = randomBytes(SHARE_TOKEN_BYTES).toString("base64url");
+  return { token, tokenHash: hashAuditReportShareToken(token) };
+}
