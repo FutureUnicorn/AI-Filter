@@ -1,0 +1,23 @@
+-- AF-97 review #88, REV-009 (Saikrishnaa-vr, blocking): bind the invite
+-- Idempotency-Key to the request it was issued for.
+--
+-- 0023_invite_idempotency.sql made a replayed key answer 202 without
+-- writing a second row, but it never checked that the replay was of the
+-- SAME request. The unique index is scoped to (organization_id,
+-- idempotency_key) alone, so a caller reusing a key -- by a client bug, a
+-- copy-pasted header, or a key generated once per admin session rather
+-- than once per submission -- against a DIFFERENT email, role or
+-- replace-existing-role intent hit the same conflict path as a genuine
+-- retry and got the same silent-success 202. The invite named in that
+-- second call was never created, and the caller was told it was.
+--
+-- The comparable writes in this tree already guard against exactly this:
+-- claimIdempotentRequest's `request_fingerprint` and finalizeCsvImport's
+-- own idempotency_key + mapping comparison both distinguish "the same
+-- request, replayed" from "a different request, reusing a key" and refuse
+-- the second rather than silently discarding it. An invite mints a bearer
+-- credential and a role grant; it belongs in that group.
+--
+-- Nullable and populated alongside idempotency_key, for the same reason
+-- that column is nullable: a login token carries neither.
+ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS idempotency_fingerprint text;

@@ -1,5 +1,5 @@
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getUserByEmail, redeemMagicLinkToken } from "@signal-audit/db";
+import { getUserByEmail, peekMagicLinkTokenIsInvite, redeemMagicLinkToken } from "@signal-audit/db";
 import { createSessionToken, hashMagicLinkToken, verifyMagicLinkToken } from "@signal-audit/security";
 
 import { readSessionSecret } from "./session";
@@ -29,6 +29,18 @@ export type MagicLinkRedemption =
   | { readonly outcome: "invalid"; readonly reason: string }
   /** The token was valid but no account exists for its email. */
   | { readonly outcome: "no_account" };
+
+/**
+ * Non-mutating: tells GET /auth/redeem whether to defer to a confirmation
+ * step instead of consuming the token itself (review #88, REV-011). See
+ * peekMagicLinkTokenIsInvite for why an invalid/expired/consumed token is
+ * deliberately indistinguishable from a plain login token here -- both
+ * fall through to the real, consuming redemption below.
+ */
+export async function isRedeemableInviteToken(token: string): Promise<boolean> {
+  const config = loadEnvironmentConfig(process.env);
+  return peekMagicLinkTokenIsInvite(config.database.url, config.database.schema, hashMagicLinkToken(token));
+}
 
 export async function redeemMagicLinkForSession(token: string): Promise<MagicLinkRedemption> {
   const config = loadEnvironmentConfig(process.env);

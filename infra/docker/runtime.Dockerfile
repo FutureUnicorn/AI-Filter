@@ -20,6 +20,12 @@ RUN pnpm install --frozen-lockfile
 
 COPY apps apps
 COPY packages packages
+# scripts/ is in the image for one reason: AF-97's `bootstrap:owner` is the
+# only way to create a deployment's first owner, and until this line it was
+# absent from both runtime stages -- so the command the README tells an
+# operator to run failed with "Cannot find module" in the one place it has
+# to work. See the `bootstrap` service in infra/compose/runtime.yml.
+COPY scripts scripts
 RUN pnpm build
 
 FROM node:24.16.0-bookworm-slim AS runtime-base

@@ -27,6 +27,13 @@ export const WEB_OPERATIONS = [
   "file.intake.get",
   "csv.import_status",
   "csv.import_errors",
+  // AF-97's entry-point routes. In WEB_OPERATIONS so their spans and events
+  // carry a real name rather than collapsing into `web.request`, and
+  // deliberately not in the alerts script's narrower MONITORED_OPERATIONS --
+  // that p95 alert set is AF-67's to widen, the same position role.* and
+  // rubric.* already sit in.
+  "organization.list",
+  "invite.create",
   "web.request"
 ] as const;
 
@@ -317,7 +324,9 @@ const ROUTE_OPERATIONS: Readonly<Record<string, WebOperation>> = {
   "/api/roles/[roleId]/applications/[applicationId]/evidence": "application.evidence",
   "/api/roles/[roleId]/applications/[applicationId]/evidence-extraction": "application.evidence_extraction.enqueue",
   "/api/roles/[roleId]/applications/[applicationId]/evidence/[criterionId]/corrections": "application.evidence.correct",
-  "/api/roles/[roleId]/applications/[applicationId]/decisions": "application.decision"
+  "/api/roles/[roleId]/applications/[applicationId]/decisions": "application.decision",
+  "/api/me/organizations": "organization.list",
+  "/api/invites": "invite.create"
 };
 
 export function operationForRoute(routePath: string): WebOperation {

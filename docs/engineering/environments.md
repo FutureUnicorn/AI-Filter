@@ -340,6 +340,40 @@ evidence showing named actor, timestamp, action, and resource. Never include a
 secret value. If the selected provider cannot produce this evidence, it does not
 satisfy AF-11.
 
+## Creating the first owner of a hosted environment (AF-97)
+
+Authentication is invite-only, and the first invite has nobody to come from,
+so a freshly migrated environment needs one out-of-band step before anybody
+can sign in. It runs inside the deployment:
+
+```bash
+docker compose --profile tools run --rm bootstrap \
+  --organization "<employer name>" --email <owner address> --name "<owner name>"
+```
+
+It creates one organization, one user and one owner membership in a single
+transaction, and converges on a re-run rather than duplicating. The output
+names the organization and user ids, and says whether a pre-existing member
+was promoted to owner.
+
+Two properties are deliberate and worth not undoing:
+
+- **It is a command, not an HTTP route.** Whatever creates the first owner
+  cannot itself sit behind authentication. As a route it would be an
+  unauthenticated privilege-granting endpoint that must be disabled after
+  first use, which is not a control. As a command it requires the database
+  credentials this environment already protects.
+- **It runs in-cluster, not from an operator's machine.** `postgres` is on
+  the `private` network (`internal: true`) and publishes no port, so there is
+  no path to it from outside the compose project — and there should not be.
+  Exposing the database to run this would be a worse posture than the one the
+  command's design assumes.
+
+Granting ownership is an administrative action in the sense of the section
+above: run it under a named identity and retain the provider audit evidence
+for the session, since the command itself writes no `audit_events` row (there
+is no actor in the system yet to attribute it to).
+
 ## Validation and evidence checklist
 
 1. Start from a fresh checkout and run local startup, seed, and smoke commands.

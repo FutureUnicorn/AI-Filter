@@ -1,0 +1,21 @@
+-- AF-97 review #88, REV-010 (Saikrishnaa-vr, blocking): persist an invite's
+-- replaceExistingRole intent so redemption can enforce it against the
+-- membership state it actually finds, not the one previewInviteEffect saw
+-- at invite creation.
+--
+-- previewInviteEffect only requires replaceExistingRole when the invitee
+-- already holds a *different* role at creation time. An invite issued while
+-- the address has no membership yet -- the ordinary case -- carries no such
+-- requirement, and 0023_invite_idempotency.sql through
+-- 0024_invite_idempotency_fingerprint.sql never stored one. If another
+-- admin, a second invite, or bootstrap grants that address a membership
+-- before this token is redeemed, provisionInvitedMembership's
+-- ON CONFLICT ... DO UPDATE SET role applied the originally requested role
+-- unconditionally: the opt-in REV-002 added at creation was never consulted
+-- at redemption, because nothing recorded what the caller had actually
+-- opted into.
+--
+-- Nullable and populated alongside idempotency_key and
+-- idempotency_fingerprint, for the same reason those columns are nullable:
+-- a plain login token carries none of the three.
+ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS replace_existing_role boolean;

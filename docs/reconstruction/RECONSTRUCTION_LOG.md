@@ -508,3 +508,210 @@ database-only code path.
 
 **Result:** full `pnpm check` exit 0 — 164 unit, 368 integration, 35
 architecture, against a real (scratch) Postgres.
+
+## AF-97 — organization and membership bootstrap
+
+The gap this branch filed rather than fixed, now fixed. Not a review round:
+a ticket of its own, raised from the PR #83 review after verifying against
+live Jira that nothing covered it.
+
+| | |
+|---|---|
+| The gap | A freshly migrated deployment has zero organizations, users and memberships and no way to create the first of any. `POST /api/auth/magic-link/request` only mails a link when `user !== undefined && memberships.length > 0`, so on an empty database it correctly mailed nobody, forever, and all 16 API routes sat behind a session nobody could obtain. Every `INSERT INTO organizations` in the tree was a test fixture. AF-16's invite machinery (`MagicLinkInvite`, `provisionInvitedMembership`, `createInviteInputSchema`) was complete and had no HTTP route. |
+| Why the pieces were green | Token generation, atomic single-use redemption, the verification decision, the session cookie and resource authorization each had passing tests. None of them could observe that there was no way to become the first user. That is the same shape as the `/auth/redeem` 404 in the baseline fixes above: individually-green pieces either side of a missing wire. |
+| 1 — first owner | `bootstrapOrganizationOwner` in `packages/db` (organization + user + owner membership, one transaction) behind `pnpm bootstrap:owner`, a command rather than an HTTP route. Whatever creates the first owner cannot itself be authenticated, so as a route it would be an unauthenticated privilege-granting endpoint that must be disabled after first use; "we remembered to disable it" is not a control. Requiring database credentials moves the authorization onto something the deployment already protects. Not refused in production, unlike `pnpm db:seed`, because production is precisely where somebody has to be first. |
+| Idempotent | An interrupted run converges: an organization of that name is reused (under `pg_advisory_xact_lock`, since `organizations.name` carries no unique constraint and two real employers may share one), the user is matched by email, and the owner membership is upserted. The result reports `created`/`promoted`/`unchanged`, so the one privilege change it can make to existing data is stated rather than silent. |
+| 2 — invites over HTTP | `POST /api/invites`, gated on `access_admin_settings`, not `manage_roles`: a recruiter holds `manage_roles` and can create hiring roles, which is not the authority to add people to the tenant. `createInviteMagicLinkToken` writes the token and its `admin_action` audit row in one transaction, with the audit field required rather than optional, so an unattributable invite cannot be expressed. The audit row's `entity_id` is the token hash, not the invited email: `audit_events` is append-only by trigger with no delete path, and the hash points at the `magic_link_tokens` row that holds the address and can be deleted. |
+| Delivery failure | Reported honestly here (503, "created but not emailed"), unlike the deliberate silence on the login endpoint. That one is unauthenticated, so a response varying by address is an account-existence oracle; this one is already authorized against the organization the invitee is joining, so there is nothing the caller could learn that they do not have. |
+| 3 — sign-in page | `/` now calls the request endpoint and reads the `?auth=` codes `GET /auth/redeem` has always redirected here with. Both halves were missing: the endpoint had zero `.tsx` callers, and nothing read the codes, so an expired link, an unknown account and a server fault were indistinguishable from a page that had reloaded. The codes are a closed map; an unrecognized one gets the generic message rather than having its text rendered. |
+| 4 — navigation | `GET /api/me/organizations` (derived entirely from the caller's own membership rows, so it cannot become an organization directory) plus a `/roles` that resolves the organization itself: an explicit `?organizationId=` still wins, a sole membership is used directly, several offer a switcher. Role rows link to rubric and applications, and `POST /api/roles` finally has a caller. |
+| Not linked | The import page needs an `?intakeId=` and nothing in the app can create an intake, so it is left unlinked rather than linked to a dead end. The upload UI is its own ticket. |
+| Tests | `tests/integration/deployment-entry-point.test.ts`, 7 cases, driven against a real database through the shipped handlers: empty deployment mails nobody, bootstrap then makes the same request redeemable, re-running converges, an existing member is promoted, an owner's invite redeems into a real membership, a recruiter's invite is 403 and a cross-tenant invite is 404, and the switcher's organizationId is the one the roles API accepts. |
+| Refactor carried | The route-loading module hook was inline in two test files and would have been a third. Extracted to `tests/support/web-route-loader.ts` with an optional specifier-redirect map, which is the only thing the two copies differed by; both migrated. |
+| Verification | No Docker daemon in this environment, so Postgres 16's own binaries were used to initialize a scratch cluster, as in round 5. `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts` (164), `pnpm test:integration` against that database (375), `pnpm check:architecture` (35) and `pnpm build` all clean. `pnpm bootstrap:owner` was additionally run by hand against a fully migrated schema: first run creates, second reports `unchanged`, a missing flag exits 1 with the usage line, and the resulting rows are one owner membership with a lowercased email. |
+
+### AF-97 — PR #88 review, round 1
+
+Four findings from Copilot on the head above. All four are real; one is
+worse than reported.
+
+| | |
+|---|---|
+| Finding 1 (medium) | The `?auth=` lookup on `/` was a plain object literal, so it was not the closed map its own comment claimed. `?auth=__proto__` resolves to `Object.prototype` and `?auth=constructor` to a function -- both truthy, so `?? GENERIC_AUTH_FAILURE` never fires, and React throws when handed a non-element object. An unauthenticated crash on the one page a stranger can always reach, triggered by sending someone a link. |
+| Fix | The mapping moved to `apps/web/src/lib/auth-codes.ts` as a `Map`, which has no inherited keys, behind an `authFailureMessage(code)` that returns a string for any input at all. Extracted rather than fixed in place so the claim is testable: the page is a client component, and a test that rebuilt the map itself would prove nothing about the page that ships. |
+| Regression | `tests/unit/sign-in-auth-codes.test.ts`: eight inherited property names each yield the generic message and, specifically, a `string`; arbitrary input always yields a string; the four codes the redeem route emits are present and mutually distinguishable. |
+| Control | The pre-fix object lookup, run directly: `__proto__` yields an object and `constructor`/`toString` yield functions. Confirmed. |
+
+| | |
+|---|---|
+| Finding 2 (medium) | `CreateRole` was rendered whenever an organization was selected, including for an auditor (no `manage_roles`) and for an explicit `?organizationId=` the caller has no membership for. Both get a form guaranteed to be refused. `InviteMember` two lines below already had the gate, and the comment justifying that gate applied word for word to the form without one. |
+| Fix | Both forms now gate on `roleHasCapability` against the capability the route will check, and on `activeOrganization !== undefined`, which is exactly the not-a-member case. The page asks ROLE_CAPABILITIES rather than naming roles, so presentation cannot drift from policy; `MembershipRole` replaces the page's re-spelled copy of the union for the same reason. |
+| Coverage | The policy itself is covered by `tests/unit/role-capabilities.test.ts` (auditor holds no `manage_roles`), and the enforcement by this file's recruiter-403 case. The rendering gate is presentation with no DOM harness in this repo, so it has no test of its own -- stated rather than implied. |
+
+| | |
+|---|---|
+| Finding 3 (medium) | `bootstrapOrganizationOwner`'s email check was `indexOf("@") < 1`, and the table's CHECK is only `position('@' in email) > 1`. Both accept `owner@` and `foo@@bar` -- and, not in the finding, `a@b`. All three are rejected by `requestMagicLinkInputSchema`. The one command whose purpose is to create somebody who can sign in could create somebody who provably could not, discovered only when they tried. |
+| Fix | Validated at the CLI boundary with contracts' own `storedEmailSchema`, the very object the sign-in endpoint parses with, so no second grammar exists to drift. packages/db may not depend on contracts, so its own check stays structural -- exactly one `@`, non-empty local part, a dotted domain -- and says where the authoritative check lives. |
+| Regression | Five rejected addresses driven through `node scripts/environment/bootstrap.mjs` as a real process, asserting exit 1, the reason, and no stack trace. Validation runs before configuration loads, so these need no database. |
+| Control | Recorded directly against both predicates: `owner@`, `foo@@bar` and `a@b` all pass the old guard and the table CHECK, and all three fail `z.email()`. |
+
+| | |
+|---|---|
+| Finding 4 (low) | The invite test treated `POST /api/invites` answering 202 as proof that the `admin_action` audit row had been written. It is not: deleting the `appendAuditEvent` call outright still inserts the token, sends the mail and answers 202. The one assertion covering AF-20's attributability invariant was inferring a write it never read, and the comment asserting otherwise was wrong. |
+| Fix | `listAuditEventsForEntity` added to packages/db, for the same reason the assert* probes are exported there. The test now reads the row and asserts every field that makes the action attributable -- organization, actor, action, entity type, the token hash as entity id -- and that the request id matches the one the response returned. |
+| Control | Removed the `appendAuditEvent` call from `createInviteMagicLinkToken`: the invite test fails, where before it passed. Confirmed. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(168), `pnpm test:integration` against a real scratch Postgres (381),
+`pnpm check:architecture` (35) and `pnpm build` all clean.
+
+### AF-97 — PR #88 review, round 2
+
+Eight findings from hemnaath04, one blocking. All eight verified as real and
+fixed.
+
+| | |
+|---|---|
+| Finding (REV-001, HIGH, blocking) | `pnpm bootstrap:owner` could not be run against the deployment this repo ships. `runtime.Dockerfile` copies `apps` and `packages` and not `scripts`, so the script is absent from both runtime stages; and `postgres` sits only on the `private` network, which is `internal: true` with no published port, so there is no path to the database from outside the project either. Both halves confirmed by inspection. For the one ticket whose purpose is that a deployment can be entered, every documented way in was closed, and `README.md` instructed an operation that could not be performed. |
+| Fix | `COPY scripts scripts` in the build stage, plus a `bootstrap` service in `runtime.yml` under `profiles: [tools]`, built from `runtime-base`, on the `private` network, using the shared runtime environment: `docker compose --profile tools run --rm bootstrap --organization ... --email ... --name ...`. This keeps the command's security argument intact rather than weakening it -- it runs inside the deployment with the deployment's own credentials, and nothing new is exposed. Deliberately not given `seed`'s production refusal: production is where a first owner is most needed. README and `docs/engineering/environments.md` now document both the local and hosted paths. |
+| Regression | `tests/integration/environment-policy.test.ts` asserts the `COPY scripts scripts` line, and that the bootstrap service exists with the right entrypoint, network, profile and shared environment, and does **not** carry the production refusal. |
+| Control | Removing the COPY line fails it; removing the service fails it with "expected a bootstrap service". Both confirmed. |
+
+| | |
+|---|---|
+| Finding (REV-002, MEDIUM) | `POST /api/invites` is also a role-change endpoint. `provisionInvitedMembership` ends in `ON CONFLICT ... DO UPDATE SET role`, unreachable from outside the process until this ticket exposed invite creation. So an invite naming an existing member replaced their role, committed by their own click on a mail that said "Your sign-in link"; and only the invite was audited, never its effect. |
+| Fix | Three parts. `previewInviteEffect` resolves what an invite would do before anything is minted; a role replacement is refused with 409 unless the caller passes `replaceExistingRole: true`, so the destructive reading of an ambiguous request cannot happen by accident. The mail now varies by purpose (`MagicLinkPurpose` on the domain port, honoured by both adapters), and the role-change wording tells the recipient that opening the link changes their access. A second `admin_action` row with `entity_type = membership_role_change` records the effect, written at creation where the accountable human is -- not at redemption, where the actor would be the person the change is being done *to*, and where audit_events' membership trigger would turn an offboarded inviter into an unredeemable invite. |
+| Limitation stated | The from/to roles travel inside `entity_id` because audit_events has no column for them, and adding one to an append-only table is not a change to make in passing. Semantic content in that column has precedent here (the kill-switch path writes "engaged"/"disengaged"). |
+
+| | |
+|---|---|
+| Finding (REV-003, MEDIUM) | An invite that would demote an organization's sole owner was created, audited, emailed and answered 202, then failed at redemption forever: the transaction rolls back so `consumed_at` stays null, every retry reproduces it, the invitee lands on `/?auth=error`, and nothing tells the admin who issued it. The undiagnosable bounce this PR's sign-in page exists to end, reintroduced through its invite route. The guard had no test at all, before or after. |
+| Fix | The same check runs in the route before minting, answering 409 with the reason, so the refusal lands on the admin who can act on it. Advisory by construction -- it is a read, and `provisionInvitedMembership`'s guard inside the redemption transaction remains the enforcement; what it buys is that the ordinary case fails in the right place. |
+
+| | |
+|---|---|
+| Finding (REV-007, LOW) | The invite route required an `Idempotency-Key` and then discarded it, so a timed-out retry minted a second live token, a second audit trail and a second email for one act. Worse than not requiring one: it tells the caller the retry is safe. |
+| Fix | `0023_invite_idempotency.sql` adds a nullable `idempotency_key` and a partial unique index on `(organization_id, idempotency_key)`; the INSERT is the deduplication, so two concurrent retries cannot both proceed, and a replay writes nothing, sends nothing and answers the same 202. Partial and organization-scoped so login tokens (no organization, no client key) are unaffected. The reviewer's premise was checked and correct: `decisions`, `finalize` and `corrections` all carry their key into the persistence layer, so an invite was the odd one out among consequential writes, not consistent with them. |
+
+| | |
+|---|---|
+| Findings (REV-004, REV-005, REV-006, REV-008, LOW) | The shared route loader dropped `redirects` on every call after the first, enforcing nothing while its doc comment said to pass it first. The new `globals.css` rules were bare element selectors, restyling the rubric and import pages this PR does not claim to touch. `sign-in-auth-codes.test.ts` compared against a hardcoded code list, so the drift its own comment warned about could not fail it. The bootstrap's `ON CONFLICT (email) DO NOTHING` does not block on a concurrent uncommitted insert, so a loser threw "did not resolve a user". |
+| Fixes | The loader throws on a later differing map instead of silently ignoring it, and looks up through a `Map`. The CSS is scoped to `.stacked-form`, leaving the other pages exactly as they were -- global consistency is a deliberate visual decision for the tickets that own those pages, not a side effect of this one. The test now extracts `?auth=` codes from the redeem route's source and asserts both directions; adding a fifth code without a message fails it (confirmed by control). The upsert matches `provisionInvitedMembership`'s `DO UPDATE SET email = EXCLUDED.email`, which takes the row lock, and reads `xmax = 0` to report whether the row was new. |
+
+**New coverage:** three integration cases (role replacement refused then confirmed, with the audit row and the mail's purpose asserted; last-owner invite refused at creation minting nothing; a retried key producing one token, one audit row and one email), plus the REV-001 infrastructure assertions.
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(168), `pnpm test:integration` against a real scratch Postgres (385),
+`pnpm check:architecture` (35) and `pnpm build` all clean. The 24 migrations
+replay from empty and then replay again idempotently, which the migrate
+service requires.
+
+### AF-97 — merging develop (AF-67 monitoring) into PR #88
+
+`develop` gained AF-67's monitoring and alerts (PR #89) while this branch was
+waiting on review, and the PR went un-mergeable.
+
+| | |
+|---|---|
+| Textual conflict | `package.json` only, in `test:unit:ts` and `test:integration` — both sides registered new test files. Resolved as a union: this branch's `sign-in-auth-codes` and `deployment-entry-point`, develop's `budgeted-inference` and `observability`. `tests/architecture/test-registration.test.ts` then confirms the result is complete on disk and free of duplicates, which is exactly the drift that list exists to catch. |
+| Semantic conflict | Nothing textual, and the merge still broke the build. AF-67 added `observability.test.ts`, which walks every `apps/web/src/**/*.ts` and asserts no `console.error` survives anywhere: handled 500s must go through `captureServerError`, which sanitizes the diagnostic before it reaches the telemetry sink. This branch's two new routes were written before that rule existed, so they carried three raw `console.error` calls. Merged cleanly, failed honestly — the reason the gate runs after a merge and not before. |
+| Fix | `/api/me/organizations` and `/api/invites` converted to the same shape develop gave every other route: handler renamed to `handleGET`/`handlePOST`, exported through `withServerOperation`, and the outer catch replaced with `captureServerError`. The invite route's delivery-failure branch follows the magic-link request route's precedent verbatim -- `describeError` into the existing `magic_link.delivery_failed` structured event, carrying `errorName`/`errorCode` rather than a raw error. |
+| Scope held | `organization.list` and `invite.create` added to `WEB_OPERATIONS` so their spans and events carry a real name instead of collapsing into `web.request`, and deliberately **not** to the alerts script's narrower `MONITORED_OPERATIONS`. That p95 alert set is AF-67's to widen; `role.*` and `rubric.*` already sit in exactly this position, so this follows the existing split rather than inventing one. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(171), `pnpm test:integration` against a real scratch Postgres (402),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
+
+### AF-97 — PR #88 review, round 3
+
+One finding from Saikrishnaa-vr, blocking. Verified as real before fixing.
+
+| | |
+|---|---|
+| Finding (REV-009, MEDIUM, blocking) | The `0023_invite_idempotency.sql` fix (round 2, REV-007) made a replayed `Idempotency-Key` answer 202 without writing a second row -- but the unique index is scoped to `(organization_id, idempotency_key)` alone, with no binding to *what* the key claimed. A key reused against a different email, role, or `replaceExistingRole` -- a client bug, a copy-pasted header, a key minted once per admin session instead of once per submission -- hit the same conflict path as a genuine retry and got the same silent-success 202. The invite named in that second call was never created, and its caller was told it was. |
+| Fix | `0024_invite_idempotency_fingerprint.sql` adds a nullable `idempotency_fingerprint` column. `createInviteMagicLinkToken` now hashes `{email, organizationId, role, replaceExistingRole}` the same way `claimIdempotentRequest` already hashes its `payload`, stores it alongside the key, and on conflict reads back the fingerprint that actually claimed the key: matching fingerprint replays (202, nothing written), differing fingerprint is refused with the existing `idempotency_key_conflict` (409) rather than silently discarded -- the same code `finalizeCsvImport` already answers when a key is reused against a different mapping. `replaceExistingRole` is now a required field on `CreateInviteMagicLinkTokenInput`, not defaulted inside the function, so the fingerprint reflects what the caller actually sent rather than an assumption. |
+| Design note | Kept as invite's own column rather than routed through the generic `idempotent_requests`/`claimIdempotentRequest` mechanism 0022 already provides: no route in this tree uses that table yet, and the local convention for a consequential write is its own bespoke idempotency column with its own comparison (`import_finalizations.idempotency_key` + `mapping`, `magic_link_tokens.idempotency_key` from round 2). Reusing the generic table would have been a second, inconsistent pattern introduced to fix one route. |
+| Regression | Two integration cases in `deployment-entry-point.test.ts`: reusing a key across two different invitees, and across the same invitee with a different role, both now 409 rather than 202, and the invite the key legitimately claimed is unaffected and still redeems; and reusing a key with a different `replaceExistingRole` answer, specifically chosen so `previewInviteEffect`'s own REV-002 gate (`changes_role` requiring opt-in) does not fire -- proving the fingerprint, not that gate, is what catches it. |
+| Control | Both new cases written first against the reverted (round-2) behavior: confirmed they fail with `202 !== 409`, then confirmed green again with the fix restored. The first draft of the second case also caught its own bug this way -- it asserted the role had changed without redeeming the invite that changes it, since `provisionInvitedMembership` applies a role at redemption, not at invite creation. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(171), `pnpm test:integration` against a real scratch Postgres (404),
+`pnpm check:architecture` (35) and `pnpm build` all clean. The 25 migrations
+replay from empty and then replay again idempotently.
+
+### AF-97 — merging develop (AF-102 durable extraction queue) into PR #88
+
+`develop` moved again while round 3 was in flight: PR #92 (AF-102, a durable
+evidence-extraction worker queue) merged in as `33f33d5`.
+
+| | |
+|---|---|
+| Conflict | `package.json` only, same shape as the AF-67 merge: both sides registered a new test file in `test:unit:ts` and `test:integration`. Resolved as a union -- this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `evidence-extraction-job`/`evidence-extraction-worker` -- and `tests/architecture/test-registration.test.ts` confirms the result is complete and duplicate-free. |
+| Checked and clean | AF-102 touches `apps/web/src/lib/observability.ts`, `packages/db/src/index.ts`, `packages/contracts/src/index.ts` and `packages/security/src/index.ts`, all files this branch also touches; every one auto-merged with no textual conflict. Re-checked for the same class of semantic break the AF-67 merge caused (a new no-`console.error` or similar rule this branch's code predates): none -- `grep -rn console.error apps/web/src apps/worker/src` is empty. A new migration, `0026_evidence_extraction_jobs.sql`, leaves a numbering gap after this branch's `0024` (no `0025` in the merged tree); `migration-ordering.test.ts` has no rule against a gap and all 8 of its cases still pass, so this is left alone rather than renumbered on a branch that doesn't own it. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(176), `pnpm test:integration` against a real scratch Postgres (423),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
+
+### AF-97 — PR #88 review, round 4
+
+Two findings from Saikrishnaa-vr, both blocking. Verified as real before fixing.
+
+| | |
+|---|---|
+| Finding (REV-010, MEDIUM, blocking) | `replaceExistingRole` was only ever checked against the membership state `previewInviteEffect` saw at invite *creation*. An invite issued while the address has no membership carries `replaceExistingRole: false` and needs no opt-in -- but if a second admin, a second invite, or bootstrap grants that address a different role before this token is redeemed, `provisionInvitedMembership`'s unconditional `ON CONFLICT ... DO UPDATE SET role` applied the originally requested role over it: the opt-in REV-002 added at creation was never consulted at redemption, because nothing recorded what the caller had actually opted into. |
+| Fix (REV-010) | `0027_invite_role_replacement_intent.sql` adds a nullable `replace_existing_role` column, populated by `createInviteMagicLinkToken` from the same `replaceExistingRole` already required for the REV-009 fingerprint, and read back by `redeemMagicLinkToken`. `provisionInvitedMembership` now takes it as a parameter and, inside the same transaction that locks the membership row `FOR UPDATE`, refuses (throws, rolls back, nothing applied) when a membership already exists with a different role and the token did not opt in. The plain, non-invite `createMagicLinkToken` gained the same optional field for the RLS/replay probes that construct tokens directly rather than through the route -- nothing shipped calls it with `invite` set. |
+| Finding (REV-011, MEDIUM, blocking) | `GET /auth/redeem` consumed the token and provisioned or changed a membership on an ordinary GET. A corporate mail gateway's prefetch of the emailed link -- indistinguishable from the recipient's own click -- could silently create the membership or apply a role change and burn the single-use token before the invitee ever acted; the invitee's own later click then landed on a dead token with nothing to explain why. |
+| Fix (REV-011) | A new, non-mutating `peekMagicLinkTokenIsInvite` (packages/db) tells `GET /auth/redeem` whether a token is a still-live invite without consuming it. A plain login token's GET is unchanged -- redemption there only mints a session, the tradeoff already documented on that route and left as-is. A live invite token instead redirects (non-mutating) to a new `/auth/confirm` page, which requires an explicit "Accept invite" click before POSTing to the same `POST /api/auth/magic-link/redeem` every other redemption in this app already uses. |
+| Regression | Two integration cases in `deployment-entry-point.test.ts`. REV-010: an invite is issued while the address has no membership, a second invite grants a different role and is redeemed first, then the first invite's redemption is confirmed refused (500, the same undiagnosable-bounce shape REV-003's last-owner guard already has) and the role is confirmed to still be exactly what the second invite granted. REV-011: the actual delivered `/auth/redeem?token=...` URL is driven through the actual GET handler; the response is confirmed to redirect to `/auth/confirm` with no session cookie, that no membership was provisioned (proven indirectly, by re-inviting the same address with a different role and confirming `previewInviteEffect` still sees `creates_membership` rather than `changes_role`), and that only the follow-up POST -- what clicking "Accept invite" does -- actually redeems the token and creates the membership. |
+| Control | Both fixes reverted in turn (the REV-010 check short-circuited, the REV-011 redirect short-circuited), packages rebuilt, and the corresponding new test confirmed to fail each time before the fix was restored and the suite confirmed green again. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(176), `pnpm test:integration` against a real scratch Postgres (425),
+`pnpm check:architecture` (35) and `pnpm build` all clean.
+
+Saikrishnaa-vr approved with both fixed, leaving one further finding, non-blocking.
+
+| | |
+|---|---|
+| Finding (REV-012, MEDIUM, non-blocking) | The REV-010 fix above locks the target membership row `FOR UPDATE` before the pre-existing owner-set `FOR UPDATE` query. Two concurrent redemptions demoting two *different* owners of the same organization could each hold the row the other needs next -- transaction A locks A's row then waits on B's, transaction B locks B's row then waits on A's -- a lock cycle Postgres breaks by aborting one with a deadlock error, rather than the last-owner refusal this scenario is actually supposed to produce. |
+| Fix | A `pg_advisory_xact_lock(hashtext(organizationId))`, the same pattern `bootstrapOrganizationOwner` already uses (there, on organization name), taken in `provisionInvitedMembership` before either row lock. It serializes every redemption for one organization, so only one is ever inside the section that takes the two row locks at a time -- the cross-wait cannot form regardless of which row either happens to lock first. |
+| Regression | Two cases. First, a deterministic one: naturally-timed concurrent redemptions did not reliably land in the exact interleaving that deadlocks -- three attempts against the reverted fix all passed by accident, one transaction consistently finishing before the other's conflicting query was even issued on this fast a local connection. So `assertUnserializedOwnerDemotionsCanDeadlock` (packages/db) forces the interleaving by hand across two raw connections, proving the hazard is real rather than theoretical, independent of the fix's own state. Second, the realistic one: two owners, two invites demoting each concurrently, redeemed via `Promise.allSettled` directly against `redeemMagicLinkToken` so the raw thrown error is inspectable -- asserts exactly one succeeds, the other is refused with the last-owner message (explicitly not a `40P01` Postgres deadlock code), and the organization ends with exactly one owner. |
+| Control | The deterministic probe (which does not exercise the fix at all, by design -- an advisory lock's serialization is a structural guarantee, not something worth re-proving empirically) was confirmed to reproduce a genuine deadlock every time it was run against the hazardous lock order. The realistic scenario's fix was then reverted, rebuilt, and confirmed to pass regardless (since natural timing does not reliably hit the window either way) -- which is exactly why the deterministic probe exists: it is the one that actually distinguishes fixed from unfixed. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(176), `pnpm test:integration` against a real scratch Postgres (427),
+`pnpm check:architecture` (35) and `pnpm build` all clean.
+
+### AF-97 — merging develop (AF-68 automated backups) into PR #88
+
+`develop` moved again while round 4 was in flight: PR #93 (AF-68, automated
+off-host backups) merged in as `4b889e2`.
+
+| | |
+|---|---|
+| Conflict | `package.json`, same shape as the two earlier merges -- both sides registered a new test file in `test:unit:ts` (this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `backup-controls`) and `test:integration` (no new file from develop's side this time). Resolved as a union; `tests/architecture/test-registration.test.ts` confirms the result is complete and duplicate-free. |
+| Conflict | `infra/compose/runtime.yml` -- a real content conflict, not textual noise: this branch's round-2 fix (REV-001) added a `bootstrap:` service at the same insertion point AF-68 added `backup-init:` and `backup:`. All three are disjoint, additive services with no shared state, so the resolution is keeping all three. One trap: git's conflict-marker rendering coalesced the two branches' identical trailing `security_opt: ["no-new-privileges:true"]` lines into a single shared copy positioned after the whole conflict, which silently would have left `bootstrap:` without its own copy -- caught by byte-comparing each reconstructed service block against `git show :2:`/`:3:` of the file before trusting the merge, not by the diff output alone. |
+| Checked and clean | AF-68 does not touch any file this branch's invite/redemption work touches (`packages/db/src/index.ts`, the auth routes, `packages/security`), so there was no second AF-67-style semantic break to look for this time. No new migration from AF-68 -- backups are operational, not schema. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(185), `pnpm test:integration` against a real scratch Postgres (432),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
+
+### AF-97 — merging develop (AF-93 preview-environment hardening, AF-95 serialised production deployments, AF-74 target account list) into PR #88
+
+`develop` moved again after Saikrishnaa-vr's round-4 approval, while the PR
+sat waiting on re-review: three PRs merged in as `c5c2c5d` -- #85 (AF-93,
+preview-environment orchestration hardening against an untrusted PR's own
+code and compose file), #87 (AF-95, a `production` concurrency group
+serialising deployments), and #91 (AF-74, a target-account qualification
+script and its own Python test suite).
+
+| | |
+|---|---|
+| Merge | Every touched file auto-merged with no conflict markers, including `README.md`, `docs/engineering/environments.md`, `infra/compose/runtime.yml`, `package.json` and `tests/integration/environment-policy.test.ts` -- all files this branch also has commits on. Confirmed by reading each diff rather than trusting the auto-merge silently: `package.json`'s `test:unit:ts`/`test:integration`/`test:python` arrays carry both sides' additions (this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `backup-controls` already merged plus AF-74's `tests/test_target_accounts.py`); `infra/compose/runtime.yml` keeps this branch's `bootstrap:` service (REV-001) fully intact alongside AF-93's `DEPLOY_SOURCE_DIRECTORY` build-context indirection on `seed`/`web`/`worker` -- `bootstrap` is not part of the preview `up` path (`grep` over `.github/workflows/preview-environment.yml` shows no reference to it), so it correctly keeps its plain `context: ../..` rather than needing the same untrusted-checkout treatment. |
+| Checked and clean | AF-93/AF-95/AF-74 touch no file this branch's invite, redemption, or bootstrap logic touches in `packages/db/src/index.ts`, the auth routes, or `packages/security` -- all three are CI/deployment orchestration and an unrelated Python validation script, so there was no semantic-break class to look for this time, unlike the AF-67 and AF-68 merges. `tests/architecture/test-registration.test.ts` and `migration-ordering.test.ts` both still pass, confirming the merged test registries stay complete and duplicate-free and no migration-numbering collision was introduced (AF-74 adds no migration). |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(185), `pnpm test:integration` against a real scratch Postgres (442),
+`pnpm check:architecture` (40) and `pnpm build` all clean on the merge commit.
