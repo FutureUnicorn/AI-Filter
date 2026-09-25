@@ -1364,6 +1364,95 @@ export const APPLICATION_EVIDENCE_STATES: readonly ApplicationEvidenceState[] = 
   "extracted"
 ] as const;
 
+// ---- AF-102: durable evidence-extraction processing queue ----
+
+export const EVIDENCE_EXTRACTION_JOB_STATES = ["ready", "running", "completed", "failed"] as const;
+export type EvidenceExtractionJobState = (typeof EVIDENCE_EXTRACTION_JOB_STATES)[number];
+
+/** Mutable delivery state. Candidate PII and evidence never belong here. */
+export interface EvidenceExtractionJob {
+  readonly jobId: string;
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly applicationId: string;
+  readonly sourceIntakeId: string;
+  readonly rubricId: string;
+  readonly workflowVersion: string;
+  readonly state: EvidenceExtractionJobState;
+  readonly enqueuedAt: string;
+  readonly availableAt: string;
+  readonly startedAt?: string | undefined;
+  readonly completedAt?: string | undefined;
+  readonly failedAt?: string | undefined;
+  readonly attemptCount: number;
+  readonly maxAttempts: number;
+  readonly leaseOwner?: string | undefined;
+  readonly leaseExpiresAt?: string | undefined;
+  readonly failureCode?: string | undefined;
+  readonly updatedAt: string;
+}
+
+export interface EvidenceExtractionJobTiming {
+  readonly queueWaitMs?: number | undefined;
+  readonly durationMs?: number | undefined;
+}
+
+/** Build the privacy-safe terminal result shared by every worker failure path. */
+export function buildEvidenceExtractionFailureOutcomes(
+  subject: { readonly organizationId: string; readonly applicationId: string },
+  criterionIds: readonly string[],
+  failureCode: string
+): EvidenceOutcome[] {
+  if (!/^[a-z][a-z0-9_]{0,63}$/u.test(failureCode)) {
+    throw new Error("failureCode must be a bounded machine-readable code");
+  }
+  return criterionIds.map((criterionId) => {
+    if (criterionId.trim().length === 0) {
+      throw new Error("terminal evidence outcomes require non-empty criterion IDs");
+    }
+    return {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      kind: "failed",
+      organizationId: subject.organizationId,
+      candidateId: subject.applicationId,
+      criterionId,
+      errorCode: failureCode,
+      message: "Evidence extraction could not be completed.",
+      retryable: false
+    };
+  });
+}
+
+function nonNegativeElapsed(later: string, earlier: string): number {
+  const elapsed = new Date(later).getTime() - new Date(earlier).getTime();
+  return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
+}
+
+/** Vendor-neutral timing facts consumed by AF-67. */
+export function deriveEvidenceExtractionJobTiming(job: EvidenceExtractionJob): EvidenceExtractionJobTiming {
+  const queueWaitMs = job.startedAt === undefined ? undefined : nonNegativeElapsed(job.startedAt, job.enqueuedAt);
+  const endedAt = job.completedAt ?? job.failedAt;
+  const durationMs = job.startedAt === undefined || endedAt === undefined
+    ? undefined
+    : nonNegativeElapsed(endedAt, job.startedAt);
+  return {
+    ...(queueWaitMs === undefined ? {} : { queueWaitMs }),
+    ...(durationMs === undefined ? {} : { durationMs })
+  };
+}
+
+export interface EvidenceExtractionQueueMonitoringSnapshot {
+  readonly observedAt: string;
+  readonly oldestReadyAgeMs: number | null;
+  readonly readyJobs: number;
+  readonly runningJobs: number;
+  readonly failedJobs: number;
+  readonly completedJobs: number;
+  readonly totalAttempts: number;
+  readonly lastHeartbeatAt: string | null;
+  readonly heartbeatAgeMs: number | null;
+}
+
 /** Just the fields the queue needs from an extraction run; the full row
  * carries model/prompt/schema/rubric versions this view never shows. */
 export interface EvidenceExtractionRunRef {

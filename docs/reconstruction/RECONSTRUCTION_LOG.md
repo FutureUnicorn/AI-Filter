@@ -638,3 +638,17 @@ One finding from Saikrishnaa-vr, blocking. Verified as real before fixing.
 (171), `pnpm test:integration` against a real scratch Postgres (404),
 `pnpm check:architecture` (35) and `pnpm build` all clean. The 25 migrations
 replay from empty and then replay again idempotently.
+
+### AF-97 — merging develop (AF-102 durable extraction queue) into PR #88
+
+`develop` moved again while round 3 was in flight: PR #92 (AF-102, a durable
+evidence-extraction worker queue) merged in as `33f33d5`.
+
+| | |
+|---|---|
+| Conflict | `package.json` only, same shape as the AF-67 merge: both sides registered a new test file in `test:unit:ts` and `test:integration`. Resolved as a union -- this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `evidence-extraction-job`/`evidence-extraction-worker` -- and `tests/architecture/test-registration.test.ts` confirms the result is complete and duplicate-free. |
+| Checked and clean | AF-102 touches `apps/web/src/lib/observability.ts`, `packages/db/src/index.ts`, `packages/contracts/src/index.ts` and `packages/security/src/index.ts`, all files this branch also touches; every one auto-merged with no textual conflict. Re-checked for the same class of semantic break the AF-67 merge caused (a new no-`console.error` or similar rule this branch's code predates): none -- `grep -rn console.error apps/web/src apps/worker/src` is empty. A new migration, `0026_evidence_extraction_jobs.sql`, leaves a numbering gap after this branch's `0024` (no `0025` in the merged tree); `migration-ordering.test.ts` has no rule against a gap and all 8 of its cases still pass, so this is left alone rather than renumbered on a branch that doesn't own it. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(176), `pnpm test:integration` against a real scratch Postgres (423),
+`pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.

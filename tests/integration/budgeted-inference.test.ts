@@ -202,3 +202,64 @@ test("a telemetry outage cannot change a settled production inference result", a
     { inputTokens: 720, outputTokens: 90 }
   );
 });
+
+test("a provider HTTP rejection releases the reservation instead of creating phantom usage", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionInferenceBudgetProbeSchema(databaseUrl);
+  const { organizationId, schema } = probe;
+  t.after(() => dropProbeSchema(databaseUrl, schema));
+  const model = `af102-http-failure-${randomUUID()}`;
+  const periodStart = "2026-09-01";
+  const adapter: AiAdapter = {
+    async runStructuredCall() {
+      throw Object.assign(new Error("synthetic unavailable"), { status: 503 });
+    }
+  };
+
+  await assert.rejects(() =>
+    executeBudgetedInference(adapter, databaseUrl, schema, {
+      organizationId,
+      model,
+      periodStart,
+      estimatedInputTokens: 800,
+      estimatedOutputTokens: 100,
+      budget: { maxTokensPerPeriod: 2_000, alertThresholdRatio: 0.8 },
+      call
+    })
+  );
+  assert.deepEqual(
+    await getInferenceUsage(databaseUrl, schema, { organizationId, model, periodStart }),
+    { inputTokens: 0, outputTokens: 0 }
+  );
+});
+
+test("an ambiguous post-dispatch failure settles the conservative estimate", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionInferenceBudgetProbeSchema(databaseUrl);
+  const { organizationId, schema } = probe;
+  t.after(() => dropProbeSchema(databaseUrl, schema));
+  const model = `af102-ambiguous-failure-${randomUUID()}`;
+  const periodStart = "2026-09-01";
+  const adapter: AiAdapter = {
+    async runStructuredCall() {
+      throw new Error("synthetic connection loss");
+    }
+  };
+
+  await assert.rejects(() =>
+    executeBudgetedInference(adapter, databaseUrl, schema, {
+      organizationId,
+      model,
+      periodStart,
+      estimatedInputTokens: 800,
+      estimatedOutputTokens: 100,
+      budget: { maxTokensPerPeriod: 2_000, alertThresholdRatio: 0.8 },
+      call
+    })
+  );
+  assert.deepEqual(
+    await getInferenceUsage(databaseUrl, schema, { organizationId, model, periodStart }),
+    { inputTokens: 800, outputTokens: 100 },
+    "unknown billing state must not be under-counted as a free request"
+  );
+});

@@ -115,6 +115,22 @@ export class InferenceKillSwitchEngagedError extends Error {
   }
 }
 
+/**
+ * The inference request was rejected before the provider client was called.
+ * Budgeting code can safely release the full reservation for this class;
+ * generic network/provider failures remain cost-unknown and must retain a
+ * conservative settlement.
+ */
+export class AiCallNotStartedError extends Error {
+  readonly stage: "kill_switch_check" | "input_validation";
+
+  constructor(stage: "kill_switch_check" | "input_validation", cause?: unknown) {
+    super("Inference call did not reach the provider.", cause === undefined ? undefined : { cause });
+    this.name = "AiCallNotStartedError";
+    this.stage = stage;
+  }
+}
+
 function isOpenAiJsonSchema(schema: unknown): schema is Record<string, unknown> {
   return typeof schema === "object" && schema !== null && !Array.isArray(schema);
 }
@@ -209,12 +225,17 @@ export function createOpenAiAdapter(
 
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
-      const status = await config.checkKillSwitch();
+      let status: { readonly engaged: boolean; readonly reason?: string };
+      try {
+        status = await config.checkKillSwitch();
+      } catch (cause) {
+        throw new AiCallNotStartedError("kill_switch_check", cause);
+      }
       if (status.engaged) {
         throw new InferenceKillSwitchEngagedError(status.reason);
       }
       if (!isOpenAiJsonSchema(input.jsonSchema)) {
-        throw new TypeError("OpenAI structured output requires an object JSON Schema.");
+        throw new AiCallNotStartedError("input_validation");
       }
       const response = await openai.responses.create({
         model: config.model,
