@@ -6,7 +6,11 @@ import type { Event, Span } from "@sentry/node";
 
 type SentrySpanJson = ReturnType<typeof Sentry.spanToJSON>;
 
-export type WorkerOperation = "worker.startup" | "worker.job" | "inference.token_budget";
+export type WorkerOperation =
+  | "worker.startup"
+  | "worker.job"
+  | "inference.token_budget"
+  | "evidence_extraction.queue";
 
 export const WORKER_JOB_FAILURE_CODES = [
   "invalid_job_context",
@@ -277,5 +281,73 @@ export async function recordInferenceBudgetTelemetry(value: InferenceBudgetTelem
     );
   } catch {
     // A monitoring outage cannot block an inference decision or worker job.
+  }
+}
+
+/**
+ * AF-67 queue-age monitoring, over AF-102's durable queue.
+ *
+ * Published on the heartbeat tick rather than when a job is dequeued.
+ * That distinction is the whole point: AF-102's ticket states that
+ * dequeue-only telemetry cannot work, because a completely stalled worker
+ * emits nothing while the queue grows behind it, and the absence of
+ * events is indistinguishable from an empty queue. Emitting on the
+ * heartbeat means a backlog is visible even when nothing is being
+ * claimed, which is the case the alert exists for.
+ *
+ * Every value is a count or a duration. No organization, application,
+ * candidate, job or document identifier is included, so the queue signal
+ * carries nothing that a retention or deletion request could reach.
+ */
+export interface EvidenceExtractionQueueTelemetry {
+  /** now - the oldest ready job's enqueued_at; null when nothing is ready. */
+  readonly oldestReadyAgeMs: number | null;
+  readonly readyJobs: number;
+  readonly runningJobs: number;
+  readonly failedJobs: number;
+  readonly completedJobs: number;
+  readonly totalAttempts: number;
+  /** now - most recent heartbeat. Null when no worker has ever reported. */
+  readonly heartbeatAgeMs: number | null;
+}
+
+export async function recordEvidenceExtractionQueueTelemetry(
+  value: EvidenceExtractionQueueTelemetry
+): Promise<void> {
+  try {
+    await telemetryAdapter.startSpan(
+      {
+        name: "evidence_extraction.queue",
+        op: "monitor.queue",
+        kind: 0,
+        forceTransaction: true,
+        attributes: {
+          "service.name": "worker",
+          "monitor.operation": "evidence_extraction.queue",
+          // -1 for "nothing ready": an empty queue reported as zero age
+          // would read to a threshold rule as a perfectly fresh backlog.
+          "monitor.queue.oldest_ready_age_ms": value.oldestReadyAgeMs ?? -1,
+          "monitor.queue.ready": value.readyJobs,
+          "monitor.queue.running": value.runningJobs,
+          "monitor.queue.failed": value.failedJobs,
+          "monitor.queue.completed": value.completedJobs,
+          "monitor.queue.attempts": value.totalAttempts,
+          // -1, not omitted: a missing attribute and "no worker has ever
+          // reported" would otherwise look the same to a no-data rule.
+          "monitor.worker.heartbeat_age_ms": value.heartbeatAgeMs ?? -1
+        }
+      },
+      (span) => {
+        span.setAttributes({
+          "monitor.queue.oldest_ready_age_ms": value.oldestReadyAgeMs ?? -1,
+          "monitor.queue.ready": value.readyJobs,
+          "monitor.worker.heartbeat_age_ms": value.heartbeatAgeMs ?? -1
+        });
+        return undefined;
+      }
+    );
+  } catch {
+    // Monitoring must never replace a durable queue outcome. A telemetry
+    // failure is not a job failure.
   }
 }

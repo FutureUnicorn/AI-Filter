@@ -333,12 +333,38 @@ test("alert definitions require external thresholds and stage blocked producers 
     SENTRY_ALERT_TOKEN_BUDGET_EVENT_THRESHOLD: "1",
     SENTRY_ALERT_P95_THRESHOLDS_MS: JSON.stringify(thresholds)
   });
-  assert.equal(definitions.length, MONITORED_OPERATIONS.length + 3);
+  assert.equal(definitions.length, MONITORED_OPERATIONS.length + 4);
   const serialized = JSON.stringify(definitions);
   assert.match(serialized, /failure_rate\(\)/u);
   assert.match(serialized, /p95\(span\.duration\)/u);
   assert.match(serialized, /inference\.token_budget/u);
-  assert.doesNotMatch(serialized, /queue\.age|dollar|rupee|currency/iu);
+  // This used to assert queue age was absent entirely, because AF-67
+  // refused to fabricate it from application timestamps or the recruiter
+  // review queue while no durable queue existed. AF-102 has since shipped
+  // one, so the invariant is no longer "no queue age" but "queue age only
+  // from the durable queue". Monetary terms stay excluded: this is
+  // token utilization and backlog, never provider spend.
+  assert.doesNotMatch(serialized, /dollar|rupee|currency/iu);
+  const queueDefinition = definitions.find((definition) =>
+    definition.payload.name.includes("evidence extraction queue age")
+  );
+  assert.ok(queueDefinition !== undefined, "the queue-age detector must be provisioned");
+  const queueQuery = JSON.stringify(queueDefinition.payload.data_sources);
+  assert.match(
+    queueQuery,
+    /monitor\.operation:evidence_extraction\.queue/u,
+    "queue age must be read from the durable queue AF-102 ships"
+  );
+  assert.doesNotMatch(
+    queueQuery,
+    /application\.created_at|application\.review_queue|evidence_extraction_runs/u,
+    "queue age must not be derived from a proxy: not application timestamps, not the recruiter review queue, not the append-only run ledger"
+  );
+  assert.match(
+    queueQuery,
+    /!monitor\.queue\.oldest_ready_age_ms:-1/u,
+    "the empty-queue sentinel must be excluded, or an idle queue reads as a zero-age backlog"
+  );
   const tokenBudgetDefinition = definitions.find((definition) =>
     definition.payload.name.includes("inference token budget")
   );

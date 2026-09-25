@@ -740,6 +740,7 @@ const SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
   "AiStructuredCallParseError",
   "AiUsageUnavailableError",
   "CredentialsProviderError",
+  "EnvironmentDependencyUnavailableError",
   "Error",
   "EvalError",
   "InferenceBudgetCappedError",
