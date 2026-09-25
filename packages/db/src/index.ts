@@ -36,10 +36,13 @@ import type {
 } from "@signal-audit/domain";
 import {
   CONTRACT_SCHEMA_VERSION,
+  beginReviewTiming,
   canonicalizeCsvColumnMapping,
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   mapCsvRowToApplication,
+  recordReviewActivity,
+  sealReviewTiming,
   summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
@@ -4082,6 +4085,27 @@ export async function listReviewTimingSpansForRole(
   }
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The name of the constraint a query violated, or undefined when the
+ * query failed for some other reason entirely.
+ *
+ * pg puts this on the error for check, foreign key, unique and not-null
+ * violations. Reading it is what separates "the bound I am testing
+ * rejected this" from "something rejected this", and those are not the
+ * same result.
+ */
+function violatedConstraint(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("constraint" in error)) {
+    return undefined;
+  }
+  const { constraint } = error as { readonly constraint?: unknown };
+  return typeof constraint === "string" ? constraint : undefined;
+}
+
 /**
  * AF-54: proves a review-timing span cannot record a duration it did
  * not measure, cannot cross tenants, and cannot be edited afterwards.
@@ -4090,7 +4114,8 @@ export async function listReviewTimingSpansForRole(
  * hex-safe. A first pass at this used ids beginning with `t`, which is
  * not a hex digit -- every case failed with "invalid input syntax for
  * type uuid" and would have read as "all rejected" from the exit status
- * alone.
+ * alone. Naming the expected constraint for each case is what makes
+ * that class of mistake impossible rather than merely fixed once.
  */
 export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<void> {
   const suffix = randomBytes(4).toString("hex");
@@ -4184,17 +4209,42 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
       throw new Error("the idle flag must survive the round trip; a summary cannot exclude what it cannot see");
     }
 
+    // 1b. The span the client producer actually emits is insertable.
+    //     Worth doing against real Postgres rather than trusting the
+    //     arithmetic: the producer's worst case is an abandoned tab, and
+    //     that is precisely the shape that would trip the wall-clock
+    //     CHECK if endedAt were the moment of closing rather than the
+    //     last interaction.
+    const abandonedStartMs = Date.parse("2026-08-29T12:00:00Z");
+    const abandoned = sealReviewTiming(
+      recordReviewActivity(beginReviewTiming(abandonedStartMs), abandonedStartMs + 45_000).state,
+      abandonedStartMs + 8 * 60 * 60 * 1_000
+    );
+    if (abandoned === undefined || !abandoned.truncatedByIdle) {
+      throw new Error("a tab abandoned for eight hours must still yield a truncated span to record");
+    }
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date(abandoned.startedAtMs),
+      endedAt: new Date(abandoned.endedAtMs),
+      activeMs: abandoned.activeMs,
+      truncatedByIdle: abandoned.truncatedByIdle
+    });
+
     // 2. A span cannot claim more active time than the wall clock it
     //    sits inside. This is the check that catches a client sending a
     //    fabricated duration, which would quietly corrupt the baseline.
-    const rejections: Array<[string, string, string, string, string, number]> = [
+    const rejections: Array<[string, string, string, string, string, number, string]> = [
       [
         "eight hours of activity inside ninety seconds",
         "ea000001-4444-4444-8444-444444444444",
         orgA,
         "2026-08-29T14:00:00Z",
         "2026-08-29T14:01:30Z",
-        28_800_000
+        28_800_000,
+        "review_timing_spans_active_within_wall_clock"
       ],
       [
         "negative active time",
@@ -4202,7 +4252,8 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgA,
         "2026-08-29T15:00:00Z",
         "2026-08-29T15:01:00Z",
-        -5
+        -5,
+        "review_timing_spans_active_ms_check"
       ],
       [
         "a span that ended before it started",
@@ -4210,7 +4261,13 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgA,
         "2026-08-29T16:00:00.500Z",
         "2026-08-29T16:00:00.000Z",
-        0
+        0,
+        // The claim worth checking mechanically: this reversal is caught
+        // by the ordering constraint specifically, not shadowed by the
+        // wall-clock bound. Half a second backwards with zero active
+        // time satisfies that one (0 <= -500 + 1000), so it has to be
+        // this constraint or none.
+        "review_timing_spans_ordered"
       ],
       [
         "another tenant timing this application",
@@ -4218,11 +4275,19 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgB,
         "2026-08-29T17:00:00Z",
         "2026-08-29T17:01:00Z",
-        60_000
+        60_000,
+        "review_timing_spans_application_id_organization_id_fkey"
       ]
     ];
-    for (const [label, id, organizationId, startedAt, endedAt, activeMs] of rejections) {
-      let rejected = false;
+    // Which constraint rejected it, not merely that something did. A
+    // bare catch here would have been satisfied by the typo that
+    // actually happened during this probe's first pass -- ids beginning
+    // with `t`, every case failing on "invalid input syntax for type
+    // uuid" -- and reported all four bounds as holding. Fixing the ids
+    // left that trap armed for the next edit; naming the constraint
+    // disarms it.
+    for (const [label, id, organizationId, startedAt, endedAt, activeMs, constraint] of rejections) {
+      let tripped: string | undefined;
       try {
         await admin.query(
           `INSERT INTO review_timing_spans
@@ -4231,17 +4296,26 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
            VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
           [id, organizationId, applicationId, reviewerId, startedAt, endedAt, activeMs]
         );
-      } catch {
-        rejected = true;
+      } catch (error) {
+        tripped = violatedConstraint(error);
+        if (tripped === undefined) {
+          throw new Error(`${label} failed for a reason that is not a constraint: ${describeError(error)}`, {
+            cause: error
+          });
+        }
       }
-      if (!rejected) {
-        throw new Error(`${label} must not be recordable as review timing`);
+      if (tripped !== constraint) {
+        throw new Error(
+          tripped === undefined
+            ? `${label} must not be recordable as review timing`
+            : `${label} must be caught by ${constraint}, but ${tripped} fired first`
+        );
       }
     }
 
     // 3. A reviewer with no standing in this tenant cannot be recorded
     //    as having reviewed.
-    let outsiderRejected = false;
+    let outsiderTripped: string | undefined;
     try {
       await admin.query(
         `INSERT INTO review_timing_spans
@@ -4250,11 +4324,15 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
          VALUES ('ea000005-4444-4444-8444-444444444444', $1, $2, $3, $4, $5, 60000, false)`,
         [orgA, applicationId, outsiderId, "2026-08-29T18:00:00Z", "2026-08-29T18:01:00Z"]
       );
-    } catch {
-      outsiderRejected = true;
+    } catch (error) {
+      outsiderTripped = violatedConstraint(error);
     }
-    if (!outsiderRejected) {
-      throw new Error("a reviewer with no membership in this organization must not be recordable");
+    if (outsiderTripped !== "review_timing_spans_organization_id_reviewer_user_id_fkey") {
+      throw new Error(
+        `a reviewer with no membership in this organization must be rejected by the membership foreign key, got ${
+          outsiderTripped ?? "no rejection"
+        }`
+      );
     }
 
     // 4. Nothing edits or erases a recorded span. Checked with rows
@@ -4269,14 +4347,18 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
       `DELETE FROM review_timing_spans`,
       `TRUNCATE review_timing_spans`
     ]) {
-      let rejected = false;
+      let message: string | undefined;
       try {
         await admin.query(statement);
-      } catch {
-        rejected = true;
+      } catch (error) {
+        message = describeError(error);
       }
-      if (!rejected) {
-        throw new Error(`a recorded timing span must be immutable; permitted: ${statement}`);
+      // The trigger's own words. A syntax error or a missing table would
+      // otherwise read as "immutability holds".
+      if (message === undefined || !message.includes("review_timing_spans is append-only")) {
+        throw new Error(
+          `a recorded timing span must be immutable; ${statement} gave ${message ?? "no error at all"}`
+        );
       }
     }
   } finally {
