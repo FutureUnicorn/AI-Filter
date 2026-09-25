@@ -697,3 +697,21 @@ off-host backups) merged in as `4b889e2`.
 **Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
 (185), `pnpm test:integration` against a real scratch Postgres (432),
 `pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
+
+### AF-97 — merging develop (AF-93 preview-environment hardening, AF-95 serialised production deployments, AF-74 target account list) into PR #88
+
+`develop` moved again after Saikrishnaa-vr's round-4 approval, while the PR
+sat waiting on re-review: three PRs merged in as `c5c2c5d` -- #85 (AF-93,
+preview-environment orchestration hardening against an untrusted PR's own
+code and compose file), #87 (AF-95, a `production` concurrency group
+serialising deployments), and #91 (AF-74, a target-account qualification
+script and its own Python test suite).
+
+| | |
+|---|---|
+| Merge | Every touched file auto-merged with no conflict markers, including `README.md`, `docs/engineering/environments.md`, `infra/compose/runtime.yml`, `package.json` and `tests/integration/environment-policy.test.ts` -- all files this branch also has commits on. Confirmed by reading each diff rather than trusting the auto-merge silently: `package.json`'s `test:unit:ts`/`test:integration`/`test:python` arrays carry both sides' additions (this branch's `sign-in-auth-codes`/`deployment-entry-point`, develop's `backup-controls` already merged plus AF-74's `tests/test_target_accounts.py`); `infra/compose/runtime.yml` keeps this branch's `bootstrap:` service (REV-001) fully intact alongside AF-93's `DEPLOY_SOURCE_DIRECTORY` build-context indirection on `seed`/`web`/`worker` -- `bootstrap` is not part of the preview `up` path (`grep` over `.github/workflows/preview-environment.yml` shows no reference to it), so it correctly keeps its plain `context: ../..` rather than needing the same untrusted-checkout treatment. |
+| Checked and clean | AF-93/AF-95/AF-74 touch no file this branch's invite, redemption, or bootstrap logic touches in `packages/db/src/index.ts`, the auth routes, or `packages/security` -- all three are CI/deployment orchestration and an unrelated Python validation script, so there was no semantic-break class to look for this time, unlike the AF-67 and AF-68 merges. `tests/architecture/test-registration.test.ts` and `migration-ordering.test.ts` both still pass, confirming the merged test registries stay complete and duplicate-free and no migration-numbering collision was introduced (AF-74 adds no migration). |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(185), `pnpm test:integration` against a real scratch Postgres (442),
+`pnpm check:architecture` (40) and `pnpm build` all clean on the merge commit.
