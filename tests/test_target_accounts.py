@@ -322,6 +322,97 @@ def test_a_claim_without_an_iso_date_is_a_register_error():
     )
 
 
+def test_an_unhashable_buyer_title_is_a_register_error_not_a_crash():
+    """buyer_title lands in a frozenset membership check (BUYER_TITLES).
+    Before REV-011's fix, an unhashable value there raised a bare
+    TypeError instead of the documented malformed-register outcome."""
+    for bad in ([], {}, ["head_of_talent"]):
+        _assert_register_error(
+            lambda bad=bad: parse_account(_record(buyer_title=bad)),
+            "expected a string",
+        )
+
+
+def test_an_unhashable_claim_name_is_a_register_error_not_a_crash():
+    """A claim's name lands in a set (seen_claims) before an Account is
+    even built, so this has to be caught earlier than buyer_title's."""
+    for bad in ([], {}):
+        _assert_register_error(
+            lambda bad=bad: parse_account(
+                _record(claims=[{"claim": bad, "source": "s", "observed_on": "2026-09-10"}])
+            ),
+            "expected a string",
+        )
+
+
+def test_a_non_string_company_or_claim_source_is_a_register_error():
+    _assert_register_error(
+        lambda: parse_account(_record(company=12345)),
+        "expected a string",
+    )
+    _assert_register_error(
+        lambda: parse_account(
+            _record(claims=[{"claim": "headcount", "source": [], "observed_on": "2026-09-10"}])
+        ),
+        "expected a string",
+    )
+
+
+def test_a_non_string_observed_on_is_a_register_error():
+    for bad in (None, [], 20260910):
+        _assert_register_error(
+            lambda bad=bad: parse_account(
+                _record(claims=[{"claim": "headcount", "source": "s", "observed_on": bad}])
+            ),
+            "ISO date",
+        )
+
+
+def test_cli_reports_an_unhashable_buyer_title_as_a_clean_exit_2():
+    """REV-011: the CLI must surface malformed input as the documented
+    exit 2 and a one-line error, never a Python traceback. Runs the real
+    script as a subprocess so this checks what a researcher actually sees,
+    not just that parse_account raises the right exception in-process."""
+    import subprocess
+    import tempfile
+
+    repository_root = Path(__file__).resolve().parents[1]
+    register = [
+        {
+            "account_id": "x",
+            "company": "X",
+            "headcount": 240,
+            "remote_technical_hiring": True,
+            "applications_per_requisition": 430,
+            "ats_platform": "lever",
+            "ats_fraud_tooling": "absent",
+            "buyer_title": [],
+            "claims": [],
+        }
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(register, handle)
+        register_path = handle.name
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "scripts/target_accounts.py", register_path, "--as-of", "2026-09-20"],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        Path(register_path).unlink()
+
+    assert result.returncode == 2, (
+        f"expected exit 2 for a malformed register, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "Traceback" not in result.stderr, f"CLI crashed instead of reporting a clean error:\n{result.stderr}"
+    assert "expected a string" in result.stderr
+
+
 def test_the_example_register_parses_and_covers_every_outcome():
     accounts = load_register(EXAMPLE_REGISTER.read_text(encoding="utf-8"))
     report = assess_register(accounts, AS_OF)

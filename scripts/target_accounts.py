@@ -368,6 +368,20 @@ def _require_bool(value, field: str, account_id: str) -> bool:
     return value
 
 
+def _require_str(value, field: str, account_id: str) -> str:
+    # A list or dict here is not just the wrong shape, it is unhashable --
+    # buyer_title and a claim's name both end up in set/frozenset membership
+    # checks (BUYER_TITLES, seen_claims), and an unhashable value there
+    # raises TypeError instead of the documented RegisterError. Catching the
+    # type here, before anything hashes it, is what keeps a malformed
+    # register a clean exit 2 rather than a traceback.
+    if not isinstance(value, str):
+        raise RegisterError(
+            f"account {account_id!r} has {field}={value!r}; expected a string"
+        )
+    return value
+
+
 def parse_account(record: dict) -> Account:
     if not isinstance(record, dict):
         raise RegisterError(f"expected an account object, got {type(record).__name__}")
@@ -398,16 +412,30 @@ def parse_account(record: dict) -> Account:
                 f"{unknown_claim_keys}"
             )
         try:
-            claim = Claim(
-                claim=raw["claim"],
-                source=raw["source"],
-                observed_on=date.fromisoformat(raw["observed_on"]),
-            )
+            raw_claim_name = raw["claim"]
+            raw_claim_source = raw["source"]
+            raw_observed_on = raw["observed_on"]
         except (KeyError, TypeError) as error:
             raise RegisterError(
                 f"account {account_id!r} has a claim missing claim/source/observed_on"
             ) from error
-        except ValueError as error:
+
+        # Validated as strings before either touches seen_claims below: that
+        # is a set, and an unhashable claim name (a list, a dict) must fail
+        # here as RegisterError, not as a bare TypeError once it is hashed.
+        claim_name = _require_str(raw_claim_name, "claim", account_id)
+        claim_source = _require_str(raw_claim_source, "source", account_id)
+
+        try:
+            claim = Claim(
+                claim=claim_name,
+                source=claim_source,
+                observed_on=date.fromisoformat(raw_observed_on),
+            )
+        except (TypeError, ValueError) as error:
+            # fromisoformat raises TypeError for a non-string (a list, a
+            # number, null) and ValueError for a string that isn't an ISO
+            # date -- both are the same malformed-register outcome here.
             raise RegisterError(
                 f"account {account_id!r} has a claim whose observed_on is not an "
                 "ISO date (YYYY-MM-DD)"
@@ -457,6 +485,13 @@ def parse_account(record: dict) -> Account:
         raise RegisterError(
             f"account {account_id!r} has a non-string ats_platform {ats_platform!r}"
         )
+
+    # buyer_title also ends up in a frozenset membership check
+    # (BUYER_TITLES), so it needs the same unhashable-value guard as a
+    # claim's name -- company does not, but is validated for the same
+    # documented-error-over-traceback reason.
+    company = _require_str(company, "company", account_id)
+    buyer_title = _require_str(buyer_title, "buyer_title", account_id)
 
     return Account(
         account_id=account_id,
