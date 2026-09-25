@@ -1,0 +1,136 @@
+# Overlay for the AF-69 synthetic Docker drill. Never deploy this file.
+services:
+  source-postgres:
+    image: postgres:17.10-alpine3.23
+    environment:
+      POSTGRES_DB: af69_source
+      POSTGRES_USER: af69_source
+      POSTGRES_PASSWORD: af69-source-password-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U af69_source -d af69_source"]
+      interval: 2s
+      retries: 30
+    networks: [test-source]
+
+  source-seed:
+    image: postgres:17.10-alpine3.23
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: source-postgres
+      PGDATABASE: af69_source
+      PGUSER: af69_source
+      PGPASSWORD: af69-source-password-only
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        for migration in /migrations/*.sql; do
+          psql -X -q -v ON_ERROR_STOP=1 -f "$$migration" >/dev/null
+        done
+        psql -X -q -v ON_ERROR_STOP=1 -f /fixtures/synthetic.sql >/dev/null
+        psql -X -q -v ON_ERROR_STOP=1 -f /fixtures/intake.sql >/dev/null
+    volumes:
+      - ../../packages/db/migrations:/migrations:ro
+      - ../../tests/fixtures/environment/synthetic.sql:/fixtures/synthetic.sql:ro
+      - ../../tests/fixtures/backups/intake.sql:/fixtures/intake.sql:ro
+    networks: [test-source]
+
+  source-storage:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: af69-source
+      MINIO_ROOT_PASSWORD: af69-source-storage-only
+    networks:
+      test-source:
+        aliases: [storage]
+
+  source-storage-seed:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on: [source-storage]
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set source http://storage:9000 af69-source af69-source-storage-only >/dev/null 2>&1; do sleep 1; done
+        mc mb source/af69-source >/dev/null
+        mc cp /fixtures/synthetic-storage-fixture.txt source/af69-source/synthetic/af69-document.txt >/dev/null
+    volumes:
+      - ../../tests/fixtures/environment/synthetic-storage-fixture.txt:/fixtures/synthetic-storage-fixture.txt:ro
+    networks: [test-source]
+
+  backup-target:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: af69-target
+      MINIO_ROOT_PASSWORD: af69-target-storage-only
+      # Static synthetic key is permitted only for this disposable drill.
+      MINIO_KMS_SECRET_KEY: af69-test:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+    volumes:
+      - ${AF69_CERT_DIR:?required}:/root/.minio/certs:ro
+    networks: [restore-egress]
+
+  backup-init:
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["configure"]
+    depends_on: [backup-target]
+    environment: &backup-test-environment
+      APP_ENV: staging
+      DEPLOYMENT_COMMIT_SHA: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      PGHOST: source-postgres
+      PGDATABASE: af69_source
+      PGUSER: af69_source
+      PGPASSWORD: af69-source-password-only
+      STORAGE_BUCKET: af69-source
+      STORAGE_ACCESS_KEY_ID: af69-source
+      STORAGE_SECRET_ACCESS_KEY: af69-source-storage-only
+      BACKUP_ENDPOINT: https://backup-target:9000
+      BACKUP_REGION: us-east-1
+      BACKUP_BUCKET: af69-target
+      BACKUP_ACCESS_KEY_ID: af69-target
+      BACKUP_SECRET_ACCESS_KEY: af69-target-storage-only
+      BACKUP_INTERVAL_SECONDS: "3600"
+      BACKUP_RETENTION_DAYS: "30"
+      BACKUP_PATH_STYLE: "on"
+      BACKUP_CONTROL_OWNER: af69-test
+      BACKUP_ENCRYPTION_REFERENCE: local-synthetic-test
+      SSL_CERT_FILE: /certs/public.crt
+    volumes:
+      - ${AF69_CERT_DIR:?required}:/certs:ro
+    networks: [test-source, restore-egress]
+
+  backup-once:
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["once"]
+    depends_on:
+      source-seed:
+        condition: service_completed_successfully
+      source-storage-seed:
+        condition: service_completed_successfully
+      backup-init:
+        condition: service_completed_successfully
+    environment: *backup-test-environment
+    volumes:
+      - ${AF69_CERT_DIR:?required}:/certs:ro
+      - test-backup-work:/var/lib/signal-audit-backup
+    networks: [test-source, restore-egress]
+
+  restore:
+    environment:
+      SSL_CERT_FILE: /certs/public.crt
+    volumes:
+      - ${AF69_CERT_DIR:?required}:/certs:ro
+
+networks:
+  test-source:
+    internal: true
+
+volumes:
+  test-backup-work: {}

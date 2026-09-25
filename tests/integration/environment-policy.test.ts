@@ -377,6 +377,35 @@ test("backup retention is reproducible and preserves current source objects", ()
   }
 });
 
+test("AF-69 restore is isolated from runtime destinations and rejects incomplete controls", () => {
+  const compose = read("infra/compose/restore.yml");
+  const restore = read("scripts/backups/restore.sh");
+  assert.match(compose, /restore-postgres:\s*\n\s*image: postgres:17\.10-alpine3\.23/u);
+  assert.match(compose, /restore-private:\s*\n\s*internal: true/u);
+  assert.doesNotMatch(compose, /\bports:/u);
+  assert.doesNotMatch(compose, /^ {2}(?:postgres-data|storage-data):|\bnetworks: \[public, private\]/mu);
+  assert.match(restore, /export PGHOST=restore-postgres PGDATABASE=af69_restore PGUSER=af69_restore/u);
+  assert.match(restore, /mc --quiet cp --version-id "\$version_id"/u);
+  assert.match(restore, /pg_restore --exit-on-error --single-transaction/u);
+  assert.match(restore, /mc --quiet cp --recursive --rewind "\$storage_cutoff_at"/u);
+  assert.doesNotMatch(restore, /pg_restore[^\n]*--clean|pg_restore[^\n]*--create/u);
+  assert.match(compose, /RESTORE_SECRET_ACCESS_KEY: \$\{RESTORE_SECRET_ACCESS_KEY:\?required\}/u);
+});
+
+test(
+  "AF-69 restore rejects missing inputs before attempting source access",
+  { skip: process.platform === "win32" ? "POSIX shell behavior runs in Linux CI and container drill" : false },
+  () => {
+    const result = spawnSync("sh", [path.join(repositoryRoot, "scripts/backups/restore.sh")], {
+      encoding: "utf8",
+      env: { RESTORE_SOURCE_ENV: "staging", BACKUP_ENDPOINT: "https://backups.example.test" }
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /BACKUP_REGION is required/u);
+    assert.doesNotMatch(result.stderr, /backups\.example\.test/u);
+  }
+);
+
 test("hosted workflows pass backup policy as variables and credentials as secrets", () => {
   for (const file of [
     ".github/workflows/staging-environment.yml",

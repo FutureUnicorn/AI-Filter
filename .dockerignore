@@ -4,6 +4,7 @@
 .next
 .pytest_cache
 .runtime
+.af69-cert.*
 .venv
 **/.env
 **/.env.local

@@ -21,6 +21,7 @@ coverage/
 .env.*.local
 **/.env
 .runtime/
+.af69-cert.*/
 
 # Local infrastructure state and credentials
 infra/runtime/

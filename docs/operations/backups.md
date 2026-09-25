@@ -26,8 +26,8 @@ success. One run performs:
 5. upload the dump to immutable history, then copy it within the destination
    store to the inactive versioned recovery slot (`database/latest-a.dump`
    or `database/latest-b.dump`);
-6. record the exact recovery-slot key and version ID, SHA-256, and immutable history key
-   in a metadata-only success manifest; and
+6. record the exact recovery-slot key and version ID, SHA-256, immutable history key,
+   and millisecond storage cutoff in a metadata-only success manifest; and
 7. replace `manifests/latest.json` only after every required step succeeds.
 
 The two storage passes make the database snapshot no earlier than the first
@@ -155,13 +155,89 @@ can contain candidate filenames.
 ## Recovery and AF-69 handoff
 
 `<environment>/manifests/latest.json` identifies the active versioned
-database recovery slot, its exact version ID, the immutable history key, checksum,
-release, storage prefix, and retention window. AF-69 must fetch the recorded
-object version into isolated infrastructure, validate the checksum, restore
-with the matching PostgreSQL major version, reconstruct storage at the
-manifest completion time from version history, and prove application-level
-records and objects agree.
+database recovery slot, its exact version ID, immutable history key, checksum,
+release, storage prefix, and retention window. New schema-version-2 manifests
+also have `storage.cutoffAt` with millisecond precision. This cutoff is taken
+immediately after the second mirror pass; seconds-only `completedAt` is not
+precise enough for S3 version rewind and can exclude an object uploaded in the
+same second. The AF-69 verifier intentionally rejects schema-version-1
+manifests rather than claiming a precise reconstruction it cannot prove.
 
-Do not restore over a live environment. Do not mark AF-69 complete from
-`pg_restore --list`; that check proves archive readability, not end-to-end
-recovery.
+### Local synthetic restore proof
+
+With Docker and OpenSSL available, run `pnpm test:restore` on Linux or
+`bash scripts/backups/test-restore.sh` from Git Bash on Windows. The drill uses a unique disposable
+Compose project, its own PostgreSQL 17, two MinIO stores, a test-only TLS
+certificate and static MinIO KMS key, the real `backup.sh` producer, and the
+real `restore.sh` consumer. It applies all current migrations, seeds a
+fictional intake and object, publishes a successful manifest, then restores
+into a fresh database and bucket. It verifies the restored row and content,
+checks a later overwrite/delete does not change the published recovery set,
+and injects wrong-checksum, missing-archive-version, missing-manifest, and
+unsafe-environment failures. The test cleans up only its exact project and
+temporary certificate directory. It never uses hosted credentials.
+
+### Hosted restore drill
+
+This is a **read-only source / isolated destination** drill, not a production
+cutover procedure. Keep `BACKUP_ENABLED=false` until the separate operational
+controls in this runbook are approved. A hosted proof additionally requires a
+real, successfully published schema-version-2 backup from that environment.
+
+1. Select the source environment (`staging` or `production`) and record the
+   approved backup bucket, PostgreSQL `DATABASE_SCHEMA`, target provider and
+   manifest's backup ID. Provision a temporary *read-only* recovery identity
+   with bucket list/version-list and versioned-object read. Do not reuse the
+   long-running writer's credentials. Obtain the values from the secret
+   manager, never from a command-line literal or retained shell history.
+2. Set `RESTORE_SOURCE_ENV`, `BACKUP_ENDPOINT`, `BACKUP_REGION`, `BACKUP_BUCKET`,
+   `BACKUP_PATH_STYLE`, `RESTORE_ACCESS_KEY_ID`, `RESTORE_SECRET_ACCESS_KEY`,
+   and `RESTORE_DATABASE_SCHEMA`. Set distinct, temporary destination-only
+   `RESTORE_POSTGRES_PASSWORD`, `RESTORE_STORAGE_ACCESS_KEY_ID`, and
+   `RESTORE_STORAGE_SECRET_ACCESS_KEY`. The source endpoint must be HTTPS.
+   Ensure the Compose host has enough free disk for the full compressed dump,
+   restored database, and object store. Use an encrypted host disk and restrict
+   Docker-daemon access: the temporary restore volume contains a plaintext
+   archive while the drill runs. Do not run `docker compose config`
+   with live secrets: it prints expanded environment values.
+3. Choose a **new**, explicitly named project such as
+   `af69-restore-staging-20260925` and run:
+
+   ```sh
+   docker compose --project-name af69-restore-staging-20260925 \
+     -f infra/compose/restore.yml run --build --rm restore
+   ```
+
+   The Compose file has no host ports and no production service, network, or
+   volume references. Its verifier hardcodes `PGHOST=restore-postgres` and
+   `PGDATABASE=af69_restore`, ignores ambient destination variables, and
+   refuses to restore into a nonempty database or object bucket. The command
+   fetches only `manifests/latest.json`, checks its strict contract, downloads
+   the *recorded version* of the dump, verifies byte count, SHA-256 and
+   `pg_restore --list`, then executes a real transactional `pg_restore`.
+   Version-rewound object copies go to the fresh `af69-recovered` bucket;
+   every uploaded/validated `file_intakes.storage_key` must resolve there,
+   and validated objects must match their stored SHA-256 content digest.
+   Tool output and object keys remain out of the retained structured log.
+4. Record the safe `restore.verified` event, backup ID, row/object counts,
+   elapsed drill time, PostgreSQL major, and any application-level checks
+   approved for that environment. Do not export candidate data into a report.
+   An exit code or archive listing alone is not sufficient recovery evidence.
+5. After evidence is captured and the exact project name is checked, remove
+   only that isolated project and its volumes:
+
+   ```sh
+   docker compose --project-name af69-restore-staging-20260925 \
+     -f infra/compose/restore.yml down --volumes
+   ```
+
+   Revoke the temporary recovery identity and rotate ephemeral destination
+   credentials. A failed drill leaves the isolated volumes for investigation;
+   never retry into a partially restored project. Use a new project.
+
+The automated check proves the actual producer/consumer path with synthetic
+data and an S3-compatible MinIO target. It does not prove the chosen hosted
+provider's version rewind, KMS/key availability, IAM policy, off-host reachability,
+recovery time at production data volume, or a complete application cutover.
+Those require a separate isolated staging/hosted drill and team-owned RPO/RTO
+decision. Never point this tool or a manual `pg_restore` at a live environment.

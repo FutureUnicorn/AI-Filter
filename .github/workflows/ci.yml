@@ -124,6 +124,18 @@ jobs:
       - name: Run cross-workspace integration tests
         run: pnpm test:integration
 
+  backup-restore:
+    name: CI / Backup restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Restore a synthetic backup produced by the real backup script
+        run: bash scripts/backups/test-restore.sh
+
   architecture:
     name: CI / Architecture
     runs-on: ubuntu-latest
@@ -172,6 +184,7 @@ jobs:
       - typecheck
       - unit
       - integration
+      - backup-restore
       - architecture
       - build
     runs-on: ubuntu-latest
@@ -183,6 +196,7 @@ jobs:
           TYPECHECK_RESULT: ${{ needs.typecheck.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           INTEGRATION_RESULT: ${{ needs.integration.result }}
+          BACKUP_RESTORE_RESULT: ${{ needs.backup-restore.result }}
           ARCHITECTURE_RESULT: ${{ needs.architecture.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
@@ -191,6 +205,7 @@ jobs:
             "$TYPECHECK_RESULT" \
             "$UNIT_RESULT" \
             "$INTEGRATION_RESULT" \
+            "$BACKUP_RESTORE_RESULT" \
             "$ARCHITECTURE_RESULT" \
             "$BUILD_RESULT"; do
             if [ "$result" != "success" ]; then

@@ -400,6 +400,13 @@ run_once() {
     cleanup_run_files
     return 1
   }
+  # S3 object versions have subsecond timestamps. A seconds-only cutoff can
+  # exclude the final mirrored object when rewind is used during recovery.
+  if ! storage_cutoff_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"; then
+    log_event error run_failed backup_timestamp "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
 
   if ! checksum_output="$(sha256sum "$dump_file")"; then
     log_event error run_failed database_checksum "$backup_id"
@@ -448,7 +455,7 @@ run_once() {
     cleanup_run_files
     return 1
   fi
-  if ! printf '%s\n' "{\"schemaVersion\":1,\"backupId\":\"$backup_id\",\"environment\":\"$APP_ENV\",\"release\":\"$DEPLOYMENT_COMMIT_SHA\",\"startedAt\":\"$started_at\",\"completedAt\":\"$completed_at\",\"retentionDays\":$BACKUP_RETENTION_DAYS,\"database\":{\"objectKey\":\"$database_latest_key\",\"versionId\":\"$latest_database_version_id\",\"historyObjectKey\":\"$database_history_key\",\"sha256\":\"$database_sha256\",\"bytes\":$database_bytes,\"format\":\"postgres-custom\"},\"storage\":{\"prefix\":\"$APP_ENV/storage/current\",\"versioned\":true}}" >"$manifest_file"
+  if ! printf '%s\n' "{\"schemaVersion\":2,\"backupId\":\"$backup_id\",\"environment\":\"$APP_ENV\",\"release\":\"$DEPLOYMENT_COMMIT_SHA\",\"startedAt\":\"$started_at\",\"completedAt\":\"$completed_at\",\"retentionDays\":$BACKUP_RETENTION_DAYS,\"database\":{\"objectKey\":\"$database_latest_key\",\"versionId\":\"$latest_database_version_id\",\"historyObjectKey\":\"$database_history_key\",\"sha256\":\"$database_sha256\",\"bytes\":$database_bytes,\"format\":\"postgres-custom\"},\"storage\":{\"prefix\":\"$APP_ENV/storage/current\",\"versioned\":true,\"cutoffAt\":\"$storage_cutoff_at\"}}" >"$manifest_file"
   then
     log_event error run_failed manifest_write "$backup_id"
     cleanup_run_files
