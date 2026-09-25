@@ -25,6 +25,7 @@ infrastructure until the product evidence gate passes.
 | Runtime | host web/worker or Compose | same Docker build path | same Docker build path | same Docker build path |
 | Cost control | local machine | CPU/memory ceilings + TTL | ceilings + provider budget reference | ceilings + provider budget/cap reference |
 | Administration | developer | preview deployment runner | named staging role | protected environment + named role + provider audit reference |
+| Backups | disabled | disabled; disposable | off-host when approved | off-host when approved |
 | Deploy source | working tree | exact PR SHA after green CI | exact green `develop` SHA | exact green `main` SHA |
 
 `NODE_ENV` does not identify these environments. `APP_ENV` must be one of
@@ -121,7 +122,9 @@ credentials, and staging URLs.
 Configure a GitHub environment named `staging`, a self-hosted runner labelled
 `signal-audit-staging`, and the variables/secrets listed below. The runner host
 must expose the web container through the URL in `STAGING_URL` and must retain
-the `signal-audit-staging` Compose volumes.
+the `signal-audit-staging` Compose volumes. When AF-68 backups are enabled, the
+runner must also allow encrypted egress to the approved off-host S3-compatible
+backup endpoint.
 
 ## Production-shaped validation
 
@@ -164,6 +167,10 @@ Staging and production environment secrets:
 | `POSTGRES_PASSWORD` | environment-only secret, at least 20 characters |
 | `STORAGE_ACCESS_KEY_ID` | environment-only storage identity |
 | `STORAGE_SECRET_ACCESS_KEY` | environment-only secret, at least 20 characters |
+| `BACKUP_ADMIN_ACCESS_KEY_ID` | short-lived deploy identity for bucket creation, privacy, versioning, and lifecycle controls |
+| `BACKUP_ADMIN_SECRET_ACCESS_KEY` | admin secret, at least 20 characters; supplied only to one-shot `backup-init` |
+| `BACKUP_WRITER_ACCESS_KEY_ID` | long-running identity limited to encrypted object read/write/list and ordinary delete markers |
+| `BACKUP_WRITER_SECRET_ACCESS_KEY` | writer secret, at least 20 characters; explicitly denied bucket administration and version deletion |
 
 Staging and production environment variables:
 
@@ -175,6 +182,18 @@ Staging and production environment variables:
 | `ADMIN_AUDIT_REFERENCE` | provider audit-log identifier/URL |
 | `ADMIN_ROLE_ALLOWLIST` | named role/group, never a shared account |
 | `STAGING_URL` / `PRODUCTION_URL` | private validation endpoint |
+| `BACKUP_ENABLED` | `true` only after AF-68 controls and values are approved; otherwise `false` |
+| `BACKUP_ENDPOINT` / `BACKUP_REGION` / `BACKUP_BUCKET` | HTTPS off-host destination and dedicated bucket |
+| `BACKUP_INTERVAL_SECONDS` | team-approved recovery-point interval; no repository default |
+| `BACKUP_RETENTION_DAYS` | team-approved retention window; no repository default |
+| `BACKUP_PATH_STYLE` | provider-compatible `auto`, `on`, or `off` |
+| `BACKUP_CONTROL_OWNER` | accountable person/team |
+| `BACKUP_ENCRYPTION_REFERENCE` | provider SSE-S3/KMS control evidence, never key material |
+
+The backup destination must be a different failure domain from the Compose
+host and its PostgreSQL/MinIO volumes. See
+[`../operations/backups.md`](../operations/backups.md) for the backup set,
+retention rules, privacy boundary, health signal, and AF-69 restore handoff.
 
 Do not copy values between environments. Secret values must never appear in Git,
 Jira, screenshots, workflow output, or shell history.
