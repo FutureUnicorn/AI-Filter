@@ -855,3 +855,202 @@ test("retrying an invite with the same Idempotency-Key mints one token, one audi
     await dropProbeSchema(databaseUrl, schema);
   }
 });
+
+test("reusing an Idempotency-Key for a different invite is refused, not silently replayed", async () => {
+  // Review #88, REV-009 (Saikrishnaa-vr, blocking): the fix above binds a
+  // key to the request that first claimed it, using the union unique index
+  // (organization_id, idempotency_key) -- which knows two calls collided on
+  // the same key, but not whether they were the SAME call retried. Before
+  // this test's fix existed, a key reused for a different email or role hit
+  // that same conflict path as a genuine retry and answered 202: the second
+  // invite was never created, and its caller was told it was.
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `reuse-owner-${Date.now()}@acme.test`;
+  const aliceEmail = `reuse-alice-${Date.now()}@acme.test`;
+  const bobEmail = `reuse-bob-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Reuse Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const sharedKey = "reused-across-two-invites";
+
+    const first = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: aliceEmail, organizationId: owner.organizationId, role: "recruiter" },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const aliceToken = extractToken(first);
+
+    // Same key, a different invitee entirely. Not a retry of anything.
+    const second = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: bobEmail, organizationId: owner.organizationId, role: "recruiter" },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 409, await response.clone().text());
+      const body = (await response.json()) as { error: { code: string; message: string } };
+      assert.equal(body.error.code, "idempotency_key_conflict");
+      assert.match(body.error.message, /different invite/u);
+    });
+    // The refusal must mint nothing for Bob: no second link delivered.
+    assert.equal(
+      /[?&]token=/u.test(second),
+      false,
+      "a refused reuse must not deliver a link for the request it refused"
+    );
+
+    // Same key, same email, a different role -- still a different request.
+    const third = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: aliceEmail, organizationId: owner.organizationId, role: "auditor" },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 409, await response.clone().text());
+      const body = (await response.json()) as { error: { code: string } };
+      assert.equal(body.error.code, "idempotency_key_conflict");
+    });
+    assert.equal(/[?&]token=/u.test(third), false);
+
+    // The original invite the key legitimately claimed is untouched by the
+    // conflicting attempts and still redeems normally.
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+    const redeemed = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "reuse-test-redeem" },
+        body: JSON.stringify({ token: aliceToken })
+      })
+    );
+    assert.equal(redeemed.status, 200, await redeemed.clone().text());
+    const redemption = (await redeemed.json()) as { email: string };
+    assert.equal(redemption.email, aliceEmail);
+
+    // And genuinely retrying the very first call, same key and same body,
+    // still replays cleanly -- REV-009 must not have broken REV-007.
+    const replay = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: aliceEmail, organizationId: owner.organizationId, role: "recruiter" },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    assert.equal(/[?&]token=/u.test(replay), false, "a genuine replay still mints nothing new");
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+test("reusing an Idempotency-Key with a different replaceExistingRole intent is refused", async () => {
+  // The fingerprint has to cover replaceExistingRole specifically, not just
+  // email and role: previewInviteEffect's gate (REV-002) only blocks a role
+  // change when replaceExistingRole is missing, so a request that no longer
+  // changes anything (outcome "unchanged") sails past that gate regardless
+  // of what replaceExistingRole says -- the idempotency binding is the only
+  // thing left to catch a key reused with a different answer to it.
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `reuse-flag-owner-${Date.now()}@acme.test`;
+  const memberEmail = `reuse-flag-member-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Reuse Flag Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+    const member = await seedMemberThroughInvite(
+      databaseUrl,
+      schema,
+      owner,
+      memberEmail,
+      "recruiter",
+      "reuse-flag-seed"
+    );
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+    const sharedKey = "reused-with-different-replace-flag";
+
+    // Explicitly opts in to the replacement, and it is granted -- but only
+    // once redeemed. provisionInvitedMembership applies the role at
+    // redemption, not at invite creation, the same way REV-002's own
+    // "replaces an existing member's role" test above confirms it.
+    const firstInviteEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "auditor",
+            replaceExistingRole: true
+          },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const firstRedemption = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "reuse-flag-redeem" },
+        body: JSON.stringify({ token: extractToken(firstInviteEmitted) })
+      })
+    );
+    assert.equal(firstRedemption.status, 200, await firstRedemption.clone().text());
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["auditor"]
+    );
+
+    // Same key, same email, same role -- now already true, so
+    // previewInviteEffect reports "unchanged" and the REV-002 gate does not
+    // apply. Only the fingerprint stands between this and a false 202.
+    const second = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "auditor",
+            replaceExistingRole: false
+          },
+          sharedKey,
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 409, await response.clone().text());
+      const body = (await response.json()) as { error: { code: string } };
+      assert.equal(body.error.code, "idempotency_key_conflict");
+    });
+    assert.equal(/[?&]token=/u.test(second), false);
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});

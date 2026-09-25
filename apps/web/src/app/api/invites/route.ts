@@ -175,6 +175,11 @@ async function handlePOST(request: NextRequest): Promise<Response> {
     const generated = generateMagicLinkToken();
     const creation = await createInviteMagicLinkToken(config.database.url, config.database.schema, {
       idempotencyKey,
+      // The caller's stated intent, not just whatever the server decided the
+      // effect was -- the fingerprint has to reflect what was actually sent
+      // (review #88, REV-009), so a retry that changed its mind about
+      // replaceExistingRole is a different request, not the same one again.
+      replaceExistingRole: parsed.data.replaceExistingRole === true,
       tokenHash: generated.tokenHash,
       email: parsed.data.email,
       invite: { organizationId: parsed.data.organizationId, role: parsed.data.role },
@@ -184,6 +189,23 @@ async function handlePOST(request: NextRequest): Promise<Response> {
         ? { roleChange: { membershipId: roleChange, from: effect.from, to: effect.to } }
         : {})
     });
+
+    if (creation.outcome === "conflict") {
+      // This key already claimed a different request (review #88,
+      // REV-009): a different email, role, or replaceExistingRole intent.
+      // Answering 202 here would tell the caller an invite was created that
+      // never was. The existing contract already has the right shape for
+      // this -- the same code finalize uses when a key is reused against a
+      // different mapping.
+      const error = buildApiError({
+        requestId,
+        code: "idempotency_key_conflict",
+        message:
+          "This Idempotency-Key was already used for a different invite (a different email, role, or " +
+          "replaceExistingRole). Use a new key for a new invite."
+      });
+      return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+    }
 
     if (creation.outcome === "replayed") {
       // This key already minted an invite. Nothing was written, and nothing

@@ -621,3 +621,20 @@ waiting on review, and the PR went un-mergeable.
 **Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
 (171), `pnpm test:integration` against a real scratch Postgres (402),
 `pnpm check:architecture` (35) and `pnpm build` all clean on the merge commit.
+
+### AF-97 — PR #88 review, round 3
+
+One finding from Saikrishnaa-vr, blocking. Verified as real before fixing.
+
+| | |
+|---|---|
+| Finding (REV-009, MEDIUM, blocking) | The `0023_invite_idempotency.sql` fix (round 2, REV-007) made a replayed `Idempotency-Key` answer 202 without writing a second row -- but the unique index is scoped to `(organization_id, idempotency_key)` alone, with no binding to *what* the key claimed. A key reused against a different email, role, or `replaceExistingRole` -- a client bug, a copy-pasted header, a key minted once per admin session instead of once per submission -- hit the same conflict path as a genuine retry and got the same silent-success 202. The invite named in that second call was never created, and its caller was told it was. |
+| Fix | `0024_invite_idempotency_fingerprint.sql` adds a nullable `idempotency_fingerprint` column. `createInviteMagicLinkToken` now hashes `{email, organizationId, role, replaceExistingRole}` the same way `claimIdempotentRequest` already hashes its `payload`, stores it alongside the key, and on conflict reads back the fingerprint that actually claimed the key: matching fingerprint replays (202, nothing written), differing fingerprint is refused with the existing `idempotency_key_conflict` (409) rather than silently discarded -- the same code `finalizeCsvImport` already answers when a key is reused against a different mapping. `replaceExistingRole` is now a required field on `CreateInviteMagicLinkTokenInput`, not defaulted inside the function, so the fingerprint reflects what the caller actually sent rather than an assumption. |
+| Design note | Kept as invite's own column rather than routed through the generic `idempotent_requests`/`claimIdempotentRequest` mechanism 0022 already provides: no route in this tree uses that table yet, and the local convention for a consequential write is its own bespoke idempotency column with its own comparison (`import_finalizations.idempotency_key` + `mapping`, `magic_link_tokens.idempotency_key` from round 2). Reusing the generic table would have been a second, inconsistent pattern introduced to fix one route. |
+| Regression | Two integration cases in `deployment-entry-point.test.ts`: reusing a key across two different invitees, and across the same invitee with a different role, both now 409 rather than 202, and the invite the key legitimately claimed is unaffected and still redeems; and reusing a key with a different `replaceExistingRole` answer, specifically chosen so `previewInviteEffect`'s own REV-002 gate (`changes_role` requiring opt-in) does not fire -- proving the fingerprint, not that gate, is what catches it. |
+| Control | Both new cases written first against the reverted (round-2) behavior: confirmed they fail with `202 !== 409`, then confirmed green again with the fix restored. The first draft of the second case also caught its own bug this way -- it asserted the role had changed without redeeming the invite that changes it, since `provisionInvitedMembership` applies a role at redemption, not at invite creation. |
+
+**Result:** `pnpm lint`, full workspace `pnpm typecheck`, `pnpm test:unit:ts`
+(171), `pnpm test:integration` against a real scratch Postgres (404),
+`pnpm check:architecture` (35) and `pnpm build` all clean. The 25 migrations
+replay from empty and then replay again idempotently.

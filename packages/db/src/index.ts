@@ -670,13 +670,38 @@ export interface CreateInviteMagicLinkTokenInput {
    * (review #88, REV-007). A retry after a timeout must not mint a second
    * live credential, a second audit trail and a second email for one
    * administrative act.
+   *
+   * Bound to the request it was issued for, not accepted bare (review #88,
+   * REV-009): a key reused against a different email, role or
+   * `replaceExistingRole` -- a client bug, a copy-pasted header, a key
+   * minted once per admin session instead of once per submission -- hit
+   * the same unique-index conflict as a genuine retry and answered the
+   * same silent-success 202, for an invite that was never created. See
+   * `replaceExistingRole` below and `createInviteMagicLinkToken`'s
+   * fingerprint comparison.
    */
   readonly idempotencyKey: string;
+  /**
+   * The caller's stated intent, folded into the idempotency fingerprint
+   * alongside email and role. Required, not defaulted to `false` inside
+   * this function: the fingerprint must reflect what the caller actually
+   * sent, and a default here would make two different requests -- one that
+   * omitted the field and one that sent `false` -- fingerprint identically,
+   * which happens to be harmless today only because they mean the same
+   * thing; a silent default is still the wrong place to encode that.
+   */
+  readonly replaceExistingRole: boolean;
 }
 
-/** `replayed` means this exact key already minted an invite: nothing was
- * written and nothing should be sent. */
-export type CreateInviteOutcome = { readonly outcome: "created" } | { readonly outcome: "replayed" };
+export type CreateInviteOutcome =
+  | { readonly outcome: "created" }
+  /** This exact request, replayed under the same key: nothing was written
+   * and nothing should be sent. */
+  | { readonly outcome: "replayed" }
+  /** The key was reused for a different request. Refused, not replayed:
+   * silently discarding the second request would tell its caller it
+   * succeeded when nothing was created for it. */
+  | { readonly outcome: "conflict" };
 
 /**
  * Mints an invite token and its audit row in one transaction.
@@ -700,6 +725,17 @@ export async function createInviteMagicLinkToken(
 ): Promise<CreateInviteOutcome> {
   assertSafeSchema(schema);
   const email = input.email.toLowerCase();
+  // Review #88, REV-009: what makes a replay "the same request" as the one
+  // that first claimed this key. Same shape as claimIdempotentRequest's own
+  // request_fingerprint -- a canonical hash of the fields that determine the
+  // invite's effect -- kept as its own column rather than reusing that
+  // generic mechanism, because invites already have their own idempotency
+  // column (REV-007) and this repo's convention is a bespoke column per
+  // consequential write (candidate decisions, import finalization,
+  // evidence corrections), not a shared table every route funnels through.
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ email, organizationId: input.invite.organizationId, role: input.invite.role, replaceExistingRole: input.replaceExistingRole }))
+    .digest("hex");
   const client = await acquireConnection(databaseUrl);
   try {
     await client.query("BEGIN");
@@ -711,8 +747,8 @@ export async function createInviteMagicLinkToken(
       // same transaction.
       const inserted = await client.query(
         `INSERT INTO "${schema}".magic_link_tokens
-           (token_hash, email, organization_id, role, expires_at, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (token_hash, email, organization_id, role, expires_at, idempotency_key, idempotency_fingerprint)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
          DO NOTHING`,
         [
@@ -721,10 +757,37 @@ export async function createInviteMagicLinkToken(
           input.invite.organizationId,
           input.invite.role,
           input.expiresAt,
-          input.idempotencyKey
+          input.idempotencyKey,
+          fingerprint
         ]
       );
       if (inserted.rowCount === 0) {
+        // Same key, but is it the same request? The unique index alone
+        // cannot tell: it only knows the (organization, key) pair
+        // conflicted, not whether this call's fingerprint matches the one
+        // that won the race. Read back what actually claimed the key and
+        // compare, the same distinction claimIdempotentRequest draws
+        // between `replay` and `fingerprint_mismatch`.
+        const existing = await client.query<{ idempotency_fingerprint: string | null }>(
+          `SELECT idempotency_fingerprint FROM "${schema}".magic_link_tokens
+            WHERE organization_id = $1 AND idempotency_key = $2`,
+          [input.invite.organizationId, input.idempotencyKey]
+        );
+        const existingFingerprint = existing.rows[0]?.idempotency_fingerprint;
+        if (existingFingerprint === undefined) {
+          // Only reachable if the row was deleted between the two
+          // statements, which nothing here does. Reported rather than
+          // silently treated as either outcome.
+          throw new Error("invite idempotency record vanished between claim and read");
+        }
+        if (existingFingerprint !== fingerprint) {
+          // A different request reused this key. Refused, not replayed:
+          // treating it as a replay would answer 202 for an invite that
+          // was never created, which is the exact failure mode reported
+          // in review #88 (REV-009).
+          await client.query("ROLLBACK");
+          return { outcome: "conflict" };
+        }
         await client.query("COMMIT");
         return { outcome: "replayed" };
       }
@@ -1618,7 +1681,10 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
       "0009_roles.sql",
       // The invite route deduplicates on this column (review #88, REV-007),
       // so a probe without it would not exercise the route as it ships.
-      "0023_invite_idempotency.sql"
+      "0023_invite_idempotency.sql",
+      // The fingerprint that binds a key to the request it was issued for
+      // (review #88, REV-009) -- same reasoning as the migration above.
+      "0024_invite_idempotency_fingerprint.sql"
     ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
