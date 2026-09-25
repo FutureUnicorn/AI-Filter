@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { requireBackupControls } from "../backups/model.mjs";
+
 import {
   assertDestructiveEnvironmentAllowed,
   derivePreviewEnvironment,
@@ -97,11 +99,14 @@ function localEnvironment() {
 
 function hostedEnvironment(appEnv) {
   requireHostedControls(appEnv, process.env);
+  const backup = requireBackupControls(appEnv, process.env);
   const sha = validateCommitSha(option("--sha") ?? process.env.DEPLOYMENT_COMMIT_SHA);
   return {
     project: `signal-audit-${appEnv}`,
+    backupEnabled: backup.enabled,
     variables: {
       ...process.env,
+      ...backup.variables,
       APP_ENV: appEnv,
       DEPLOYMENT_COMMIT_SHA: sha,
       POSTGRES_DB: `signal_audit_${appEnv}`,
@@ -113,12 +118,12 @@ function hostedEnvironment(appEnv) {
   };
 }
 
-function startEnvironment(environment, { local = false, seed = false } = {}) {
-  runDocker(environment.project, environment.variables, ["up", "-d", "postgres", "storage"], local);
-  runDocker(environment.project, environment.variables, ["run", "--rm", "storage-init"], local);
-  runDocker(environment.project, environment.variables, ["run", "--rm", "migrate"], local);
+function startEnvironment(environment, { local = false, seed = false } = {}, dockerRunner = runDocker) {
+  dockerRunner(environment.project, environment.variables, ["up", "-d", "postgres", "storage"], local);
+  dockerRunner(environment.project, environment.variables, ["run", "--rm", "storage-init"], local);
+  dockerRunner(environment.project, environment.variables, ["run", "--rm", "migrate"], local);
   if (seed) {
-    runDocker(
+    dockerRunner(
       environment.project,
       environment.variables,
       ["--profile", "tools", "run", "--rm", "seed"],
@@ -127,9 +132,40 @@ function startEnvironment(environment, { local = false, seed = false } = {}) {
   }
 }
 
-function deployEnvironment(environment, seed) {
-  startEnvironment(environment, { seed });
-  runDocker(environment.project, environment.variables, ["up", "-d", "--build", "web", "worker"]);
+export function deployEnvironment(environment, seed, dockerRunner = runDocker) {
+  if (environment.backupEnabled !== true) {
+    dockerRunner(environment.project, environment.variables, [
+      "--profile",
+      "backups",
+      "rm",
+      "--stop",
+      "--force",
+      "backup"
+    ]);
+  }
+  startEnvironment(environment, { seed }, dockerRunner);
+  if (environment.backupEnabled === true) {
+    dockerRunner(environment.project, environment.variables, [
+      "--profile",
+      "backups",
+      "run",
+      "--build",
+      "--rm",
+      "backup-init"
+    ]);
+    dockerRunner(environment.project, environment.variables, [
+      "--profile",
+      "backups",
+      "up",
+      "-d",
+      "--build",
+      "web",
+      "worker",
+      "backup"
+    ]);
+    return;
+  }
+  dockerRunner(environment.project, environment.variables, ["up", "-d", "--build", "web", "worker"]);
 }
 
 function previewStatePath(pr) {
@@ -182,31 +218,37 @@ function sweepPreviews() {
   }
 }
 
-const [scope, action] = process.argv.slice(2, 4);
+function main() {
+  const [scope, action] = process.argv.slice(2, 4);
 
-if (scope === "local") {
-  const environment = localEnvironment();
-  if (action === "up") startEnvironment(environment, { local: true });
-  else if (action === "down") {
-    assertDestructiveEnvironmentAllowed("development", "local teardown");
-    runDocker(environment.project, environment.variables, ["down", "--remove-orphans"], true);
-  } else if (action === "reset") {
-    assertDestructiveEnvironmentAllowed("development", "local reset");
-    runDocker(environment.project, environment.variables, ["down", "--volumes", "--remove-orphans"], true);
-    startEnvironment(environment, { local: true, seed: true });
-  } else if (action === "migrate") {
-    runDocker(environment.project, environment.variables, ["run", "--rm", "migrate"], true);
-  } else if (action === "seed") {
-    runDocker(environment.project, environment.variables, ["--profile", "tools", "run", "--rm", "seed"], true);
-  } else throw new Error("Expected local up|down|reset|migrate|seed");
-} else if (scope === "preview") {
-  if (action === "up") upPreview();
-  else if (action === "down") downPreview();
-  else if (action === "sweep") sweepPreviews();
-  else throw new Error("Expected preview up|down|sweep");
-} else if (scope === "staging" || scope === "production") {
-  if (action !== "up") throw new Error("Hosted environments support only controlled up");
-  deployEnvironment(hostedEnvironment(scope), scope === "staging");
-} else {
-  throw new Error("Expected local, preview, staging, or production command scope");
+  if (scope === "local") {
+    const environment = localEnvironment();
+    if (action === "up") startEnvironment(environment, { local: true });
+    else if (action === "down") {
+      assertDestructiveEnvironmentAllowed("development", "local teardown");
+      runDocker(environment.project, environment.variables, ["down", "--remove-orphans"], true);
+    } else if (action === "reset") {
+      assertDestructiveEnvironmentAllowed("development", "local reset");
+      runDocker(environment.project, environment.variables, ["down", "--volumes", "--remove-orphans"], true);
+      startEnvironment(environment, { local: true, seed: true });
+    } else if (action === "migrate") {
+      runDocker(environment.project, environment.variables, ["run", "--rm", "migrate"], true);
+    } else if (action === "seed") {
+      runDocker(environment.project, environment.variables, ["--profile", "tools", "run", "--rm", "seed"], true);
+    } else throw new Error("Expected local up|down|reset|migrate|seed");
+  } else if (scope === "preview") {
+    if (action === "up") upPreview();
+    else if (action === "down") downPreview();
+    else if (action === "sweep") sweepPreviews();
+    else throw new Error("Expected preview up|down|sweep");
+  } else if (scope === "staging" || scope === "production") {
+    if (action !== "up") throw new Error("Hosted environments support only controlled up");
+    deployEnvironment(hostedEnvironment(scope), scope === "staging");
+  } else {
+    throw new Error("Expected local, preview, staging, or production command scope");
+  }
+}
+
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
 }
