@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@sentry/node": "10.75.0",
+    "@signal-audit/ai": "workspace:*",
     "@signal-audit/config": "workspace:*",
+    "@signal-audit/contracts": "workspace:*",
     "@signal-audit/db": "workspace:*",
     "@signal-audit/domain": "workspace:*",
     "@signal-audit/ingestion": "workspace:*",

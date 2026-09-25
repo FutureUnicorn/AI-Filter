@@ -18,6 +18,26 @@ x-runtime-environment: &runtime-environment
   MAGIC_LINK_EMAIL_API_KEY: ${MAGIC_LINK_EMAIL_API_KEY:-}
   MAGIC_LINK_EMAIL_FROM: ${MAGIC_LINK_EMAIL_FROM:-}
   SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
+  WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
+
+x-backup-environment: &backup-environment
+  APP_ENV: ${APP_ENV:?APP_ENV is required}
+  DEPLOYMENT_COMMIT_SHA: ${DEPLOYMENT_COMMIT_SHA:?DEPLOYMENT_COMMIT_SHA is required}
+  PGHOST: postgres
+  PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+  PGUSER: ${POSTGRES_USER:?POSTGRES_USER is required}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:?STORAGE_BUCKET is required}
+  STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:?STORAGE_ACCESS_KEY_ID is required}
+  STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:?STORAGE_SECRET_ACCESS_KEY is required}
+  BACKUP_ENDPOINT: ${BACKUP_ENDPOINT:-}
+  BACKUP_REGION: ${BACKUP_REGION:-}
+  BACKUP_BUCKET: ${BACKUP_BUCKET:-}
+  BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-}
+  BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
+  BACKUP_PATH_STYLE: ${BACKUP_PATH_STYLE:-auto}
+  BACKUP_CONTROL_OWNER: ${BACKUP_CONTROL_OWNER:-}
+  BACKUP_ENCRYPTION_REFERENCE: ${BACKUP_ENCRYPTION_REFERENCE:-}
 
 services:
   postgres:
@@ -125,6 +145,57 @@ services:
     networks: [private]
     security_opt: ["no-new-privileges:true"]
 
+  backup-init:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["configure"]
+    restart: "no"
+    environment:
+      <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_ADMIN_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_ADMIN_SECRET_ACCESS_KEY:-}
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=70,gid=70
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  backup:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["loop"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_WRITER_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_WRITER_SECRET_ACCESS_KEY:-}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/signal-audit-backup", "health"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=70,gid=70
+    volumes:
+      - backup-work:/var/lib/signal-audit-backup
+    mem_limit: ${BACKUP_MEMORY_LIMIT:-512m}
+    cpus: ${BACKUP_CPU_LIMIT:-0.50}
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
   web:
     build:
       context: ../..
@@ -172,6 +243,20 @@ services:
     environment:
       <<: *runtime-environment
       SENTRY_DSN: ${SENTRY_WORKER_DSN:-}
+      WORKER_PROCESSING_ENABLED: ${WORKER_PROCESSING_ENABLED:-false}
+      WORKER_INSTANCE_ID: ${WORKER_INSTANCE_ID:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-10000}
+      WORKER_LEASE_DURATION_MS: ${WORKER_LEASE_DURATION_MS:-60000}
+      WORKER_RETRY_BASE_DELAY_MS: ${WORKER_RETRY_BASE_DELAY_MS:-5000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_ESCALATION_MODEL: ${OPENAI_ESCALATION_MODEL:-}
+      INFERENCE_MAX_TOKENS_PER_PERIOD: ${INFERENCE_MAX_TOKENS_PER_PERIOD:-}
+      INFERENCE_ALERT_THRESHOLD_RATIO: ${INFERENCE_ALERT_THRESHOLD_RATIO:-}
+      INFERENCE_BUDGET_PERIOD: ${INFERENCE_BUDGET_PERIOD:-}
+      INFERENCE_ESTIMATED_OUTPUT_TOKENS: ${INFERENCE_ESTIMATED_OUTPUT_TOKENS:-2000}
     healthcheck:
       test:
         [
@@ -183,7 +268,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    networks: [private]
+    # No host port is published, but provider execution requires outbound access.
+    networks: [public, private]
     mem_limit: ${WORKER_MEMORY_LIMIT:-384m}
     cpus: ${WORKER_CPU_LIMIT:-0.50}
     security_opt: ["no-new-privileges:true"]
@@ -196,3 +282,4 @@ networks:
 volumes:
   postgres-data: {}
   storage-data: {}
+  backup-work: {}

@@ -378,6 +378,7 @@ export const LOG_EVENT_NAMES = [
   "web.environment_health_failed",
   "worker.environment_health_failed",
   "worker.health_listening",
+  "worker.job_failed",
   "worker.operation_failed",
   "worker.ready"
 ] as const;
