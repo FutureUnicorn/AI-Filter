@@ -11,6 +11,7 @@ import { createRole, getMembershipsForUser, listRolesForOrganization } from "@si
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { z } from "zod";
 import { readSessionUserId } from "../../../lib/session";
+import { captureServerError } from "../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -63,7 +64,7 @@ export async function GET(request: NextRequest): Promise<Response> {
     const roles = await listRolesForOrganization(config.database.url, config.database.schema, parsedOrgId.data);
     return Response.json({ roles }, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("role list failed", error);
+    captureServerError(error, { requestId, operation: "role.list" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",
@@ -131,7 +132,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     });
     return Response.json(role, { status: 201, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("role creation failed", error);
+    captureServerError(error, { requestId, operation: "role.create" });
     const apiError = buildApiError({
       requestId,
       code: "internal_error",

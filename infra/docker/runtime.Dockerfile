@@ -36,4 +36,4 @@ CMD ["node", "apps/web/node_modules/next/dist/bin/next", "start", "apps/web", "-
 
 FROM runtime-base AS worker
 EXPOSE 3001
-CMD ["node", "apps/worker/dist/index.js"]
+CMD ["node", "--import", "./apps/worker/dist/instrumentation.js", "apps/worker/dist/index.js"]

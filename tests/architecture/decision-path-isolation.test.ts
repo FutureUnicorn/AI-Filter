@@ -76,3 +76,15 @@ test("the input contract offers no way to name a decider", () => {
     "the input schema must offer no way to name a decider"
   );
 });
+
+// Merging develop (2026-09-25): an unrelated replay commit (3f20ce7,
+// predating this PR) had reintroduced the old regex-based verb check this
+// file already explains removing above, and AF-67 (e7ef653) then had to
+// widen that regex to also match `export const X = ...` once the decisions
+// route started wrapping its handlers in withServerOperation. That edit is
+// itself the failure mode described above, arriving on schedule: the guard
+// had to be patched by hand to keep matching source text that changed shape
+// without changing behavior. Resolved by keeping this file's converted form;
+// the verb inventory stays in api-route-harness.test.ts's loadRouteMethods
+// check, which reads the loaded module's real exports and does not care
+// whether a handler is `export async function` or `export const ... =`.

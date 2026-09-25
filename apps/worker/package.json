@@ -5,14 +5,17 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
-    "dev": "node src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "node --import ./src/instrumentation.ts src/index.ts",
+    "start": "node --import ./dist/instrumentation.js dist/index.js",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint src",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@sentry/node": "10.75.0",
+    "@signal-audit/ai": "workspace:*",
     "@signal-audit/config": "workspace:*",
+    "@signal-audit/contracts": "workspace:*",
     "@signal-audit/db": "workspace:*",
     "@signal-audit/domain": "workspace:*",
     "@signal-audit/ingestion": "workspace:*",
