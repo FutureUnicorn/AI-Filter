@@ -5861,7 +5861,22 @@ export async function resolveAuditReportShareLink(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    await client.query("BEGIN");
+        // REV-009: refuse a clock that cannot be compared, before anything is
+    // read. An invalid Date makes getTime() NaN, every comparison with NaN
+    // is false, and the expiry guard is written as "expired IF past", so a
+    // malformed clock did not expire the link, it served the report. A
+    // fail-open at an unauthenticated disclosure boundary.
+    //
+    // Reading the clock from the database instead would remove the input
+    // rather than guard it, which is what created_at does after REV-003.
+    // It is not available here: expires_at > created_at is a CHECK and
+    // created_at is now pinned to the database clock, so an expired row
+    // cannot be constructed to test against, and the expiry path would
+    // become unreachable by any test that does not wait a real day.
+    if (!Number.isFinite(now.getTime())) {
+      throw new Error("resolveAuditReportShareLink: now must be a valid date");
+    }
+await client.query("BEGIN");
     const found = await client.query<{
       share_link_id: string;
       report: RoleAuditReport;
@@ -5896,7 +5911,7 @@ export async function resolveAuditReportShareLink(
       await client.query("COMMIT");
       return { status: "unavailable", internalReason: "revoked" };
     }
-    if (link.expires_at.getTime() <= now.getTime()) {
+if (link.expires_at.getTime() <= now.getTime()) {
       await client.query("COMMIT");
       return { status: "unavailable", internalReason: "expired" };
     }
@@ -5954,6 +5969,10 @@ export async function revokeAuditReportShareLinks(
 }
 
 export interface AuditReportShareLinkObservations {
+  /** REV-009: the refusal a non-finite clock produced, empty if it was accepted. */
+  readonly invalidClockRejection: string;
+  /** REV-009: a refused resolve must not leave a view row claiming it served. */
+  readonly invalidClockLoggedNoView: boolean;
   /** REV-006: did the resolve wait behind an in-flight revoke rather than racing past it. */
   readonly resolveBlockedOnRevoke: boolean;
   /** The public status the resolve returned once that revoke committed. */
@@ -6273,7 +6292,29 @@ export async function assertAuditReportShareLinkSecurity(
       await blocker.end().catch(() => undefined);
     }
 
+    // REV-009: an unusable clock must refuse before anything is read, and
+    // must not leave a view row behind claiming the report was served.
+    let invalidClockRejection = "";
+    const viewsBeforeInvalid = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_report_share_link_views WHERE share_link_id = $1`,
+      [liveId]
+    );
+    try {
+      await resolveAuditReportShareLink(databaseUrl, schema, hash("live"), new Date("not-a-date"));
+      invalidClockRejection = "";
+    } catch (error) {
+      invalidClockRejection = error instanceof Error ? error.message : String(error);
+    }
+    const viewsAfterInvalid = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_report_share_link_views WHERE share_link_id = $1`,
+      [liveId]
+    );
+    const invalidClockLoggedNoView =
+      viewsBeforeInvalid.rows[0]?.count === viewsAfterInvalid.rows[0]?.count;
+
     return {
+      invalidClockRejection,
+      invalidClockLoggedNoView,
       resolveBlockedOnRevoke,
       raceResolutionStatus,
       raceResolutionReason,

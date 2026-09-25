@@ -142,3 +142,26 @@ test("a revoke landing mid-resolve is not raced past", async () => {
     "the raced revoke must be diagnosed exactly as an ordinary revoked link"
   );
 });
+
+// REV-009. `now` was caller-supplied and unvalidated. An invalid Date makes
+// getTime() NaN, every comparison with NaN is false, and the expiry check
+// reads "expired IF past" — so a malformed clock did not expire the link,
+// it served the report. Fifth instance of one shape on this stack: a
+// backdatable extension on AF-64, two authorization guards skipped by NaN
+// on AF-66 and AF-65, a movable created_at anchor here, and now this. In
+// each, the system trusted a time it was handed.
+
+test("an unusable clock refuses the link rather than serving it", async () => {
+  const observations = await observe();
+  assert.match(
+    observations.invalidClockRejection,
+    /must be a valid date/u,
+    "a non-finite clock must be refused, not compared"
+  );
+  // Refused before anything is read, so no view row claims it was served.
+  assert.equal(
+    observations.invalidClockLoggedNoView,
+    true,
+    "a refused resolve must not record a view"
+  );
+});
