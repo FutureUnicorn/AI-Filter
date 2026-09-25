@@ -51,10 +51,23 @@ test("a deployed path reaches the token-budget emitter", () => {
     /from "\.\/extraction\.ts"/u,
     "the worker entry must pull in the extraction loop"
   );
+  // The identifier alone is not evidence. It appears three times in this
+  // file: the import, the re-export, and the actual call. An earlier
+  // version of this assertion matched any of them, so deleting the call
+  // inside `if (processing.enabled)` left it passing and the entry-to-worker
+  // hop unguarded, which is the one hop this test exists for.
   assert.match(
     entry,
-    /runEvidenceExtractionWorker/u,
-    "the entry point must reference the loop that claims and processes jobs"
+    /processingLoop\s*=\s*runEvidenceExtractionWorker\s*\(/u,
+    "the entry point must INVOKE the loop, not merely import or re-export it"
+  );
+  // Invoked from the startup path, not from a helper nothing calls.
+  const enabledIndex = entry.indexOf("if (processing.enabled)");
+  const callIndex = entry.search(/processingLoop\s*=\s*runEvidenceExtractionWorker\s*\(/u);
+  assert.ok(enabledIndex >= 0, "the processing-enabled branch must be locatable");
+  assert.ok(
+    callIndex > enabledIndex,
+    "the loop must start inside the processing-enabled branch of the entry point"
   );
 
   const extraction = source("apps/worker/src/extraction.ts");
