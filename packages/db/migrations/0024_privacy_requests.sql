@@ -173,6 +173,86 @@ ALTER TABLE privacy_request_extensions
   FOREIGN KEY (request_id, organization_id)
   REFERENCES privacy_requests (request_id, organization_id) ON DELETE RESTRICT;
 
+-- REV-003: the timeliness CHECK compares extended_at against received_at,
+-- which two values a direct writer controls together. After the first
+-- month has passed, setting extended_at = received_at + INTERVAL '1 month'
+-- and due_at = received_at + INTERVAL '3 months' satisfies every CHECK on
+-- the row, so a late extension can be recorded as a timely one and a late
+-- response represented as compliant. The constraint checked the shape of
+-- the values and never that they described something that actually
+-- happened.
+--
+-- The database clock is the only party here with no motive. This trigger
+-- owns extended_at on both tables: it overwrites whatever was supplied
+-- with clock_timestamp(), and refuses the write outright once the
+-- statutory month has elapsed. Backdating is then not merely refused, it
+-- is unrepresentable.
+CREATE OR REPLACE FUNCTION pin_privacy_extension_clock() RETURNS trigger
+LANGUAGE plpgsql
+-- Pinned to the schema this migration ran in. The application
+-- schema-qualifies its tables and never sets search_path, so an unpinned
+-- function would fail to resolve privacy_requests and refuse every real
+-- extension. Same reason support_access_grants_operators_not_revoked pins
+-- its own.
+SET search_path FROM CURRENT AS $$
+DECLARE
+  request_received_at timestamptz;
+BEGIN
+  IF TG_TABLE_NAME = 'privacy_requests' THEN
+    IF NEW.extended_at IS NULL THEN
+      RETURN NEW;
+    END IF;
+    -- Only on the transition into extended. A later unrelated UPDATE must
+    -- not re-stamp an extension that was already granted.
+    IF TG_OP = 'UPDATE' AND OLD.extended_at IS NOT NULL THEN
+      IF NEW.extended_at IS DISTINCT FROM OLD.extended_at THEN
+        RAISE EXCEPTION 'privacy request extension timestamp is immutable once granted';
+      END IF;
+      RETURN NEW;
+    END IF;
+    request_received_at := NEW.received_at;
+    NEW.extended_at := clock_timestamp();
+  ELSE
+    -- The ledger takes the request row's already-pinned value rather than
+    -- reading the clock again. extendPrivacyRequest updates the request
+    -- first and inserts here in the same transaction, so by now that value
+    -- is the trigger-owned one. Two independent clock reads would leave the
+    -- two tables disagreeing by microseconds about one event, which is the
+    -- property this ledger exists to hold.
+    SELECT received_at, extended_at INTO request_received_at, NEW.extended_at
+      FROM privacy_requests WHERE request_id = NEW.request_id;
+    -- Fall back to the clock when the request carries no extension yet.
+    -- The mirror is what keeps the two tables describing one instant; it
+    -- is not the timing control. The check below still applies either
+    -- way, so a ledger row can never claim a moment the clock refuses,
+    -- and a row written without its request being extended still has to
+    -- pass every other constraint on this table rather than being
+    -- short-circuited here.
+    IF NEW.extended_at IS NULL THEN
+      NEW.extended_at := clock_timestamp();
+    END IF;
+  END IF;
+
+  IF request_received_at IS NULL THEN
+    RAISE EXCEPTION 'privacy request extension cannot be timed against a missing request';
+  END IF;
+  IF NEW.extended_at > request_received_at + INTERVAL '1 month' THEN
+    RAISE EXCEPTION 'a privacy request extension must be granted within one month of receipt';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS privacy_requests_pin_extension_clock ON privacy_requests;
+CREATE TRIGGER privacy_requests_pin_extension_clock
+  BEFORE INSERT OR UPDATE ON privacy_requests
+  FOR EACH ROW EXECUTE FUNCTION pin_privacy_extension_clock();
+
+DROP TRIGGER IF EXISTS privacy_request_extensions_pin_clock ON privacy_request_extensions;
+CREATE TRIGGER privacy_request_extensions_pin_clock
+  BEFORE INSERT ON privacy_request_extensions
+  FOR EACH ROW EXECUTE FUNCTION pin_privacy_extension_clock();
+
 DROP TRIGGER IF EXISTS privacy_request_extensions_append_only ON privacy_request_extensions;
 CREATE TRIGGER privacy_request_extensions_append_only
   BEFORE UPDATE OR DELETE ON privacy_request_extensions

@@ -82,3 +82,20 @@ test("one organization cannot extend another's request", async () => {
   const observed = await observe();
   assert.match(observed.crossTenantRejection, /no request .* in organization 22222222/);
 });
+
+// REV-003. privacy_requests_extension_is_timely compares extended_at
+// against received_at, and one writer controls both. After the statutory
+// month has passed, setting extended_at = received_at + INTERVAL '1 month'
+// and due_at = received_at + INTERVAL '3 months' satisfies every CHECK on
+// the row, so a late extension records as a timely one and a late response
+// represents as compliant. The constraint checked the shape of the values,
+// never that they described something that happened.
+
+test("a late extension cannot be dated early to look timely", async () => {
+  const observations = await observe();
+  assert.match(
+    observations.backdatedExtensionRejection,
+    /within one month of receipt/u,
+    "the database clock, not the writer's arithmetic, decides whether an extension was timely"
+  );
+});

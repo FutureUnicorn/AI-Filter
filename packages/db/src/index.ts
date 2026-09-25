@@ -5834,6 +5834,8 @@ export interface PrivacyRequestExtensionObservations {
   readonly ledgerRowsForAlreadyExtended: number;
   /** The database's own backstops, for a writer that bypasses the function. */
   readonly secondLedgerRowRejection: string;
+  /** REV-003: a raw backdated extension after the statutory month. */
+  readonly backdatedExtensionRejection: string;
   readonly zeroMonthsLedgerRejection: string;
   readonly ledgerUpdateRejection: string;
 }
@@ -6055,6 +6057,23 @@ export async function assertPrivacyRequestExtension(
         [timely.requestId, org, userId]
       )
     );
+    // REV-003: the exact attack the timeliness CHECK did not stop. The
+    // request was received over a month ago, so an extension is late. A
+    // direct writer sets extended_at to received_at + 1 month and due_at
+    // to received_at + 3 months: every CHECK on the row is satisfied,
+    // because they compare two values the same writer chose. The clock is
+    // the only thing that can refuse it.
+    const backdatedExtensionRejection = await expectRejected("extend:backdated_after_deadline", () =>
+      admin.query(
+        `UPDATE privacy_requests
+            SET extended_at = received_at + INTERVAL '1 month',
+                extension_reason = 'recorded late, dated early',
+                due_at = received_at + INTERVAL '3 months'
+          WHERE request_id = $1`,
+        [late.requestId]
+      )
+    );
+
     const zeroMonthsLedgerRejection = await expectRejected("ledger:zero_months", () =>
       admin.query(
         `INSERT INTO privacy_request_extensions
@@ -6096,6 +6115,7 @@ export async function assertPrivacyRequestExtension(
         lateAfter.rows[0]?.due_at.toISOString() === late.dueAt && lateAfter.rows[0]?.extended_at === null,
       ledgerRowsForAlreadyExtended: Number.parseInt(ledgerCount.rows[0]?.count ?? "", 10),
       secondLedgerRowRejection,
+      backdatedExtensionRejection,
       zeroMonthsLedgerRejection,
       ledgerUpdateRejection
     };
