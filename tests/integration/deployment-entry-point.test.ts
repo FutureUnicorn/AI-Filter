@@ -72,7 +72,7 @@ function applyRouteEnvironment(databaseUrl: string, routeSchema: string): void {
     STORAGE_FORCE_PATH_STYLE: "true",
     WEB_PORT: "3000",
     WORKER_PORT: "3001",
-    PUBLIC_APP_ORIGIN: "https://canonical.acme.test",
+    PUBLIC_APP_ORIGIN,
     SESSION_SECRET
   });
   delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
@@ -131,9 +131,11 @@ const { NextRequest } = (await import(nextServerUrl)) as {
 
 const REQUEST_ROUTE = "../../apps/web/src/app/api/auth/magic-link/request/route.ts";
 const REDEEM_ROUTE = "../../apps/web/src/app/api/auth/magic-link/redeem/route.ts";
+const EMAIL_LINK_ROUTE = "../../apps/web/src/app/auth/redeem/route.ts";
 const INVITE_ROUTE = "../../apps/web/src/app/api/invites/route.ts";
 const ORGANIZATIONS_ROUTE = "../../apps/web/src/app/api/me/organizations/route.ts";
 const ROLES_ROUTE = "../../apps/web/src/app/api/roles/route.ts";
+const PUBLIC_APP_ORIGIN = "https://canonical.acme.test";
 
 function sessionCookie(userId: string): string {
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(createSessionToken(userId, SESSION_SECRET))}`;
@@ -792,6 +794,185 @@ test("an invite that would strand an organization without an owner is refused at
       (await listOrganizationsForUser(databaseUrl, schema, owner.userId)).map((o) => o.role),
       ["owner"]
     );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88, REV-010 (Saikrishnaa-vr, blocking). previewInviteEffect only
+// requires replaceExistingRole against the membership state it sees AT
+// INVITE CREATION. An invite issued while the address has no membership
+// carries no such requirement and none was stored -- so if a second admin
+// grants that address a different role before the first invite is
+// redeemed, provisionInvitedMembership's unconditional upsert applied the
+// first invite's role over it, silently overriding a membership the caller
+// never agreed to replace. This is exactly that race, constructed directly
+// rather than waited for: invite 1 is issued and left unredeemed, invite 2
+// is issued and redeemed for the same address with a different role, and
+// only then is invite 1 redeemed.
+test("an invite issued before a later role grant cannot silently overwrite that membership at redemption", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `race-owner-${Date.now()}@acme.test`;
+  const victimEmail = `race-victim-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Race Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+
+    // Invite 1: the victim has no membership yet, so previewInviteEffect
+    // sees "creates_membership" and requires no opt-in. Left unredeemed.
+    const firstEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: victimEmail, organizationId: owner.organizationId, role: "recruiter" },
+          "race-first-invite",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const firstToken = extractToken(firstEmitted);
+
+    // Before invite 1 is redeemed, a second invite grants the same address
+    // a different role and is redeemed -- exactly the race a
+    // creation-time-only preview cannot see.
+    const member = await seedMemberThroughInvite(
+      databaseUrl,
+      schema,
+      owner,
+      victimEmail,
+      "auditor",
+      "race-second"
+    );
+
+    // Redeeming invite 1 now must not silently apply "recruiter" over the
+    // membership invite 2 already granted.
+    const firstRedemption = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "race-first-redeem" },
+        body: JSON.stringify({ token: firstToken })
+      })
+    );
+    assert.equal(
+      firstRedemption.status,
+      500,
+      `redeeming an invite against a membership created after it was issued must be refused, got: ${await firstRedemption
+        .clone()
+        .text()}`
+    );
+
+    // The role is exactly what invite 2 granted -- not replaced, and not
+    // left half-applied.
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["auditor"]
+    );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88, REV-011 (Saikrishnaa-vr, blocking). GET /auth/redeem used to
+// consume an invite token and provision or change a membership on an
+// ordinary GET -- indistinguishable from a corporate mail gateway's
+// prefetch of the emailed link. This drives the actual delivered URL
+// through the actual GET handler, the same one a scanner would fetch, and
+// proves it does not touch the token or the membership; only the explicit
+// confirm action (the same POST redemption every other flow in this app
+// uses) does.
+test("a prefetch of the emailed invite link leaves the token and membership unchanged", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `prefetch-owner-${Date.now()}@acme.test`;
+  const inviteeEmail = `prefetch-invitee-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Prefetch Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const emitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: inviteeEmail, organizationId: owner.organizationId, role: "recruiter" },
+          "prefetch-invite",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const token = extractToken(emitted);
+    const deliveredLink = `${PUBLIC_APP_ORIGIN}/auth/redeem?token=${token}`;
+
+    // The scanner's GET: the exact URL the email contains, through the
+    // exact handler that serves it.
+    const emailLinkRoute = await loadWebRoute<GetRouteModule>(import.meta.url, EMAIL_LINK_ROUTE);
+    const prefetch = await emailLinkRoute.GET(new NextRequest(deliveredLink));
+
+    // A redirect, but not to /roles -- to the confirmation step, and with
+    // no session minted.
+    assert.ok(prefetch.status >= 300 && prefetch.status < 400, `expected a redirect, got ${prefetch.status}`);
+    const location = prefetch.headers.get("location");
+    assert.ok(location !== null && location.includes("/auth/confirm"), `expected /auth/confirm, got ${location}`);
+    assert.ok(location.includes(`token=${token}`), "the confirmation step needs the token to act on");
+    assert.equal(prefetch.headers.get("set-cookie"), null, "a prefetch must not establish a session");
+
+    // No membership exists yet: provisioning was deferred, not performed.
+    // There is no userId to query directly (no user row exists until
+    // provisionInvitedMembership runs), so this is proven indirectly: a
+    // second invite naming a DIFFERENT role is previewInviteEffect's
+    // "creates_membership" case (202) only while no membership exists. If
+    // the prefetch above had silently provisioned one at "recruiter", this
+    // would instead see "changes_role" and refuse with 409 for lack of
+    // replaceExistingRole.
+    const secondInvite = await inviteRoute.POST(
+      authenticatedJsonRequest(
+        "http://localhost:3000/api/invites",
+        { email: inviteeEmail, organizationId: owner.organizationId, role: "admin" },
+        "prefetch-relies-on-no-membership",
+        owner.userId
+      )
+    );
+    assert.equal(
+      secondInvite.status,
+      202,
+      `a prefetch GET must not have provisioned a membership, got: ${await secondInvite.clone().text()}`
+    );
+
+    // The token the scanner fetched is still live: the confirm step's own
+    // POST (what clicking "Accept invite" actually does) redeems it.
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+    const confirmed = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "prefetch-confirm" },
+        body: JSON.stringify({ token })
+      })
+    );
+    assert.equal(confirmed.status, 200, await confirmed.clone().text());
+    const confirmedBody = (await confirmed.json()) as { userId: string };
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, confirmedBody.userId)).map((o) => o.role),
+      ["recruiter"]
+    );
+
+    // And having been redeemed, the same token cannot be spent a second
+    // time through the GET path either.
+    const secondPrefetch = await emailLinkRoute.GET(new NextRequest(deliveredLink));
+    assert.equal(secondPrefetch.headers.get("set-cookie"), null, "a consumed token must not mint a session");
   } finally {
     await dropProbeSchema(databaseUrl, schema);
   }

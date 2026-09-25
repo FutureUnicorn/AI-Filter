@@ -304,6 +304,11 @@ interface MagicLinkTokenRow {
   readonly role: MembershipRole | null;
   readonly expires_at: Date;
   readonly consumed_at: Date | null;
+  /** Review #88, REV-010: read back at redemption so provisionInvitedMembership
+   * enforces the caller's actual opt-in rather than trusting the state
+   * previewInviteEffect saw at invite creation. Absent (null) for a plain
+   * login token, same as organization_id and role. */
+  readonly replace_existing_role: boolean | null;
 }
 
 function mapMagicLinkTokenRow(row: MagicLinkTokenRow): MagicLinkTokenRecord {
@@ -324,6 +329,16 @@ export interface CreateMagicLinkTokenInput {
   readonly email: string;
   readonly invite?: MagicLinkInvite;
   readonly expiresAt: Date;
+  /**
+   * Only meaningful alongside `invite`; ignored for a plain login token.
+   * Nothing shipped calls this function with `invite` set -- that path is
+   * `createInviteMagicLinkToken`, which requires the field and gates it on
+   * `previewInviteEffect` -- so this is the raw persistence-layer knob,
+   * used directly only by RLS/replay probes constructing a token without
+   * going through the route. Review #88, REV-010: defaults to false, the
+   * safer reading of a caller that did not say.
+   */
+  readonly replaceExistingRole?: boolean;
 }
 
 /**
@@ -415,7 +430,8 @@ async function provisionInvitedMembership(
   schema: string,
   email: string,
   organizationId: string,
-  role: MembershipRole
+  role: MembershipRole,
+  replaceExistingRole: boolean
 ): Promise<void> {
   const displayName = email.split("@")[0] || email;
   const userResult = await client.query<{ user_id: string }>(
@@ -437,6 +453,29 @@ async function provisionInvitedMembership(
   // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
   // sharing the connection.
   await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+
+  // Review #88, REV-010: replaceExistingRole was only ever checked against
+  // the membership state previewInviteEffect saw at invite CREATION. An
+  // invite issued while this address had no membership carries
+  // replaceExistingRole=false and needed no opt-in at creation -- but if
+  // another admin, a second invite, or bootstrap granted a membership
+  // before this token was redeemed, the unconditional DO UPDATE below
+  // would apply the originally requested role over it, replacing a
+  // membership the caller never agreed to replace. FOR UPDATE locks this
+  // row for the rest of the transaction, so a concurrent grant cannot land
+  // between this check and the upsert.
+  const currentMembership = await client.query<{ role: MembershipRole }>(
+    `SELECT role FROM "${schema}".memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+    [organizationId, userId]
+  );
+  const currentRole = currentMembership.rows[0]?.role;
+  if (currentRole !== undefined && currentRole !== role && !replaceExistingRole) {
+    throw new Error(
+      `invite would change ${email}'s role in organization ${organizationId} from ${currentRole} to ${role} ` +
+        `without replaceExistingRole; a membership was created or changed after this invite was issued`
+    );
+  }
+
   // Applying the invited role (below) makes one destructive direction
   // reachable that DO NOTHING made impossible: a re-invite naming a
   // non-owner role for the organization's only owner would leave it with
@@ -493,14 +532,16 @@ export async function createMagicLinkToken(
       throw new Error("login magic link requires an existing user with a membership");
     }
     await client.query(
-      `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO "${schema}".magic_link_tokens
+         (token_hash, email, organization_id, role, expires_at, replace_existing_role)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         input.tokenHash,
         email,
         input.invite?.organizationId ?? null,
         input.invite?.role ?? null,
-        input.expiresAt
+        input.expiresAt,
+        input.invite === undefined ? null : (input.replaceExistingRole ?? false)
       ]
     );
   } finally {
@@ -750,8 +791,9 @@ export async function createInviteMagicLinkToken(
       // same transaction.
       const inserted = await client.query(
         `INSERT INTO "${schema}".magic_link_tokens
-           (token_hash, email, organization_id, role, expires_at, idempotency_key, idempotency_fingerprint)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+           (token_hash, email, organization_id, role, expires_at, idempotency_key, idempotency_fingerprint,
+            replace_existing_role)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
          DO NOTHING`,
         [
@@ -761,7 +803,11 @@ export async function createInviteMagicLinkToken(
           input.invite.role,
           input.expiresAt,
           input.idempotencyKey,
-          fingerprint
+          fingerprint,
+          // Review #88, REV-010: stored so redemption can enforce the
+          // opt-in against the membership state it actually finds, not the
+          // one previewInviteEffect saw when this invite was created.
+          input.replaceExistingRole
         ]
       );
       if (inserted.rowCount === 0) {
@@ -842,6 +888,46 @@ export async function createInviteMagicLinkToken(
 }
 
 /**
+ * Whether a token is an invite, without consuming it.
+ *
+ * Review #88, REV-011: `GET /auth/redeem` used to call the atomic,
+ * consuming redemption directly, so a corporate mail gateway's prefetch of
+ * the emailed link -- an ordinary GET, indistinguishable from the
+ * recipient's own click -- provisioned or changed a membership and burned
+ * the single-use token before the invitee ever acted. A plain login token
+ * has no comparable effect (redemption only mints a session, the accepted
+ * tradeoff already documented on that route), so this only needs to steer
+ * invite tokens to a non-mutating confirmation step; everything else keeps
+ * going straight to the real, consuming redemption, which re-validates
+ * expiry and single-use atomically regardless of what this said.
+ *
+ * Deliberately not authoritative: an invalid, expired or already-consumed
+ * token reports "not_invite" here and falls through to that same real
+ * redemption, which already produces the right invalid/expired/consumed
+ * outcome. This function only has one job, telling a still-live invite
+ * apart from everything else, so the caller knows to defer.
+ */
+export async function peekMagicLinkTokenIsInvite(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ organization_id: string | null }>(
+      `SELECT organization_id
+         FROM "${schema}".magic_link_tokens
+        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    return result.rows[0]?.organization_id !== null && result.rows[0]?.organization_id !== undefined;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Atomic single-use redemption: the UPDATE only ever matches a row once,
  * so two concurrent redemption attempts on the same token cannot both
  * succeed. Expiry is compared to database time (clock_timestamp()), not
@@ -866,7 +952,7 @@ export async function redeemMagicLinkToken(
         `UPDATE "${schema}".magic_link_tokens
             SET consumed_at = clock_timestamp()
           WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
-          RETURNING email, organization_id, role, expires_at, consumed_at`,
+          RETURNING email, organization_id, role, expires_at, consumed_at, replace_existing_role`,
         [tokenHash]
       );
       const redeemedRow = redeemed.rows[0];
@@ -878,7 +964,8 @@ export async function redeemMagicLinkToken(
             schema,
             record.email.toLowerCase(),
             record.invite.organizationId,
-            record.invite.role
+            record.invite.role,
+            redeemedRow.replace_existing_role === true
           );
         }
         await client.query("COMMIT");
@@ -886,7 +973,7 @@ export async function redeemMagicLinkToken(
       }
 
       const existing = await client.query<MagicLinkTokenRow>(
-        `SELECT email, organization_id, role, expires_at, consumed_at
+        `SELECT email, organization_id, role, expires_at, consumed_at, replace_existing_role
            FROM "${schema}".magic_link_tokens WHERE token_hash = $1`,
         [tokenHash]
       );
@@ -1724,7 +1811,10 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
       "0023_invite_idempotency.sql",
       // The fingerprint that binds a key to the request it was issued for
       // (review #88, REV-009) -- same reasoning as the migration above.
-      "0024_invite_idempotency_fingerprint.sql"
+      "0024_invite_idempotency_fingerprint.sql",
+      // The persisted replaceExistingRole intent redemption enforces
+      // (review #88, REV-010) -- same reasoning as the two migrations above.
+      "0027_invite_role_replacement_intent.sql"
     ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
@@ -3401,6 +3491,12 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0003_magic_link_tokens.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    // redeemMagicLinkToken now reads replace_existing_role back on every
+    // redemption (review #88, REV-010), so a probe schema without it would
+    // fail on the SELECT rather than exercising RLS.
+    await admin.query(
+      readFileSync(join(MIGRATIONS_DIRECTORY, "0027_invite_role_replacement_intent.sql"), "utf8")
+    );
     await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
     await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
@@ -3470,11 +3566,15 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     }
 
     // A promotion re-invite: DO NOTHING would report success here while
-    // silently leaving the old role in place.
+    // silently leaving the old role in place. replaceExistingRole: true
+    // because this deliberately targets an email that already holds a
+    // membership (review #88, REV-010) -- without it, redemption now
+    // refuses the change before DO NOTHING/DO UPDATE is ever reached.
     await createMagicLinkToken(probeDatabaseUrl, schema, {
       tokenHash: `rls-reinvite-${suffix}`,
       email: invitedEmail,
       invite: { organizationId, role: "admin" },
+      replaceExistingRole: true,
       expiresAt
     });
     await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);

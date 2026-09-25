@@ -4,7 +4,7 @@ import { SESSION_COOKIE_NAME } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
-import { SESSION_COOKIE_OPTIONS, redeemMagicLinkForSession } from "../../../lib/magic-link";
+import { SESSION_COOKIE_OPTIONS, isRedeemableInviteToken, redeemMagicLinkForSession } from "../../../lib/magic-link";
 import { captureServerError, withServerOperation } from "../../../lib/observability";
 
 export const dynamic = "force-dynamic";
@@ -24,13 +24,23 @@ export const runtime = "nodejs";
  * a failed attempt and the user lands somewhere they can retry from. The
  * token is never placed in a redirect target.
  *
- * Tradeoff worth stating: a GET that consumes a single-use token can be
- * spent by an aggressive link scanner or mail-client prefetch. That is
- * inherent to emailed magic links, and the mitigations already in place are
- * the ones that matter -- single use enforced atomically in
- * `redeemMagicLinkToken`, and a short expiry. A confirm-button interstitial
- * would remove the prefetch risk at the cost of an extra click; that is a
- * product decision, not one to make silently here.
+ * Tradeoff worth stating for a plain login token: a GET that consumes a
+ * single-use token can be spent by an aggressive link scanner or mail-client
+ * prefetch. That is inherent to emailed magic links, and the mitigations
+ * already in place are the ones that matter -- single use enforced
+ * atomically in `redeemMagicLinkToken`, and a short expiry. Redemption there
+ * only mints a session, so a scanner spending it costs the real recipient a
+ * second request for a link, and is left as-is.
+ *
+ * An invite token is a different risk (review #88, REV-011): redemption
+ * also provisions or changes a persistent membership, so a scanner spending
+ * it silently creates the membership, or applies a role change, before the
+ * invitee ever acted -- and the invitee's own click then lands on a dead
+ * token with no way to tell what happened. So this GET does not consume an
+ * invite token at all; it peeks (non-mutating) and, if the token is still a
+ * live invite, redirects to `/auth/confirm`, which requires an explicit
+ * action before calling the same redemption this route uses for everything
+ * else.
  */
 async function handleGET(request: NextRequest): Promise<Response> {
   const requestId = generateRequestId();
@@ -47,6 +57,19 @@ async function handleGET(request: NextRequest): Promise<Response> {
   }
 
   try {
+    // Non-mutating (review #88, REV-011): a still-live invite token defers
+    // to a confirmation step instead of being consumed by this GET, so a
+    // mail scanner's prefetch cannot provision or change a membership on
+    // the invitee's behalf. The token stays in the query string here only
+    // because this redirect is same-origin and server-issued, never shown
+    // to the browser as the page it lands on -- unlike the outcomes below,
+    // which deliberately drop it.
+    if (await isRedeemableInviteToken(token)) {
+      const confirmUrl = new URL("/auth/confirm", origin);
+      confirmUrl.searchParams.set("token", token);
+      return NextResponse.redirect(confirmUrl, { headers });
+    }
+
     const redemption = await redeemMagicLinkForSession(token);
     if (redemption.outcome === "invalid") {
       return NextResponse.redirect(new URL("/?auth=invalid_link", origin), { headers });
