@@ -67,7 +67,7 @@ Common commands:
 
 ```bash
 pnpm dev:web             # start the Next.js shell
-pnpm dev:worker          # run the credential-free worker shell
+pnpm dev:worker          # run health only by default; enable processing explicitly
 pnpm lint
 pnpm typecheck
 pnpm test:unit           # deterministic Python citation-validation tests
@@ -91,6 +91,13 @@ pnpm env:smoke
 pnpm dev:web
 pnpm dev:worker
 ```
+
+The durable evidence-extraction worker remains disabled locally until
+`WORKER_PROCESSING_ENABLED=true` and the provider/budget settings in
+`.env.example` are supplied. Enqueue eligible work with
+`POST /api/roles/{roleId}/applications/{applicationId}/evidence-extraction`
+and a validated PDF/DOCX `sourceIntakeId`; see
+[`docs/operations/evidence-extraction-worker.md`](docs/operations/evidence-extraction-worker.md).
 
 Return the local database and storage to the known synthetic state with
 `pnpm dev:reset`. Destructive commands refuse staging and production targets.

@@ -69,6 +69,16 @@ test("preview lifecycle is green-SHA scoped with close and TTL cleanup", () => {
   assert.match(workflow, /preview sweep/u);
 });
 
+test("local Compose explicitly loads .env.local without affecting hosted commands", () => {
+  const cli = read("scripts/environment/cli.mjs");
+
+  assert.match(cli, /const localEnvFile = path\.join\(repositoryRoot, "\.env\.local"\);/u);
+  assert.match(cli, /if \(!fs\.existsSync\(localEnvFile\)\) \{[\s\S]*?Missing \.env\.local\. Copy \.env\.example to \.env\.local before running local infrastructure\.[\s\S]*?\}/u);
+  assert.match(cli, /if \(local\) \{[\s\S]*?files\.push\("--env-file", localEnvFile\);[\s\S]*?\}/u);
+  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "postgres", "storage"\], local\);/u);
+  assert.match(cli, /runDocker\(environment\.project, environment\.variables, \["up", "-d", "--build", "web", "worker"\]\);/u);
+});
+
 test("staging and production deploy only exact green revisions", () => {
   const staging = read(".github/workflows/staging-environment.yml");
   const production = read(".github/workflows/production-gate.yml");
@@ -179,6 +189,49 @@ test("compose passes the web service its session secret and the shared hosted co
   assert.doesNotMatch(workerService!, /SESSION_SECRET/u, "the worker must not require a session secret it never reads");
 });
 
+test("compose maps service-specific Sentry projects and a shared explicit sample rate", () => {
+  const compose = read("infra/compose/runtime.yml");
+  const runtimeEnvironmentBlock = /x-runtime-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  assert.ok(runtimeEnvironmentBlock);
+  assert.match(runtimeEnvironmentBlock!, /SENTRY_TRACES_SAMPLE_RATE: \$\{SENTRY_TRACES_SAMPLE_RATE:-\}/u);
+
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(webService);
+  assert.ok(workerService);
+  assert.match(webService!, /SENTRY_DSN: \$\{SENTRY_WEB_DSN:-\}/u);
+  assert.match(workerService!, /SENTRY_DSN: \$\{SENTRY_WORKER_DSN:-\}/u);
+  assert.doesNotMatch(webService!, /SENTRY_WORKER_DSN/u);
+  assert.doesNotMatch(workerService!, /SENTRY_WEB_DSN/u);
+});
+
+test("compose keeps provider secrets worker-only and gives the unexposed worker outbound access", () => {
+  const compose = read("infra/compose/runtime.yml");
+  const runtimeEnvironmentBlock = /x-runtime-environment:[\s\S]*?(?=\nservices:)/u.exec(compose)?.[0];
+  const webService = /^ {2}web:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  const workerService = /^ {2}worker:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(runtimeEnvironmentBlock);
+  assert.ok(webService);
+  assert.ok(workerService);
+  assert.match(runtimeEnvironmentBlock!, /WORKER_MAX_ATTEMPTS: \$\{WORKER_MAX_ATTEMPTS:-3\}/u);
+  assert.doesNotMatch(runtimeEnvironmentBlock!, /OPENAI_API_KEY/u);
+  assert.doesNotMatch(webService!, /OPENAI_API_KEY|WORKER_PROCESSING_ENABLED/u);
+  for (const name of [
+    "WORKER_PROCESSING_ENABLED",
+    "WORKER_INSTANCE_ID",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "OPENAI_ESCALATION_MODEL",
+    "INFERENCE_MAX_TOKENS_PER_PERIOD",
+    "INFERENCE_ALERT_THRESHOLD_RATIO",
+    "INFERENCE_BUDGET_PERIOD"
+  ]) {
+    assert.match(workerService!, new RegExp(`${name}:`, "u"));
+  }
+  assert.match(workerService!, /networks: \[public, private\]/u);
+  assert.doesNotMatch(workerService!, /^ {4}ports:/mu, "the worker needs egress, not a host-exposed port");
+});
+
 test("the web server refuses to start without a session secret", () => {
   // REV-003's other half. Documenting SESSION_SECRET is not enough on its own:
   // read at request time, its absence is a 500 per request rather than a
@@ -186,7 +239,7 @@ test("the web server refuses to start without a session secret", () => {
   // calls register() once and waits for it before serving, so throwing there
   // is what makes absence a startup failure.
   const instrumentation = read("apps/web/src/instrumentation.ts");
-  assert.match(instrumentation, /export function register\(/u, "Next.js only calls a function named register");
+  assert.match(instrumentation, /export (?:async )?function register\(/u, "Next.js only calls a function named register");
   assert.match(instrumentation, /SESSION_SECRET/u);
   assert.match(instrumentation, /throw new Error/u, "it has to throw; logging a warning still serves requests");
 });

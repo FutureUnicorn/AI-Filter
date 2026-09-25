@@ -380,10 +380,11 @@ test("the URL delivered in the email is itself redeemable, not just the API hand
 // without attempting a send. Any provider outage therefore turned the
 // endpoint into an account-existence oracle, with no attacker access to the
 // provider required. The public response must be identical either way.
-test("a delivery failure for a known account is indistinguishable from an unknown account", async () => {
+test("a delivery failure for a known account is indistinguishable from an unknown account", async (t) => {
   const databaseUrl = requireDatabase();
   const knownEmail = `oracle-known-${Date.now()}@acme.test`;
   const routeSchema = await provisionRouteProbeSchema(databaseUrl);
+  const errorLog = t.mock.method(console, "error", () => undefined);
   try {
     applyRouteEnvironment(databaseUrl, routeSchema);
     await seedRecruiter(databaseUrl, routeSchema, knownEmail);
@@ -419,6 +420,24 @@ test("a delivery failure for a known account is indistinguishable from an unknow
     );
     // Bodies too: a difference there leaks just as much as a status would.
     assert.equal(await knownResponse.clone().text(), await unknownResponse.clone().text());
+    const deliveryLine = errorLog.mock.calls
+      .map((call) => String(call.arguments[0]))
+      .find((line) => line.includes('"message":"magic_link.delivery_failed"'));
+    assert.ok(deliveryLine !== undefined, "the hidden provider failure must remain operator-visible");
+    const deliveryLog = JSON.parse(deliveryLine) as {
+      readonly context?: {
+        readonly errorName?: string;
+        readonly errorCode?: string;
+        readonly action?: string;
+      };
+    };
+    assert.equal(deliveryLog.context?.errorName, "TypeError");
+    assert.ok(
+      deliveryLog.context?.errorCode === "econnrefused" ||
+        deliveryLog.context?.errorCode === "unknown_error"
+    );
+    assert.equal(deliveryLog.context?.action, "email.send");
+    assert.doesNotMatch(deliveryLine, /oracle-known|acme\.test|test-key|token=/iu);
   } finally {
     delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
     delete process.env.MAGIC_LINK_EMAIL_API_KEY;

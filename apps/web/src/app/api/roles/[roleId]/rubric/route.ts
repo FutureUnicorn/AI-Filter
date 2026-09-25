@@ -10,6 +10,7 @@ import { loadEnvironmentConfig } from "@signal-audit/config";
 import { getMembershipsForUser, getRoleById, getRubricForRole, upsertDraftRubric } from "@signal-audit/db";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../lib/session";
+import { captureServerError } from "../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -80,7 +81,7 @@ export async function GET(request: NextRequest, context: RouteContext): Promise<
     }
     return Response.json(rubric, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("rubric fetch failed", error);
+    captureServerError(error, { requestId, operation: "rubric.get" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not fetch the rubric." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
@@ -132,7 +133,7 @@ export async function PUT(request: NextRequest, context: RouteContext): Promise<
     }
     return Response.json(outcome.rubric, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("rubric draft save failed", error);
+    captureServerError(error, { requestId, operation: "rubric.save" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not save the rubric." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }

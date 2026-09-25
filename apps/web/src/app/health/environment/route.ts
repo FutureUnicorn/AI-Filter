@@ -1,7 +1,7 @@
 import { loadEnvironmentConfig, publicEnvironmentSummary } from "@signal-audit/config";
 import { checkDatabaseConnection } from "@signal-audit/db";
 import { checkStorageConnection } from "@signal-audit/ingestion";
-import { logStructured } from "@signal-audit/security";
+import { describeError, logStructured } from "@signal-audit/security";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -33,8 +33,13 @@ export async function GET(): Promise<Response> {
         headers: { "Cache-Control": "no-store" }
       }
     );
-  } catch {
-    logStructured("error", "web.environment_health_failed");
+  } catch (error) {
+    const diagnostic = describeError(error);
+    logStructured("error", "web.environment_health_failed", {
+      errorName: diagnostic.errorName,
+      errorCode: diagnostic.errorCode,
+      statusCode: 503
+    });
     return Response.json(
       {
         status: "misconfigured",

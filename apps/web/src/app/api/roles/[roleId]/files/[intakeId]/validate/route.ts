@@ -12,6 +12,7 @@ import {
 } from "@signal-audit/ingestion";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
 import { readSessionUserId } from "../../../../../../../lib/session";
+import { captureServerError, withServerOperation } from "../../../../../../../lib/observability";
 import type { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -34,7 +35,7 @@ interface RouteContext {
  * the one-shot WHERE status = 'uploaded' in packages/db is what actually
  * prevents a second, more lenient pass from overriding a quarantine.
  */
-export async function POST(_request: NextRequest, context: RouteContext): Promise<Response> {
+async function handlePOST(_request: NextRequest, context: RouteContext): Promise<Response> {
   const requestId = generateRequestId();
   const { roleId, intakeId } = await context.params;
   const userId = readSessionUserId(_request);
@@ -128,8 +129,10 @@ export async function POST(_request: NextRequest, context: RouteContext): Promis
     }
     return Response.json(outcome.intake, { status: 200, headers: withRequestId(undefined, requestId) });
   } catch (error) {
-    console.error("file validation failed", error);
+    captureServerError(error, { requestId, operation: "file.validate" });
     const apiError = buildApiError({ requestId, code: "internal_error", message: "Could not validate the file." });
     return Response.json(apiError.body, { status: apiError.status, headers: withRequestId(undefined, requestId) });
   }
 }
+
+export const POST = withServerOperation("file.validate", handlePOST);
