@@ -37,11 +37,13 @@ docs/
   VALIDATION_STATUS.md   — current gate status (problem / value / payment / retention / economics)
   architecture/          — repository dependency rules
   rubric_template.md     — the employer-approved criteria template used per role
+  validation/            — who the pilot conversations are with, and why they qualify
 evals/                   — model-quality cases and synthetic datasets, separate from tests
 scripts/
   schema.py              — the structured evidence-item schema (single source of truth)
   extract_evidence.py    — LLM extraction: rubric + one application -> evidence items
   validate_citations.py  — exact-substring citation validator (the core trust mechanism)
+  target_accounts.py     — qualifies the pilot target account list against the AF-74 rules
   README.md              — how to run the manual pipeline end to end
 tests/                   — Python, architecture, integration, and synthetic fixture tests
 ```

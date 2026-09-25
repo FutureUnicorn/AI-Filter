@@ -115,7 +115,15 @@ services:
           PGOPTIONS="-c search_path=$$DATABASE_SCHEMA" psql -v ON_ERROR_STOP=1 --file "$$migration"
         done
     volumes:
-      - ../../packages/db/migrations:/migrations:ro
+      # AF-93 PR #85 review (Copilot): DEPLOY_SOURCE_DIRECTORY lets the preview
+      # deploy job run cli.mjs (and this compose file) from a TRUSTED
+      # default-branch checkout while mounting the PR's own untrusted
+      # revision's migrations -- a preview must run that PR's own migrations
+      # for correctness, so this stays pointed at the PR checkout even though
+      # the orchestration script itself no longer is. Unset (every other
+      # caller: local/staging/production/manual preview) resolves relative to
+      # this compose file's own location exactly as before.
+      - ${DEPLOY_SOURCE_DIRECTORY:-../..}/packages/db/migrations:/migrations:ro
     networks: [private]
     security_opt: ["no-new-privileges:true"]
 
@@ -141,7 +149,7 @@ services:
         case "$$DATABASE_SCHEMA" in (*[!a-z0-9_]*|'') echo 'Unsafe DATABASE_SCHEMA' >&2; exit 2;; esac
         PGOPTIONS="-c search_path=$$DATABASE_SCHEMA" psql -v ON_ERROR_STOP=1 --file /fixtures/synthetic.sql
     volumes:
-      - ../../tests/fixtures/environment:/fixtures:ro
+      - ${DEPLOY_SOURCE_DIRECTORY:-../..}/tests/fixtures/environment:/fixtures:ro
     networks: [private]
     security_opt: ["no-new-privileges:true"]
 
@@ -239,7 +247,14 @@ services:
 
   web:
     build:
-      context: ../..
+      # AF-93 PR #85 review (Copilot): the preview deploy job runs cli.mjs
+      # from a trusted default-branch checkout but must still BUILD the
+      # exact, untrusted PR revision under test. DEPLOY_SOURCE_DIRECTORY
+      # (an absolute path when set) points the build -- and only the build --
+      # at that untrusted checkout, so the attacker-controlled Dockerfile and
+      # source are never mistaken for orchestration code with access to
+      # PREVIEW_STATE_DIRECTORY or other previews' state.
+      context: ${DEPLOY_SOURCE_DIRECTORY:-../..}
       dockerfile: infra/docker/runtime.Dockerfile
       target: web
     restart: unless-stopped
@@ -272,7 +287,7 @@ services:
 
   worker:
     build:
-      context: ../..
+      context: ${DEPLOY_SOURCE_DIRECTORY:-../..}
       dockerfile: infra/docker/runtime.Dockerfile
       target: worker
     restart: unless-stopped
