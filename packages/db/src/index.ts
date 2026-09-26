@@ -4925,6 +4925,40 @@ export async function observeRetentionResidue(
       [
         "candidate_decisions",
         `SELECT count(*) FROM "${schema}".candidate_decisions WHERE organization_id = $1 AND decided_at <= $2`
+      ],
+      // REV-001: the four surfaces that keep a candidate's application
+      // identifier in an append-only table. All four were previously
+      // either exempt or absent from the plan, so a tenant could
+      // reconcile clean while every one of them still held rows past the
+      // cutoff -- which is the one outcome this job exists to prevent.
+      //
+      // Each anchors on the timestamp the DATABASE owns, never one a
+      // caller supplies. review_timing_spans is the case that matters:
+      // started_at and ended_at come from the browser, and anchoring
+      // retention on either would let a client decide when its own rows
+      // fall out of scope. recorded_at defaults to clock_timestamp().
+      [
+        "audit_events",
+        `SELECT count(*) FROM "${schema}".audit_events WHERE organization_id = $1 AND occurred_at <= $2`
+      ],
+      [
+        "evidence_extraction_runs",
+        `SELECT count(*) FROM "${schema}".evidence_extraction_runs
+          WHERE organization_id = $1 AND created_at <= $2`
+      ],
+      [
+        "review_timing_spans",
+        `SELECT count(*) FROM "${schema}".review_timing_spans WHERE organization_id = $1 AND recorded_at <= $2`
+      ],
+      // audit_sample_members has no timestamp of its own: it is one row
+      // per candidate in a draw, and the draw carries the time. Joined
+      // rather than left uncounted, because the members are the half
+      // that names candidates.
+      [
+        "audit_sample_members",
+        `SELECT count(*) FROM "${schema}".audit_sample_members asm
+           JOIN "${schema}".audit_samples s ON s.audit_sample_id = asm.audit_sample_id
+          WHERE asm.organization_id = $1 AND s.drawn_at <= $2`
       ]
     ];
 
@@ -5028,22 +5062,30 @@ export async function probeRetentionReconciliation(
   const intakeA = "55555555-5555-4555-8555-555555555555";
   const intakeB = "88888888-8888-4888-8888-888888888888";
   const applicationId = "44444444-4444-4444-8444-444444444444";
+  const auditSampleId = "99999999-9999-4999-8999-999999999999";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
 
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql"
-    ]) {
+    // REV-001: every migration in the runner's own order, minus the one
+    // deliberately held back below. This used to be a hand-picked list
+    // ending at 0016, which is the same defect AF-61's purge probe was
+    // corrected for: a probe that applies the tables someone already
+    // thought of can only measure the surfaces someone already thought
+    // of. It is also precisely why the four append-only surfaces that
+    // keep an application identifier were never observed here -- three of
+    // their migrations were not in the list at all.
+    const deferred = "0019_candidate_decisions.sql";
+    const applied = listMigrationsInRunnerOrder().filter((file) => file !== deferred);
+    if (applied.length === listMigrationsInRunnerOrder().length) {
+      throw new Error(
+        `probeRetentionReconciliation: ${deferred} must exist to be held back; the ` +
+          `missing-surface-table observation below depends on it`
+      );
+    }
+    for (const file of applied) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
@@ -5106,6 +5148,37 @@ export async function probeRetentionReconciliation(
     await admin.query(
       `INSERT INTO candidate_decisions (organization_id, application_id, decision, rationale, decided_by_user_id)
        VALUES ($1,$2,'hold','Revisit after the panel',$3)`,
+      [orgA, applicationId, userId]
+    );
+    // REV-001: the four append-only surfaces that keep a candidate's
+    // application identifier. Rows here are what let a report be clean
+    // while the identifier for a real candidate remained, so the fixture
+    // has to contain them or the property is untested.
+    await admin.query(
+      `INSERT INTO audit_events (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+       VALUES ($1,$2,'decision_recorded','application',$3,'req_11111111-1111-4111-8111-111111111111')`,
+      [orgA, userId, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,'application',$2,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size,
+         eligible_count, drawn_by_user_id)
+       VALUES ($1,$2,$3,'recon-probe',1,1,$4)`,
+      [auditSampleId, orgA, roleA, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at,
+         ended_at, active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-07-01T12:00:00Z','2026-07-01T12:01:00Z',60000,false)`,
       [orgA, applicationId, userId]
     );
 

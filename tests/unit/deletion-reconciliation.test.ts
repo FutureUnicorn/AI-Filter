@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RETENTION_SURFACES, planRetention, reconcileRetention } from "../../packages/domain/src/index.ts";
-import type { RetentionResidue } from "../../packages/domain/src/index.ts";
+import {
+  RETENTION_SURFACES,
+  assertRetentionExemptionsAreLive,
+  planRetention,
+  reconcileRetention
+} from "../../packages/domain/src/index.ts";
+import type { RetentionPlan, RetentionResidue } from "../../packages/domain/src/index.ts";
 
 // AF-63: "Scheduled job confirms every store that should be empty
 // actually is; produces a reconciliation report so deletion drift is
@@ -20,6 +25,14 @@ const CLASSIFIED_TABLES = [
   "evidence_outcomes",
   "candidate_decisions",
   "audit_events",
+  // REV-001: three of these were exempt and one was absent from the plan
+  // entirely, and all four keep a candidate's application identifier.
+  // audit_samples is the one that stays exempt, so leaving it here keeps
+  // the exemption exercised rather than merely declared.
+  "evidence_extraction_runs",
+  "audit_sample_members",
+  "review_timing_spans",
+  "audit_samples",
   "organizations",
   "users",
   "memberships",
@@ -118,10 +131,49 @@ test("a blocked finding quotes the plan's own reason rather than inventing one",
   assert.match(finding?.detail ?? "", /cannot be redacted in place/);
 });
 
-test("audit_events holding rows is not a finding, because it holds no candidate data", () => {
+// ---- REV-001: the surfaces that keep the identifier ----
+//
+// This test asserted the opposite and passed, which is what a test
+// pinning a defect looks like. AF-61 classified audit_events as holding
+// nothing candidate-derived, and the classification was true about
+// candidate TEXT and false about identifiers, so the reconciler was
+// correctly implementing a wrong rule. Three more surfaces were exempt
+// or absent for the same reason.
+
+test("audit_events holding rows past the cutoff is a finding, because it keeps the identifier", () => {
   const report = reconcileRetention(PLAN, residue({ rowsPastCutoffBySurface: { audit_events: 5000 } }));
-  assert.deepEqual(report.findings, []);
-  assert.equal(report.clean, true);
+  const finding = report.findings.find((f) => f.surface === "audit_events");
+  assert.equal(finding?.kind, "blocked_as_planned");
+  assert.equal(finding?.rowsPastCutoff, 5000);
+  assert.equal(report.clean, false, "rows a tenant cannot delete are not a clean bill of health");
+});
+
+test("no tenant reconciles clean while any identifier surface still holds rows", () => {
+  // The fixture Sai asked for, stated as the property rather than as one
+  // table: every surface that keeps an application identifier, each on
+  // its own, has to be enough to take the report out of clean.
+  for (const surface of [
+    "audit_events",
+    "evidence_extraction_runs",
+    "audit_sample_members",
+    "review_timing_spans"
+  ] as const) {
+    const report = reconcileRetention(PLAN, residue({ rowsPastCutoffBySurface: { [surface]: 1 } }));
+    assert.equal(report.clean, false, `${surface} holding a row past the cutoff must not reconcile clean`);
+    assert.equal(
+      report.findings.find((f) => f.surface === surface)?.kind,
+      "blocked_as_planned",
+      `${surface} must be reported by name, not merely counted`
+    );
+  }
+});
+
+test("no exemption shadows a classified surface", () => {
+  // The failure this catches is silent: a table in both lists is
+  // classified, described in the privacy notice, and skipped by the
+  // reconciler, with each half looking right on its own. That is exactly
+  // the state evidence_extraction_runs was in.
+  assertRetentionExemptionsAreLive();
 });
 
 test("the statement names every category present, so a reader need not read the findings array", () => {
@@ -192,17 +244,30 @@ test("every plan surface unmeasured is every plan surface reported, none skipped
   // open for any Postgres surface whose table is missing from the schema.
   const report = reconcileRetention(PLAN, residue({ observedSurfaces: [] }));
   const unmeasured = new Set(report.findings.filter((f) => f.kind === "not_observed").map((f) => f.surface));
-  const expected = new Set(RETENTION_SURFACES.filter((surface) => surface !== "audit_events"));
+  // Every one of them now. The exclusion here was audit_events, on the
+  // strength of a disposition it no longer carries.
+  const expected = new Set(RETENTION_SURFACES);
   assert.deepEqual(unmeasured, expected);
   assert.equal(report.clean, false);
 });
 
-test("a no_candidate_data surface is not reported as unmeasured, because a count would say nothing", () => {
-  // audit_events holds nothing candidate-derived by construction, and
-  // reconcileRetention discards its count even when it has one. Demanding
-  // a measurement that is then thrown away would be noise on every run,
-  // and noise is what makes a report get skimmed.
-  const report = reconcileRetention(PLAN, residue({ observedSurfaces: measuredExcept("audit_events") }));
+test("the no_candidate_data branch still skips the unmeasured check, on a plan that reaches it", () => {
+  // No surface carries that disposition any more, so planRetention
+  // cannot reach this branch. The branch stays rather than being
+  // deleted: the reasoning is sound for a surface that genuinely holds
+  // nothing, RetentionPlan is exported so a caller can build one, and
+  // deleting it would leave the rule undocumented and untested against
+  // the day a surface qualifies. Exercised on a hand-built plan, which
+  // is the honest way to keep an unreachable branch covered.
+  const plan: RetentionPlan = {
+    ...PLAN,
+    surfaces: PLAN.surfaces.map((surface) =>
+      surface.surface === "audit_events"
+        ? { ...surface, disposition: "no_candidate_data" as const }
+        : surface
+    )
+  };
+  const report = reconcileRetention(plan, residue({ observedSurfaces: measuredExcept("audit_events") }));
   assert.deepEqual(report.findings, []);
   assert.equal(report.clean, true);
 });

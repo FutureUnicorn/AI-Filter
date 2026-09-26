@@ -2429,6 +2429,26 @@ export interface ReconciliationReport {
  * pattern-matched, so adding a table is a decision someone makes here
  * rather than something a prefix rule silently absorbs.
  */
+/**
+ * Tables the reconciler will not report as unclassified.
+ *
+ * REV-001: this list had four entries that held a candidate's
+ * application identifier, so the reconciliation could report a tenant
+ * clean without ever measuring them. evidence_extraction_runs,
+ * audit_sample_members and review_timing_spans are now classified
+ * surfaces in AF-61's plan and are measured per tenant; they are gone
+ * from here, and assertRetentionExemptionsAreLive fails if a planned
+ * surface is ever listed in both places, because an exemption that
+ * shadows a classification is how a measured surface stops being
+ * measured without anyone editing the measurement.
+ *
+ * audit_samples stays, and it is the one entry that needs its reasoning
+ * written down rather than assumed: the draw itself holds a seed, a
+ * role, counts and a drawing user, and no application identifier. Its
+ * members are what name candidates, and those are now counted. A draw
+ * with no members past the cutoff is genuinely nothing about a
+ * candidate.
+ */
 const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "organizations",
   "users",
@@ -2436,15 +2456,35 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "roles",
   "rubrics",
   "magic_link_tokens",
-  "evidence_extraction_runs",
   "inference_usage_ledger",
   "inference_kill_switch",
   "import_finalizations",
   "audit_samples",
-  "audit_sample_members",
-  "review_timing_spans",
   "af11_synthetic_environment_fixture"
 ]);
+
+/**
+ * Every exempt table is still unplanned, and every planned surface is
+ * still unexempt.
+ *
+ * Exported so a test can run it, and written as an assertion rather than
+ * a test-local loop because the failure it catches is silent: a table
+ * that appears in both places is classified, described in the privacy
+ * notice, and skipped by the reconciler, with each half looking correct
+ * on its own. That is exactly the state this stack was in for
+ * evidence_extraction_runs.
+ */
+export function assertRetentionExemptionsAreLive(): void {
+  const planned = new Set<string>(RETENTION_SURFACES);
+  const shadowed = [...RETENTION_EXEMPT_TABLES].filter((table) => planned.has(table)).sort();
+  if (shadowed.length > 0) {
+    throw new Error(
+      `RETENTION_EXEMPT_TABLES exempts ${shadowed.join(", ")}, which AF-61 classifies as a retention ` +
+        `surface. An exemption on a planned surface stops it being reconciled while the plan still ` +
+        `claims it is accounted for.`
+    );
+  }
+}
 
 export function reconcileRetention(
   plan: RetentionPlan,

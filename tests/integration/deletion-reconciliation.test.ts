@@ -252,3 +252,64 @@ test("a valid external count is accepted, so the guards above are not simply rej
   assert.equal(guards.acceptedUnobservableSurface.rowsPastCutoffBySurface["object_storage_documents"], 7);
   assert.ok(guards.acceptedUnobservableSurface.observedSurfaces.includes("object_storage_documents"));
 });
+
+// ---- REV-001: the surfaces that keep the identifier, against a real tenant ----
+//
+// The four surfaces below were either exempt from reconciliation or
+// absent from the retention plan, and all four hold a candidate's
+// application identifier in an append-only table. A tenant could
+// therefore reconcile clean with every one of them still populated.
+//
+// Asserted through the live observer rather than a hand-built residue,
+// because the exemption and the measurement were two separate omissions:
+// classifying the surface does nothing if observeRetentionResidue has no
+// query for it, and a hand-built residue would supply the counts the
+// observer is supposed to produce.
+
+test("the append-only identifier surfaces are measured per tenant by the live observer", async () => {
+  const url = requireDatabase();
+  const { residue } = await probeRetentionReconciliation(url, NOW.toISOString());
+  for (const surface of [
+    "audit_events",
+    "evidence_extraction_runs",
+    "audit_sample_members",
+    "review_timing_spans"
+  ]) {
+    assert.ok(
+      residue.observedSurfaces.includes(surface),
+      `${surface} must be measured, not assumed; an unmeasured surface reads as empty`
+    );
+    assert.equal(
+      residue.rowsPastCutoffBySurface[surface],
+      1,
+      `${surface} holds one row for this tenant's candidate and the observer must find it`
+    );
+  }
+});
+
+test("a tenant whose candidate identifier survives in those surfaces cannot reconcile clean", async () => {
+  const url = requireDatabase();
+  const { residue, organizationId } = await probeRetentionReconciliation(url, NOW.toISOString());
+  const report = reconcileRetention(planRetention({ organizationId, windowDays: 30 }, NOW), residue);
+  assert.equal(report.clean, false);
+  for (const surface of [
+    "audit_events",
+    "evidence_extraction_runs",
+    "audit_sample_members",
+    "review_timing_spans"
+  ]) {
+    const finding = report.findings.find((f) => f.surface === surface);
+    assert.equal(finding?.kind, "blocked_as_planned", `${surface} must be reported by name`);
+    assert.equal(finding?.rowsPastCutoff, 1);
+  }
+});
+
+test("another tenant's rows in those surfaces are not counted against this one", async () => {
+  // The four new counts are scoped by organization_id, and
+  // audit_sample_members takes its cutoff from a joined audit_samples
+  // row, which is the one place a join could have lost the tenant scope.
+  const url = requireDatabase();
+  const { residue } = await probeRetentionReconciliation(url, NOW.toISOString());
+  assert.equal(residue.rowsPastCutoffBySurface["audit_sample_members"], 1);
+  assert.equal(residue.rowsPastCutoffBySurface["review_timing_spans"], 1);
+});
