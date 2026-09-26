@@ -8,6 +8,7 @@ import { revealedCriterionId } from "../../../../../lib/review-keys";
 import { ShortcutHelp } from "../../../../../lib/ShortcutHelp";
 import { buildSourceContextAnnouncement } from "../../../../../lib/review-focus";
 import { useReviewKeyboard } from "../../../../../lib/review-keyboard";
+import { useReviewTiming } from "../../../../../lib/review-timing";
 
 interface SourceCitation {
   readonly document: string;
@@ -135,6 +136,12 @@ export default function EvidenceCardPage() {
       }, 50);
     }
   });
+  // AF-54: this page is where a candidate is reviewed, so this is where
+  // time-per-application is measured. Nothing is shown to the reviewer:
+  // a visible stopwatch changes the thing it measures, and the baseline
+  // is supposed to describe how review works today rather than how it
+  // works while being timed.
+  useReviewTiming({ roleId, applicationId });
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {

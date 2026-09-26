@@ -6,12 +6,12 @@ import { fileURLToPath } from "node:url";
 import type {
   Application,
   AuditAction,
+  CandidateDecision,
+  CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
-  CandidateDecision,
-  CandidateDecisionKind,
   DomainPort,
   EvidenceExtractionRunRef,
   EvidenceOutcome,
@@ -25,6 +25,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  ReviewTimingSpan,
   Role,
   RoleStatus,
   Rubric,
@@ -34,10 +35,13 @@ import type {
 } from "@signal-audit/domain";
 import {
   CONTRACT_SCHEMA_VERSION,
+  beginReviewTiming,
   canonicalizeCsvColumnMapping,
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   mapCsvRowToApplication,
+  recordReviewActivity,
+  sealReviewTiming,
   summarizeImportRows
 } from "@signal-audit/domain";
 import { Client } from "pg";
@@ -3732,6 +3736,408 @@ export async function assertAuditSampleIntegrity(databaseUrl: string): Promise<v
       }
       if (!rejected) {
         throw new Error(`a recorded draw must be immutable; permitted: ${statement}`);
+      }
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-54: capture recruiter review timing ----
+
+export interface RecordReviewTimingSpanInput {
+  readonly organizationId: string;
+  readonly applicationId: string;
+  readonly reviewerUserId: string;
+  readonly startedAt: Date;
+  readonly endedAt: Date;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+export async function recordReviewTimingSpan(
+  databaseUrl: string,
+  schema: string,
+  input: RecordReviewTimingSpanInput
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query(
+      `INSERT INTO "${schema}".review_timing_spans
+         (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        input.applicationId,
+        input.reviewerUserId,
+        input.startedAt,
+        input.endedAt,
+        input.activeMs,
+        input.truncatedByIdle
+      ]
+    );
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Spans for a role, grouped by application.
+ *
+ * There is deliberately NO listReviewTimingSpansForReviewer, and no
+ * index that would make one cheap. Time-per-application is a product
+ * baseline; the same rows sorted by person are a performance-management
+ * dataset, and which of those exists is decided by which query is easy
+ * to write. reviewer_user_id is stored because a span with no actor
+ * cannot be deduplicated or excluded when someone leaves -- not so it
+ * can be reported on.
+ */
+export async function listReviewTimingSpansForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<readonly ReviewTimingSpan[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      application_id: string;
+      active_ms: number;
+      truncated_by_idle: boolean;
+    }>(
+      `SELECT s.application_id, s.active_ms, s.truncated_by_idle
+         FROM "${schema}".review_timing_spans s
+         JOIN "${schema}".applications a
+           ON a.application_id = s.application_id AND a.organization_id = s.organization_id
+        WHERE s.organization_id = $1 AND a.role_id = $2
+        ORDER BY s.application_id, s.started_at`,
+      [organizationId, roleId]
+    );
+    return result.rows.map((row) => ({
+      applicationId: row.application_id,
+      activeMs: row.active_ms,
+      truncatedByIdle: row.truncated_by_idle
+    }));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The name of the constraint a query violated, or undefined when the
+ * query failed for some other reason entirely.
+ *
+ * pg puts this on the error for check, foreign key, unique and not-null
+ * violations. Reading it is what separates "the bound I am testing
+ * rejected this" from "something rejected this", and those are not the
+ * same result.
+ */
+function violatedConstraint(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("constraint" in error)) {
+    return undefined;
+  }
+  const { constraint } = error as { readonly constraint?: unknown };
+  return typeof constraint === "string" ? constraint : undefined;
+}
+
+/**
+ * AF-54: proves a review-timing span cannot record a duration it did
+ * not measure, cannot cross tenants, and cannot be edited afterwards.
+ *
+ * Every rejection attempt uses its own primary key, and the ids are
+ * hex-safe. A first pass at this used ids beginning with `t`, which is
+ * not a hex digit -- every case failed with "invalid input syntax for
+ * type uuid" and would have read as "all rejected" from the exit status
+ * alone. Naming the expected constraint for each case is what makes
+ * that class of mistake impossible rather than merely fixed once.
+ */
+export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `timing_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [orgA, orgB]);
+    const reviewer = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Reviewer') RETURNING user_id`,
+      [`reviewer_${suffix}@acme.test`]
+    );
+    const outsider = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'Outsider') RETURNING user_id`,
+      [`outsider_${suffix}@acme.test`]
+    );
+    const reviewerId = reviewer.rows[0]?.user_id;
+    const outsiderId = outsider.rows[0]?.user_id;
+    if (reviewerId === undefined || outsiderId === undefined) {
+      throw new Error("probe could not create users");
+    }
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      orgA,
+      reviewerId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'R', $2) RETURNING role_id`,
+      [orgA, reviewerId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+      [orgA, roleId, `probe/${suffix}.csv`, reviewerId]
+    );
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'C', $4) RETURNING application_id`,
+      [orgA, roleId, intake.rows[0]?.intake_id, `c_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (applicationId === undefined || roleId === undefined) {
+      throw new Error("probe could not create an application");
+    }
+
+    // 1. Two honest spans record and read back at the right grain.
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date("2026-08-29T10:00:00Z"),
+      endedAt: new Date("2026-08-29T10:01:30Z"),
+      activeMs: 90_000,
+      truncatedByIdle: false
+    });
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date("2026-08-29T11:00:00Z"),
+      endedAt: new Date("2026-08-29T11:05:00Z"),
+      activeMs: 120_000,
+      truncatedByIdle: true
+    });
+    const spans = await listReviewTimingSpansForRole(databaseUrl, schema, orgA, roleId);
+    if (spans.length !== 2) {
+      throw new Error(`expected both spans for this role, got ${spans.length}`);
+    }
+    if (!spans.some((span) => span.truncatedByIdle)) {
+      throw new Error("the idle flag must survive the round trip; a summary cannot exclude what it cannot see");
+    }
+
+    // 1b. The span the client producer actually emits is insertable.
+    //     Worth doing against real Postgres rather than trusting the
+    //     arithmetic: the producer's worst case is an abandoned tab, and
+    //     that is precisely the shape that would trip the wall-clock
+    //     CHECK if endedAt were the moment of closing rather than the
+    //     last interaction.
+    const abandonedStartMs = Date.parse("2026-08-29T12:00:00Z");
+    const abandoned = sealReviewTiming(
+      recordReviewActivity(beginReviewTiming(abandonedStartMs), abandonedStartMs + 45_000).state,
+      abandonedStartMs + 8 * 60 * 60 * 1_000
+    );
+    if (abandoned === undefined || !abandoned.truncatedByIdle) {
+      throw new Error("a tab abandoned for eight hours must still yield a truncated span to record");
+    }
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date(abandoned.startedAtMs),
+      endedAt: new Date(abandoned.endedAtMs),
+      activeMs: abandoned.activeMs,
+      truncatedByIdle: abandoned.truncatedByIdle
+    });
+
+    // A zero-duration span is not a measurement. sealReviewTiming refuses
+    //    to emit one; this proves the database refuses to store one too, so
+    //    a direct writer cannot put an application into the measured sample
+    //    with no measured time, which would lower the assisted median and
+    //    inflate the reported review-time reduction.
+    let zeroDurationRejection = "";
+    try {
+      await admin.query(
+        `INSERT INTO review_timing_spans
+           (application_id, organization_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ($1, $2, $3, now() - INTERVAL '5 minutes', now(), 0, false)`,
+        [applicationId, orgA, reviewerId]
+      );
+    } catch (error) {
+      zeroDurationRejection = error instanceof Error ? error.message : String(error);
+    }
+    if (!/review_timing_spans_active_is_measured/u.test(zeroDurationRejection)) {
+      throw new Error(
+        `a zero-duration span must be refused by the database; got: ${zeroDurationRejection || "accepted"}`
+      );
+    }
+
+    // 2. A span cannot claim more active time than the wall clock it
+    //    sits inside. This is the check that catches a client sending a
+    //    fabricated duration, which would quietly corrupt the baseline.
+    const rejections: Array<[string, string, string, string, string, number, string]> = [
+      [
+        "eight hours of activity inside ninety seconds",
+        "ea000001-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T14:00:00Z",
+        "2026-08-29T14:01:30Z",
+        28_800_000,
+        "review_timing_spans_active_within_wall_clock"
+      ],
+      [
+        "negative active time",
+        "ea000002-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T15:00:00Z",
+        "2026-08-29T15:01:00Z",
+        -5,
+        // Either constraint is a correct refusal. active_is_measured
+        // (active_ms > 0) subsumes the original >= 0 check and fires first
+        // for a negative, so this asserts the rule, that negative active
+        // time is refused, rather than which guard happens to catch it.
+        "review_timing_spans_active_(ms_check|is_measured)"
+      ],
+      [
+        "a span that ended before it started",
+        "ea000003-4444-4444-8444-444444444444",
+        orgA,
+        "2026-08-29T16:00:00.500Z",
+        "2026-08-29T16:00:00.000Z",
+        1,
+        // The claim worth checking mechanically: this reversal is caught
+        // by the ordering constraint specifically, not shadowed by either
+        // of the others. One millisecond of active time satisfies the
+        // wall-clock bound (1 <= -500 + 1000) and satisfies
+        // active_is_measured (1 > 0), so it has to be this constraint or
+        // none. It was zero until active_is_measured was added, which
+        // would have made that new constraint fire first and hidden what
+        // this case is actually testing.
+        "review_timing_spans_ordered"
+      ],
+      [
+        "another tenant timing this application",
+        "ea000004-4444-4444-8444-444444444444",
+        orgB,
+        "2026-08-29T17:00:00Z",
+        "2026-08-29T17:01:00Z",
+        60_000,
+        "review_timing_spans_application_id_organization_id_fkey"
+      ]
+    ];
+    // Which constraint rejected it, not merely that something did. A
+    // bare catch here would have been satisfied by the typo that
+    // actually happened during this probe's first pass -- ids beginning
+    // with `t`, every case failing on "invalid input syntax for type
+    // uuid" -- and reported all four bounds as holding. Fixing the ids
+    // left that trap armed for the next edit; naming the constraint
+    // disarms it.
+    for (const [label, id, organizationId, startedAt, endedAt, activeMs, constraint] of rejections) {
+      let tripped: string | undefined;
+      try {
+        await admin.query(
+          `INSERT INTO review_timing_spans
+             (review_timing_span_id, organization_id, application_id, reviewer_user_id,
+              started_at, ended_at, active_ms, truncated_by_idle)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+          [id, organizationId, applicationId, reviewerId, startedAt, endedAt, activeMs]
+        );
+      } catch (error) {
+        tripped = violatedConstraint(error);
+        if (tripped === undefined) {
+          throw new Error(`${label} failed for a reason that is not a constraint: ${describeError(error)}`, {
+            cause: error
+          });
+        }
+      }
+      // constraint may name a single guard or a set of acceptable ones,
+      // for the cases where two constraints both correctly refuse and
+      // which fires first is not the property under test.
+      if (tripped === undefined || !new RegExp(`^${constraint}$`, "u").test(tripped)) {
+        throw new Error(
+          tripped === undefined
+            ? `${label} must not be recordable as review timing`
+            : `${label} must be caught by ${constraint}, but ${tripped} fired first`
+        );
+      }
+    }
+
+    // 3. A reviewer with no standing in this tenant cannot be recorded
+    //    as having reviewed.
+    let outsiderTripped: string | undefined;
+    try {
+      await admin.query(
+        `INSERT INTO review_timing_spans
+           (review_timing_span_id, organization_id, application_id, reviewer_user_id,
+            started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ('ea000005-4444-4444-8444-444444444444', $1, $2, $3, $4, $5, 60000, false)`,
+        [orgA, applicationId, outsiderId, "2026-08-29T18:00:00Z", "2026-08-29T18:01:00Z"]
+      );
+    } catch (error) {
+      outsiderTripped = violatedConstraint(error);
+    }
+    if (outsiderTripped !== "review_timing_spans_organization_id_reviewer_user_id_fkey") {
+      throw new Error(
+        `a reviewer with no membership in this organization must be rejected by the membership foreign key, got ${
+          outsiderTripped ?? "no rejection"
+        }`
+      );
+    }
+
+    // 4. Nothing edits or erases a recorded span. Checked with rows
+    //    present -- an UPDATE or DELETE affecting zero rows never fires
+    //    a row-level trigger and would pass for the wrong reason.
+    const before = await admin.query<{ count: string }>(`SELECT count(*)::text AS count FROM review_timing_spans`);
+    if (Number(before.rows[0]?.count ?? 0) === 0) {
+      throw new Error("the immutability check needs rows present to be meaningful");
+    }
+    for (const statement of [
+      `UPDATE review_timing_spans SET active_ms = 1`,
+      `DELETE FROM review_timing_spans`,
+      `TRUNCATE review_timing_spans`
+    ]) {
+      let message: string | undefined;
+      try {
+        await admin.query(statement);
+      } catch (error) {
+        message = describeError(error);
+      }
+      // The trigger's own words. A syntax error or a missing table would
+      // otherwise read as "immutability holds".
+      if (message === undefined || !message.includes("review_timing_spans is append-only")) {
+        throw new Error(
+          `a recorded timing span must be immutable; ${statement} gave ${message ?? "no error at all"}`
+        );
       }
     }
   } finally {
