@@ -11,6 +11,7 @@ import {
   renderRoleAuditReport,
   selectAuditSample,
   summarizeEvidencePrecision,
+  summarizeMetric,
   summarizeQualifiedPreservation,
   summarizeReviewTiming,
   CONTRACT_SCHEMA_VERSION
@@ -64,14 +65,36 @@ function revision(evidenceOutcomeId: string, supersedes?: string): EvidenceRevis
   };
 }
 
+// AF-57 replaced `reviewed: boolean` with the record that establishes
+// examination, and this is what an honest live pilot looks like under
+// that API: one item proven examined by its own correction, two counted
+// because a decision was recorded on the candidate, one nobody touched.
+//
+// It cannot be written any other way without ceasing to be a live pilot.
+// `item_correction` is the only item-level proof a pilot produces, so a
+// fixture with no inferred examinations is a fixture where every
+// examined item was corrected, which is a precision of 0. The inferred
+// denominator is the normal case, not the edge case, and the report has
+// to survive it.
 function itemHistories(): readonly EvidenceItemHistory[] {
   return [
-    { itemId: "i1", revisions: [revision("i1")], reviewed: true },
-    { itemId: "i2", revisions: [revision("i2")], reviewed: true },
-    { itemId: "i3", revisions: [revision("i3"), revision("i3-fix", "i3")], reviewed: true },
-    { itemId: "i4", revisions: [revision("i4")], reviewed: false }
+    { itemId: "i1", dataset: "live_pilot", revisions: [revision("i1")], examinedVia: "candidate_decision" },
+    { itemId: "i2", dataset: "live_pilot", revisions: [revision("i2")], examinedVia: "candidate_decision" },
+    {
+      itemId: "i3",
+      dataset: "live_pilot",
+      revisions: [revision("i3"), revision("i3-fix", "i3")],
+      examinedVia: "item_correction"
+    },
+    { itemId: "i4", dataset: "live_pilot", revisions: [revision("i4")], examinedVia: "not_examined" }
   ];
 }
+
+// The name AF-57 gives a live-pilot sample whose denominator rests on
+// candidate-level decisions. Written out once, here, so the assertions
+// below read as the report publishing a specific identity rather than
+// matching a prefix.
+const INFERRED_PRECISION_METRIC = "evidence_precision_live_pilot_examination_inferred";
 
 function assembled() {
   const timing = summarizeReviewTiming(timingSpans(), APPLICATIONS.length);
@@ -82,7 +105,7 @@ function assembled() {
       evidence: { strength: "cited" as const, citedCount: 3, uncitedCount: 0, totalCriteria: 3 }
     }))
   );
-  const precision = summarizeEvidencePrecision(itemHistories());
+  const precision = summarizeEvidencePrecision(itemHistories(), "live_pilot");
   const metrics: Record<RoleAuditMetric, MetricSample | null> = {
     review_time_reduction: describeReviewTimeReduction(
       timing,
@@ -90,7 +113,7 @@ function assembled() {
       1
     ),
     qualified_candidate_preservation: describeQualifiedPreservation(preservation, 1),
-    evidence_precision_live_pilot: describeEvidencePrecision(precision, "live_pilot", 1),
+    evidence_precision_live_pilot: describeEvidencePrecision(precision, 1),
     failed_document_rate: null
   };
   return {
@@ -102,7 +125,7 @@ function assembled() {
       generatedAt: "2026-08-29T18:00:00.000Z",
       metrics,
       corrections: {
-        reviewedItems: precision.reviewedItems,
+        examinedItems: precision.examinedItems,
         correctedItems: precision.correctedItems,
         correctionEvents: precision.correctionEvents
       },
@@ -117,20 +140,87 @@ function assembled() {
   };
 }
 
-test("every metric the report declares is actually produced by a describe* function under that name", () => {
+test("every metric the report declares is filed under a name that section accepts", () => {
   // Two readings that have to agree: the report's key set and the metric
-  // names the producers emit. A rename on either side currently silently
-  // yields a report section that is permanently "not measured".
-  const { metrics } = assembled();
-  const produced = new Set(
-    ROLE_AUDIT_METRICS.map((metric) => metrics[metric]?.metric).filter((name): name is string => name !== undefined)
-  );
+  // names the producers emit. A rename on either side silently yields a
+  // report section that is permanently "not measured", which is the one
+  // way this document can be wrong that reads as good news.
+  //
+  // AF-57 made that a live risk rather than a hypothetical: precision now
+  // renames itself when its denominator is inferred, so "agree" has to
+  // mean "the metric or a declared qualification of it", and the report
+  // is what decides which qualifications exist.
+  const { metrics, report } = assembled();
   for (const metric of ROLE_AUDIT_METRICS) {
-    if (metrics[metric] === null) {
+    const sample = metrics[metric];
+    if (sample === null) {
       continue;
     }
-    assert.ok(produced.has(metric), `no producer emits a sample named ${metric}`);
+    // buildRoleAuditReport already threw if it disagreed; this is the
+    // reading of that, plus proof the sample reached the report whole.
+    assert.equal(report.metrics[metric]?.metric, sample.metric);
   }
+  assert.equal(
+    metrics.evidence_precision_live_pilot?.metric,
+    INFERRED_PRECISION_METRIC,
+    "a live-pilot denominator built from candidate decisions must not claim the measured metric's name"
+  );
+});
+
+test("a live-pilot precision figure reaches the report at all", () => {
+  // The regression this guards is a refusal, not a wrong number. AF-57's
+  // rename plus AF-59's fixed key set meant buildRoleAuditReport rejected
+  // every precision sample a live pilot can actually produce, and the
+  // section a report cannot publish renders as "Not measured for this
+  // role" -- which an employer reads as nothing to report.
+  const { report } = assembled();
+  const sample = report.metrics.evidence_precision_live_pilot;
+  assert.equal(sample?.metric, INFERRED_PRECISION_METRIC);
+  assert.equal(sample?.value, 2 / 3);
+});
+
+test("the heading carries the qualification, not just the note underneath it", () => {
+  // The reason AF-57 renamed the metric instead of attaching a caveat is
+  // that a caveat travels in prose and the number travels in a slide. A
+  // heading that still read "Evidence precision" would undo that at the
+  // last boundary, where the only reader is someone with no one present
+  // to explain it.
+  const rendered = renderRoleAuditReport(assembled().report);
+  assert.match(rendered, /Evidence precision \(examination inferred, not measured item by item\)/);
+  assert.ok(
+    !/Evidence precision\n/u.test(rendered),
+    "the unqualified heading must not appear over an inferred denominator"
+  );
+});
+
+test("a sample belonging to another metric is still refused", () => {
+  // The qualification rule widened what a section accepts, so this
+  // asserts what it did not widen. Built by hand: the producers cannot
+  // emit a sample under the wrong section, which is exactly why the
+  // boundary check is the only thing standing between a hand-assembled
+  // report and a preservation figure printed as precision.
+  const { report } = assembled();
+  assert.throws(
+    () =>
+      buildRoleAuditReport({
+        organizationId: report.organizationId,
+        roleId: report.roleId,
+        generatedAt: report.generatedAt,
+        metrics: {
+          ...report.metrics,
+          evidence_precision_live_pilot: summarizeMetric({
+            metric: "qualified_candidate_preservation",
+            value: 0.97,
+            sampleSize: 3,
+            population: 4,
+            minimumSampleSize: 1
+          })
+        },
+        corrections: report.corrections,
+        auditSample: report.auditSample
+      }),
+    /carries a sample for "qualified_candidate_preservation"/
+  );
 });
 
 test("the rendered numbers match what the metric functions computed", () => {
@@ -140,8 +230,8 @@ test("the rendered numbers match what the metric functions computed", () => {
   assert.equal(reduction, 0.5);
   assert.match(rendered, /Review time saved\n {2}50\.0%/);
   assert.match(rendered, /Qualified candidates preserved\n {2}100\.0%/);
-  // 3 reviewed items, 1 corrected -> 2/3
-  assert.match(rendered, /Evidence precision\n {2}66\.7%/);
+  // 3 examined items, 1 corrected -> 2/3
+  assert.match(rendered, /Evidence precision \(examination inferred, not measured item by item\)\n {2}66\.7%/);
 });
 
 test("the employer-reported caveat survives all the way into the rendered report", () => {
@@ -158,7 +248,10 @@ test("the unread evidence backlog reaches the report as a stated limitation", ()
   // the employer actually sees it.
   const { report } = assembled();
   const rendered = renderRoleAuditReport(report);
-  assert.match(rendered, /Note: 1 of 4 in scope are not yet counted toward evidence_precision_live_pilot/);
+  assert.match(
+    rendered,
+    new RegExp(`Note: 1 of 4 in scope are not yet counted toward ${INFERRED_PRECISION_METRIC}`)
+  );
 });
 
 test("an end-to-end report still carries no candidate identifier", () => {
@@ -170,6 +263,27 @@ test("an end-to-end report still carries no candidate identifier", () => {
   for (const applicationId of APPLICATIONS) {
     assert.ok(!serialised.includes(applicationId), `report leaked ${applicationId}`);
   }
+});
+
+test("the corrections line and the precision line are two readings of one denominator", () => {
+  // buildRoleAuditReport now refuses a report whose corrections and
+  // evidence_precision_live_pilot disagree on how many items a human
+  // reviewed. This asserts that constraint is the one the real producers
+  // already satisfy rather than a rule invented at the report boundary:
+  // describeEvidencePrecision takes sampleSize straight from the same
+  // EvidencePrecision the corrections are read off.
+  const { report, precision, metrics } = assembled();
+  assert.equal(report.corrections?.examinedItems, precision.examinedItems);
+  assert.equal(metrics.evidence_precision_live_pilot?.sampleSize, precision.examinedItems);
+
+  const rendered = renderRoleAuditReport(report);
+  // The reader can divide one line and land on the other: 1 of 3
+  // corrected is the 66.7% printed above it.
+  assert.match(
+    rendered,
+    /Evidence precision \(examination inferred, not measured item by item\)\n {2}66\.7% \(from 3 of 4\)/
+  );
+  assert.match(rendered, /1 of 3 examined evidence items were corrected, across 1 correction\(s\)\./);
 });
 
 test("a metric that was never computed is visible as not measured, end to end", () => {

@@ -2202,7 +2202,16 @@ export const METRIC_LIMITATION_CODES = [
    * says the two sides were measured differently, this one says some of
    * the reference side was thrown away as unusable.
    */
-  "adjudication_not_independent"
+  "adjudication_not_independent",
+  /**
+   * AF-57. Part of the denominator counts as examined on the strength of
+   * a record about the candidate rather than about the item being
+   * counted. Like the two codes above, this is about the KIND of data
+   * and not the amount: the examination fact is at a coarser grain than
+   * the unit of the metric, so a larger sample does not make it any more
+   * certain that any single item was read.
+   */
+  "examination_inferred"
 ] as const;
 
 export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
@@ -2740,6 +2749,76 @@ export const ROLE_AUDIT_METRICS = [
 export type RoleAuditMetric = (typeof ROLE_AUDIT_METRICS)[number];
 
 /**
+ * Metric identities a section may be filled by besides the one it is
+ * named for, each with the words that carry the difference into the
+ * heading the reader sees.
+ *
+ * AF-57 changes the precision metric's identity when its denominator
+ * rests on candidate-level decisions instead of item-level proof: the
+ * sample comes back named
+ * `evidence_precision_live_pilot_examination_inferred` precisely so that
+ * it cannot be read against the 98% target. That rename is right, and it
+ * meets a report whose sections are fixed keys.
+ *
+ * Refusing the qualified name here looks like the strict choice and is
+ * the dangerous one. A live pilot only produces the unqualified name
+ * when every examined item carried a correction, which is a precision of
+ * 0 by construction, so in practice the section would be permanently
+ * absent -- and an absent section renders as "not measured", which reads
+ * as "no problems here". That is the exact failure the required-keys
+ * design exists to prevent, arrived at by being strict about a name.
+ *
+ * So a section accepts its own metric or a declared qualification of it,
+ * and the qualification travels into the heading rather than only into a
+ * note underneath it. A caveat printed below the number does not stop
+ * the number being quoted; the name above it does. Anything not declared
+ * here is still refused: a preservation figure under the precision key
+ * remains an error.
+ *
+ * The heading text lives in this same table on purpose. A qualification
+ * that could be declared without saying how it reads would be a
+ * qualification the renderer had to invent words for, and those words
+ * are the whole point of it.
+ */
+const ROLE_AUDIT_METRIC_QUALIFICATIONS: Readonly<
+  Record<RoleAuditMetric, Readonly<Record<string, string>>>
+> = {
+  review_time_reduction: {},
+  qualified_candidate_preservation: {},
+  evidence_precision_live_pilot: {
+    examination_inferred: "examination inferred, not measured item by item"
+  },
+  failed_document_rate: {}
+};
+
+/**
+ * The heading words for the qualification a sample carries under this
+ * section, or null when the sample is the metric itself.
+ *
+ * Throws when it is neither, which is the mislabelling check: this is
+ * the one fact summarizeMetric cannot know, since it is told the name
+ * and has no idea which section it will be filed under.
+ */
+function resolveRoleAuditQualification(
+  context: string,
+  metric: RoleAuditMetric,
+  sampleMetric: string
+): string | null {
+  if (sampleMetric === metric) {
+    return null;
+  }
+  for (const [qualifier, heading] of Object.entries(ROLE_AUDIT_METRIC_QUALIFICATIONS[metric])) {
+    if (sampleMetric === `${metric}_${qualifier}`) {
+      return heading;
+    }
+  }
+  // A sample filed under the wrong key would be rendered with the wrong
+  // heading -- a preservation figure labelled as precision is worse than
+  // a missing one, because it is believable.
+  throw new Error(`${context}: metrics.${metric} carries a sample for "${sampleMetric}"`);
+}
+
+/**
  * AF-52's selection with the sampled application ids removed.
  *
  * The employer needs to see that the sample was drawn honestly -- the
@@ -2755,16 +2834,42 @@ export interface AuditSampleProvenance {
 }
 
 export function describeAuditSampleProvenance(selection: AuditSampleSelection): AuditSampleProvenance {
+  const distinct = new Set(selection.sampledApplicationIds);
+  if (distinct.size !== selection.sampledApplicationIds.length) {
+    // This is the last place the ids exist. sampledCount is published
+    // beside a claim that re-running the draw reproduces the sample, and
+    // a repeated id counts one candidate twice -- so the published count
+    // no longer matches anything a reproducer can arrive at, and every
+    // stage after this one has lost the evidence needed to notice. The
+    // store rejects it too: audit_sample_members is UNIQUE on
+    // (audit_sample_id, application_id).
+    throw new Error(
+      "describeAuditSampleProvenance: the selection repeats an application id, so sampledCount would overstate the draw"
+    );
+  }
   return {
     seed: selection.seed,
     eligibleCount: selection.eligibleCount,
-    sampledCount: selection.sampledApplicationIds.length
+    sampledCount: distinct.size
   };
 }
 
-/** The correction figures AF-57 produces, without the precision rate. */
+/**
+ * The correction figures AF-57 produces, without the precision rate.
+ *
+ * `examinedItems`, not `reviewedItems`. It is the same denominator the
+ * precision metric is computed over, and AF-57 stopped calling that
+ * "reviewed" because nothing in this system records that a human read a
+ * given item: an item counts as examined by naming the record that
+ * establishes it, which for a live pilot is usually a decision taken on
+ * the whole candidate. Printing "reviewed evidence items" to an employer
+ * re-asserts in prose the exact fact the metric's name was changed to
+ * stop asserting, two lines below the heading that now says examination
+ * was inferred. The section immediately above carries what the word
+ * rests on, so this one only has to stop overclaiming.
+ */
 export interface CorrectionSummary {
-  readonly reviewedItems: number;
+  readonly examinedItems: number;
   readonly correctedItems: number;
   readonly correctionEvents: number;
 }
@@ -2788,23 +2893,102 @@ export interface BuildRoleAuditReportInput {
   readonly auditSample: AuditSampleProvenance | null;
 }
 
+/**
+ * Every figure this report prints has to survive a reader with no one
+ * present to explain it, so each one is checked here before it can be
+ * published.
+ *
+ * The metrics do not need it: summarizeMetric is a real constructor and
+ * refuses a non-integer count, a sampleSize above its population and a
+ * non-finite value, so the only thing left for this boundary to check is
+ * the one fact the constructor cannot know, which key the sample was
+ * filed under. CorrectionSummary and AuditSampleProvenance had no such
+ * constructor -- they are bare interfaces assembled at the call site --
+ * and so reached the renderer with nothing checked at all.
+ */
+function assertPublishableCounts(context: string, counts: Readonly<Record<string, number>>): void {
+  for (const [name, value] of Object.entries(counts)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${context} requires a non-negative integer ${name}, got: ${value}`);
+    }
+  }
+}
+
 export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = input.metrics[metric];
-    if (sample !== null && sample.metric !== metric) {
-      // A sample filed under the wrong key would be rendered with the
-      // wrong heading -- a preservation figure labelled as precision is
-      // worse than a missing one, because it is believable.
+    if (sample !== null) {
+      // Throws unless the sample is this metric or a declared
+      // qualification of it.
+      resolveRoleAuditQualification("buildRoleAuditReport", metric, sample.metric);
+    }
+  }
+
+  const corrections = input.corrections;
+  if (corrections !== null) {
+    assertPublishableCounts("buildRoleAuditReport: corrections", {
+      examinedItems: corrections.examinedItems,
+      correctedItems: corrections.correctedItems,
+      correctionEvents: corrections.correctionEvents
+    });
+    if (corrections.correctedItems > corrections.examinedItems) {
       throw new Error(
-        `buildRoleAuditReport: metrics.${metric} carries a sample for "${sample.metric}"`
+        "buildRoleAuditReport: correctedItems cannot exceed examinedItems"
+      );
+    }
+    if (corrections.correctionEvents < corrections.correctedItems) {
+      // Correcting an item is what produces a correction event, so events
+      // below corrected items is not a small discrepancy: one of the two
+      // numbers is measuring something other than what the report says it
+      // is, and the reader has no way to tell which.
+      throw new Error(
+        `buildRoleAuditReport: ${corrections.correctionEvents} correction event(s) cannot account for ` +
+          `${corrections.correctedItems} corrected item(s); correcting an item takes at least one event`
+      );
+    }
+    const precision = input.metrics.evidence_precision_live_pilot;
+    if (precision !== null && precision.sampleSize !== corrections.examinedItems) {
+      // Both figures are AF-57's, over one set of examined items, and the
+      // report prints both: "(from N of M)" under Evidence precision and
+      // "x of N examined evidence items" under Corrections. Two different
+      // N's is a document that contradicts itself, and a reader who
+      // divides the corrections line gets a precision that is not the one
+      // printed above it.
+      throw new Error(
+        `buildRoleAuditReport: corrections cover ${corrections.examinedItems} examined item(s) but ` +
+          `evidence_precision_live_pilot was computed over ${precision.sampleSize}; the report would print ` +
+          "two different denominators for the same set"
       );
     }
   }
-  if (input.corrections !== null && input.corrections.correctedItems > input.corrections.reviewedItems) {
-    throw new Error(
-      "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
-    );
+
+  const auditSample = input.auditSample;
+  if (auditSample !== null) {
+    assertPublishableCounts("buildRoleAuditReport: auditSample", {
+      eligibleCount: auditSample.eligibleCount,
+      sampledCount: auditSample.sampledCount
+    });
+    if (auditSample.seed.trim().length === 0) {
+      // The report prints the seed as the thing that makes the draw
+      // checkable. A blank one is printed just the same and explains
+      // nothing, which is why audit_samples CHECKs it in the store.
+      throw new Error(
+        "buildRoleAuditReport: the audit sample seed cannot be blank; it is what makes the draw reproducible"
+      );
+    }
+    if (auditSample.sampledCount > auditSample.eligibleCount) {
+      // The report tells the reader that re-running the selection with
+      // this seed reproduces this sample. A draw larger than the set it
+      // came from cannot be reproduced by anyone, so the report would be
+      // inviting a check that is guaranteed to fail and calling that
+      // provenance.
+      throw new Error(
+        `buildRoleAuditReport: the audit sample claims ${auditSample.sampledCount} of ` +
+          `${auditSample.eligibleCount} eligible candidates; a draw cannot exceed what it was drawn from`
+      );
+    }
   }
+
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     organizationId: input.organizationId,
@@ -2849,12 +3033,22 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = report.metrics[metric];
-    lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
     if (sample === null) {
+      lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
       lines.push(`  Not measured for this role.`);
       lines.push(``);
       continue;
     }
+    // Re-resolved here rather than trusted from buildRoleAuditReport.
+    // RoleAuditReport is an interface, so a caller can assemble one
+    // directly, and this is the boundary where a wrong name becomes a
+    // wrong heading in front of an employer.
+    const qualification = resolveRoleAuditQualification("renderRoleAuditReport", metric, sample.metric);
+    lines.push(
+      qualification === null
+        ? `${ROLE_AUDIT_METRIC_HEADINGS[metric]}`
+        : `${ROLE_AUDIT_METRIC_HEADINGS[metric]} (${qualification})`
+    );
     lines.push(
       sample.value === null
         ? `  Not enough data to report.`
@@ -2871,7 +3065,7 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
     lines.push(`  Not measured for this role.`);
   } else {
     lines.push(
-      `  ${report.corrections.correctedItems} of ${report.corrections.reviewedItems} reviewed evidence items ` +
+      `  ${report.corrections.correctedItems} of ${report.corrections.examinedItems} examined evidence items ` +
         `were corrected, across ${report.corrections.correctionEvents} correction(s).`
     );
   }
@@ -2924,36 +3118,130 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 // are two populations. Pooling them lets a large, clean offline eval
 // mask live-pilot errors -- and the offline set is exactly the one that
 // can be grown cheaply. There is deliberately no function here that
-// accepts both at once; the dataset is a required argument, and it
-// selects the metric name.
+// accepts both at once.
+//
+// Which dataset an item came from is a property of the item, not an
+// argument supplied at the end. The first version of this took the
+// dataset only where the metric name was chosen, and checked it against
+// the examination source: `candidate_decision` belongs to a live pilot,
+// `offline_annotation` to the locked eval. That catches nothing for the
+// source that matters, because `item_correction` is the one examination
+// record both worlds produce -- a recruiter correcting a card and an
+// annotator marking an item wrong leave the same shape of revision
+// chain. So a batch of live-pilot corrections could be reported under
+// the offline name, and the inverse too: precisely the pooling the two
+// targets exist to prevent, with the number carrying no trace of it.
+// Every history now names its dataset, every item in a batch has to
+// agree with it, and the sample takes its name from that rather than
+// from a second argument nothing cross-checks.
+//
+// **An item enters the denominator only by naming what proves a human
+// examined it.** The first version of this took a bare
+// `reviewed: boolean`, which asks the caller to assert the single fact
+// the metric cannot check and this stack does not record. Nothing
+// records it: evidence_outcomes (0016_evidence_outcomes.sql) stores what
+// was produced and what was corrected, candidate_decisions
+// (0019_candidate_decisions.sql), audit_sample_members
+// (0020_audit_samples.sql) and review_timing_spans
+// (0021_review_timing.sql) are all per application, and AF-53's focused
+// card index never leaves the browser. A bare boolean lets a caller
+// count items nobody opened and inflate precision, with the emitted
+// sample saying nothing about it.
+//
+// Narrowing the denominator to item-level proof is not the way out: a
+// correction is the only item-level record there is, so a denominator
+// made only of proven examinations is a denominator of corrected items,
+// and the metric would report 0 for ever. So the flag is replaced by the
+// fact behind it, and the weakest fact in the denominator is carried out
+// with the number. A correction proves the item it lands on was
+// examined. A locked-eval annotation proves it too, because every case
+// in evals/datasets/gold-set-v1.json carries an expected kind per
+// criterion, so each item was adjudicated one at a time. A decision
+// recorded on the candidate proves only that the candidate was handled:
+// it covers every item on that candidate at once, and it is all that is
+// available for the common case of an item a reviewer read and left
+// alone. Those still count -- excluding them is the always-0 metric
+// above -- but they attach `examination_inferred`, so what the
+// denominator rests on is machine-readable rather than a doc comment
+// nobody reads. Expect that code on every live-pilot sample until
+// something records per-item examination. That is the honest state of
+// the data, not noise.
 
 export type EvidencePrecisionDataset = "live_pilot" | "locked_offline_eval";
+
+export const EVIDENCE_EXAMINATION_SOURCES = [
+  /** Nobody is known to have looked at this item. It stays out of the denominator. */
+  "not_examined",
+  /**
+   * The item's own revision chain carries a human correction
+   * (0017_evidence_corrections.sql). Item-level proof, and the only kind
+   * a live pilot produces today. It says nothing about which dataset the
+   * item came from: both worlds correct items, and the chains are
+   * indistinguishable. That is why the dataset is carried separately.
+   */
+  "item_correction",
+  /**
+   * A locked-eval annotator labelled this item. Item-level proof, since
+   * an expected kind is recorded per criterion rather than per case, and
+   * it exists only for the offline dataset.
+   */
+  "offline_annotation",
+  /**
+   * A decision was recorded on the candidate (0019_candidate_decisions.sql).
+   * That the candidate was handled, not that this item was read: one
+   * decision covers every item on the candidate at once. An inference,
+   * counted but declared.
+   */
+  "candidate_decision"
+] as const;
+
+export type EvidenceExaminationSource = (typeof EVIDENCE_EXAMINATION_SOURCES)[number];
 
 export interface EvidenceItemHistory {
   /** Stable identity across corrections: the root of the revision chain. */
   readonly itemId: string;
+  /**
+   * Which population this item belongs to. Caller-asserted like
+   * `examinedVia`, and for the same reason: nothing in a revision chain
+   * distinguishes a pilot correction from an eval one. Stating it per
+   * item is what makes a mixed batch detectable at all, since a single
+   * dataset argument agrees with itself no matter what it is handed.
+   */
+  readonly dataset: EvidencePrecisionDataset;
   /** Every revision of this one item, in any order. */
   readonly revisions: readonly EvidenceRevision[];
   /**
-   * Whether a human examined this item -- a decision was recorded on the
-   * candidate, or the item itself was corrected. Not derivable from the
-   * revisions alone, because the common case is an item a reviewer read
-   * and left alone, which leaves no trace on the item.
+   * What establishes that a human examined this item. Deliberately not a
+   * boolean: examination is asserted by the caller and cannot be checked
+   * here, so the assertion has to name the record it rests on and carry
+   * that record's weakness into the reported sample.
    */
-  readonly reviewed: boolean;
+  readonly examinedVia: EvidenceExaminationSource;
 }
 
 export interface EvidencePrecision {
-  /** 1 - (corrected / reviewed). null when nothing has been reviewed. */
+  /**
+   * The one population these items came from. Carried through rather
+   * than restated at reporting time, so the metric name cannot disagree
+   * with the data it was computed over.
+   */
+  readonly dataset: EvidencePrecisionDataset;
+  /** 1 - (corrected / examined). null when nothing has been examined. */
   readonly precision: number | null;
   /** Items a human examined: the denominator. */
-  readonly reviewedItems: number;
-  /** Reviewed items that needed at least one correction. */
+  readonly examinedItems: number;
+  /** Examined items that needed at least one correction. */
   readonly correctedItems: number;
-  /** Items produced, reviewed or not: the population. */
+  /** Items produced, examined or not: the population. */
   readonly producedItems: number;
   /**
-   * Corrections applied across reviewed items, counting repeats. Reported
+   * Denominator items counted as examined because a decision was
+   * recorded on the candidate, with nothing recorded against the item.
+   * Drives `examination_inferred`.
+   */
+  readonly inferredExaminations: number;
+  /**
+   * Corrections applied across examined items, counting repeats. Reported
    * beside correctedItems rather than folded into it: an item corrected
    * three times is one imprecise item for this metric, but three
    * corrections is a different and worse story than one, and only the
@@ -2968,16 +3256,53 @@ export interface EvidencePrecision {
  * Counting correction events instead would let a single stubborn item
  * push the rate below any target on its own, and the number would stop
  * meaning "share of items" while still being named that.
+ *
+ * `examinedVia` has to agree with the revisions in both directions. A
+ * correction is a human act, so an item carrying one was examined by
+ * definition and cannot be attributed to anything weaker; and an item
+ * with no correction cannot claim `item_correction`, which is the only
+ * way a caller could otherwise assert item-level proof for an item no
+ * record covers. Both are contradictory input rather than edge cases:
+ * each hides a bug in whatever built the histories, and that bug moves
+ * the denominator.
+ *
+ * `dataset` is required and every item must match it. Pooling is caught
+ * here, where the items are, rather than at reporting time, where all
+ * that is left of them is a count: by then a live-pilot correction and
+ * an offline one are the same integer.
  */
 export function summarizeEvidencePrecision(
-  items: readonly EvidenceItemHistory[]
+  items: readonly EvidenceItemHistory[],
+  dataset: EvidencePrecisionDataset
 ): EvidencePrecision {
   const seen = new Set<string>();
-  let reviewedItems = 0;
+  let examinedItems = 0;
   let correctedItems = 0;
   let correctionEvents = 0;
+  let inferredExaminations = 0;
 
   for (const item of items) {
+    if (item.dataset !== dataset) {
+      // The live pilot and the locked eval answer to different targets,
+      // so an item counted into the wrong one is not a mislabelled row:
+      // it is the pooling this metric is split in two to prevent.
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} belongs to ${item.dataset} ` +
+          `and cannot be counted into a ${dataset} sample`
+      );
+    }
+    if (item.examinedVia === "offline_annotation" && dataset !== "locked_offline_eval") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia offline_annotation ` +
+          `in a ${dataset} sample; only the locked eval has annotators`
+      );
+    }
+    if (item.examinedVia === "candidate_decision" && dataset !== "live_pilot") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia candidate_decision ` +
+          `in a ${dataset} sample; only a live pilot has recruiters deciding on candidates`
+      );
+    }
     if (seen.has(item.itemId)) {
       // Two histories for one item would double-count it in both
       // numerator and denominator -- not cancelling out, because only one
@@ -2990,33 +3315,41 @@ export function summarizeEvidencePrecision(
       (revision) => revision.supersedesEvidenceOutcomeId !== undefined
     ).length;
 
-    if (corrections > 0 && !item.reviewed) {
-      // Contradictory input rather than an edge case: a correction is a
-      // human act, so the item was examined by definition. Silently
-      // flipping the flag would hide a bug in whatever computed it, and
-      // that bug moves the denominator.
+    if (corrections > 0 && item.examinedVia !== "item_correction") {
       throw new Error(
-        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s) but is marked unreviewed`
+        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s), ` +
+          `which is item-level proof of examination, but claims examinedVia ${item.examinedVia}`
       );
     }
-    if (!item.reviewed) {
+    if (corrections === 0 && item.examinedVia === "item_correction") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia item_correction ` +
+          "but none of its revisions supersedes another"
+      );
+    }
+    if (item.examinedVia === "not_examined") {
       continue;
     }
-    reviewedItems += 1;
+    examinedItems += 1;
     correctionEvents += corrections;
     if (corrections > 0) {
       correctedItems += 1;
     }
+    if (item.examinedVia === "candidate_decision") {
+      inferredExaminations += 1;
+    }
   }
 
   return {
+    dataset,
     // null, never 1. Perfect precision over an empty denominator is what
     // a pilot that has not started yet would report, and it is the single
     // most quotable wrong number this metric could produce.
-    precision: reviewedItems === 0 ? null : (reviewedItems - correctedItems) / reviewedItems,
-    reviewedItems,
+    precision: examinedItems === 0 ? null : (examinedItems - correctedItems) / examinedItems,
+    examinedItems,
     correctedItems,
     producedItems: items.length,
+    inferredExaminations,
     correctionEvents
   };
 }
@@ -3025,21 +3358,78 @@ export function summarizeEvidencePrecision(
  * Precision as a reportable metric, for one dataset at a time.
  *
  * `population` is every item produced and `sampleSize` is only those
- * reviewed, so an unread backlog surfaces as population_incomplete
+ * examined, so an unread backlog surfaces as population_incomplete
  * without anyone having to remember to mention it.
+ *
+ * A denominator resting on candidate-level decisions is reported, with
+ * `examination_inferred` attached. Suppressing the number instead would
+ * suppress every live-pilot figure this product can currently produce,
+ * and a metric nobody can compute is not a safer metric: it is the same
+ * claim made in a slide deck with nothing attached to it at all.
+ *
+ * There is deliberately no dataset argument. The dataset arrived with
+ * the items and was checked against every one of them; taking it again
+ * here would create a second place to state it and therefore a way for
+ * the two to disagree, which is the same reasoning that keeps a
+ * candidate's workflow status out of a column on applications
+ * (0019_candidate_decisions.sql). A sample reported under the wrong name
+ * is not rejected here because it cannot be constructed.
  */
 export function describeEvidencePrecision(
   precision: EvidencePrecision,
-  dataset: EvidencePrecisionDataset,
   minimumSampleSize: number
 ): MetricSample {
-  return summarizeMetric({
-    metric: `evidence_precision_${dataset}`,
+  // REV-001: the metric's NAME is what makes it comparable to AF-57's 98%
+  // target. A denominator built partly from candidate-level decisions is
+  // not measured item examination, and attaching a limitation to a figure
+  // still called evidence_precision_live_pilot does not stop anyone
+  // reading it as one: a caveat travels in prose and the number travels in
+  // a slide.
+  //
+  // So the identity changes with the denominator. When any item counts as
+  // examined only because a decision was recorded on the candidate, this
+  // reports as evidence_precision_<dataset>_examination_inferred, which
+  // has no target to be measured against and cannot be mistaken for the
+  // one that does.
+  //
+  // Suppressing the value outright was the alternative and is worse: it
+  // would suppress every live-pilot figure this product can currently
+  // produce, and a metric nobody can compute is not a safer metric, it is
+  // the same claim made with nothing attached to it at all. Renaming keeps
+  // the signal and removes the false equivalence, which is the actual
+  // defect.
+  const inferred = precision.inferredExaminations > 0;
+  const sample = summarizeMetric({
+    metric: inferred
+      ? `evidence_precision_${precision.dataset}_examination_inferred`
+      : `evidence_precision_${precision.dataset}`,
     value: precision.precision,
-    sampleSize: precision.reviewedItems,
+    sampleSize: precision.examinedItems,
     population: precision.producedItems,
     minimumSampleSize
   });
+
+  if (!inferred) {
+    return sample;
+  }
+  // Attached even when the value is suppressed, for the reason AF-55
+  // gives: this describes how the denominator was built, not how large
+  // it is, and a caveat that appeared and vanished with sample size
+  // would read as being about sample size.
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "examination_inferred",
+        detail:
+          `${precision.inferredExaminations} of ${precision.examinedItems} item(s) in the denominator ` +
+          "count as examined because a decision was recorded on the candidate, not because anything " +
+          "records that this item was read; nothing in this system captures per-item examination, so an " +
+          "item a reviewer scrolled past is indistinguishable here from one they checked and accepted"
+      }
+    ]
+  };
 }
 
 // ---- AF-56: qualified-candidate preservation ----
