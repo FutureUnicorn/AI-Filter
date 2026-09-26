@@ -35,7 +35,9 @@ const PROBED_SURFACES: readonly RetentionSurface[] = [
   // neither deleted nor redacted -- is one a DELETE and an UPDATE settle
   // exactly.
   "audit_events",
-  "evidence_extraction_runs"
+  "evidence_extraction_runs",
+  "audit_sample_members",
+  "review_timing_spans"
 ];
 
 function databaseUrl(): string {
@@ -439,4 +441,74 @@ test("the identifier really cannot be deleted or blanked on either polymorphic s
   assert.match(failures["audit_events:redact"] ?? "", /append-only: UPDATE is not allowed/);
   assert.match(failures["evidence_extraction_runs:delete"] ?? "", /append-only: DELETE is not allowed/);
   assert.match(failures["evidence_extraction_runs:redact"] ?? "", /append-only: UPDATE is not allowed/);
+});
+
+// ---- REV-001: named as a blocker is not the same as classified ----
+//
+// audit_sample_members and review_timing_spans declare their link to a
+// candidate properly: a composite foreign key onto applications, which
+// pg_constraint reports and the reference inventory above reads. They
+// still went unclassified, because that inventory accepts a table being
+// NAMED in a planned surface's detail as accounting for it, and both are
+// named -- as two of the five constraints that block deleting an
+// application. Being the reason another surface cannot be purged is not
+// the same claim as being a surface that holds candidate data, and
+// nothing was checking for the gap between them.
+//
+// So this reads the column that makes a row candidate-linked, and asks
+// the plan about every table that has it.
+
+/**
+ * Tables carrying application_id that are nonetheless out of retention
+ * scope. Empty, and every entry would have to state why the identifier
+ * there is not candidate-linked, which is a hard thing to argue.
+ */
+const APPLICATION_LINKED_EXEMPTIONS: ReadonlyArray<{
+  readonly table: string;
+  readonly reason: string;
+}> = [];
+
+test("every table carrying application_id is a planned retention surface", async () => {
+  const { tableColumns } = await assertRetentionPurgeBlockers(databaseUrl());
+  const linked = Object.entries(tableColumns)
+    .filter(([table, columns]) => table !== "applications" && columns.includes("application_id"))
+    .map(([table]) => table)
+    .sort();
+
+  // Not vacuous, and specific: these five are the tables that hold a
+  // candidate's application identifier today. A new one appearing here
+  // has to be classified or argued away.
+  assert.deepEqual(linked, [
+    "audit_sample_members",
+    "candidate_decisions",
+    "evidence_outcomes",
+    "import_rows",
+    "review_timing_spans"
+  ]);
+
+  const unaccounted = linked
+    .filter((table) => !(RETENTION_SURFACES as readonly string[]).includes(table))
+    .filter((table) => !APPLICATION_LINKED_EXEMPTIONS.some((exemption) => exemption.table === table));
+  assert.deepEqual(
+    unaccounted,
+    [],
+    "a table holds a candidate's application identifier but the retention plan does not classify " +
+      "it. Being named in another surface's detail as a blocker does not account for what this " +
+      "table itself keeps."
+  );
+
+  for (const exemption of APPLICATION_LINKED_EXEMPTIONS) {
+    assert.ok(
+      linked.includes(exemption.table),
+      `${exemption.table} no longer carries application_id; remove the exemption (${exemption.reason})`
+    );
+  }
+});
+
+test("the two newly classified surfaces refuse both deletion and redaction", async () => {
+  const { failures } = await assertRetentionPurgeBlockers(databaseUrl());
+  assert.match(failures["audit_sample_members:delete"] ?? "", /append-only: DELETE is not allowed/);
+  assert.match(failures["audit_sample_members:redact"] ?? "", /append-only: UPDATE is not allowed/);
+  assert.match(failures["review_timing_spans:delete"] ?? "", /append-only: DELETE is not allowed/);
+  assert.match(failures["review_timing_spans:redact"] ?? "", /append-only: UPDATE is not allowed/);
 });

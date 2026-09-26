@@ -274,7 +274,12 @@ test("the survival summary lists exactly the surfaces that survive, no more and 
       // identifier, and both previously outside this list: one by a
       // wrong disposition and one by being absent from the plan.
       "audit_events",
-      "evidence_extraction_runs"
+      "evidence_extraction_runs",
+      // Named in the applications detail as two of the five blockers,
+      // which is not the same as being classified as surfaces of their
+      // own. Both are append-only and both keep the identifier.
+      "audit_sample_members",
+      "review_timing_spans"
     ]
   );
 });
@@ -338,7 +343,12 @@ test("once deletion is enforced, the survivors are still named as the exception"
       // identifier, and both previously outside this list: one by a
       // wrong disposition and one by being absent from the plan.
       "audit_events",
-      "evidence_extraction_runs"
+      "evidence_extraction_runs",
+      // Named in the applications detail as two of the five blockers,
+      // which is not the same as being classified as surfaces of their
+      // own. Both are append-only and both keep the identifier.
+      "audit_sample_members",
+      "review_timing_spans"
     ]
   );
 });

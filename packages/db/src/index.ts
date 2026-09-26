@@ -4639,6 +4639,32 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       { sqlstate: "P0001" },
       `UPDATE evidence_extraction_runs SET entity_id = 'redacted' WHERE run_id = '${extractionRunId}'`
     );
+    // The two that declare the link properly and were still unclassified.
+    // Their rows are the ones seeded to pin sampledApplicationId and
+    // timedApplicationId, and the refusals here are why those pins hold:
+    // the dependent cannot be deleted first to clear the way.
+    await expectRejected(
+      "audit_sample_members:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_sample_members WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "audit_sample_members:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_sample_members SET application_id = '${applicationId}'
+        WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM review_timing_spans WHERE application_id = '${timedApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:redact",
+      { sqlstate: "P0001" },
+      `UPDATE review_timing_spans SET reviewer_user_id = '${userId}'
+        WHERE application_id = '${timedApplicationId}'`
+    );
 
     // 2. The referential blockers, each named by the constraint that
     //    refused rather than by a substring of the message. One

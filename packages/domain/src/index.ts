@@ -2430,7 +2430,17 @@ export const RETENTION_SURFACES = [
   "evidence_outcomes",
   "candidate_decisions",
   "audit_events",
-  "evidence_extraction_runs"
+  "evidence_extraction_runs",
+  // The same rule one step further out. These two declare their link to
+  // a candidate properly, with a composite foreign key onto
+  // applications, so the reference inventory could always see them -- and
+  // saw them accounted for, because the applications detail names both
+  // as blockers. Being named as something that pins another surface is
+  // not the same as being classified as a surface, and nothing was
+  // checking for the difference. Both are append-only and both keep an
+  // application identifier past any cutoff.
+  "audit_sample_members",
+  "review_timing_spans"
 ] as const;
 
 export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
@@ -2595,6 +2605,26 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "written here, and two of the four audit actions are per-application by definition. An " +
       "identifier is what re-links every other surviving record to a person, so a retention statement " +
       "that counts it as nothing is claiming more deletion than happens."
+  },
+  audit_sample_members: {
+    disposition: "blocked_append_only",
+    holds: "application_id, the identifier of a candidate drawn into an audit sample",
+    detail:
+      "Append-only (0020_audit_samples.sql): DELETE and UPDATE are both rejected. It carries no " +
+      "candidate text, only the identifier and the draw it belongs to, but the row is itself a " +
+      "statement about a named candidate -- that they were selected for audit -- and it is one of " +
+      "the four uncascaded foreign keys that pin applications, so it cannot go first either."
+  },
+  review_timing_spans: {
+    disposition: "blocked_append_only",
+    holds:
+      "application_id, plus reviewer_user_id and the start, end and active duration of every " +
+      "review of that candidate",
+    detail:
+      "Append-only (0021_review_timing.sql): DELETE and UPDATE are both rejected. Beyond the " +
+      "identifier this is behavioural data linking a named reviewer to a named candidate at a " +
+      "specific time, which is more than an aggregate input to AF-55's median. Another of the four " +
+      "uncascaded foreign keys pinning applications."
   },
   evidence_extraction_runs: {
     disposition: "blocked_append_only",
