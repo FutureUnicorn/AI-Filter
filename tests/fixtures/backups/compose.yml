@@ -87,9 +87,9 @@ services:
       - /bin/sh
       - -ec
       - |
-        mc alias set target "$$BACKUP_ENDPOINT" "$$BACKUP_ACCESS_KEY_ID" "$$BACKUP_SECRET_ACCESS_KEY" --path on >/dev/null 2>&1
         attempts=0
-        until mc ls target >/dev/null 2>&1; do
+        until mc alias set target "$$BACKUP_ENDPOINT" "$$BACKUP_ACCESS_KEY_ID" "$$BACKUP_SECRET_ACCESS_KEY" --path on >/dev/null 2>&1 \
+          && mc ls target >/dev/null 2>&1; do
           attempts=$$((attempts + 1))
           if [ "$$attempts" -ge 30 ]; then
             echo 'Synthetic backup target did not become ready' >&2
