@@ -161,10 +161,47 @@ test("the candidate's filename is recognised as PII, not just a label", () => {
   assert.match(intakes?.holds ?? "", /declared_filename/);
 });
 
-test("audit_events is listed as holding no candidate data, so its exclusion is stated not omitted", () => {
+// REV-001: an identifier is candidate data for retention purposes.
+//
+// The previous version of this test asserted audit_events held nothing
+// candidate-derived, which is what a test that encodes the defect looks
+// like: it passed, and what it was pinning was the wrong
+// classification. audit_events holds no candidate TEXT, which is what
+// AF-21's redaction guarantees and all it guarantees. entity_type and
+// entity_id are free text, and the identifier of a candidate's
+// application is written there whenever a correction or a decision is
+// recorded, which is two of the four audit actions.
+
+test("audit_events survives holding the identifier, not classified as holding nothing", () => {
   const plan = planRetention(policy(), NOW);
   const audit = plan.surfaces.find((surface) => surface.surface === "audit_events");
-  assert.equal(audit?.disposition, "no_candidate_data");
+  assert.equal(audit?.disposition, "blocked_append_only");
+  assert.match(audit?.holds ?? "", /entity_id/);
+  assert.match(audit?.detail ?? "", /DELETE and UPDATE are both rejected/);
+});
+
+test("evidence_extraction_runs is in the plan at all", () => {
+  // It was absent entirely, and absent is how the inventory that finds
+  // unaccounted tables missed it: that check reads pg_constraint, and
+  // this table's link to an application is two text columns with no
+  // foreign key between them.
+  const plan = planRetention(policy(), NOW);
+  const runs = plan.surfaces.find((surface) => surface.surface === "evidence_extraction_runs");
+  assert.equal(runs?.disposition, "blocked_append_only");
+  assert.match(runs?.holds ?? "", /entity_id/);
+});
+
+test("no surface is classified as holding nothing candidate-derived any more", () => {
+  // Both surfaces that carried no_candidate_data carried it wrongly, for
+  // the same reason: the classification asks "is there candidate text
+  // here", and an identifier is not text. Keeping the disposition in the
+  // type is deliberate, since a future surface may genuinely qualify,
+  // but a new one should have to argue for it against this.
+  const plan = planRetention(policy(), NOW);
+  assert.deepEqual(
+    plan.surfaces.filter((surface) => surface.disposition === "no_candidate_data").map((s) => s.surface),
+    []
+  );
 });
 
 test("the survival summary produces a sentence a privacy notice can use truthfully", () => {
@@ -228,7 +265,17 @@ test("the survival summary lists exactly the surfaces that survive, no more and 
   const summary = summarizeSurvivingCandidateData(planRetention(policy(), NOW), NOT_ENFORCED);
   assert.deepEqual(
     summary.surfaces.map((surface) => surface.surface),
-    ["file_intakes", "applications", "evidence_outcomes", "candidate_decisions"]
+    [
+      "file_intakes",
+      "applications",
+      "evidence_outcomes",
+      "candidate_decisions",
+      // REV-001. Both append-only, both keeping the application
+      // identifier, and both previously outside this list: one by a
+      // wrong disposition and one by being absent from the plan.
+      "audit_events",
+      "evidence_extraction_runs"
+    ]
   );
 });
 
@@ -282,7 +329,17 @@ test("once deletion is enforced, the survivors are still named as the exception"
   assert.match(summary.statement, /evidence_outcomes \(citation quotes/);
   assert.deepEqual(
     summary.surfaces.map((surface) => surface.surface),
-    ["file_intakes", "applications", "evidence_outcomes", "candidate_decisions"]
+    [
+      "file_intakes",
+      "applications",
+      "evidence_outcomes",
+      "candidate_decisions",
+      // REV-001. Both append-only, both keeping the application
+      // identifier, and both previously outside this list: one by a
+      // wrong disposition and one by being absent from the plan.
+      "audit_events",
+      "evidence_extraction_runs"
+    ]
   );
 });
 

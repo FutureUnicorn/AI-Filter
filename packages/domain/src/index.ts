@@ -2340,6 +2340,8 @@ export function describeFailedDocumentRate(
 //                                 import_rows_check, which the FK's
 //                                 ON DELETE SET NULL trips (23514)
 //   DELETE file_intakes        -> FK violation from applications
+//   DELETE audit_events        -> append-only, DELETE and UPDATE both
+//   DELETE evidence_extraction_runs -> append-only, DELETE and UPDATE both
 //
 //   DELETE canonical_text_extractions -> permitted, the row goes
 //   DELETE import_rows                -> permitted, the row goes
@@ -2349,6 +2351,13 @@ export function describeFailedDocumentRate(
 // the ticket does not mention: candidate_full_name and candidate_email
 // on applications, declared_filename on file_intakes, the verbatim
 // quote on evidence_outcomes and the rationale on candidate_decisions.
+//
+// And below that, a layer that is not text at all: the application
+// identifier, written into audit_events and evidence_extraction_runs
+// through a polymorphic entity_type/entity_id pair. It reads as
+// metadata and is not -- it is the key that re-links every surviving
+// row above to one person, and both tables are append-only, so it
+// cannot be removed or redacted either.
 //
 // Every line above is asserted against a real Postgres by
 // assertRetentionPurgeBlockers, the permitted ones included. The first
@@ -2382,6 +2391,27 @@ export function describeFailedDocumentRate(
 // well beyond this ticket and needs a human decision, so AF-61 stops at
 // telling the truth about the current state.
 
+// REV-001: two surfaces link to a candidate through a polymorphic
+// entity_type/entity_id text pair rather than a foreign key, and both
+// were mishandled because of it.
+//
+// evidence_extraction_runs (0006_evidence_extraction_runs.sql) was
+// absent from this list altogether. The inventory that would have caught
+// the omission reads pg_constraint, and there is no constraint to read:
+// the link to an application is two text columns. A table invisible to
+// the check that finds unaccounted tables is exactly the one that goes
+// unaccounted for.
+//
+// audit_events was listed, and classified no_candidate_data. It holds no
+// candidate TEXT -- AF-21's redaction and the closed context allowlist
+// are real -- but entity_type and entity_id are free text constrained
+// only by length > 0, and two of the four audit actions
+// (evidence_corrected, decision_recorded) are per-application by
+// definition. So the identifier of a candidate's application is written
+// there in the ordinary course of business, and an identifier is not a
+// lesser kind of candidate data for retention purposes: it is the thing
+// that re-links every surviving record to a person. Both tables are
+// append-only, so it can be neither deleted nor redacted.
 export const RETENTION_SURFACES = [
   "object_storage_documents",
   "file_intakes",
@@ -2390,7 +2420,8 @@ export const RETENTION_SURFACES = [
   "applications",
   "evidence_outcomes",
   "candidate_decisions",
-  "audit_events"
+  "audit_events",
+  "evidence_extraction_runs"
 ] as const;
 
 export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
@@ -2542,11 +2573,33 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "evidence who decided what."
   },
   audit_events: {
-    disposition: "no_candidate_data",
-    holds: "nothing candidate-derived, by construction",
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, which is a candidate's application identifier whenever entity_type is " +
+      "\"application\" -- what evidence_corrected and decision_recorded record by definition",
     detail:
-      "Append-only, and AF-21's redaction plus the closed context allowlist are what keep " +
-      "candidate text out of it. Listed so its exclusion is a stated finding rather than an omission."
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "identifier can be neither removed nor redacted in place. It carries no candidate TEXT -- AF-21's " +
+      "redaction and the closed context allowlist keep that out, and that part of the earlier " +
+      "no_candidate_data classification was right -- but entity_type and entity_id are free text " +
+      "checked only for length, so nothing in the schema stops an application identifier being " +
+      "written here, and two of the four audit actions are per-application by definition. An " +
+      "identifier is what re-links every other surviving record to a person, so a retention statement " +
+      "that counts it as nothing is claiming more deletion than happens."
+  },
+  evidence_extraction_runs: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, an application identifier for every run this product writes " +
+      "(APPLICATION_ENTITY_TYPE), alongside provider, model and version strings that are not " +
+      "candidate-derived",
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql): DELETE and UPDATE are both rejected. Its " +
+      "association with an application is the polymorphic entity_type/entity_id pair and not a " +
+      "foreign key, which is why pg_constraint cannot see it and why this surface was missing from " +
+      "the plan rather than merely misclassified. listEvidenceExtractionRunsForEntities queries it " +
+      "by entity_type = \"application\" and a list of application identifiers, so the association is " +
+      "load-bearing production behaviour rather than a possibility the schema leaves open."
   }
 };
 

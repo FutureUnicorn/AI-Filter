@@ -26,7 +26,16 @@ const PROBED_SURFACES: readonly RetentionSurface[] = [
   "import_rows",
   "applications",
   "evidence_outcomes",
-  "candidate_decisions"
+  "candidate_decisions",
+  // REV-001. audit_events used to be excused from probing on the grounds
+  // that its claim was about what it holds rather than what the schema
+  // permits. That was the wrong shape of excuse: the claim was that it
+  // holds nothing candidate-derived, and it holds the application
+  // identifier, so the claim it now makes -- that the identifier can be
+  // neither deleted nor redacted -- is one a DELETE and an UPDATE settle
+  // exactly.
+  "audit_events",
+  "evidence_extraction_runs"
 ];
 
 function databaseUrl(): string {
@@ -144,14 +153,13 @@ test("what the database refuses matches what the plan says it refuses, surface b
     new Date("2026-08-29T12:00:00.000Z")
   );
 
-  // A surface added to the plan without a probe is the exact gap
-  // REV-001 reported, so make it fail rather than rely on remembering.
-  // Only two can legitimately go unprobed: object storage is not in this
-  // database, and audit_events' claim is about what it holds rather than
-  // what the schema permits, which no DELETE can settle.
+  // A surface added to the plan without a probe is the exact gap the
+  // first round reported, so make it fail rather than rely on
+  // remembering. Exactly one can legitimately go unprobed: object
+  // storage is not in this database at all.
   assert.deepEqual(
     RETENTION_SURFACES.filter((surface) => !PROBED_SURFACES.includes(surface)),
-    ["object_storage_documents", "audit_events"],
+    ["object_storage_documents"],
     "a new retention surface needs a probe, or a stated reason it cannot have one"
   );
 
@@ -322,4 +330,113 @@ test("every reference exemption is still true, or it has to go", async () => {
         `the exemption (${exemption.reason})`
     );
   }
+});
+
+// ---- REV-001: the surfaces no foreign key can find ----
+//
+// The reference inventory above reads pg_constraint, so it can only find
+// a table that declares its association. audit_events and
+// evidence_extraction_runs associate with an application through an
+// entity_type/entity_id text pair, which pg_constraint has nothing to
+// say about. One was therefore missing from the plan entirely and the
+// other sat in it classified as holding nothing candidate-derived, and
+// neither failure could have been caught by a check that looks for
+// foreign keys.
+//
+// So this reads the columns instead. Any table carrying the pair can
+// name an application, and a table that can name an application is in
+// scope for retention whether or not anyone remembered to say so.
+
+/**
+ * Tables carrying the polymorphic pair that are nonetheless out of
+ * retention scope.
+ *
+ * Empty, deliberately, and the test below still runs over it: an
+ * exemption has to state the entity types that table actually writes,
+ * and that claim is checked, so the list cannot become a place to put
+ * things nobody wants to think about. Prefer adding the table to
+ * RETENTION_SURFACES over adding it here.
+ */
+const POLYMORPHIC_ENTITY_EXEMPTIONS: ReadonlyArray<{
+  readonly table: string;
+  readonly reason: string;
+}> = [];
+
+function polymorphicTables(tableColumns: Readonly<Record<string, readonly string[]>>): readonly string[] {
+  return Object.entries(tableColumns)
+    .filter(([, columns]) => columns.includes("entity_type") && columns.includes("entity_id"))
+    .map(([table]) => table)
+    .sort();
+}
+
+test("every table carrying an entity_type/entity_id pair is a planned retention surface", async () => {
+  const { tableColumns } = await assertRetentionPurgeBlockers(databaseUrl());
+  const polymorphic = polymorphicTables(tableColumns);
+
+  // Not vacuous: these two are why the check exists, so if the column
+  // read ever stops finding them the test has to fail rather than pass
+  // over an empty set.
+  assert.deepEqual(
+    polymorphic,
+    ["audit_events", "evidence_extraction_runs"],
+    "the column read must still find the two known polymorphic tables"
+  );
+
+  const unaccounted = polymorphic
+    .filter((table) => !(RETENTION_SURFACES as readonly string[]).includes(table))
+    .filter((table) => !POLYMORPHIC_ENTITY_EXEMPTIONS.some((exemption) => exemption.table === table));
+  assert.deepEqual(
+    unaccounted,
+    [],
+    "a table can name an application through entity_type/entity_id but is not in the retention plan. " +
+      "No foreign key declares that association, so nothing else will catch it. Add it to " +
+      "RETENTION_SURFACES, or exempt it with the entity types it writes."
+  );
+
+  for (const exemption of POLYMORPHIC_ENTITY_EXEMPTIONS) {
+    assert.ok(
+      polymorphic.includes(exemption.table),
+      `${exemption.table} no longer carries the pair; remove the exemption (${exemption.reason})`
+    );
+  }
+});
+
+test("each polymorphic surface says in the plan that it keeps the identifier", async () => {
+  // The classification is the thing that was wrong, not the membership.
+  // audit_events was in RETENTION_SURFACES the whole time, under a
+  // disposition that took it straight back out of the survivor list, so
+  // a check that only asserted membership would have passed against the
+  // defect.
+  const { tableColumns } = await assertRetentionPurgeBlockers(databaseUrl());
+  const plan = planRetention(
+    { organizationId: "11111111-1111-4111-8111-111111111111", windowDays: 30 },
+    new Date("2026-08-29T12:00:00.000Z")
+  );
+  for (const table of polymorphicTables(tableColumns)) {
+    const surface = plan.surfaces.find((entry) => entry.surface === table);
+    assert.ok(surface !== undefined, `${table} is not in the plan`);
+    assert.match(
+      surface.holds,
+      /entity_id/u,
+      `${table} carries entity_id but its holds does not name it, so the privacy notice built from ` +
+        `this plan does not mention the identifier it keeps`
+    );
+    assert.ok(
+      surface.disposition.startsWith("blocked"),
+      `${table} is append-only and keeps an application identifier, so it cannot be dispositioned ` +
+        `${surface.disposition}`
+    );
+  }
+});
+
+test("the identifier really cannot be deleted or blanked on either polymorphic surface", async () => {
+  // Both directions, because a plan saying the identifier is retained
+  // would be wrong in the other direction if an UPDATE could blank it:
+  // retention would then be a one-line redaction job rather than a
+  // schema decision, the same distinction the evidence quote turns on.
+  const { failures } = await assertRetentionPurgeBlockers(databaseUrl());
+  assert.match(failures["audit_events:delete"] ?? "", /append-only: DELETE is not allowed/);
+  assert.match(failures["audit_events:redact"] ?? "", /append-only: UPDATE is not allowed/);
+  assert.match(failures["evidence_extraction_runs:delete"] ?? "", /append-only: DELETE is not allowed/);
+  assert.match(failures["evidence_extraction_runs:redact"] ?? "", /append-only: UPDATE is not allowed/);
 });

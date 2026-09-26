@@ -4361,6 +4361,11 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
   const auditSampleId = "88888888-8888-4888-8888-888888888888";
   const outcomeId = "66666666-6666-4666-8666-666666666666";
   const decisionId = "77777777-7777-4777-8777-777777777777";
+  // Doubles as the request_id body: audit_events CHECKs request_id
+  // against req_ + a version-4 UUID, so reusing this one keeps the seed
+  // honest instead of inventing a second literal that has to match.
+  const auditEventId = "99999999-9999-4999-8999-999999999999";
+  const extractionRunId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const failures: Record<string, string> = {};
   const permitted: Record<string, number> = {};
@@ -4564,6 +4569,27 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
        VALUES ($1,$2,$3,'decline','Jo Roe has no Python depth on the CV',$4)`,
       [decisionId, org, decidedApplicationId, userId]
     );
+    // REV-001: the two surfaces whose link to a candidate is a
+    // polymorphic entity_type/entity_id text pair rather than a foreign
+    // key. Written exactly as production writes them -- the recorded
+    // action is per-application, so the entity IS the application -- so
+    // that what the probe proves is the ordinary case and not a
+    // hypothetical one. No foreign key means pg_constraint cannot see
+    // the association at all, which is why evidence_extraction_runs was
+    // missing from the plan and audit_events was in it under a
+    // disposition that said it held nothing candidate-derived.
+    await admin.query(
+      `INSERT INTO audit_events (audit_event_id, organization_id, actor_user_id, action, entity_type,
+         entity_id, request_id)
+       VALUES ($1,$2,$3,'decision_recorded','application',$4,$5)`,
+      [auditEventId, org, userId, decidedApplicationId, `req_${auditEventId}`]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (run_id, organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,$2,'application',$3,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [extractionRunId, org, applicationId]
+    );
 
     // 1. The append-only surfaces. P0001 is what RAISE EXCEPTION in
     //    reject_append_only_mutation() reports.
@@ -4587,6 +4613,31 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       "candidate_decisions:redact",
       { sqlstate: "P0001" },
       `UPDATE candidate_decisions SET rationale = 'redacted' WHERE decision_id = '${decisionId}'`
+    );
+    // REV-001. Both directions on both polymorphic surfaces, because the
+    // plan's claim is that the application identifier can be neither
+    // removed nor blanked. audit_events raises through
+    // reject_audit_event_mutation and evidence_extraction_runs through
+    // the generic reject_append_only_mutation; both report P0001.
+    await expectRejected(
+      "audit_events:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_events WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "audit_events:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_events SET entity_id = 'redacted' WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM evidence_extraction_runs WHERE run_id = '${extractionRunId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:redact",
+      { sqlstate: "P0001" },
+      `UPDATE evidence_extraction_runs SET entity_id = 'redacted' WHERE run_id = '${extractionRunId}'`
     );
 
     // 2. The referential blockers, each named by the constraint that
