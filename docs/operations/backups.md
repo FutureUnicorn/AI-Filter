@@ -23,12 +23,15 @@ success. One run performs:
 3. verify the archive can be parsed with `pg_restore --list`;
 4. mirror object storage a second time to cover immutable uploads committed
    while the database snapshot was running;
-5. upload the dump to immutable history, then copy it within the destination
+5. record each current mirrored object's exact S3 version ID in a private,
+   checksum-pinned storage catalog;
+6. upload the dump to immutable history, then copy it within the destination
    store to the inactive versioned recovery slot (`database/latest-a.dump`
    or `database/latest-b.dump`);
-6. record the exact recovery-slot key and version ID, SHA-256, immutable history key,
-   and millisecond storage cutoff in a metadata-only success manifest; and
-7. replace `manifests/latest.json` only after every required step succeeds.
+7. record the exact recovery-slot key and version ID, SHA-256, immutable history
+   key, and the catalog's key, version, count, size and checksum in a metadata-only
+   success manifest; and
+8. replace `manifests/latest.json` only after every required step succeeds.
 
 The two storage passes make the database snapshot no earlier than the first
 copy and no later than the second. This avoids publishing a successful backup
@@ -38,8 +41,11 @@ point-in-time snapshot.
 
 Object names, filenames, document text, candidate data, database values,
 provider errors, and credentials are never written to backup logs or the
-success manifest. Tool output is suppressed; failures emit only a closed stage
-code such as `database_dump` or `storage_mirror`.
+success manifest. The separate storage catalog contains object keys, which
+may include filenames; it is private, uploaded with SSE-S3, and retained for
+the approved backup window. Treat it as sensitive backup data. Tool output is
+suppressed; failures emit only a closed stage code such as `database_dump` or
+`storage_mirror`.
 
 ## Retention model
 
@@ -52,6 +58,7 @@ authoritative.
 - the two recovery-slot keys never expire while current; older exact versions
   age out after the same window while the newest noncurrent version is retained;
 - historical manifests expire after the same window;
+- per-run storage version catalogs expire after the same window;
 - overwritten or deleted object-storage versions expire after that window;
 - current mirrored objects do not expire while they still exist in primary
   storage; and
@@ -80,7 +87,8 @@ must approve:
 - `BACKUP_RETENTION_DAYS`: recovery window;
 - `BACKUP_ENDPOINT`, `BACKUP_REGION`, and `BACKUP_BUCKET`: a dedicated,
   off-host target per environment, verified to support versioning, lifecycle
-  rules, exact-key listing, and encrypted server-side object copy;
+  rules, current/version listing, exact-version reads, and encrypted
+  server-side object copy;
 - `BACKUP_CONTROL_OWNER`: accountable person or team; and
 - `BACKUP_ENCRYPTION_REFERENCE`: provider encryption/KMS evidence.
 
@@ -93,9 +101,9 @@ the web or worker containers.
   versioning, lifecycle configuration, and control verification.
 - `BACKUP_WRITER_ACCESS_KEY_ID` / `BACKUP_WRITER_SECRET_ACCESS_KEY` are
   supplied to the long-running `backup` container. Allow only encrypted
-  object put/get/head, bucket listing, and ordinary object deletion needed to
-  create mirror delete markers. Explicitly deny version deletion, lifecycle
-  changes, versioning changes, and bucket-policy changes.
+  object put/get/head, bucket listing and version listing, and ordinary object
+  deletion needed to create mirror delete markers. Explicitly deny version
+  deletion, lifecycle changes, versioning changes, and bucket-policy changes.
 
 Use provider Object Lock in governance mode for database/manifests when the
 approved provider supports it. That is defense in depth; the admin/writer
@@ -156,13 +164,13 @@ can contain candidate filenames.
 
 `<environment>/manifests/latest.json` identifies the active versioned
 database recovery slot, its exact version ID, immutable history key, checksum,
-release, storage prefix, and retention window. New schema-version-2 manifests
-also have `storage.cutoffAt` at a fenced whole-second boundary after the
-second mirror pass. Publication waits until that entire second has passed, so
-later object versions cannot share the rewind tick even when an S3 listing
-reports timestamps only to the second. The wait is bounded and fails the run
-closed if the clock does not advance. The AF-69 verifier rejects schema-version-1
-manifests rather than claiming a precise reconstruction it cannot prove.
+release, storage prefix, and retention window. Schema-version-3 manifests also
+pin the storage version catalog by exact version, byte count and SHA-256. The
+verifier copies each object by its recorded version ID, so a later overwrite or
+delete cannot alter the recovered set. Schema-version-1/2 manifests are
+intentionally rejected: the earlier time-rewind method selected later content
+in the clean Linux restore drill and is not credible recovery proof. Take a
+new schema-version-3 backup before attempting AF-69 verification.
 
 ### Local synthetic restore proof
 
@@ -174,8 +182,9 @@ real `restore.sh` consumer. It applies all current migrations, seeds a
 fictional intake and object, publishes a successful manifest, then restores
 into a fresh database and bucket. It verifies the restored row and content,
 checks a later overwrite/delete does not change the published recovery set,
-and injects wrong-checksum, missing-archive-version, missing-manifest, and
-unsafe-environment failures. The test cleans up only its exact project and
+and injects incomplete-catalog, wrong-checksum, missing-catalog-version,
+missing-archive-version, missing-manifest, and unsafe-environment failures.
+The test cleans up only its exact project and
 temporary certificate directory. It never uses hosted credentials.
 
 The Compose MinIO server/client and backup image use the same upstream MinIO
@@ -192,7 +201,7 @@ approved internal distribution policy for offline deployment.
 This is a **read-only source / isolated destination** drill, not a production
 cutover procedure. Keep `BACKUP_ENABLED=false` until the separate operational
 controls in this runbook are approved. A hosted proof additionally requires a
-real, successfully published schema-version-2 backup from that environment.
+real, successfully published schema-version-3 backup from that environment.
 
 1. Select the source environment (`staging` or `production`) and record the
    approved backup bucket, PostgreSQL `DATABASE_SCHEMA`, target provider and
@@ -225,7 +234,8 @@ real, successfully published schema-version-2 backup from that environment.
    fetches only `manifests/latest.json`, checks its strict contract, downloads
    the *recorded version* of the dump, verifies byte count, SHA-256 and
    `pg_restore --list`, then executes a real transactional `pg_restore`.
-   Version-rewound object copies go to the fresh `af69-recovered` bucket;
+   Exact-version object copies from the checksum-verified catalog go to the
+   fresh `af69-recovered` bucket;
    every uploaded/validated `file_intakes.storage_key` must resolve there,
    and validated objects must match their stored SHA-256 content digest.
    Tool output and object keys remain out of the retained structured log.
@@ -247,7 +257,7 @@ real, successfully published schema-version-2 backup from that environment.
 
 The automated check proves the actual producer/consumer path with synthetic
 data and an S3-compatible MinIO target. It does not prove the chosen hosted
-provider's version rewind, KMS/key availability, IAM policy, off-host reachability,
+provider's exact-version reads, KMS/key availability, IAM policy, off-host reachability,
 recovery time at production data volume, or a complete application cutover.
 Those require a separate isolated staging/hosted drill and team-owned RPO/RTO
 decision. Never point this tool or a manual `pg_restore` at a live environment.

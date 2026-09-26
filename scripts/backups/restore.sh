@@ -48,6 +48,8 @@ export MC_CONFIG_DIR=/tmp/restore-mc MC_NO_COLOR=1 MC_QUIET=1
 work_dir="$(mktemp -d /work/af69-restore.XXXXXX)"
 manifest_file="$work_dir/manifest.json"
 dump_file="$work_dir/database.dump"
+catalog_file="$work_dir/storage-catalog.jsonl"
+validated_catalog_file="$work_dir/validated-storage-catalog.jsonl"
 
 stage=source_authentication
 mkdir -p "$MC_CONFIG_DIR"
@@ -63,7 +65,7 @@ mc --quiet cp "source/$BACKUP_BUCKET/$RESTORE_SOURCE_ENV/manifests/latest.json" 
   "$manifest_file" >/dev/null 2>&1
 stage=manifest_validation
 jq -e --arg env "$RESTORE_SOURCE_ENV" '
-  .schemaVersion == 2 and .environment == $env and
+  .schemaVersion == 3 and .environment == $env and
   (.backupId | type == "string" and test("^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{1,12}-[a-f0-9]{8}$")) and
   (.completedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
   (.database.objectKey | . == ($env + "/database/latest-a.dump") or . == ($env + "/database/latest-b.dump")) and
@@ -72,14 +74,22 @@ jq -e --arg env "$RESTORE_SOURCE_ENV" '
   (.database.bytes | type == "number" and . > 0 and . == floor) and
   .database.format == "postgres-custom" and
   .storage.prefix == ($env + "/storage/current") and .storage.versioned == true and
-  (.storage.cutoffAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"))
+  .storage.catalog.objectKey == ($env + "/storage/catalogs/" + .backupId + ".jsonl") and
+  (.storage.catalog.versionId | type == "string" and test("^[A-Za-z0-9._~+/=-]{1,200}$")) and
+  (.storage.catalog.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+  (.storage.catalog.bytes | type == "number" and . >= 0 and . == floor) and
+  (.storage.catalog.count | type == "number" and . >= 0 and . == floor)
 ' "$manifest_file" >/dev/null 2>&1
 object_key="$(jq -er '.database.objectKey' "$manifest_file")"
 version_id="$(jq -er '.database.versionId' "$manifest_file")"
 expected_sha="$(jq -er '.database.sha256' "$manifest_file")"
 expected_bytes="$(jq -er '.database.bytes' "$manifest_file")"
-storage_cutoff_at="$(jq -er '.storage.cutoffAt' "$manifest_file")"
 backup_id="$(jq -er '.backupId' "$manifest_file")"
+catalog_key="$(jq -er '.storage.catalog.objectKey' "$manifest_file")"
+catalog_version_id="$(jq -er '.storage.catalog.versionId' "$manifest_file")"
+catalog_sha256="$(jq -er '.storage.catalog.sha256' "$manifest_file")"
+catalog_bytes="$(jq -er '.storage.catalog.bytes' "$manifest_file")"
+catalog_count="$(jq -er '.storage.catalog.count' "$manifest_file")"
 
 stage=archive_fetch
 mc --quiet cp --version-id "$version_id" "source/$BACKUP_BUCKET/$object_key" \
@@ -88,6 +98,21 @@ stage=archive_integrity
 [ "$(stat -c '%s' "$dump_file")" = "$expected_bytes" ]
 [ "$(sha256sum "$dump_file" | cut -d ' ' -f 1)" = "$expected_sha" ]
 pg_restore --list "$dump_file" >/dev/null 2>&1
+
+stage=catalog_fetch
+mc --quiet cp --version-id "$catalog_version_id" "source/$BACKUP_BUCKET/$catalog_key" \
+  "$catalog_file" >/dev/null 2>&1
+stage=catalog_integrity
+[ "$(stat -c '%s' "$catalog_file")" = "$catalog_bytes" ]
+[ "$(sha256sum "$catalog_file" | cut -d ' ' -f 1)" = "$catalog_sha256" ]
+jq -c '
+  if type == "object" and
+     (.key | type == "string" and length > 0 and length <= 1024 and
+       (startswith("/") | not) and (test("(^|/)\\.\\.(/|$)|[[:cntrl:]]") | not)) and
+     (.versionId | type == "string" and test("^[A-Za-z0-9._~+/=-]{1,200}$"))
+  then {key, versionId} else error("invalid storage catalog") end
+' "$catalog_file" >"$validated_catalog_file" 2>/dev/null
+[ "$(wc -l <"$validated_catalog_file" | tr -d ' ')" = "$catalog_count" ]
 
 stage=destination_preflight
 pg_isready -q
@@ -109,12 +134,17 @@ stage=database_validation
   "SELECT count(*) FROM pg_tables WHERE schemaname='$RESTORE_DATABASE_SCHEMA' AND tablename IN ('af11_synthetic_environment_fixture','file_intakes')")" = 2 ]
 
 stage=storage_restore
-# The target is versioned. Rewind to the published cutoff so later deletes or
-# overwrites cannot silently change the recovered set. Do not use mc mirror's
-# current-view behavior here.
-mc --quiet cp --recursive --rewind "$storage_cutoff_at" \
-  "source/$BACKUP_BUCKET/$RESTORE_SOURCE_ENV/storage/current/" \
-  recovered/af69-recovered/ >/dev/null 2>&1
+# Every copied object comes from the exact version published in the catalog.
+# A current-view listing or time rewind can select a later overwrite.
+while IFS= read -r entry; do
+  encoded_key="$(printf '%s' "$entry" | jq -er '.key | @base64')"
+  object_name="$(printf '%s' "$encoded_key" | base64 -d)"
+  object_version_id="$(printf '%s' "$entry" | jq -er '.versionId')"
+  stage=storage_object_fetch
+  mc --quiet cp --version-id "$object_version_id" \
+    "source/$BACKUP_BUCKET/$RESTORE_SOURCE_ENV/storage/current/$object_name" \
+    "recovered/af69-recovered/$object_name" >/dev/null 2>&1
+done <"$validated_catalog_file"
 
 stage=application_records
 # The SQL result contains only base64-encoded keys and code-like state/hash.

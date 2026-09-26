@@ -7,6 +7,8 @@ LAST_SUCCESS_FILE="$BACKUP_WORK_DIR/last-success-epoch"
 dump_file=
 manifest_file=
 dump_stderr_file=
+catalog_listing_file=
+catalog_file=
 active_pid=
 
 is_lower_hex_length() {
@@ -30,7 +32,7 @@ extract_version_id() {
 
 cleanup_run_files() {
   cleanup_status=0
-  for cleanup_path in "${dump_file-}" "${manifest_file-}" "${dump_stderr_file-}"; do
+  for cleanup_path in "${dump_file-}" "${manifest_file-}" "${dump_stderr_file-}" "${catalog_listing_file-}" "${catalog_file-}"; do
     if [ -n "$cleanup_path" ] && ! rm -f "$cleanup_path"; then
       cleanup_status=1
     fi
@@ -39,6 +41,8 @@ cleanup_run_files() {
     dump_file=
     manifest_file=
     dump_stderr_file=
+    catalog_listing_file=
+    catalog_file=
   fi
   return "$cleanup_status"
 }
@@ -265,6 +269,13 @@ write_lifecycle_configuration() {
       "NoncurrentVersionExpiration": { "NoncurrentDays": $BACKUP_RETENTION_DAYS }
     },
     {
+      "ID": "af69-storage-catalog-retention",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "$APP_ENV/storage/catalogs/" },
+      "Expiration": { "Days": $BACKUP_RETENTION_DAYS },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+    },
+    {
       "ID": "af68-delete-marker-cleanup",
       "Status": "Enabled",
       "Filter": { "Prefix": "$APP_ENV/" },
@@ -359,6 +370,8 @@ run_once() {
   dump_file="$BACKUP_WORK_DIR/$backup_id.dump"
   manifest_file="/tmp/$backup_id.json"
   dump_stderr_file="/tmp/$backup_id-pg-dump.stderr"
+  catalog_listing_file="/tmp/$backup_id-storage-listing.jsonl"
+  catalog_file="/tmp/$backup_id-storage-catalog.jsonl"
   umask 077
 
   log_event info run_started begin "$backup_id"
@@ -400,50 +413,57 @@ run_once() {
     cleanup_run_files
     return 1
   }
-  # Some S3 version-listing paths have only second-level resolution. Fence the
-  # completed mirror into the next whole second, and do not publish until that
-  # entire second has passed. A later overwrite cannot share the rewind tick.
-  if ! mirror_finished_epoch="$(date -u +%s)"; then
-    log_event error run_failed backup_timestamp "$backup_id"
+  # Capture exact current versions. Recursive --rewind has selected later
+  # content on a clean Linux runner even when its cutoff was time-fenced.
+  # The listing stays local/private and only a validated catalog is published.
+  if ! run_interruptible mc --json ls --recursive --versions \
+    "target/$BACKUP_BUCKET/$APP_ENV/storage/current/" >"$catalog_listing_file" 2>/dev/null; then
+    log_event error run_failed storage_catalog_listing "$backup_id"
     cleanup_run_files
     return 1
   fi
-  case "$mirror_finished_epoch" in
-    ''|*[!0-9]*)
-      log_event error run_failed backup_timestamp "$backup_id"
-      cleanup_run_files
-      return 1
-      ;;
-  esac
-  cutoff_epoch=$((mirror_finished_epoch + 1))
-  if ! storage_cutoff_at="$(date -u -d "@$cutoff_epoch" +%Y-%m-%dT%H:%M:%S.000Z)"; then
-    log_event error run_failed backup_timestamp "$backup_id"
+  if ! jq -c '
+    if .status != "success" then error("storage listing failed")
+    elif .type == "file" and (.versionOrdinal | type != "number") then
+      error("version ordinal missing")
+    elif .versionOrdinal == 1 and .type == "file" then
+      if (.key | type == "string" and length > 0 and length <= 1024 and
+          (startswith("/") | not) and (test("(^|/)\\.\\.(/|$)|[[:cntrl:]]") | not)) and
+         (.versionId | type == "string" and test("^[A-Za-z0-9._~+/=-]{1,200}$"))
+      then {key, versionId} else error("unversioned current object") end
+    else empty end
+  ' "$catalog_listing_file" >"$catalog_file" 2>/dev/null; then
+    log_event error run_failed storage_catalog_validation "$backup_id"
     cleanup_run_files
     return 1
   fi
-  fence_attempts=0
-  while :; do
-    if ! now_epoch="$(date -u +%s)"; then
-      log_event error run_failed backup_timestamp "$backup_id"
-      cleanup_run_files
-      return 1
-    fi
-    case "$now_epoch" in
-      ''|*[!0-9]*)
-        log_event error run_failed backup_timestamp "$backup_id"
-        cleanup_run_files
-        return 1
-        ;;
-    esac
-    [ "$now_epoch" -gt "$cutoff_epoch" ] && break
-    fence_attempts=$((fence_attempts + 1))
-    if [ "$fence_attempts" -ge 30 ]; then
-      log_event error run_failed backup_timestamp_fence "$backup_id"
-      cleanup_run_files
-      return 1
-    fi
-    sleep 0.1
-  done
+  if ! catalog_count="$(awk 'END { print NR }' "$catalog_file")" ||
+     ! catalog_bytes="$(stat -c '%s' "$catalog_file")" ||
+     ! catalog_checksum_output="$(sha256sum "$catalog_file")"; then
+    log_event error run_failed storage_catalog_integrity "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  catalog_sha256="${catalog_checksum_output%% *}"
+  if ! is_lower_hex_length "$catalog_sha256" 64; then
+    log_event error run_failed storage_catalog_integrity "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  catalog_key="$APP_ENV/storage/catalogs/$backup_id.jsonl"
+  if ! run_interruptible mc --quiet cp --enc-s3 \
+    "target/$BACKUP_BUCKET/$APP_ENV/storage/catalogs" \
+    "$catalog_file" "target/$BACKUP_BUCKET/$catalog_key" >/dev/null 2>&1; then
+    log_event error run_failed storage_catalog_upload "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  if ! catalog_stat="$(mc --json stat "target/$BACKUP_BUCKET/$catalog_key" 2>/dev/null)" ||
+     ! catalog_version_id="$(extract_version_id "$catalog_stat")"; then
+    log_event error run_failed storage_catalog_version "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
 
   if ! checksum_output="$(sha256sum "$dump_file")"; then
     log_event error run_failed database_checksum "$backup_id"
@@ -492,7 +512,7 @@ run_once() {
     cleanup_run_files
     return 1
   fi
-  if ! printf '%s\n' "{\"schemaVersion\":2,\"backupId\":\"$backup_id\",\"environment\":\"$APP_ENV\",\"release\":\"$DEPLOYMENT_COMMIT_SHA\",\"startedAt\":\"$started_at\",\"completedAt\":\"$completed_at\",\"retentionDays\":$BACKUP_RETENTION_DAYS,\"database\":{\"objectKey\":\"$database_latest_key\",\"versionId\":\"$latest_database_version_id\",\"historyObjectKey\":\"$database_history_key\",\"sha256\":\"$database_sha256\",\"bytes\":$database_bytes,\"format\":\"postgres-custom\"},\"storage\":{\"prefix\":\"$APP_ENV/storage/current\",\"versioned\":true,\"cutoffAt\":\"$storage_cutoff_at\"}}" >"$manifest_file"
+  if ! printf '%s\n' "{\"schemaVersion\":3,\"backupId\":\"$backup_id\",\"environment\":\"$APP_ENV\",\"release\":\"$DEPLOYMENT_COMMIT_SHA\",\"startedAt\":\"$started_at\",\"completedAt\":\"$completed_at\",\"retentionDays\":$BACKUP_RETENTION_DAYS,\"database\":{\"objectKey\":\"$database_latest_key\",\"versionId\":\"$latest_database_version_id\",\"historyObjectKey\":\"$database_history_key\",\"sha256\":\"$database_sha256\",\"bytes\":$database_bytes,\"format\":\"postgres-custom\"},\"storage\":{\"prefix\":\"$APP_ENV/storage/current\",\"versioned\":true,\"catalog\":{\"objectKey\":\"$catalog_key\",\"versionId\":\"$catalog_version_id\",\"sha256\":\"$catalog_sha256\",\"bytes\":$catalog_bytes,\"count\":$catalog_count}}}" >"$manifest_file"
   then
     log_event error run_failed manifest_write "$backup_id"
     cleanup_run_files

@@ -317,7 +317,7 @@ test("hosted backups leave application credentials isolated and use an off-host 
   assert.match(script, /run_interruptible pg_dump/u);
   assert.match(script, /run_interruptible pg_restore/u);
   assert.match(script, /run_interruptible mc --quiet mirror/u);
-  assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 4);
+  assert.equal((script.match(/run_interruptible mc --quiet cp/gu) ?? []).length, 5);
   assert.match(
     script,
     /"target\/\$BACKUP_BUCKET\/\$database_history_key" "target\/\$BACKUP_BUCKET\/\$database_latest_key"/u,
@@ -348,6 +348,10 @@ test("backup retention is reproducible and preserves current source objects", ()
   assert.match(script, /af68-manifest-history-retention/u);
   assert.match(script, /af68-latest-manifest-history-retention/u);
   assert.match(script, /af68-storage-history-retention/u);
+  assert.match(script, /af69-storage-catalog-retention/u);
+  assert.match(script, /mc --json ls --recursive --versions/u);
+  assert.match(script, /versionOrdinal == 1/u);
+  assert.match(script, /storage_catalog_validation/u);
   assert.match(script, /NoncurrentVersionExpiration/u);
   assert.match(script, /ExpiredObjectDeleteMarker/u);
 
@@ -392,7 +396,9 @@ test("AF-69 restore is isolated from runtime destinations and rejects incomplete
   assert.match(restore, /export PGHOST=restore-postgres PGDATABASE=af69_restore PGUSER=af69_restore/u);
   assert.match(restore, /mc --quiet cp --version-id "\$version_id"/u);
   assert.match(restore, /pg_restore --exit-on-error --single-transaction/u);
-  assert.match(restore, /mc --quiet cp --recursive --rewind "\$storage_cutoff_at"/u);
+  assert.match(restore, /mc --quiet cp --version-id "\$catalog_version_id"/u);
+  assert.match(restore, /mc --quiet cp --version-id "\$object_version_id"/u);
+  assert.doesNotMatch(restore, /--rewind|mc --quiet mirror/u);
   assert.doesNotMatch(restore, /pg_restore[^\n]*--clean|pg_restore[^\n]*--create/u);
   assert.match(compose, /RESTORE_SECRET_ACCESS_KEY: \$\{RESTORE_SECRET_ACCESS_KEY:\?required\}/u);
 });

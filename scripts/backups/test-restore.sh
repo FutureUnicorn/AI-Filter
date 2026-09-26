@@ -67,6 +67,27 @@ row_count="$(compose exec -T restore-postgres psql -U af69_restore -d af69_resto
 compose run --rm --no-deps --entrypoint /bin/sh restore -ec \
   'mc alias set recovered http://restore-storage:9000 af69-recovered af69-recovered-storage-only >/dev/null 2>&1; mc cat recovered/af69-recovered/synthetic/af69-document.txt 2>/dev/null | grep -q "fictional test data"'
 
+# A catalog that claims more pinned objects than it contains is incomplete,
+# even if its database dump and currently visible storage objects exist.
+compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
+  mc alias set target https://backup-target:9000 af69-target af69-target-storage-only --path on >/dev/null 2>&1
+  mc cat target/af69-target/staging/manifests/latest.json >/tmp/original.json
+  jq ".storage.catalog.count += 1" /tmp/original.json >/tmp/incomplete.json
+  mc cp --enc-s3 target/af69-target/staging/manifests/latest.json /tmp/incomplete.json target/af69-target/staging/manifests/latest.json >/dev/null 2>&1
+'
+if compose run --rm --no-deps restore >"$cert_dir/incomplete.out" 2>&1; then
+  echo 'Incomplete storage catalog unexpectedly restored' >&2
+  exit 1
+fi
+grep -q '"stage":"catalog_integrity"' "$cert_dir/incomplete.out"
+compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
+  mc alias set target https://backup-target:9000 af69-target af69-target-storage-only --path on >/dev/null 2>&1
+  backup_id="$(mc cat target/af69-target/staging/manifests/latest.json | jq -r .backupId)"
+  mc cp --enc-s3 target/af69-target/staging/manifests/latest.json \
+    "target/af69-target/staging/manifests/history/$backup_id.json" \
+    target/af69-target/staging/manifests/latest.json >/dev/null 2>&1
+'
+
 # A valid-looking but wrong published checksum must fail before DB or object
 # restore. The original archive/version is immutable and remains untouched.
 compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
@@ -81,8 +102,28 @@ if compose run --rm --no-deps restore >"$cert_dir/corrupt.out" 2>&1; then
 fi
 grep -q '"stage":"archive_integrity"' "$cert_dir/corrupt.out"
 
-# Restore the immutable history manifest, then remove only the pinned archive
-# version in this disposable target. A live-looking slot is not a substitute.
+# Restore the immutable history manifest, then remove only the pinned catalog
+# version. A live-looking catalog is not a substitute for the published one.
+compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
+  mc alias set target https://backup-target:9000 af69-target af69-target-storage-only --path on >/dev/null 2>&1
+  manifest="$(mc cat target/af69-target/staging/manifests/latest.json)"
+  backup_id="$(printf "%s" "$manifest" | jq -r .backupId)"
+  mc cp --enc-s3 target/af69-target/staging/manifests/latest.json \
+    "target/af69-target/staging/manifests/history/$backup_id.json" \
+    target/af69-target/staging/manifests/latest.json >/dev/null 2>&1
+  manifest="$(mc cat target/af69-target/staging/manifests/latest.json)"
+  key="$(printf "%s" "$manifest" | jq -r .storage.catalog.objectKey)"
+  version="$(printf "%s" "$manifest" | jq -r .storage.catalog.versionId)"
+  mc rm --version-id "$version" "target/af69-target/$key" >/dev/null 2>&1
+'
+if compose run --rm --no-deps restore >"$cert_dir/catalog.out" 2>&1; then
+  echo 'Missing pinned catalog version unexpectedly restored' >&2
+  exit 1
+fi
+grep -q '"stage":"catalog_fetch"' "$cert_dir/catalog.out"
+
+# Remove only the pinned archive version in this disposable target. A
+# live-looking slot is not a substitute for the published archive.
 compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
   mc alias set target https://backup-target:9000 af69-target af69-target-storage-only --path on >/dev/null 2>&1
   manifest="$(mc cat target/af69-target/staging/manifests/latest.json)"
