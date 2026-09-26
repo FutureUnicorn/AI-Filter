@@ -2373,6 +2373,76 @@ export const ROLE_AUDIT_METRICS = [
 export type RoleAuditMetric = (typeof ROLE_AUDIT_METRICS)[number];
 
 /**
+ * Metric identities a section may be filled by besides the one it is
+ * named for, each with the words that carry the difference into the
+ * heading the reader sees.
+ *
+ * AF-57 changes the precision metric's identity when its denominator
+ * rests on candidate-level decisions instead of item-level proof: the
+ * sample comes back named
+ * `evidence_precision_live_pilot_examination_inferred` precisely so that
+ * it cannot be read against the 98% target. That rename is right, and it
+ * meets a report whose sections are fixed keys.
+ *
+ * Refusing the qualified name here looks like the strict choice and is
+ * the dangerous one. A live pilot only produces the unqualified name
+ * when every examined item carried a correction, which is a precision of
+ * 0 by construction, so in practice the section would be permanently
+ * absent -- and an absent section renders as "not measured", which reads
+ * as "no problems here". That is the exact failure the required-keys
+ * design exists to prevent, arrived at by being strict about a name.
+ *
+ * So a section accepts its own metric or a declared qualification of it,
+ * and the qualification travels into the heading rather than only into a
+ * note underneath it. A caveat printed below the number does not stop
+ * the number being quoted; the name above it does. Anything not declared
+ * here is still refused: a preservation figure under the precision key
+ * remains an error.
+ *
+ * The heading text lives in this same table on purpose. A qualification
+ * that could be declared without saying how it reads would be a
+ * qualification the renderer had to invent words for, and those words
+ * are the whole point of it.
+ */
+const ROLE_AUDIT_METRIC_QUALIFICATIONS: Readonly<
+  Record<RoleAuditMetric, Readonly<Record<string, string>>>
+> = {
+  review_time_reduction: {},
+  qualified_candidate_preservation: {},
+  evidence_precision_live_pilot: {
+    examination_inferred: "examination inferred, not measured item by item"
+  },
+  failed_document_rate: {}
+};
+
+/**
+ * The heading words for the qualification a sample carries under this
+ * section, or null when the sample is the metric itself.
+ *
+ * Throws when it is neither, which is the mislabelling check: this is
+ * the one fact summarizeMetric cannot know, since it is told the name
+ * and has no idea which section it will be filed under.
+ */
+function resolveRoleAuditQualification(
+  context: string,
+  metric: RoleAuditMetric,
+  sampleMetric: string
+): string | null {
+  if (sampleMetric === metric) {
+    return null;
+  }
+  for (const [qualifier, heading] of Object.entries(ROLE_AUDIT_METRIC_QUALIFICATIONS[metric])) {
+    if (sampleMetric === `${metric}_${qualifier}`) {
+      return heading;
+    }
+  }
+  // A sample filed under the wrong key would be rendered with the wrong
+  // heading -- a preservation figure labelled as precision is worse than
+  // a missing one, because it is believable.
+  throw new Error(`${context}: metrics.${metric} carries a sample for "${sampleMetric}"`);
+}
+
+/**
  * AF-52's selection with the sampled application ids removed.
  *
  * The employer needs to see that the sample was drawn honestly -- the
@@ -2408,9 +2478,22 @@ export function describeAuditSampleProvenance(selection: AuditSampleSelection): 
   };
 }
 
-/** The correction figures AF-57 produces, without the precision rate. */
+/**
+ * The correction figures AF-57 produces, without the precision rate.
+ *
+ * `examinedItems`, not `reviewedItems`. It is the same denominator the
+ * precision metric is computed over, and AF-57 stopped calling that
+ * "reviewed" because nothing in this system records that a human read a
+ * given item: an item counts as examined by naming the record that
+ * establishes it, which for a live pilot is usually a decision taken on
+ * the whole candidate. Printing "reviewed evidence items" to an employer
+ * re-asserts in prose the exact fact the metric's name was changed to
+ * stop asserting, two lines below the heading that now says examination
+ * was inferred. The section immediately above carries what the word
+ * rests on, so this one only has to stop overclaiming.
+ */
 export interface CorrectionSummary {
-  readonly reviewedItems: number;
+  readonly examinedItems: number;
   readonly correctedItems: number;
   readonly correctionEvents: number;
 }
@@ -2458,26 +2541,23 @@ function assertPublishableCounts(context: string, counts: Readonly<Record<string
 export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = input.metrics[metric];
-    if (sample !== null && sample.metric !== metric) {
-      // A sample filed under the wrong key would be rendered with the
-      // wrong heading -- a preservation figure labelled as precision is
-      // worse than a missing one, because it is believable.
-      throw new Error(
-        `buildRoleAuditReport: metrics.${metric} carries a sample for "${sample.metric}"`
-      );
+    if (sample !== null) {
+      // Throws unless the sample is this metric or a declared
+      // qualification of it.
+      resolveRoleAuditQualification("buildRoleAuditReport", metric, sample.metric);
     }
   }
 
   const corrections = input.corrections;
   if (corrections !== null) {
     assertPublishableCounts("buildRoleAuditReport: corrections", {
-      reviewedItems: corrections.reviewedItems,
+      examinedItems: corrections.examinedItems,
       correctedItems: corrections.correctedItems,
       correctionEvents: corrections.correctionEvents
     });
-    if (corrections.correctedItems > corrections.reviewedItems) {
+    if (corrections.correctedItems > corrections.examinedItems) {
       throw new Error(
-        "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
+        "buildRoleAuditReport: correctedItems cannot exceed examinedItems"
       );
     }
     if (corrections.correctionEvents < corrections.correctedItems) {
@@ -2491,15 +2571,15 @@ export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAudi
       );
     }
     const precision = input.metrics.evidence_precision_live_pilot;
-    if (precision !== null && precision.sampleSize !== corrections.reviewedItems) {
-      // Both figures are AF-57's, over one set of reviewed items, and the
+    if (precision !== null && precision.sampleSize !== corrections.examinedItems) {
+      // Both figures are AF-57's, over one set of examined items, and the
       // report prints both: "(from N of M)" under Evidence precision and
-      // "x of N reviewed evidence items" under Corrections. Two different
+      // "x of N examined evidence items" under Corrections. Two different
       // N's is a document that contradicts itself, and a reader who
       // divides the corrections line gets a precision that is not the one
       // printed above it.
       throw new Error(
-        `buildRoleAuditReport: corrections cover ${corrections.reviewedItems} reviewed item(s) but ` +
+        `buildRoleAuditReport: corrections cover ${corrections.examinedItems} examined item(s) but ` +
           `evidence_precision_live_pilot was computed over ${precision.sampleSize}; the report would print ` +
           "two different denominators for the same set"
       );
@@ -2577,12 +2657,22 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = report.metrics[metric];
-    lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
     if (sample === null) {
+      lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
       lines.push(`  Not measured for this role.`);
       lines.push(``);
       continue;
     }
+    // Re-resolved here rather than trusted from buildRoleAuditReport.
+    // RoleAuditReport is an interface, so a caller can assemble one
+    // directly, and this is the boundary where a wrong name becomes a
+    // wrong heading in front of an employer.
+    const qualification = resolveRoleAuditQualification("renderRoleAuditReport", metric, sample.metric);
+    lines.push(
+      qualification === null
+        ? `${ROLE_AUDIT_METRIC_HEADINGS[metric]}`
+        : `${ROLE_AUDIT_METRIC_HEADINGS[metric]} (${qualification})`
+    );
     lines.push(
       sample.value === null
         ? `  Not enough data to report.`
@@ -2599,7 +2689,7 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
     lines.push(`  Not measured for this role.`);
   } else {
     lines.push(
-      `  ${report.corrections.correctedItems} of ${report.corrections.reviewedItems} reviewed evidence items ` +
+      `  ${report.corrections.correctedItems} of ${report.corrections.examinedItems} examined evidence items ` +
         `were corrected, across ${report.corrections.correctionEvents} correction(s).`
     );
   }

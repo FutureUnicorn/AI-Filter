@@ -38,7 +38,7 @@ function report(overrides: Record<string, unknown> = {}) {
     roleId: ROLE,
     generatedAt: "2026-08-29T18:00:00.000Z",
     metrics: metrics(),
-    corrections: { reviewedItems: 40, correctedItems: 3, correctionEvents: 4 },
+    corrections: { examinedItems: 40, correctedItems: 3, correctionEvents: 4 },
     auditSample: { seed: "pilot-1", eligibleCount: 60, sampledCount: 10 },
     ...overrides
   });
@@ -140,14 +140,14 @@ test("a sample filed under the wrong key is rejected rather than mislabelled", (
   );
 });
 
-test("more corrected items than reviewed items is rejected", () => {
+test("more corrected items than examined items is rejected", () => {
   assert.throws(
-    () => report({ corrections: { reviewedItems: 3, correctedItems: 4, correctionEvents: 4 } }),
-    /correctedItems cannot exceed reviewedItems/
+    () => report({ corrections: { examinedItems: 3, correctedItems: 4, correctionEvents: 4 } }),
+    /correctedItems cannot exceed examinedItems/
   );
 });
 
-// REV-001. correctedItems > reviewedItems was the only correction
+// REV-001. correctedItems > examinedItems was the only correction
 // invariant checked, and it is a comparison, so every input that is not a
 // count at all slipped past it: -1 > 40 is false, NaN > 40 is false. The
 // remaining cases below are the same defect, not extra polish -- each one
@@ -155,10 +155,10 @@ test("more corrected items than reviewed items is rejected", () => {
 // login and without anyone present to question it.
 
 test("a negative corrected count is rejected rather than printed as a correction", () => {
-  // -1 > reviewedItems is false, so the old comparison waved this through
-  // and the report printed "-1 of 40 reviewed evidence items".
+  // -1 > examinedItems is false, so the old comparison waved this through
+  // and the report printed "-1 of 40 examined evidence items".
   assert.throws(
-    () => report({ corrections: { reviewedItems: 40, correctedItems: -1, correctionEvents: 0 } }),
+    () => report({ corrections: { examinedItems: 40, correctedItems: -1, correctionEvents: 0 } }),
     /corrections requires a non-negative integer correctedItems, got: -1/
   );
 });
@@ -167,17 +167,17 @@ test("a correction count that is not a number at all is rejected", () => {
   // Every comparison against NaN is false, so NaN was the one value that
   // passed the old check by construction and rendered as "NaN of 40".
   assert.throws(
-    () => report({ corrections: { reviewedItems: 40, correctedItems: Number.NaN, correctionEvents: 4 } }),
+    () => report({ corrections: { examinedItems: 40, correctedItems: Number.NaN, correctionEvents: 4 } }),
     /corrections requires a non-negative integer correctedItems, got: NaN/
   );
 });
 
-test("a fractional reviewed count is rejected", () => {
+test("a fractional examined count is rejected", () => {
   // Items are counted, not measured. A fraction means whatever produced
   // it was not counting items.
   assert.throws(
-    () => report({ corrections: { reviewedItems: 40.5, correctedItems: 3, correctionEvents: 4 } }),
-    /corrections requires a non-negative integer reviewedItems, got: 40\.5/
+    () => report({ corrections: { examinedItems: 40.5, correctedItems: 3, correctionEvents: 4 } }),
+    /corrections requires a non-negative integer examinedItems, got: 40\.5/
   );
 });
 
@@ -186,19 +186,19 @@ test("fewer correction events than corrected items is rejected", () => {
   // corrected items means one of the two numbers is counting something
   // other than what the report says it is.
   assert.throws(
-    () => report({ corrections: { reviewedItems: 40, correctedItems: 3, correctionEvents: 2 } }),
+    () => report({ corrections: { examinedItems: 40, correctedItems: 3, correctionEvents: 2 } }),
     /2 correction event\(s\) cannot account for 3 corrected item\(s\)/
   );
 });
 
-test("corrections and the precision metric cannot disagree on how many items were reviewed", () => {
-  // Both are AF-57's, over one set of reviewed items, and the report
+test("corrections and the precision metric cannot disagree on how many items were examined", () => {
+  // Both are AF-57's, over one set of examined items, and the report
   // prints both denominators. Two different ones let a reader divide the
   // corrections line and get a precision other than the one printed
   // directly above it.
   assert.throws(
-    () => report({ corrections: { reviewedItems: 41, correctedItems: 3, correctionEvents: 4 } }),
-    /corrections cover 41 reviewed item\(s\) but evidence_precision_live_pilot was computed over 40/
+    () => report({ corrections: { examinedItems: 41, correctedItems: 3, correctionEvents: 4 } }),
+    /corrections cover 41 examined item\(s\) but evidence_precision_live_pilot was computed over 40/
   );
 });
 
@@ -252,7 +252,7 @@ test("a selection that repeats a candidate is rejected while the ids are still t
 
 test("corrections report items and events separately", () => {
   const rendered = renderRoleAuditReport(report());
-  assert.match(rendered, /3 of 40 reviewed evidence items were corrected, across 4 correction\(s\)\./);
+  assert.match(rendered, /3 of 40 examined evidence items were corrected, across 4 correction\(s\)\./);
 });
 
 test("the audit sample tells the employer how to reproduce it", () => {
