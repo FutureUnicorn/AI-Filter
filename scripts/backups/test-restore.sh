@@ -57,6 +57,24 @@ compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
   mc cp --enc-s3 target/af69-target/staging/storage/current /tmp/later.txt target/af69-target/staging/storage/current/synthetic/af69-document.txt >/dev/null 2>&1
   mc rm target/af69-target/staging/storage/current/synthetic/af69-document.txt >/dev/null 2>&1
 '
+# Prove the producer catalog names the original synthetic bytes even after a
+# later overwrite/delete. This check uses only fictional test data.
+compose run --rm --no-deps --entrypoint /bin/sh backup-once -ec '
+  mc alias set target https://backup-target:9000 af69-target af69-target-storage-only --path on >/dev/null 2>&1
+  manifest="$(mc cat target/af69-target/staging/manifests/latest.json)"
+  catalog_key="$(printf "%s" "$manifest" | jq -r .storage.catalog.objectKey)"
+  catalog_version="$(printf "%s" "$manifest" | jq -r .storage.catalog.versionId)"
+  mc cp --version-id "$catalog_version" "target/af69-target/$catalog_key" /tmp/catalog.jsonl >/dev/null 2>&1
+  pinned_version="$(jq -r "select(.key == \"synthetic/af69-document.txt\") | .versionId" /tmp/catalog.jsonl)"
+  [ -n "$pinned_version" ] && [ "$pinned_version" != null ]
+  mc cp --version-id "$pinned_version" target/af69-target/staging/storage/current/synthetic/af69-document.txt /tmp/pinned.txt >/dev/null 2>&1
+  if ! grep -q "fictional test data" /tmp/pinned.txt; then
+    echo "Published synthetic object version did not recover original content" >&2
+    mc --json ls --recursive --versions target/af69-target/staging/storage/current/ | jq -c "{type,key,versionOrdinal,versionId}" >&2
+    sha256sum /tmp/pinned.txt >&2
+    exit 1
+  fi
+'
 compose run --build --rm restore
 
 # The recovered DB and object must be the synthetic source values, not merely
