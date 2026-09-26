@@ -2326,6 +2326,402 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-59: role-level audit report ----
+//
+// "The actual pilot deliverable: time saved, preservation, precision,
+// corrections, and failures for one role, in a form an employer can read
+// without a login."
+//
+// Two properties of "without a login" drive everything here.
+//
+// **It is unauthenticated, so it must carry no candidate identifiers.**
+// A role-level report is an aggregate by definition, and the moment one
+// applicationId reaches it, a link forwarded to a recruiter's personal
+// inbox has leaked a named candidate outside the tenant (POL-011). The
+// report type is therefore shaped so that no candidate identifier can be
+// placed in it -- AuditSampleProvenance exists precisely to strip the
+// sampled ids off AF-52's selection -- rather than relying on whoever
+// renders it to leave them out.
+//
+// **It is read without anyone present to explain it.** Every guard the
+// metric tickets added lives in `limitations`, and a renderer that shows
+// `value` and drops them undoes all of it: a suppressed metric would
+// render as blank, and blank next to four real numbers reads as zero or
+// as nothing to report. So the report holds MetricSample values whole,
+// and renderRoleAuditReport prints the caveats with the number rather
+// than beside it.
+//
+// The five figures the ticket names are REQUIRED KEYS, not an array. A
+// section that is merely absent from a customer-facing report reads as
+// "no problems here", which is the most expensive way this document
+// could be wrong. Absent becomes an explicit "not measured" line.
+//
+// Deliberately NOT decided here: how the report reaches the employer.
+// An unauthenticated URL is a real security design -- token lifetime,
+// revocation, whether the link survives the pilot -- and belongs with
+// AF-64's privacy work and a human sign-off, not inside a reporting
+// helper. This module produces the artifact and says nothing about
+// delivery.
+
+export const ROLE_AUDIT_METRICS = [
+  "review_time_reduction",
+  "qualified_candidate_preservation",
+  "evidence_precision_live_pilot",
+  "failed_document_rate"
+] as const;
+
+export type RoleAuditMetric = (typeof ROLE_AUDIT_METRICS)[number];
+
+/**
+ * Metric identities a section may be filled by besides the one it is
+ * named for, each with the words that carry the difference into the
+ * heading the reader sees.
+ *
+ * AF-57 changes the precision metric's identity when its denominator
+ * rests on candidate-level decisions instead of item-level proof: the
+ * sample comes back named
+ * `evidence_precision_live_pilot_examination_inferred` precisely so that
+ * it cannot be read against the 98% target. That rename is right, and it
+ * meets a report whose sections are fixed keys.
+ *
+ * Refusing the qualified name here looks like the strict choice and is
+ * the dangerous one. A live pilot only produces the unqualified name
+ * when every examined item carried a correction, which is a precision of
+ * 0 by construction, so in practice the section would be permanently
+ * absent -- and an absent section renders as "not measured", which reads
+ * as "no problems here". That is the exact failure the required-keys
+ * design exists to prevent, arrived at by being strict about a name.
+ *
+ * So a section accepts its own metric or a declared qualification of it,
+ * and the qualification travels into the heading rather than only into a
+ * note underneath it. A caveat printed below the number does not stop
+ * the number being quoted; the name above it does. Anything not declared
+ * here is still refused: a preservation figure under the precision key
+ * remains an error.
+ *
+ * The heading text lives in this same table on purpose. A qualification
+ * that could be declared without saying how it reads would be a
+ * qualification the renderer had to invent words for, and those words
+ * are the whole point of it.
+ */
+const ROLE_AUDIT_METRIC_QUALIFICATIONS: Readonly<
+  Record<RoleAuditMetric, Readonly<Record<string, string>>>
+> = {
+  review_time_reduction: {},
+  qualified_candidate_preservation: {},
+  evidence_precision_live_pilot: {
+    examination_inferred: "examination inferred, not measured item by item"
+  },
+  failed_document_rate: {}
+};
+
+/**
+ * The heading words for the qualification a sample carries under this
+ * section, or null when the sample is the metric itself.
+ *
+ * Throws when it is neither, which is the mislabelling check: this is
+ * the one fact summarizeMetric cannot know, since it is told the name
+ * and has no idea which section it will be filed under.
+ */
+function resolveRoleAuditQualification(
+  context: string,
+  metric: RoleAuditMetric,
+  sampleMetric: string
+): string | null {
+  if (sampleMetric === metric) {
+    return null;
+  }
+  for (const [qualifier, heading] of Object.entries(ROLE_AUDIT_METRIC_QUALIFICATIONS[metric])) {
+    if (sampleMetric === `${metric}_${qualifier}`) {
+      return heading;
+    }
+  }
+  // A sample filed under the wrong key would be rendered with the wrong
+  // heading -- a preservation figure labelled as precision is worse than
+  // a missing one, because it is believable.
+  throw new Error(`${context}: metrics.${metric} carries a sample for "${sampleMetric}"`);
+}
+
+/**
+ * AF-52's selection with the sampled application ids removed.
+ *
+ * The employer needs to see that the sample was drawn honestly -- the
+ * seed makes it reproducible and eligibleCount shows what it was drawn
+ * from -- and needs none of the identities to see that. Constructed by a
+ * function rather than assembled at call sites so there is exactly one
+ * place where the ids are dropped.
+ */
+export interface AuditSampleProvenance {
+  readonly seed: string;
+  readonly eligibleCount: number;
+  readonly sampledCount: number;
+}
+
+export function describeAuditSampleProvenance(selection: AuditSampleSelection): AuditSampleProvenance {
+  const distinct = new Set(selection.sampledApplicationIds);
+  if (distinct.size !== selection.sampledApplicationIds.length) {
+    // This is the last place the ids exist. sampledCount is published
+    // beside a claim that re-running the draw reproduces the sample, and
+    // a repeated id counts one candidate twice -- so the published count
+    // no longer matches anything a reproducer can arrive at, and every
+    // stage after this one has lost the evidence needed to notice. The
+    // store rejects it too: audit_sample_members is UNIQUE on
+    // (audit_sample_id, application_id).
+    throw new Error(
+      "describeAuditSampleProvenance: the selection repeats an application id, so sampledCount would overstate the draw"
+    );
+  }
+  return {
+    seed: selection.seed,
+    eligibleCount: selection.eligibleCount,
+    sampledCount: distinct.size
+  };
+}
+
+/**
+ * The correction figures AF-57 produces, without the precision rate.
+ *
+ * `examinedItems`, not `reviewedItems`. It is the same denominator the
+ * precision metric is computed over, and AF-57 stopped calling that
+ * "reviewed" because nothing in this system records that a human read a
+ * given item: an item counts as examined by naming the record that
+ * establishes it, which for a live pilot is usually a decision taken on
+ * the whole candidate. Printing "reviewed evidence items" to an employer
+ * re-asserts in prose the exact fact the metric's name was changed to
+ * stop asserting, two lines below the heading that now says examination
+ * was inferred. The section immediately above carries what the word
+ * rests on, so this one only has to stop overclaiming.
+ */
+export interface CorrectionSummary {
+  readonly examinedItems: number;
+  readonly correctedItems: number;
+  readonly correctionEvents: number;
+}
+
+export interface RoleAuditReport extends VersionedRecord {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly generatedAt: string;
+  /** Every named metric, present as null when it was never computed. */
+  readonly metrics: Readonly<Record<RoleAuditMetric, MetricSample | null>>;
+  readonly corrections: CorrectionSummary | null;
+  readonly auditSample: AuditSampleProvenance | null;
+}
+
+export interface BuildRoleAuditReportInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly generatedAt: string;
+  readonly metrics: Readonly<Record<RoleAuditMetric, MetricSample | null>>;
+  readonly corrections: CorrectionSummary | null;
+  readonly auditSample: AuditSampleProvenance | null;
+}
+
+/**
+ * Every figure this report prints has to survive a reader with no one
+ * present to explain it, so each one is checked here before it can be
+ * published.
+ *
+ * The metrics do not need it: summarizeMetric is a real constructor and
+ * refuses a non-integer count, a sampleSize above its population and a
+ * non-finite value, so the only thing left for this boundary to check is
+ * the one fact the constructor cannot know, which key the sample was
+ * filed under. CorrectionSummary and AuditSampleProvenance had no such
+ * constructor -- they are bare interfaces assembled at the call site --
+ * and so reached the renderer with nothing checked at all.
+ */
+function assertPublishableCounts(context: string, counts: Readonly<Record<string, number>>): void {
+  for (const [name, value] of Object.entries(counts)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${context} requires a non-negative integer ${name}, got: ${value}`);
+    }
+  }
+}
+
+export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
+  for (const metric of ROLE_AUDIT_METRICS) {
+    const sample = input.metrics[metric];
+    if (sample !== null) {
+      // Throws unless the sample is this metric or a declared
+      // qualification of it.
+      resolveRoleAuditQualification("buildRoleAuditReport", metric, sample.metric);
+    }
+  }
+
+  const corrections = input.corrections;
+  if (corrections !== null) {
+    assertPublishableCounts("buildRoleAuditReport: corrections", {
+      examinedItems: corrections.examinedItems,
+      correctedItems: corrections.correctedItems,
+      correctionEvents: corrections.correctionEvents
+    });
+    if (corrections.correctedItems > corrections.examinedItems) {
+      throw new Error(
+        "buildRoleAuditReport: correctedItems cannot exceed examinedItems"
+      );
+    }
+    if (corrections.correctionEvents < corrections.correctedItems) {
+      // Correcting an item is what produces a correction event, so events
+      // below corrected items is not a small discrepancy: one of the two
+      // numbers is measuring something other than what the report says it
+      // is, and the reader has no way to tell which.
+      throw new Error(
+        `buildRoleAuditReport: ${corrections.correctionEvents} correction event(s) cannot account for ` +
+          `${corrections.correctedItems} corrected item(s); correcting an item takes at least one event`
+      );
+    }
+    const precision = input.metrics.evidence_precision_live_pilot;
+    if (precision !== null && precision.sampleSize !== corrections.examinedItems) {
+      // Both figures are AF-57's, over one set of examined items, and the
+      // report prints both: "(from N of M)" under Evidence precision and
+      // "x of N examined evidence items" under Corrections. Two different
+      // N's is a document that contradicts itself, and a reader who
+      // divides the corrections line gets a precision that is not the one
+      // printed above it.
+      throw new Error(
+        `buildRoleAuditReport: corrections cover ${corrections.examinedItems} examined item(s) but ` +
+          `evidence_precision_live_pilot was computed over ${precision.sampleSize}; the report would print ` +
+          "two different denominators for the same set"
+      );
+    }
+  }
+
+  const auditSample = input.auditSample;
+  if (auditSample !== null) {
+    assertPublishableCounts("buildRoleAuditReport: auditSample", {
+      eligibleCount: auditSample.eligibleCount,
+      sampledCount: auditSample.sampledCount
+    });
+    if (auditSample.seed.trim().length === 0) {
+      // The report prints the seed as the thing that makes the draw
+      // checkable. A blank one is printed just the same and explains
+      // nothing, which is why audit_samples CHECKs it in the store.
+      throw new Error(
+        "buildRoleAuditReport: the audit sample seed cannot be blank; it is what makes the draw reproducible"
+      );
+    }
+    if (auditSample.sampledCount > auditSample.eligibleCount) {
+      // The report tells the reader that re-running the selection with
+      // this seed reproduces this sample. A draw larger than the set it
+      // came from cannot be reproduced by anyone, so the report would be
+      // inviting a check that is guaranteed to fail and calling that
+      // provenance.
+      throw new Error(
+        `buildRoleAuditReport: the audit sample claims ${auditSample.sampledCount} of ` +
+          `${auditSample.eligibleCount} eligible candidates; a draw cannot exceed what it was drawn from`
+      );
+    }
+  }
+
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId: input.organizationId,
+    roleId: input.roleId,
+    generatedAt: input.generatedAt,
+    metrics: { ...input.metrics },
+    corrections: input.corrections,
+    auditSample: input.auditSample
+  };
+}
+
+const ROLE_AUDIT_METRIC_HEADINGS: Readonly<Record<RoleAuditMetric, string>> = {
+  review_time_reduction: "Review time saved",
+  qualified_candidate_preservation: "Qualified candidates preserved",
+  evidence_precision_live_pilot: "Evidence precision",
+  failed_document_rate: "Documents that could not be processed"
+};
+
+function formatPercentage(value: number): string {
+  // One decimal place, and the sign kept: a negative review-time
+  // reduction means the tool made review slower, and dropping the sign
+  // would turn the most important result this report can carry into its
+  // opposite.
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+/**
+ * Plain text, because the audience reads it without a login and quite
+ * possibly without a browser that renders our CSS.
+ *
+ * A suppressed metric prints "not enough data to report" and its reason.
+ * It never prints an empty value: blank beside four real numbers reads
+ * as zero, and zero is a claim.
+ */
+export function renderRoleAuditReport(report: RoleAuditReport): string {
+  const lines: string[] = [
+    `Evidence audit report`,
+    `Role: ${report.roleId}`,
+    `Generated: ${report.generatedAt}`,
+    ``
+  ];
+
+  for (const metric of ROLE_AUDIT_METRICS) {
+    const sample = report.metrics[metric];
+    if (sample === null) {
+      lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
+      lines.push(`  Not measured for this role.`);
+      lines.push(``);
+      continue;
+    }
+    // Re-resolved here rather than trusted from buildRoleAuditReport.
+    // RoleAuditReport is an interface, so a caller can assemble one
+    // directly, and this is the boundary where a wrong name becomes a
+    // wrong heading in front of an employer.
+    const qualification = resolveRoleAuditQualification("renderRoleAuditReport", metric, sample.metric);
+    lines.push(
+      qualification === null
+        ? `${ROLE_AUDIT_METRIC_HEADINGS[metric]}`
+        : `${ROLE_AUDIT_METRIC_HEADINGS[metric]} (${qualification})`
+    );
+    lines.push(
+      sample.value === null
+        ? `  Not enough data to report.`
+        : `  ${formatPercentage(sample.value)} (from ${sample.sampleSize} of ${sample.population})`
+    );
+    for (const limitation of sample.limitations) {
+      lines.push(`  Note: ${limitation.detail}`);
+    }
+    lines.push(``);
+  }
+
+  lines.push(`Corrections`);
+  if (report.corrections === null) {
+    lines.push(`  Not measured for this role.`);
+  } else {
+    lines.push(
+      `  ${report.corrections.correctedItems} of ${report.corrections.examinedItems} examined evidence items ` +
+        `were corrected, across ${report.corrections.correctionEvents} correction(s).`
+    );
+  }
+  lines.push(``);
+
+  lines.push(`Audit sample`);
+  if (report.auditSample === null) {
+    lines.push(`  No audit sample was drawn for this role.`);
+  } else {
+    lines.push(
+      `  ${report.auditSample.sampledCount} of ${report.auditSample.eligibleCount} eligible candidates, ` +
+        `drawn with seed ${report.auditSample.seed}.`
+    );
+    // The seed is a reconstruction key, not just a provenance label:
+    // anyone who ALSO holds this role's candidate list can recompute
+    // exactly which candidates were sampled -- verified, not assumed.
+    // That is precisely what makes the draw auditable for the employer,
+    // whose data it is, and it is inert for a stranger holding neither.
+    // But it means the report is not safe to hand to a third party with
+    // an overlapping candidate set, which is a plausible thing to do with
+    // a pilot report. Said here rather than only in a ticket, because the
+    // person choosing who to forward this to is the person reading it.
+    lines.push(
+      `  Anyone holding this role's candidate list can re-run the selection with that seed and ` +
+        `reproduce the same sample. That is what makes the draw auditable -- and why this report ` +
+        `should not be forwarded to a party that holds candidate data of its own.`
+    );
+  }
+
+  return lines.join("\n") + "\n";
+}
+
 // ---- AF-57: evidence precision / correction rate ----
 //
 // "Share of evidence items a recruiter had to correct. Target >= 98%
