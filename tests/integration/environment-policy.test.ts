@@ -398,6 +398,8 @@ test("AF-69 restore is isolated from runtime destinations and rejects incomplete
   assert.match(restore, /pg_restore --exit-on-error --single-transaction/u);
   assert.match(restore, /mc --quiet cp --version-id "\$catalog_version_id"/u);
   assert.match(restore, /mc --quiet cp --version-id "\$object_version_id"/u);
+  assert.match(restore, /"\$work_dir\/pinned-object"/u);
+  assert.match(restore, /mc --quiet cp "\$work_dir\/pinned-object"/u);
   assert.doesNotMatch(restore, /--rewind|mc --quiet mirror/u);
   assert.doesNotMatch(restore, /pg_restore[^\n]*--clean|pg_restore[^\n]*--create/u);
   assert.match(compose, /RESTORE_SECRET_ACCESS_KEY: \$\{RESTORE_SECRET_ACCESS_KEY:\?required\}/u);

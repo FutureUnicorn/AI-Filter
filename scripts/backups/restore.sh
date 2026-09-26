@@ -143,7 +143,14 @@ while IFS= read -r entry; do
   stage=storage_object_fetch
   mc --quiet cp --version-id "$object_version_id" \
     "source/$BACKUP_BUCKET/$RESTORE_SOURCE_ENV/storage/current/$object_name" \
+    "$work_dir/pinned-object" >/dev/null 2>&1
+  # A direct S3-to-S3 copy has selected the later current version on Linux
+  # despite --version-id. Stage one object privately so the recovered bytes
+  # are exactly those returned by the pinned-version download.
+  stage=storage_object_upload
+  mc --quiet cp "$work_dir/pinned-object" \
     "recovered/af69-recovered/$object_name" >/dev/null 2>&1
+  rm -f "$work_dir/pinned-object"
 done <"$validated_catalog_file"
 
 stage=application_records

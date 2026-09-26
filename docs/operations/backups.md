@@ -215,7 +215,8 @@ real, successfully published schema-version-3 backup from that environment.
    `RESTORE_POSTGRES_PASSWORD`, `RESTORE_STORAGE_ACCESS_KEY_ID`, and
    `RESTORE_STORAGE_SECRET_ACCESS_KEY`. The source endpoint must be HTTPS.
    Ensure the Compose host has enough free disk for the full compressed dump,
-   restored database, and object store. Use an encrypted host disk and restrict
+   restored database, object store, and one temporarily staged object. Use an
+   encrypted host disk and restrict
    Docker-daemon access: the temporary restore volume contains a plaintext
    archive while the drill runs. Do not run `docker compose config`
    with live secrets: it prints expanded environment values.
@@ -234,8 +235,9 @@ real, successfully published schema-version-3 backup from that environment.
    fetches only `manifests/latest.json`, checks its strict contract, downloads
    the *recorded version* of the dump, verifies byte count, SHA-256 and
    `pg_restore --list`, then executes a real transactional `pg_restore`.
-   Exact-version object copies from the checksum-verified catalog go to the
-   fresh `af69-recovered` bucket;
+   Each exact-version object from the checksum-verified catalog is downloaded
+   to the private restore workspace and then uploaded to the fresh
+   `af69-recovered` bucket;
    every uploaded/validated `file_intakes.storage_key` must resolve there,
    and validated objects must match their stored SHA-256 content digest.
    Tool output and object keys remain out of the retained structured log.
