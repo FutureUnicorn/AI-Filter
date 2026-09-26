@@ -4233,6 +4233,28 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
       truncatedByIdle: abandoned.truncatedByIdle
     });
 
+    // A zero-duration span is not a measurement. sealReviewTiming refuses
+    //    to emit one; this proves the database refuses to store one too, so
+    //    a direct writer cannot put an application into the measured sample
+    //    with no measured time, which would lower the assisted median and
+    //    inflate the reported review-time reduction.
+    let zeroDurationRejection = "";
+    try {
+      await admin.query(
+        `INSERT INTO review_timing_spans
+           (application_id, organization_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ($1, $2, $3, now() - INTERVAL '5 minutes', now(), 0, false)`,
+        [applicationId, orgA, reviewerId]
+      );
+    } catch (error) {
+      zeroDurationRejection = error instanceof Error ? error.message : String(error);
+    }
+    if (!/review_timing_spans_active_is_measured/u.test(zeroDurationRejection)) {
+      throw new Error(
+        `a zero-duration span must be refused by the database; got: ${zeroDurationRejection || "accepted"}`
+      );
+    }
+
     // 2. A span cannot claim more active time than the wall clock it
     //    sits inside. This is the check that catches a client sending a
     //    fabricated duration, which would quietly corrupt the baseline.
@@ -4253,7 +4275,11 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         "2026-08-29T15:00:00Z",
         "2026-08-29T15:01:00Z",
         -5,
-        "review_timing_spans_active_ms_check"
+        // Either constraint is a correct refusal. active_is_measured
+        // (active_ms > 0) subsumes the original >= 0 check and fires first
+        // for a negative, so this asserts the rule, that negative active
+        // time is refused, rather than which guard happens to catch it.
+        "review_timing_spans_active_(ms_check|is_measured)"
       ],
       [
         "a span that ended before it started",
@@ -4261,12 +4287,15 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgA,
         "2026-08-29T16:00:00.500Z",
         "2026-08-29T16:00:00.000Z",
-        0,
+        1,
         // The claim worth checking mechanically: this reversal is caught
-        // by the ordering constraint specifically, not shadowed by the
-        // wall-clock bound. Half a second backwards with zero active
-        // time satisfies that one (0 <= -500 + 1000), so it has to be
-        // this constraint or none.
+        // by the ordering constraint specifically, not shadowed by either
+        // of the others. One millisecond of active time satisfies the
+        // wall-clock bound (1 <= -500 + 1000) and satisfies
+        // active_is_measured (1 > 0), so it has to be this constraint or
+        // none. It was zero until active_is_measured was added, which
+        // would have made that new constraint fire first and hidden what
+        // this case is actually testing.
         "review_timing_spans_ordered"
       ],
       [
@@ -4304,7 +4333,10 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
           });
         }
       }
-      if (tripped !== constraint) {
+      // constraint may name a single guard or a set of acceptable ones,
+      // for the cases where two constraints both correctly refuse and
+      // which fires first is not the property under test.
+      if (tripped === undefined || !new RegExp(`^${constraint}$`, "u").test(tripped)) {
         throw new Error(
           tripped === undefined
             ? `${label} must not be recordable as review timing`

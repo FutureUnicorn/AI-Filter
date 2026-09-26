@@ -1943,6 +1943,18 @@ export function summarizeReviewTiming(
     if (partiallyObserved.has(span.applicationId)) {
       continue;
     }
+    // A zero-duration span is not a measurement. AF-54 now refuses to
+    // accept or store one, at the contract and at the database, but rows
+    // written before those constraints existed are still readable here,
+    // and this summary is what decides whether an application counts.
+    //
+    // Excluding it rather than summing it matters in both directions: a
+    // zero would pull the assisted median down and inflate the reported
+    // review-time reduction, and it would inflate sampleSize, which is the
+    // number AF-60 uses to say whether the figure can be trusted at all.
+    if (span.activeMs <= 0) {
+      continue;
+    }
     totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
   }
 

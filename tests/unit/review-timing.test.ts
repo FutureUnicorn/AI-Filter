@@ -134,3 +134,39 @@ test("span order does not change the answer", () => {
 test("a single measured application is its own median", () => {
   assert.equal(summarizeReviewTiming([span("a", 7_500)], 4).medianActiveMs, 7_500);
 });
+
+// AF-55 REV-001. AF-54 now refuses a zero-duration span at the contract and
+// at the database, but rows written before those constraints existed remain
+// readable, and this summary is what decides whether an application counts
+// as measured. A zero here does two things at once: it drags the assisted
+// median down, inflating the reported review-time reduction, and it inflates
+// sampleSize, which is the number AF-60 uses to say whether the figure can
+// be trusted at all. So the exclusion lives here too, not only upstream.
+
+test("a zero-duration span cannot make an application count as measured", () => {
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    reviewerUserId: "22222222-2222-4222-8222-222222222222",
+    truncatedByIdle: false
+  };
+  const summary = summarizeReviewTiming([
+    { ...base, applicationId: "a", activeMs: 60_000 },
+    { ...base, applicationId: "b", activeMs: 0 }
+  ]);
+  assert.equal(summary.sampleSize, 1, "the zero-time application must not be counted");
+  assert.equal(summary.medianActiveMs, 60_000, "and must not move the median");
+});
+
+test("an application with only zero-duration spans contributes nothing at all", () => {
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    reviewerUserId: "22222222-2222-4222-8222-222222222222",
+    truncatedByIdle: false
+  };
+  const summary = summarizeReviewTiming([
+    { ...base, applicationId: "only-zero", activeMs: 0 },
+    { ...base, applicationId: "only-zero", activeMs: 0 }
+  ]);
+  assert.equal(summary.sampleSize, 0, "no measured time means no sample");
+  assert.equal(summary.medianActiveMs, null, "and no median to report");
+});
