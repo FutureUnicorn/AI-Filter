@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -4240,6 +4240,598 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         throw new Error(`a recorded timing span must be immutable; permitted: ${statement}`);
       }
     }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-61: prove the retention purge blockers against the real schema ----
+
+export interface RetentionPurgeProbe {
+  /**
+   * Every purge the plan calls blocked, mapped to the database's own
+   * rejection message.
+   */
+  readonly failures: Record<string, string>;
+  /**
+   * Every purge the plan calls possible, mapped to the number of rows it
+   * actually removed. A surface the plan calls blocked while the
+   * database deletes it happily is wrong in the other direction: the
+   * privacy notice then overstates what is retained, which is still a
+   * false statement to a candidate.
+   */
+  readonly permitted: Record<string, number>;
+  /**
+   * REV-004: every migration file the probe applied, in the order it
+   * applied them, so a test can check that it is the whole directory in the
+   * runner's order rather than a hand-picked subset.
+   */
+  readonly appliedMigrations: readonly string[];
+  /**
+   * REV-004: every foreign key in the fully migrated schema, read from
+   * pg_constraint rather than from anyone's memory of the migrations. The
+   * hand-picked migration list is how five blockers on applications were
+   * reported as two: nothing failed when the schema gained a table that
+   * references a planned surface.
+   */
+  readonly foreignKeys: readonly RetentionForeignKey[];
+  /** Column names per table, so an exemption can prove what a table does not hold. */
+  readonly tableColumns: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface RetentionForeignKey {
+  readonly referencing: string;
+  readonly referenced: string;
+  readonly constraint: string;
+}
+
+/**
+ * Every migration, in the order infra/compose/runtime.yml applies them.
+ *
+ * That runner is a shell glob over /migrations/*.sql, which sorts
+ * bytewise, and it replays every file on every run with no manifest. Two
+ * things make a naive "apply everything" wrong. readdirSync's order is the
+ * filesystem's, not sorted: APFS happens to return it sorted and ext4,
+ * which CI runs on, does not, so an unsorted loop passes locally and runs
+ * 0016 before 0015 in CI. And the sort must be the default code-unit sort,
+ * never localeCompare, because bytewise is what the runner does and this
+ * branch has two files sharing the 0009 prefix, which have to run in the
+ * order every environment has run them.
+ */
+export function listMigrationsInRunnerOrder(): readonly string[] {
+  return readdirSync(MIGRATIONS_DIRECTORY)
+    .filter((file) => /^\d{4}_[a-z0-9_]+\.sql$/u.test(file))
+    .sort();
+}
+
+/**
+ * The domain's retention plan claims a disposition for every surface.
+ * This proves each one against a real Postgres, rather than leaving the
+ * claim resting on my reading of the migrations -- the same
+ * two-readings-must-agree shape as AF-57's card/metric check, applied to
+ * a claim that will end up in a privacy notice.
+ *
+ * Both directions are proved, not just the blocked one. The first
+ * revision of this probe covered evidence_outcomes, applications and
+ * file_intakes only, and the three surfaces it left to unit tests
+ * reading the plan's own static content included two the plan had
+ * wrong: canonical_text_extractions and import_rows are directly
+ * deletable, because nothing references them and no trigger guards
+ * them. Only the cascade route through file_intakes is blocked, and
+ * reasoning from that route alone is what produced the wrong
+ * disposition. Asserting the permitted deletes is what stops that
+ * recurring.
+ *
+ * If a future migration ever unblocks a blocked path, or pins a
+ * currently free one, the assertion here is what makes it visible.
+ */
+export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<RetentionPurgeProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `ret_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  // A second intake with the same dependents but no application, so the
+  // cascade the plan describes can be shown to work where nothing pins
+  // the parent. Without it "cascades from file_intakes" is a claim about
+  // a path no test ever walks.
+  const freeIntakeId = "55555555-5555-4555-8555-555555555556";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  // A second application carrying a decision and no evidence, so the
+  // candidate_decisions foreign key can be shown to block on its own.
+  // On the first application the evidence_outcomes constraint is checked
+  // first and is all the error names, which is how it stayed hidden.
+  const decidedApplicationId = "44444444-4444-4444-8444-444444444445";
+  // REV-003: three more, one per remaining blocker, each pinned by that
+  // dependent and nothing else. The detail once named two blockers
+  // because nobody enumerated the schema; there are five, and a blocker
+  // without its own application is one this probe cannot tell apart.
+  const sampledApplicationId = "44444444-4444-4444-8444-444444444446";
+  const timedApplicationId = "44444444-4444-4444-8444-444444444447";
+  // On its own intake, so its processed ledger row does not change what
+  // "import_rows:delete" removes from the first intake.
+  const importedIntakeId = "55555555-5555-4555-8555-555555555557";
+  const importedApplicationId = "44444444-4444-4444-8444-444444444448";
+  const auditSampleId = "88888888-8888-4888-8888-888888888888";
+  const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const decisionId = "77777777-7777-4777-8777-777777777777";
+  // Doubles as the request_id body: audit_events CHECKs request_id
+  // against req_ + a version-4 UUID, so reusing this one keeps the seed
+  // honest instead of inventing a second literal that has to match.
+  const auditEventId = "99999999-9999-4999-8999-999999999999";
+  const extractionRunId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const failures: Record<string, string> = {};
+  const permitted: Record<string, number> = {};
+
+  const countRows = async (sql: string, params: readonly unknown[]): Promise<number> => {
+    const result = await admin.query<{ count: string }>(sql, [...params]);
+    return Number(result.rows[0]?.count ?? 0);
+  };
+
+  /**
+   * A bare catch here would record any error as a retention blocker,
+   * including a typo: "relation does not exist" is SQLSTATE 42P01 and
+   * reads exactly like a refusal. So the caller states which refusal it
+   * expects, and for a referential one, which constraint had to be the
+   * refusing party.
+   */
+  const expectRejected = async (
+    label: string,
+    expected: { readonly sqlstate: string; readonly constraint?: string },
+    sql: string
+  ): Promise<void> => {
+    let refusal: unknown;
+    let refused = false;
+    try {
+      await admin.query(sql);
+    } catch (error) {
+      refused = true;
+      refusal = error;
+    }
+    if (!refused) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`
+      );
+    }
+    const sqlstate = (refusal as { code?: unknown }).code;
+    const constraint = (refusal as { constraint?: unknown }).constraint;
+    const message = refusal instanceof Error ? refusal.message : String(refusal);
+    if (sqlstate !== expected.sqlstate) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused with SQLSTATE ${String(sqlstate)}, ` +
+          `expected ${expected.sqlstate}. The probe is testing something other than it thinks: ${message}`
+      );
+    }
+    if (expected.constraint !== undefined && constraint !== expected.constraint) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused by constraint ${String(constraint)}, ` +
+          `expected ${expected.constraint}: ${message}`
+      );
+    }
+    failures[label] = message;
+  };
+
+  /**
+   * The mirror of the above, for a surface the plan says can be purged.
+   * Guarded on rows being present first: a DELETE matching nothing
+   * violates no foreign key and fires no row trigger, so it reports
+   * success for a reason that proves nothing at all.
+   */
+  const expectPermitted = async (
+    label: string,
+    deleteSql: string,
+    countSql: string,
+    params: readonly unknown[]
+  ): Promise<void> => {
+    const before = await countRows(countSql, params);
+    if (before === 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" needs rows present; a DELETE affecting none of them ` +
+          `succeeds without proving the surface is purgeable`
+      );
+    }
+    const deleted = await admin.query(deleteSql, [...params]);
+    const after = await countRows(countSql, params);
+    if (after !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" reported success but ${after} row(s) are still there`
+      );
+    }
+    permitted[label] = deleted.rowCount ?? 0;
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    // REV-004: the whole schema, as the migrate service builds it, not the
+    // tables someone already thought of. A blocker nobody listed a
+    // migration for is a blocker this probe could never find.
+    const appliedMigrations = listMigrationsInRunnerOrder();
+    for (const file of appliedMigrations) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    // Applying every migration brings in 0004_tenant_scoped_rls.sql, which
+    // puts FORCE ROW LEVEL SECURITY on memberships. Seeding a membership
+    // without a tenant then works only because the probe happens to connect
+    // as a superuser, which bypasses RLS. Setting the tenant makes the seed
+    // hold under an ordinary role too, instead of depending on that.
+    await admin.query(`SELECT set_config('app.current_org_id', $1, false)`, [org]);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `ret_${suffix}@acme.test`
+    ]);
+    // candidate_decisions requires the decider to hold a membership in
+    // the organization, not merely to exist as a user.
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter')`, [
+      org,
+      userId
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'candidates.csv','text/csv','imported',$5)`,
+      [importedIntakeId, org, roleId, `key-${suffix}-imported`, userId]
+    );
+    for (const intake of [intakeId, freeIntakeId]) {
+      await admin.query(
+        `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+           declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+        [intake, org, roleId, `key-${suffix}-${intake.slice(-1)}`, userId]
+      );
+      await admin.query(
+        `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+         VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+        [intake]
+      );
+      // A failed row, because failure_reason is the column that holds
+      // candidate text: it quotes the row it could not parse.
+      await admin.query(
+        `INSERT INTO import_rows (intake_id, row_number, outcome, failure_reason)
+         VALUES ($1, 1, 'failed', 'could not parse: Jane Doe,jane@example.test')`,
+        [intake]
+      );
+    }
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, org, roleId, intakeId]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,2,'Jo Roe','jo@example.test')`,
+      [decidedApplicationId, org, roleId, intakeId]
+    );
+    for (const [pinnedId, row] of [
+      [sampledApplicationId, 3],
+      [timedApplicationId, 4]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email)
+         VALUES ($1,$2,$3,$4,$5,'Pat Poe','pat${row}@example.test')`,
+        [pinnedId, org, roleId, intakeId, row]
+      );
+    }
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Sam Soe','sam@example.test')`,
+      [importedApplicationId, org, roleId, importedIntakeId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size, eligible_count,
+         drawn_by_user_id)
+       VALUES ($1,$2,$3,'ret-probe',1,1,$4)`,
+      [auditSampleId, org, roleId, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, org, sampledApplicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at, ended_at,
+         active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-08-29T12:00:00Z','2026-08-29T12:01:00Z',60000,false)`,
+      [org, timedApplicationId, userId]
+    );
+    // What every CSV import writes: the processed ledger row for the
+    // application it created. Its FK is ON DELETE SET NULL, and the CHECK
+    // that a processed row keeps its application_id is what refuses.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id) VALUES ($1,1,'processed',$2)`,
+      [importedIntakeId, importedApplicationId]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1,$2,$3,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
+      [outcomeId, org, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (decision_id, organization_id, application_id, decision, rationale,
+         decided_by_user_id)
+       VALUES ($1,$2,$3,'decline','Jo Roe has no Python depth on the CV',$4)`,
+      [decisionId, org, decidedApplicationId, userId]
+    );
+    // REV-001: the two surfaces whose link to a candidate is a
+    // polymorphic entity_type/entity_id text pair rather than a foreign
+    // key. Written exactly as production writes them -- the recorded
+    // action is per-application, so the entity IS the application -- so
+    // that what the probe proves is the ordinary case and not a
+    // hypothetical one. No foreign key means pg_constraint cannot see
+    // the association at all, which is why evidence_extraction_runs was
+    // missing from the plan and audit_events was in it under a
+    // disposition that said it held nothing candidate-derived.
+    await admin.query(
+      `INSERT INTO audit_events (audit_event_id, organization_id, actor_user_id, action, entity_type,
+         entity_id, request_id)
+       VALUES ($1,$2,$3,'decision_recorded','application',$4,$5)`,
+      [auditEventId, org, userId, decidedApplicationId, `req_${auditEventId}`]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (run_id, organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,$2,'application',$3,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [extractionRunId, org, applicationId]
+    );
+
+    // 1. The append-only surfaces. P0001 is what RAISE EXCEPTION in
+    //    reject_append_only_mutation() reports.
+    await expectRejected(
+      "evidence_outcomes:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM evidence_outcomes WHERE evidence_outcome_id = '${outcomeId}'`
+    );
+    await expectRejected(
+      "evidence_outcomes:redact",
+      { sqlstate: "P0001" },
+      `UPDATE evidence_outcomes SET outcome = '{"kind":"supported","criterionId":"python"}'::jsonb
+        WHERE evidence_outcome_id = '${outcomeId}'`
+    );
+    await expectRejected(
+      "candidate_decisions:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM candidate_decisions WHERE decision_id = '${decisionId}'`
+    );
+    await expectRejected(
+      "candidate_decisions:redact",
+      { sqlstate: "P0001" },
+      `UPDATE candidate_decisions SET rationale = 'redacted' WHERE decision_id = '${decisionId}'`
+    );
+    // REV-001. Both directions on both polymorphic surfaces, because the
+    // plan's claim is that the application identifier can be neither
+    // removed nor blanked. audit_events raises through
+    // reject_audit_event_mutation and evidence_extraction_runs through
+    // the generic reject_append_only_mutation; both report P0001.
+    await expectRejected(
+      "audit_events:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_events WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "audit_events:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_events SET entity_id = 'redacted' WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM evidence_extraction_runs WHERE run_id = '${extractionRunId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:redact",
+      { sqlstate: "P0001" },
+      `UPDATE evidence_extraction_runs SET entity_id = 'redacted' WHERE run_id = '${extractionRunId}'`
+    );
+    // The two that declare the link properly and were still unclassified.
+    // Their rows are the ones seeded to pin sampledApplicationId and
+    // timedApplicationId, and the refusals here are why those pins hold:
+    // the dependent cannot be deleted first to clear the way.
+    await expectRejected(
+      "audit_sample_members:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_sample_members WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "audit_sample_members:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_sample_members SET application_id = '${applicationId}'
+        WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM review_timing_spans WHERE application_id = '${timedApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:redact",
+      { sqlstate: "P0001" },
+      `UPDATE review_timing_spans SET reviewer_user_id = '${userId}'
+        WHERE application_id = '${timedApplicationId}'`
+    );
+
+    // 2. The referential blockers, each named by the constraint that
+    //    refused rather than by a substring of the message. One
+    //    application per blocker because Postgres reports only the first
+    //    constraint it checks, so one row carrying several dependents
+    //    would prove one of them and hide the rest.
+    await expectRejected(
+      "applications:delete",
+      { sqlstate: "23503", constraint: "evidence_outcomes_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${applicationId}'`
+    );
+    await expectRejected(
+      "applications:delete_pinned_only_by_a_decision",
+      { sqlstate: "23503", constraint: "candidate_decisions_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${decidedApplicationId}'`
+    );
+    // REV-003: the other three, each on an application nothing else
+    // pins. Proved to be single-dependent first, because a second
+    // dependent would let the refusal come from the wrong constraint and
+    // still name the right one only by the luck of check order.
+    const pinnedBy: ReadonlyArray<readonly [string, string]> = [
+      [applicationId, "evidence_outcomes"],
+      [decidedApplicationId, "candidate_decisions"],
+      [sampledApplicationId, "audit_sample_members"],
+      [timedApplicationId, "review_timing_spans"],
+      [importedApplicationId, "import_rows"]
+    ];
+    for (const [pinnedId, onlyDependent] of pinnedBy) {
+      const dependents = await admin.query<{ source: string; count: string }>(
+        `SELECT source, count(*)::text AS count FROM (
+           SELECT 'evidence_outcomes' AS source FROM evidence_outcomes WHERE application_id = $1
+           UNION ALL SELECT 'candidate_decisions' FROM candidate_decisions WHERE application_id = $1
+           UNION ALL SELECT 'audit_sample_members' FROM audit_sample_members WHERE application_id = $1
+           UNION ALL SELECT 'review_timing_spans' FROM review_timing_spans WHERE application_id = $1
+           UNION ALL SELECT 'import_rows' FROM import_rows WHERE application_id = $1
+         ) AS d GROUP BY source ORDER BY source`,
+        [pinnedId]
+      );
+      const found = dependents.rows.map((row) => `${row.source}=${row.count}`).join(", ");
+      if (found !== `${onlyDependent}=1`) {
+        throw new Error(
+          `assertRetentionPurgeBlockers: application ${pinnedId} must be pinned only by one ${onlyDependent} row, ` +
+            `found: ${found || "none"}`
+        );
+      }
+    }
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_audit_sample",
+      { sqlstate: "23503", constraint: "audit_sample_members_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "applications:delete_pinned_only_by_a_timing_span",
+      { sqlstate: "23503", constraint: "review_timing_spans_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${timedApplicationId}'`
+    );
+    // 23514, not 23503: the FK itself would allow the delete by nulling
+    // the reference, and it is the ledger's CHECK that refuses the null.
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_import_row",
+      { sqlstate: "23514", constraint: "import_rows_check" },
+      `DELETE FROM applications WHERE application_id = '${importedApplicationId}'`
+    );
+    await expectRejected(
+      "file_intakes:delete",
+      { sqlstate: "23503", constraint: "applications_intake_id_fkey" },
+      `DELETE FROM file_intakes WHERE intake_id = '${intakeId}'`
+    );
+
+    // 3. The surfaces the plan says are purgeable, proved by purging
+    //    them. Nothing references either table and neither carries a
+    //    trigger, so the row goes directly, whatever the cascade route
+    //    through file_intakes does.
+    await expectPermitted(
+      "canonical_text_extractions:delete",
+      `DELETE FROM canonical_text_extractions WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    await expectPermitted(
+      "import_rows:delete",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    // 3b. The ordering the plan states: purge import_rows, and the
+    //     application it was the only thing pinning then goes. Without
+    //     this, "import_rows must be purged before applications" is a
+    //     claim no test walks, and it doubles as the control that the
+    //     import-row application was pinned by nothing else.
+    await expectPermitted(
+      "import_rows:delete_processed_row",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [importedIntakeId]
+    );
+    await expectPermitted(
+      "applications:delete_after_import_rows_purged",
+      `DELETE FROM applications WHERE application_id = $1`,
+      `SELECT count(*)::text AS count FROM applications WHERE application_id = $1`,
+      [importedApplicationId]
+    );
+
+    // 4. The cascade the plan describes is real, shown on the intake
+    //    nothing pins. This is the route that IS blocked for the first
+    //    intake, and asserting it here is what keeps the plan's
+    //    explanation of why honest.
+    const cascading = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (cascading !== 2) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: the cascade check needs both dependents present, found ${cascading}`
+      );
+    }
+    await expectPermitted(
+      "file_intakes:delete_when_unreferenced",
+      `DELETE FROM file_intakes WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM file_intakes WHERE intake_id = $1`,
+      [freeIntakeId]
+    );
+    const orphaned = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (orphaned !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: deleting an unreferenced file_intake left ${orphaned} dependent row(s), ` +
+          `so the plan's "cascades from file_intakes" is wrong`
+      );
+    }
+    permitted["canonical_text_extractions:cascade_from_file_intakes"] = 1;
+    permitted["import_rows:cascade_from_file_intakes"] = 1;
+
+    // 5. The candidate's identity survived every blocked path, which is
+    //    the finding the privacy statement is written from.
+    const surviving = await admin.query<{ candidate_full_name: string }>(
+      `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
+      [applicationId]
+    );
+    if (surviving.rows[0]?.candidate_full_name !== "Jane Doe") {
+      throw new Error("assertRetentionPurgeBlockers: expected the candidate row to have survived every purge attempt");
+    }
+    const foreignKeys = await admin.query<RetentionForeignKey>(
+      `SELECT rel.relname AS referencing, ref.relname AS referenced, c.conname AS constraint
+         FROM pg_constraint c
+         JOIN pg_class rel ON rel.oid = c.conrelid
+         JOIN pg_class ref ON ref.oid = c.confrelid
+         JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE c.contype = 'f' AND n.nspname = $1
+        ORDER BY 2, 1, 3`,
+      [schema]
+    );
+    const columns = await admin.query<{ table_name: string; column_name: string }>(
+      `SELECT table_name, column_name FROM information_schema.columns
+        WHERE table_schema = $1 ORDER BY table_name, column_name`,
+      [schema]
+    );
+    const tableColumns: Record<string, string[]> = {};
+    for (const row of columns.rows) {
+      (tableColumns[row.table_name] ??= []).push(row.column_name);
+    }
+    return { failures, permitted, appliedMigrations, foreignKeys: foreignKeys.rows, tableColumns };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

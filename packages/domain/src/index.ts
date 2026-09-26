@@ -2326,6 +2326,412 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-61: retention policy ----
+//
+// "Default retention window for raw candidate data (e.g. 30-90 days),
+// configurable per contract, applied consistently across object storage,
+// canonical text, and derived indexes."
+//
+// "Consistently" is the whole ticket, and the honest finding is that it
+// is not currently achievable. Measured against the real migrations, on
+// a candidate with one document, one evidence outcome and one decision,
+// the deletion paths split in two:
+//
+//   DELETE evidence_outcomes   -> append-only trigger rejects DELETE
+//   UPDATE evidence_outcomes   -> append-only trigger rejects UPDATE too,
+//                                 so the quote cannot even be redacted
+//   DELETE candidate_decisions -> append-only, DELETE and UPDATE both
+//   DELETE applications        -> refused by five independent constraints,
+//                                 any one of which is enough: the FKs from
+//                                 evidence_outcomes, candidate_decisions,
+//                                 audit_sample_members and
+//                                 review_timing_spans (23503), and
+//                                 import_rows_check, which the FK's
+//                                 ON DELETE SET NULL trips (23514)
+//   DELETE file_intakes        -> FK violation from applications
+//   DELETE audit_events        -> append-only, DELETE and UPDATE both
+//   DELETE evidence_extraction_runs -> append-only, DELETE and UPDATE both
+//
+//   DELETE canonical_text_extractions -> permitted, the row goes
+//   DELETE import_rows                -> permitted, the row goes
+//
+// So the two surfaces the ticket names directly, canonical text and a
+// derived index, can be purged on time today. What cannot is the layer
+// the ticket does not mention: candidate_full_name and candidate_email
+// on applications, declared_filename on file_intakes, the verbatim
+// quote on evidence_outcomes and the rationale on candidate_decisions.
+//
+// And below that, a layer that is not text at all: the application
+// identifier, written into audit_events and evidence_extraction_runs
+// through a polymorphic entity_type/entity_id pair. It reads as
+// metadata and is not -- it is the key that re-links every surviving
+// row above to one person, and both tables are append-only, so it
+// cannot be removed or redacted either.
+//
+// Every line above is asserted against a real Postgres by
+// assertRetentionPurgeBlockers, the permitted ones included. The first
+// revision of this module called canonical_text_extractions and
+// import_rows blocked, reasoning from their cascade through file_intakes
+// and never trying the direct DELETE, and the probe is what disproved
+// it. A plan that overstates what survives is wrong in the same way as
+// one that understates it, which is why both directions are proved.
+//
+// That the blocked half is blocked is not a bug in any one migration:
+// 0016_evidence_outcomes.sql is append-only because an evidence record
+// that can be edited after the fact cannot serve as an audit trail, and
+// it deliberately has no ON DELETE CASCADE because a cascade issues a
+// DELETE that the very same trigger rejects (the AF-20 defect).
+// 0019_candidate_decisions.sql repeats both decisions for the same
+// stated reasons, and so do 0020_audit_samples.sql and
+// 0021_review_timing.sql. Each is right on its own terms and together
+// they make a complete purge unimplementable.
+//
+// So this module does NOT pretend to purge. It produces a plan in which
+// every surface carries an explicit disposition, blocked ones say why,
+// and summarizeSurvivingCandidateData reports what is still there
+// afterwards -- because a privacy notice written from an optimistic
+// retention policy is a false statement to a candidate, which is a
+// materially worse outcome than an honest "we keep quotes indefinitely".
+//
+// The unblocking design is named, not built: encrypt candidate-derived
+// text under a per-candidate key and delete the key at expiry. The
+// append-only row survives intact, so the audit trail holds, while its
+// readable content does not. That is a schema and key-management change
+// well beyond this ticket and needs a human decision, so AF-61 stops at
+// telling the truth about the current state.
+
+// REV-001: two surfaces link to a candidate through a polymorphic
+// entity_type/entity_id text pair rather than a foreign key, and both
+// were mishandled because of it.
+//
+// evidence_extraction_runs (0006_evidence_extraction_runs.sql) was
+// absent from this list altogether. The inventory that would have caught
+// the omission reads pg_constraint, and there is no constraint to read:
+// the link to an application is two text columns. A table invisible to
+// the check that finds unaccounted tables is exactly the one that goes
+// unaccounted for.
+//
+// audit_events was listed, and classified no_candidate_data. It holds no
+// candidate TEXT -- AF-21's redaction and the closed context allowlist
+// are real -- but entity_type and entity_id are free text constrained
+// only by length > 0, and two of the four audit actions
+// (evidence_corrected, decision_recorded) are per-application by
+// definition. So the identifier of a candidate's application is written
+// there in the ordinary course of business, and an identifier is not a
+// lesser kind of candidate data for retention purposes: it is the thing
+// that re-links every surviving record to a person. Both tables are
+// append-only, so it can be neither deleted nor redacted.
+export const RETENTION_SURFACES = [
+  "object_storage_documents",
+  "file_intakes",
+  "canonical_text_extractions",
+  "import_rows",
+  "applications",
+  "evidence_outcomes",
+  "candidate_decisions",
+  "audit_events",
+  "evidence_extraction_runs",
+  // The same rule one step further out. These two declare their link to
+  // a candidate properly, with a composite foreign key onto
+  // applications, so the reference inventory could always see them -- and
+  // saw them accounted for, because the applications detail names both
+  // as blockers. Being named as something that pins another surface is
+  // not the same as being classified as a surface, and nothing was
+  // checking for the difference. Both are append-only and both keep an
+  // application identifier past any cutoff.
+  "audit_sample_members",
+  "review_timing_spans"
+] as const;
+
+export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
+
+export type RetentionDisposition =
+  /** Can be deleted at expiry today. */
+  | "purge"
+  /** Holds candidate data that an append-only guarantee forbids removing. */
+  | "blocked_append_only"
+  /** Deletable in principle, but a foreign key from a blocked surface pins it. */
+  | "blocked_by_reference"
+  /** In scope for completeness; holds no candidate-derived content. */
+  | "no_candidate_data";
+
+export interface RetentionSurfacePlan {
+  readonly surface: RetentionSurface;
+  readonly disposition: RetentionDisposition;
+  /** What candidate-derived content this surface holds, in plain words. */
+  readonly holds: string;
+  /** Why the disposition is what it is. Never empty for a blocked surface. */
+  readonly detail: string;
+}
+
+export interface RetentionPolicy {
+  readonly organizationId: string;
+  readonly windowDays: number;
+  /**
+   * Required once the window exceeds the standard range, so an unusually
+   * long retention is traceable to something someone signed rather than
+   * to a config value nobody remembers setting.
+   */
+  readonly contractReference?: string | undefined;
+}
+
+/** The ticket's stated norm. Anything longer needs a contract reference. */
+export const RETENTION_STANDARD_MAX_DAYS = 90;
+/** Shortest of the stated range: a default that errs long keeps candidate data by accident. */
+export const RETENTION_DEFAULT_DAYS = 30;
+/** A hard ceiling, so a typo cannot become a decade. */
+export const RETENTION_ABSOLUTE_MAX_DAYS = 3650;
+
+export function validateRetentionPolicy(policy: RetentionPolicy): void {
+  if (!Number.isInteger(policy.windowDays) || policy.windowDays < 1) {
+    throw new Error(
+      `retention windowDays must be a positive whole number of days, got: ${policy.windowDays}`
+    );
+  }
+  if (policy.windowDays > RETENTION_ABSOLUTE_MAX_DAYS) {
+    throw new Error(
+      `retention windowDays ${policy.windowDays} exceeds the absolute maximum of ${RETENTION_ABSOLUTE_MAX_DAYS}`
+    );
+  }
+  if (policy.windowDays > RETENTION_STANDARD_MAX_DAYS) {
+    const reference = policy.contractReference?.trim() ?? "";
+    if (reference.length === 0) {
+      throw new Error(
+        `a retention window of ${policy.windowDays} days exceeds the standard ` +
+          `${RETENTION_STANDARD_MAX_DAYS} days and requires a contractReference`
+      );
+    }
+  }
+}
+
+/**
+ * Records created at or before this instant are past their window.
+ *
+ * Computed from an explicit `now` rather than reading the clock, so the
+ * same policy evaluated twice in one purge run cannot straddle midnight
+ * and delete a different set the second time.
+ */
+export function computeRetentionCutoff(policy: RetentionPolicy, now: Date): string {
+  validateRetentionPolicy(policy);
+  const cutoff = new Date(now.getTime() - policy.windowDays * 24 * 60 * 60 * 1000);
+  return cutoff.toISOString();
+}
+
+const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePlan, "surface">>> = {
+  object_storage_documents: {
+    disposition: "purge",
+    holds: "the uploaded document itself",
+    detail: "Deletable by storage key; nothing in the database references the object's bytes."
+  },
+  file_intakes: {
+    disposition: "blocked_by_reference",
+    holds:
+      "declared_filename, which routinely contains the candidate's name, and " +
+      "storage_key, which embeds that same filename",
+    detail:
+      "DELETE fails with a foreign key violation from applications. The filename is easy to " +
+      "overlook as PII and is often exactly 'Firstname_Lastname_CV.pdf'."
+  },
+  canonical_text_extractions: {
+    disposition: "purge",
+    holds: "the full extracted text of the candidate's document",
+    detail:
+      "Deletable directly by intake_id. Nothing references this table and it carries no " +
+      "append-only trigger, so the row goes. It also cascades away with its file_intake, and " +
+      "that route is blocked while an application references the intake, but it is not the " +
+      "only route: reading the cascade alone is what previously made this surface look " +
+      "blocked. The largest single store of raw candidate text, and it can go on time. " +
+      "Purging it does leave the citation quotes in evidence_outcomes with no source text to " +
+      "validate against, which is a consequence to accept deliberately rather than discover."
+  },
+  import_rows: {
+    disposition: "purge",
+    holds: "failure_reason, which can quote the offending row",
+    detail:
+      "Deletable directly by intake_id, for the same reason as canonical_text_extractions: " +
+      "nothing references it and no trigger guards it. The cascade from file_intakes is " +
+      "blocked, but it is not the only route. Purging it drops rows from the per-row import " +
+      "ledger, so AF-32's 'every input row is accounted for' stops holding once an intake " +
+      "has expired. Its processed rows are also one of the five things that pin applications, " +
+      "so any purge that reaches applications has to purge import_rows first."
+  },
+  applications: {
+    disposition: "blocked_by_reference",
+    holds: "candidate_full_name, candidate_email, external_reference_id",
+    detail:
+      "DELETE is refused by five independent constraints, any one of which is enough on its " +
+      "own. Four are uncascaded foreign keys from append-only tables, each refused with a " +
+      "foreign key violation: evidence_outcomes (0016_evidence_outcomes.sql), " +
+      "candidate_decisions (0019_candidate_decisions.sql), audit_sample_members " +
+      "(0020_audit_samples.sql) and review_timing_spans (0021_review_timing.sql). None carries " +
+      "ON DELETE CASCADE, deliberately, since a cascade issues a DELETE the append-only trigger " +
+      "would reject anyway, and the same trigger stops those rows being deleted first. The " +
+      "fifth is import_rows (0015_applications_and_import_finalization.sql): its foreign key " +
+      "is ON DELETE SET NULL, but import_rows_check requires a processed row to keep its " +
+      "application_id, so the SET NULL is refused with a check violation. Every CSV-imported " +
+      "application has a processed import row, so this applies to all of them, and import_rows " +
+      "must be purged before applications. Postgres names only the first refusal it meets, so " +
+      "unblocking any one of these independently leaves this surface blocked by the others."
+  },
+  evidence_outcomes: {
+    disposition: "blocked_append_only",
+    holds:
+      "citation quotes, which are verbatim candidate text, and correction_reason, " +
+      "free text a reviewer wrote about the candidate's evidence",
+    detail:
+      "Both DELETE and UPDATE are rejected by the append-only trigger, so the quote cannot be " +
+      "removed and cannot be redacted in place either. It is one of four append-only tables " +
+      "whose foreign keys pin applications, alongside candidate_decisions, " +
+      "audit_sample_members and review_timing_spans, so unblocking it alone frees nothing."
+  },
+  candidate_decisions: {
+    disposition: "blocked_append_only",
+    holds: "rationale, free text a human wrote about the candidate",
+    detail:
+      "Append-only for the same reason: a decision record that can be edited afterwards cannot " +
+      "evidence who decided what."
+  },
+  audit_events: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, which is a candidate's application identifier whenever entity_type is " +
+      "\"application\" -- what evidence_corrected and decision_recorded record by definition",
+    detail:
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "identifier can be neither removed nor redacted in place. It carries no candidate TEXT -- AF-21's " +
+      "redaction and the closed context allowlist keep that out, and that part of the earlier " +
+      "no_candidate_data classification was right -- but entity_type and entity_id are free text " +
+      "checked only for length, so nothing in the schema stops an application identifier being " +
+      "written here, and two of the four audit actions are per-application by definition. An " +
+      "identifier is what re-links every other surviving record to a person, so a retention statement " +
+      "that counts it as nothing is claiming more deletion than happens."
+  },
+  audit_sample_members: {
+    disposition: "blocked_append_only",
+    holds: "application_id, the identifier of a candidate drawn into an audit sample",
+    detail:
+      "Append-only (0020_audit_samples.sql): DELETE and UPDATE are both rejected. It carries no " +
+      "candidate text, only the identifier and the draw it belongs to, but the row is itself a " +
+      "statement about a named candidate -- that they were selected for audit -- and it is one of " +
+      "the four uncascaded foreign keys that pin applications, so it cannot go first either."
+  },
+  review_timing_spans: {
+    disposition: "blocked_append_only",
+    holds:
+      "application_id, plus reviewer_user_id and the start, end and active duration of every " +
+      "review of that candidate",
+    detail:
+      "Append-only (0021_review_timing.sql): DELETE and UPDATE are both rejected. Beyond the " +
+      "identifier this is behavioural data linking a named reviewer to a named candidate at a " +
+      "specific time, which is more than an aggregate input to AF-55's median. Another of the four " +
+      "uncascaded foreign keys pinning applications."
+  },
+  evidence_extraction_runs: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, an application identifier for every run this product writes " +
+      "(APPLICATION_ENTITY_TYPE), alongside provider, model and version strings that are not " +
+      "candidate-derived",
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql): DELETE and UPDATE are both rejected. Its " +
+      "association with an application is the polymorphic entity_type/entity_id pair and not a " +
+      "foreign key, which is why pg_constraint cannot see it and why this surface was missing from " +
+      "the plan rather than merely misclassified. listEvidenceExtractionRunsForEntities queries it " +
+      "by entity_type = \"application\" and a list of application identifiers, so the association is " +
+      "load-bearing production behaviour rather than a possibility the schema leaves open."
+  }
+};
+
+export interface RetentionPlan {
+  readonly organizationId: string;
+  readonly windowDays: number;
+  readonly cutoff: string;
+  readonly surfaces: readonly RetentionSurfacePlan[];
+}
+
+/**
+ * Every surface appears, always. A surface missing from a retention plan
+ * reads as "nothing to do there", which is the same failure mode as a
+ * missing section in AF-59's report and has the same fix: make omission
+ * unrepresentable rather than discouraged.
+ */
+export function planRetention(policy: RetentionPolicy, now: Date): RetentionPlan {
+  return {
+    organizationId: policy.organizationId,
+    windowDays: policy.windowDays,
+    cutoff: computeRetentionCutoff(policy, now),
+    surfaces: RETENTION_SURFACES.map((surface) => ({ surface, ...RETENTION_PLAN[surface] }))
+  };
+}
+
+export interface SurvivingCandidateData {
+  /** True when at least one surface still holds candidate data after expiry. */
+  readonly anySurvives: boolean;
+  /** Echoed from the input, so whoever renders the notice can see which case it is. */
+  readonly automatedDeletionActive: boolean;
+  readonly surfaces: readonly RetentionSurfacePlan[];
+  /**
+   * A sentence a privacy notice can be written from without it becoming a
+   * false statement to a candidate.
+   */
+  readonly statement: string;
+}
+
+export interface RetentionEnforcement {
+  /**
+   * Whether a purge executor is actually running for this deployment.
+   * Must be read from deployment configuration, never passed as a literal
+   * true: this decides whether a data subject is told their data is
+   * deleted. Required with no default, so the optimistic sentence cannot be
+   * reached by forgetting an argument, only by stating something false.
+   */
+  readonly automatedDeletionActive: boolean;
+}
+
+/**
+ * REV-005: the statement describes what actually happens, not what the
+ * policy would do if something enforced it. Nothing runs planRetention or
+ * deletes anything on a schedule yet, so with no executor the sentence
+ * says so outright, and says the data is kept past the window, rather
+ * than listing survivors in a way that implies everything unlisted is
+ * gone. Understating what we delete is safe; overstating it is a false
+ * statement to the person whose data it is.
+ *
+ * The anySurvives: false branch cannot be reached through planRetention
+ * today, because the plan always carries blocked surfaces, but
+ * RetentionPlan is exported and a hand-built plan reaches it, so it obeys
+ * the same rule and is tested rather than trusted.
+ */
+export function summarizeSurvivingCandidateData(
+  plan: RetentionPlan,
+  enforcement: RetentionEnforcement
+): SurvivingCandidateData {
+  const { automatedDeletionActive } = enforcement;
+  const surviving = plan.surfaces.filter(
+    (surface) =>
+      surface.disposition === "blocked_append_only" || surface.disposition === "blocked_by_reference"
+  );
+  const survivorList = surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ");
+  const notEnforced =
+    `Candidate data is not currently deleted automatically: no deletion process runs yet, so it is ` +
+    `kept after the ${plan.windowDays}-day retention window until one does.`;
+
+  let statement: string;
+  if (!automatedDeletionActive) {
+    statement =
+      surviving.length === 0
+        ? notEnforced
+        : `${notEnforced} Even once it does, the following cannot currently be deleted: ${survivorList}.`;
+  } else {
+    statement =
+      surviving.length === 0
+        ? `Raw candidate data is deleted ${plan.windowDays} days after intake.`
+        : `Raw candidate data is deleted ${plan.windowDays} days after intake, except the following, ` +
+          `which is retained and cannot currently be deleted: ${survivorList}.`;
+  }
+  return { anySurvives: surviving.length > 0, automatedDeletionActive, surfaces: surviving, statement };
+}
+
 // ---- AF-59: role-level audit report ----
 //
 // "The actual pilot deliverable: time saved, preservation, precision,
