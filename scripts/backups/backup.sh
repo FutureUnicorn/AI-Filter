@@ -400,13 +400,50 @@ run_once() {
     cleanup_run_files
     return 1
   }
-  # S3 object versions have subsecond timestamps. A seconds-only cutoff can
-  # exclude the final mirrored object when rewind is used during recovery.
-  if ! storage_cutoff_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"; then
+  # Some S3 version-listing paths have only second-level resolution. Fence the
+  # completed mirror into the next whole second, and do not publish until that
+  # entire second has passed. A later overwrite cannot share the rewind tick.
+  if ! mirror_finished_epoch="$(date -u +%s)"; then
     log_event error run_failed backup_timestamp "$backup_id"
     cleanup_run_files
     return 1
   fi
+  case "$mirror_finished_epoch" in
+    ''|*[!0-9]*)
+      log_event error run_failed backup_timestamp "$backup_id"
+      cleanup_run_files
+      return 1
+      ;;
+  esac
+  cutoff_epoch=$((mirror_finished_epoch + 1))
+  if ! storage_cutoff_at="$(date -u -d "@$cutoff_epoch" +%Y-%m-%dT%H:%M:%S.000Z)"; then
+    log_event error run_failed backup_timestamp "$backup_id"
+    cleanup_run_files
+    return 1
+  fi
+  fence_attempts=0
+  while :; do
+    if ! now_epoch="$(date -u +%s)"; then
+      log_event error run_failed backup_timestamp "$backup_id"
+      cleanup_run_files
+      return 1
+    fi
+    case "$now_epoch" in
+      ''|*[!0-9]*)
+        log_event error run_failed backup_timestamp "$backup_id"
+        cleanup_run_files
+        return 1
+        ;;
+    esac
+    [ "$now_epoch" -gt "$cutoff_epoch" ] && break
+    fence_attempts=$((fence_attempts + 1))
+    if [ "$fence_attempts" -ge 30 ]; then
+      log_event error run_failed backup_timestamp_fence "$backup_id"
+      cleanup_run_files
+      return 1
+    fi
+    sleep 0.1
+  done
 
   if ! checksum_output="$(sha256sum "$dump_file")"; then
     log_event error run_failed database_checksum "$backup_id"

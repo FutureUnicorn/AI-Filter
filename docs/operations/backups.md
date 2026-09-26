@@ -157,10 +157,11 @@ can contain candidate filenames.
 `<environment>/manifests/latest.json` identifies the active versioned
 database recovery slot, its exact version ID, immutable history key, checksum,
 release, storage prefix, and retention window. New schema-version-2 manifests
-also have `storage.cutoffAt` with millisecond precision. This cutoff is taken
-immediately after the second mirror pass; seconds-only `completedAt` is not
-precise enough for S3 version rewind and can exclude an object uploaded in the
-same second. The AF-69 verifier intentionally rejects schema-version-1
+also have `storage.cutoffAt` at a fenced whole-second boundary after the
+second mirror pass. Publication waits until that entire second has passed, so
+later object versions cannot share the rewind tick even when an S3 listing
+reports timestamps only to the second. The wait is bounded and fails the run
+closed if the clock does not advance. The AF-69 verifier rejects schema-version-1
 manifests rather than claiming a precise reconstruction it cannot prove.
 
 ### Local synthetic restore proof
