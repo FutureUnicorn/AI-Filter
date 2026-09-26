@@ -2607,15 +2607,37 @@ export function describeEvidencePrecision(
   precision: EvidencePrecision,
   minimumSampleSize: number
 ): MetricSample {
+  // REV-001: the metric's NAME is what makes it comparable to AF-57's 98%
+  // target. A denominator built partly from candidate-level decisions is
+  // not measured item examination, and attaching a limitation to a figure
+  // still called evidence_precision_live_pilot does not stop anyone
+  // reading it as one: a caveat travels in prose and the number travels in
+  // a slide.
+  //
+  // So the identity changes with the denominator. When any item counts as
+  // examined only because a decision was recorded on the candidate, this
+  // reports as evidence_precision_<dataset>_examination_inferred, which
+  // has no target to be measured against and cannot be mistaken for the
+  // one that does.
+  //
+  // Suppressing the value outright was the alternative and is worse: it
+  // would suppress every live-pilot figure this product can currently
+  // produce, and a metric nobody can compute is not a safer metric, it is
+  // the same claim made with nothing attached to it at all. Renaming keeps
+  // the signal and removes the false equivalence, which is the actual
+  // defect.
+  const inferred = precision.inferredExaminations > 0;
   const sample = summarizeMetric({
-    metric: `evidence_precision_${precision.dataset}`,
+    metric: inferred
+      ? `evidence_precision_${precision.dataset}_examination_inferred`
+      : `evidence_precision_${precision.dataset}`,
     value: precision.precision,
     sampleSize: precision.examinedItems,
     population: precision.producedItems,
     minimumSampleSize
   });
 
-  if (precision.inferredExaminations === 0) {
+  if (!inferred) {
     return sample;
   }
   // Attached even when the value is suppressed, for the reason AF-55

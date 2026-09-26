@@ -270,8 +270,66 @@ test("live pilot and locked offline eval are separate metrics, named by their ow
   );
   assert.equal(live.dataset, "live_pilot");
   assert.equal(offline.dataset, "locked_offline_eval");
-  assert.equal(describeEvidencePrecision(live, 1).metric, "evidence_precision_live_pilot");
-  assert.equal(describeEvidencePrecision(offline, 1).metric, "evidence_precision_locked_offline_eval");
+  // The dataset drives the name and the two never pool, which is what this
+  // case is for. The suffix differs between them because the denominators
+  // differ, not because the datasets do: the live fixture examines via a
+  // candidate decision and the offline one via a recorded annotation. That
+  // is exactly the distinction REV-001 asked the name to carry.
+  assert.equal(
+    describeEvidencePrecision(live, 1).metric,
+    "evidence_precision_live_pilot_examination_inferred"
+  );
+  assert.equal(
+    describeEvidencePrecision(offline, 1).metric,
+    "evidence_precision_locked_offline_eval",
+    "a recorded annotation is measured examination, so it keeps the plain name"
+  );
+  assert.notEqual(
+    describeEvidencePrecision(live, 1).metric,
+    describeEvidencePrecision(offline, 1).metric,
+    "the two datasets must never share a metric identity"
+  );
+});
+
+// REV-001: a denominator built from candidate-level decisions is not
+// measured item examination, and the metric NAME is what makes a figure
+// comparable to AF-57's 98% target. A limitation attached to something
+// still called evidence_precision_live_pilot does not stop it being read
+// as one: the caveat travels in prose and the number travels in a slide.
+
+test("an inferred denominator cannot be reported under the target's metric name", () => {
+  const inferred = summarizeEvidencePrecision([clean("a"), corrected("b")], "live_pilot");
+  const sample = describeEvidencePrecision(inferred, 1);
+  assert.equal(
+    sample.metric,
+    "evidence_precision_live_pilot_examination_inferred",
+    "an inferred denominator must not claim the measured metric's identity"
+  );
+  assert.notEqual(
+    sample.metric,
+    "evidence_precision_live_pilot",
+    "this is the name AF-57's 98% target is stated against"
+  );
+  assert.ok(codes(sample).includes("examination_inferred"), "and the limitation still travels with it");
+});
+
+test("a directly examined denominator keeps the measured metric name", () => {
+  // The rename is driven by the denominator, not by the dataset. Once
+  // examination is recorded per item, the same dataset reports under the
+  // name the target is written against, with no code change needed.
+  const measured = summarizeEvidencePrecision(
+    [
+      clean("a", "offline_annotation", "locked_offline_eval"),
+      corrected("b", 1, "locked_offline_eval")
+    ],
+    "locked_offline_eval"
+  );
+  assert.equal(measured.inferredExaminations, 0, "nothing here rests on a candidate decision");
+  assert.equal(
+    describeEvidencePrecision(measured, 1).metric,
+    "evidence_precision_locked_offline_eval",
+    "a denominator of recorded examinations reports under the name a target can be written against"
+  );
 });
 
 test("a precision figure below the minimum sample is suppressed", () => {

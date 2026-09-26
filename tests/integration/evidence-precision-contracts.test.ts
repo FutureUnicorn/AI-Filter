@@ -128,7 +128,15 @@ test("a precision sample validates as a MetricSample for either dataset", () => 
   for (const dataset of ["live_pilot", "locked_offline_eval"] as const) {
     const sample = describeEvidencePrecision(byDataset[dataset], 1);
     metricSampleSchema.parse(sample);
-    assert.equal(sample.metric, `evidence_precision_${dataset}`);
+    // REV-001: the name now also carries how the denominator was built, so
+    // a figure resting on candidate-level decisions cannot be compared
+    // with the target written against the measured one. The property here
+    // is that the dataset is in the name and the two never pool.
+    const expected = byDataset[dataset].inferredExaminations > 0
+      ? `evidence_precision_${dataset}_examination_inferred`
+      : `evidence_precision_${dataset}`;
+    assert.equal(sample.metric, expected);
+    assert.match(sample.metric, new RegExp(`^evidence_precision_${dataset}`, "u"));
   }
 });
 
@@ -260,9 +268,18 @@ test("a real correction chain cannot be reported under the other dataset's name"
     /belongs to live_pilot and cannot be counted into a locked_offline_eval sample/
   );
 
-  const sample = metricSampleSchema.parse(
-    describeEvidencePrecision(summarizeEvidencePrecision([history], "live_pilot"), 1)
+  const summary = summarizeEvidencePrecision([history], "live_pilot");
+  const sample = metricSampleSchema.parse(describeEvidencePrecision(summary, 1));
+  // REV-001: the name carries how the denominator was built. Derived from
+  // the summary rather than hard-coded, so this case keeps testing what it
+  // was written for, that a live-pilot chain stays the live pilot's, while
+  // still holding the new property.
+  assert.equal(
+    sample.metric,
+    summary.inferredExaminations > 0
+      ? "evidence_precision_live_pilot_examination_inferred"
+      : "evidence_precision_live_pilot"
   );
-  assert.equal(sample.metric, "evidence_precision_live_pilot");
+  assert.match(sample.metric, /^evidence_precision_live_pilot/u, "it stays the live pilot's");
   assert.equal(sample.value, 0, "one item, corrected: the pilot's precision is 0, and it stays the pilot's");
 });
