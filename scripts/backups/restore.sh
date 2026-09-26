@@ -116,7 +116,7 @@ mc --quiet cp --recursive --rewind "$storage_cutoff_at" \
   "source/$BACKUP_BUCKET/$RESTORE_SOURCE_ENV/storage/current/" \
   recovered/af69-recovered/ >/dev/null 2>&1
 
-stage=application_consistency
+stage=application_records
 # The SQL result contains only base64-encoded keys and code-like state/hash.
 # Neither keys nor tool diagnostics are logged. Uploaded rows require presence;
 # validated rows must also match the content digest used by application reads.
@@ -126,9 +126,12 @@ psql -X -A -t -v ON_ERROR_STOP=1 -c \
 verified_objects=0
 while IFS=' ' read -r encoded_key intake_status expected_object_sha; do
   [ -n "$encoded_key" ] || continue
+  stage=application_key_decode
   object_name="$(printf '%s' "$encoded_key" | base64 -d)"
+  stage=application_object_presence
   mc --quiet stat "recovered/af69-recovered/$object_name" >/dev/null 2>&1
   if [ "$intake_status" = validated ]; then
+    stage=application_object_digest
     printf '%s' "$expected_object_sha" | grep -Eq '^[a-f0-9]{64}$'
     mc --quiet cp "recovered/af69-recovered/$object_name" "$work_dir/validated-object" >/dev/null 2>&1
     [ "$(sha256sum "$work_dir/validated-object" | cut -d ' ' -f 1)" = "$expected_object_sha" ]
