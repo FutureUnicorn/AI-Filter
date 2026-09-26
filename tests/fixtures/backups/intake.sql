@@ -14,5 +14,5 @@ INSERT INTO file_intakes
    status, created_by_user_id, sniffed_mime_type, size_bytes, sha256_hash)
 SELECT organization_id, role_id, 'synthetic/af69-document.txt',
   'af69-document.txt', 'text/plain', 'validated', created_by_user_id,
-  'text/plain', 85, '4f67112c0a959a42eca86506983490bfc1b3d6c748f11e326e8762414a4cee26'
+  'text/plain', 84, '62df4d5144a526889f80b46e9b75fef304cdab3296ba7bb3defb3013f1c4b1ca'
 FROM role;

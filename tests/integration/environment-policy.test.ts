@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,16 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 function read(relativePath: string): string {
   return fs.readFileSync(path.join(repositoryRoot, relativePath), "utf8");
 }
+
+test("synthetic restore SQL records the exact LF-normalized object bytes", () => {
+  const fixture = fs.readFileSync(path.join(repositoryRoot, "tests/fixtures/environment/synthetic-storage-fixture.txt"));
+  const sql = read("tests/fixtures/backups/intake.sql");
+  const recorded = sql.match(/'text\/plain', (\d+), '([a-f0-9]{64})'/u);
+  assert.ok(recorded);
+  assert.equal(fixture.includes(13), false);
+  assert.equal(Number(recorded[1]), fixture.length);
+  assert.equal(recorded[2], createHash("sha256").update(fixture).digest("hex"));
+});
 
 test("runtime infrastructure is isolated, private, bounded, and pinned", () => {
   const compose = read("infra/compose/runtime.yml");

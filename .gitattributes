@@ -1,3 +1,4 @@
 scripts/backups/backup.sh text eol=lf
 scripts/backups/restore.sh text eol=lf
 scripts/backups/test-restore.sh text eol=lf
+tests/fixtures/environment/synthetic-storage-fixture.txt text eol=lf
