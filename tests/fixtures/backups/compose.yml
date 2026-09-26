@@ -121,7 +121,7 @@ services:
       BACKUP_ENCRYPTION_REFERENCE: local-synthetic-test
       SSL_CERT_FILE: /certs/public.crt
     volumes:
-      - ${AF69_CERT_DIR:?required}:/certs:ro
+      - ${AF69_CERT_FILE:?required}:/certs/public.crt:ro
     networks: [test-source, restore-egress]
 
   backup-once:
@@ -138,7 +138,7 @@ services:
         condition: service_completed_successfully
     environment: *backup-test-environment
     volumes:
-      - ${AF69_CERT_DIR:?required}:/certs:ro
+      - ${AF69_CERT_FILE:?required}:/certs/public.crt:ro
       - test-backup-work:/var/lib/signal-audit-backup
     networks: [test-source, restore-egress]
 
@@ -146,7 +146,7 @@ services:
     environment:
       SSL_CERT_FILE: /certs/public.crt
     volumes:
-      - ${AF69_CERT_DIR:?required}:/certs:ro
+      - ${AF69_CERT_FILE:?required}:/certs/public.crt:ro
 
 networks:
   test-source:

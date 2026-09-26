@@ -25,8 +25,10 @@ trap cleanup EXIT HUP INT TERM
 
 if command -v cygpath >/dev/null 2>&1; then
   export AF69_CERT_DIR="$(cygpath -w "$cert_dir")"
+  export AF69_CERT_FILE="$(cygpath -w "$cert_dir/public.crt")"
 else
   export AF69_CERT_DIR="$cert_dir"
+  export AF69_CERT_FILE="$cert_dir/public.crt"
 fi
 export RESTORE_SOURCE_ENV=staging BACKUP_ENDPOINT=https://backup-target:9000
 export BACKUP_REGION=us-east-1 BACKUP_BUCKET=af69-target BACKUP_PATH_STYLE=on
@@ -39,6 +41,7 @@ export RESTORE_DATABASE_SCHEMA=public
 MSYS2_ARG_CONV_EXCL='/CN=' openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$cert_dir/private.key" -out "$cert_dir/public.crt" \
   -subj /CN=backup-target -addext 'subjectAltName=DNS:backup-target' >/dev/null 2>&1
+chmod 0644 "$cert_dir/public.crt"
 
 compose() {
   MSYS2_ARG_CONV_EXCL='/bin/sh' docker compose --project-name "$project" \

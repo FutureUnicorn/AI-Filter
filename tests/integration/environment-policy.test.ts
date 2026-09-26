@@ -397,6 +397,15 @@ test("AF-69 restore is isolated from runtime destinations and rejects incomplete
   assert.match(compose, /RESTORE_SECRET_ACCESS_KEY: \$\{RESTORE_SECRET_ACCESS_KEY:\?required\}/u);
 });
 
+test("AF-69 non-root clients mount only the public test certificate", () => {
+  const fixture = read("tests/fixtures/backups/compose.yml");
+  const drill = read("scripts/backups/test-restore.sh");
+  assert.match(fixture, /AF69_CERT_DIR:\?required\}:\/root\/\.minio\/certs:ro/u);
+  assert.equal((fixture.match(/AF69_CERT_FILE:\?required\}:\/certs\/public\.crt:ro/gu) ?? []).length, 3);
+  assert.doesNotMatch(fixture, /AF69_CERT_DIR:\?required\}:\/certs:ro/u);
+  assert.match(drill, /chmod 0644 "\$cert_dir\/public\.crt"/u);
+});
+
 test(
   "AF-69 restore rejects missing inputs before attempting source access",
   { skip: process.platform === "win32" ? "POSIX shell behavior runs in Linux CI and container drill" : false },
