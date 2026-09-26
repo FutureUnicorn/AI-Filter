@@ -2326,6 +2326,305 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-63: deletion reconciliation ----
+//
+// "Scheduled job confirms every store that should be empty actually is;
+// produces a reconciliation report so deletion drift is caught, not
+// assumed."
+//
+// AF-61 produced a static plan of what retention intends. This checks
+// what is actually there, which is a different question, and given
+// AF-61's finding the honest first answer is "everything". That is the
+// point: the plan says deletion is blocked, and reconciliation makes
+// that a standing measurement rather than a claim someone made once.
+//
+// **The failure this is really guarding against is a surface nobody
+// classified.** A reconciliation that only checks the tables someone
+// remembered to list inherits the exact blind spot of the plan it is
+// checking -- if a future migration adds a table holding candidate text
+// and nobody adds it to RETENTION_SURFACES, a list-driven job reports
+// "all clear" while the data sits there. So reconciliation takes the
+// tables observed in the live schema and reports anything the plan does
+// not classify as its own finding. An unclassified surface is not
+// automatically a leak; it is automatically unreviewed, which is the
+// thing that must not be silent.
+//
+// **The second way this job could lie is by not measuring a surface at
+// all.** An absent count and a measured zero are the same number, so a
+// surface nothing looked at reads exactly like a surface that was looked
+// at and found empty. object_storage_documents is the live case: it is
+// the only surface the plan calls purgeable, it does not live in
+// Postgres, and nothing counts blob objects, so a tenant whose uploaded
+// CVs are still sitting in storage past the window reconciles
+// `clean: true` -- green because the report never looked, which is the
+// failure this ticket exists to prevent. The same hole opens for any
+// Postgres surface whose table is absent from the schema the observer
+// read.
+//
+// So a measurement is something a residue has to claim explicitly, via
+// `observedSurfaces`, and anything a run did not measure becomes a
+// `not_observed` finding that keeps the report off green. That makes the
+// honest answer representable rather than deferring it: `clean` again
+// means "every surface was looked at, and was empty", and it stays
+// reachable, because a caller that really does list blob storage can
+// supply that count and earn it.
+
+export type ReconciliationFindingKind =
+  /** A surface the plan says should be emptied still holds rows past the cutoff. */
+  | "residue_present"
+  /** A surface the plan already admits it cannot purge. Expected, still reported. */
+  | "blocked_as_planned"
+  /** A table exists in the schema that the retention plan does not classify at all. */
+  | "unclassified_surface"
+  /** The plan covers this surface, but this run never measured it, so nothing is known about it. */
+  | "not_observed";
+
+export interface ReconciliationFinding {
+  readonly kind: ReconciliationFindingKind;
+  readonly surface: string;
+  /**
+   * Rows past the cutoff, or `undefined` when this run did not measure
+   * the surface. Never 0 standing in for "not measured": that
+   * substitution is the whole defect this field's shape guards against.
+   */
+  readonly rowsPastCutoff: number | undefined;
+  readonly detail: string;
+}
+
+export interface RetentionResidue {
+  /** Rows older than the cutoff still present, per surface name. */
+  readonly rowsPastCutoffBySurface: Readonly<Record<string, number>>;
+  /**
+   * The plan surfaces this run actually measured, whether or not it
+   * found anything. Stated separately rather than inferred from the keys
+   * of `rowsPastCutoffBySurface`, so an observer that can only reach some
+   * of the surfaces has to say which ones, instead of an omission
+   * quietly reading as a zero.
+   *
+   * A surface may be measured from outside Postgres: an object-storage
+   * listing belongs here exactly as much as a `count(*)` does.
+   */
+  readonly observedSurfaces: readonly string[];
+  /** Every table observed in the live schema, however named. */
+  readonly observedTables: readonly string[];
+}
+
+export interface ReconciliationReport {
+  readonly organizationId: string;
+  readonly cutoff: string;
+  readonly findings: readonly ReconciliationFinding[];
+  /**
+   * True when nothing at all needs a human: every surface the plan covers
+   * was measured, none held anything past the cutoff, and no table is
+   * unclassified. A surface this run could not measure keeps `clean`
+   * false, because "we did not look" is not "it was empty".
+   */
+  readonly clean: boolean;
+  readonly statement: string;
+}
+
+/**
+ * Tables that legitimately hold no candidate-derived data and are not
+ * expected to appear in a retention plan. Listed explicitly rather than
+ * pattern-matched, so adding a table is a decision someone makes here
+ * rather than something a prefix rule silently absorbs.
+ */
+/**
+ * Tables the reconciler will not report as unclassified.
+ *
+ * REV-001: this list had four entries that held a candidate's
+ * application identifier, so the reconciliation could report a tenant
+ * clean without ever measuring them. evidence_extraction_runs,
+ * audit_sample_members and review_timing_spans are now classified
+ * surfaces in AF-61's plan and are measured per tenant; they are gone
+ * from here, and assertRetentionExemptionsAreLive fails if a planned
+ * surface is ever listed in both places, because an exemption that
+ * shadows a classification is how a measured surface stops being
+ * measured without anyone editing the measurement.
+ *
+ * audit_samples stays, and it is the one entry that needs its reasoning
+ * written down rather than assumed: the draw itself holds a seed, a
+ * role, counts and a drawing user, and no application identifier. Its
+ * members are what name candidates, and those are now counted. A draw
+ * with no members past the cutoff is genuinely nothing about a
+ * candidate.
+ */
+const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
+  "organizations",
+  "users",
+  "memberships",
+  "roles",
+  "rubrics",
+  "magic_link_tokens",
+  "inference_usage_ledger",
+  "inference_kill_switch",
+  "import_finalizations",
+  "audit_samples",
+  "af11_synthetic_environment_fixture"
+]);
+
+/**
+ * Every exempt table is still unplanned, and every planned surface is
+ * still unexempt.
+ *
+ * Exported so a test can run it, and written as an assertion rather than
+ * a test-local loop because the failure it catches is silent: a table
+ * that appears in both places is classified, described in the privacy
+ * notice, and skipped by the reconciler, with each half looking correct
+ * on its own. That is exactly the state this stack was in for
+ * evidence_extraction_runs.
+ */
+export function assertRetentionExemptionsAreLive(): void {
+  const planned = new Set<string>(RETENTION_SURFACES);
+  const shadowed = [...RETENTION_EXEMPT_TABLES].filter((table) => planned.has(table)).sort();
+  if (shadowed.length > 0) {
+    throw new Error(
+      `RETENTION_EXEMPT_TABLES exempts ${shadowed.join(", ")}, which AF-61 classifies as a retention ` +
+        `surface. An exemption on a planned surface stops it being reconciled while the plan still ` +
+        `claims it is accounted for.`
+    );
+  }
+}
+
+export function reconcileRetention(
+  plan: RetentionPlan,
+  residue: RetentionResidue
+): ReconciliationReport {
+  const findings: ReconciliationFinding[] = [];
+  const planned = new Map(plan.surfaces.map((surface) => [String(surface.surface), surface]));
+  const observed = new Set(residue.observedSurfaces);
+
+  for (const surface of plan.surfaces) {
+    if (surface.disposition === "no_candidate_data") {
+      // Deliberately exempt from the not_observed check below, not an
+      // oversight. The plan's claim here is not "this is empty past the
+      // cutoff", it is "nothing candidate-derived is ever written here,
+      // by construction". A row count neither confirms nor refutes that,
+      // so counting the surface would not make the report any truer, and
+      // reporting it unmeasured every single run would be noise that
+      // trains a reader to skim past the findings that matter. Changing
+      // a surface to this disposition is an explicit edit to
+      // RETENTION_PLAN, so the silence is still someone's recorded
+      // decision rather than an omission.
+      continue;
+    }
+    if (!observed.has(surface.surface)) {
+      findings.push({
+        kind: "not_observed",
+        surface: surface.surface,
+        rowsPastCutoff: undefined,
+        detail:
+          `This run did not measure ${surface.surface}, so the report cannot say whether it is ` +
+          `empty past the cutoff. It holds ${surface.holds}, and that may still be there. ` +
+          `Supply a count for it before reading this report as a clean bill of health.`
+      });
+      continue;
+    }
+    const rows = residue.rowsPastCutoffBySurface[surface.surface] ?? 0;
+    if (rows === 0) {
+      continue;
+    }
+    if (surface.disposition === "purge") {
+      findings.push({
+        kind: "residue_present",
+        surface: surface.surface,
+        rowsPastCutoff: rows,
+        detail:
+          `${rows} row(s) older than the cutoff remain in a surface the plan says is purgeable. ` +
+          `Either the purge did not run or it did not cover this surface.`
+      });
+      continue;
+    }
+    findings.push({
+      kind: "blocked_as_planned",
+      surface: surface.surface,
+      rowsPastCutoff: rows,
+      detail: `${rows} row(s) retained past the cutoff, as the plan predicts: ${surface.detail}`
+    });
+  }
+
+  for (const table of residue.observedTables) {
+    if (planned.has(table) || RETENTION_EXEMPT_TABLES.has(table)) {
+      continue;
+    }
+    findings.push({
+      kind: "unclassified_surface",
+      surface: table,
+      // Undefined rather than 0 when nothing counted it. An unclassified
+      // table has no known tenant column, so the observer cannot scope a
+      // count to one organization, and an unscoped count would be a
+      // cross-tenant read in a report handed to one customer. The finding
+      // stands on the table's existence either way; what must not happen
+      // is a never-measured table reporting "0 rows" as if someone looked.
+      rowsPastCutoff: residue.rowsPastCutoffBySurface[table],
+      detail:
+        `Table "${table}" exists in the schema but the retention plan does not classify it. ` +
+        `It may hold candidate data that nothing is accounting for. Classify it in ` +
+        `RETENTION_SURFACES or add it to the exempt list, so the decision is recorded either way.`
+    });
+  }
+
+  // `clean` is deliberately NOT satisfied by blocked_as_planned findings
+  // alone -- those are expected, and a report that called them clean
+  // would go green while candidate data sits there indefinitely, which is
+  // exactly the drift this job exists to surface.
+  const needsAttention = findings.filter((finding) => finding.kind !== "blocked_as_planned");
+  const blocked = findings.filter((finding) => finding.kind === "blocked_as_planned");
+
+  return {
+    organizationId: plan.organizationId,
+    cutoff: plan.cutoff,
+    findings,
+    clean: needsAttention.length === 0 && blocked.length === 0,
+    statement: buildReconciliationStatement(needsAttention, blocked)
+  };
+}
+
+function buildReconciliationStatement(
+  needsAttention: readonly ReconciliationFinding[],
+  blocked: readonly ReconciliationFinding[]
+): string {
+  const parts: string[] = [];
+  const unclassified = needsAttention.filter((finding) => finding.kind === "unclassified_surface");
+  const residue = needsAttention.filter((finding) => finding.kind === "residue_present");
+  const unmeasured = needsAttention.filter((finding) => finding.kind === "not_observed");
+  if (residue.length > 0) {
+    parts.push(
+      `${residue.length} surface(s) that should have been purged still hold data: ` +
+        residue.map((finding) => finding.surface).join(", ")
+    );
+  }
+  // Named before the blocked surfaces, and in the sentence rather than
+  // only in the findings array, because this is the one category a
+  // reader could otherwise mistake for a clean result.
+  if (unmeasured.length > 0) {
+    parts.push(
+      `${unmeasured.length} surface(s) were not measured by this run, so nothing here says whether ` +
+        `they are empty: ` +
+        unmeasured.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (unclassified.length > 0) {
+    parts.push(
+      `${unclassified.length} table(s) are not classified by the retention plan: ` +
+        unclassified.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      `${blocked.length} surface(s) retain data past the cutoff because deletion is blocked: ` +
+        blocked.map((finding) => finding.surface).join(", ")
+    );
+  }
+  if (parts.length === 0) {
+    return (
+      "Every surface the retention plan covers was measured and is empty past the cutoff, " +
+      "and no table is unclassified."
+    );
+  }
+  return parts.join(". ") + ".";
+}
+
 // ---- AF-61: retention policy ----
 //
 // "Default retention window for raw candidate data (e.g. 30-90 days),

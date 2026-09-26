@@ -26,6 +26,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  RetentionResidue,
   ReviewTimingSpan,
   Role,
   RoleStatus,
@@ -4832,6 +4833,479 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       (tableColumns[row.table_name] ??= []).push(row.column_name);
     }
     return { failures, permitted, appliedMigrations, foreignKeys: foreignKeys.rows, tableColumns };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-63: observe what retention actually left behind ----
+
+/**
+ * Counts candidate-data rows older than the cutoff, and lists every table
+ * in the schema.
+ *
+ * The table listing is the part that matters. A reconciliation job driven
+ * only by a hand-maintained surface list inherits the blind spot of that
+ * list: a migration adding a table full of candidate text would be
+ * invisible to it, and the job would report all clear. Reading
+ * information_schema instead means a new table shows up as unclassified
+ * the first time this runs, which is a nuisance rather than a leak, and
+ * is the correct direction to fail in.
+ *
+ * canonical_text_extractions and import_rows carry no organization_id of
+ * their own, so they are scoped through file_intakes rather than counted
+ * globally -- counting them across tenants would make one noisy tenant
+ * look like everyone's problem.
+ *
+ * `observedSurfaces` names what this call actually measured, and it is
+ * the reason the result cannot quietly overstate itself. Two surfaces
+ * would otherwise come back as an implicit zero: object_storage_documents,
+ * which is not in Postgres at all and is the only surface the plan calls
+ * purgeable, and any surface whose table is missing from this schema.
+ * Both are now absent from observedSurfaces instead, and reconcileRetention
+ * turns that into a not_observed finding rather than a clean bill of health.
+ *
+ * `externalCounts` is how a surface outside Postgres gets measured: a
+ * caller that lists blob storage for this tenant passes
+ * `{ object_storage_documents: n }` and the residue_present branch becomes
+ * reachable for real. A count is only accepted for a surface this
+ * function cannot see itself, so a caller cannot paper over a table that
+ * is right there to be counted.
+ */
+export async function observeRetentionResidue(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  cutoff: string,
+  externalCounts: Readonly<Record<string, number>> = {}
+): Promise<RetentionResidue> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+
+    const tables = await client.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+        ORDER BY table_name`,
+      [schema]
+    );
+    const observedTables = tables.rows.map((row) => row.table_name);
+
+    // Only count surfaces that actually exist in this schema: the probe
+    // schemas used by other tests apply a subset of migrations, and a
+    // missing table there is not residue.
+    const present = new Set(observedTables);
+    const counts: Record<string, number> = {};
+    const observedSurfaces: string[] = [];
+    const scoped: ReadonlyArray<readonly [string, string]> = [
+      ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "canonical_text_extractions",
+        `SELECT count(*) FROM "${schema}".canonical_text_extractions cte
+           JOIN "${schema}".file_intakes fi ON fi.intake_id = cte.intake_id
+          WHERE fi.organization_id = $1 AND cte.created_at <= $2`
+      ],
+      [
+        "import_rows",
+        `SELECT count(*) FROM "${schema}".import_rows ir
+           JOIN "${schema}".file_intakes fi ON fi.intake_id = ir.intake_id
+          WHERE fi.organization_id = $1 AND ir.created_at <= $2`
+      ],
+      ["applications", `SELECT count(*) FROM "${schema}".applications WHERE organization_id = $1 AND created_at <= $2`],
+      [
+        "evidence_outcomes",
+        `SELECT count(*) FROM "${schema}".evidence_outcomes WHERE organization_id = $1 AND recorded_at <= $2`
+      ],
+      [
+        "candidate_decisions",
+        `SELECT count(*) FROM "${schema}".candidate_decisions WHERE organization_id = $1 AND decided_at <= $2`
+      ],
+      // REV-001: the four surfaces that keep a candidate's application
+      // identifier in an append-only table. All four were previously
+      // either exempt or absent from the plan, so a tenant could
+      // reconcile clean while every one of them still held rows past the
+      // cutoff -- which is the one outcome this job exists to prevent.
+      //
+      // Each anchors on the timestamp the DATABASE owns, never one a
+      // caller supplies. review_timing_spans is the case that matters:
+      // started_at and ended_at come from the browser, and anchoring
+      // retention on either would let a client decide when its own rows
+      // fall out of scope. recorded_at defaults to clock_timestamp().
+      [
+        "audit_events",
+        `SELECT count(*) FROM "${schema}".audit_events WHERE organization_id = $1 AND occurred_at <= $2`
+      ],
+      [
+        "evidence_extraction_runs",
+        `SELECT count(*) FROM "${schema}".evidence_extraction_runs
+          WHERE organization_id = $1 AND created_at <= $2`
+      ],
+      [
+        "review_timing_spans",
+        `SELECT count(*) FROM "${schema}".review_timing_spans WHERE organization_id = $1 AND recorded_at <= $2`
+      ],
+      // audit_sample_members has no timestamp of its own: it is one row
+      // per candidate in a draw, and the draw carries the time. Joined
+      // rather than left uncounted, because the members are the half
+      // that names candidates.
+      [
+        "audit_sample_members",
+        `SELECT count(*) FROM "${schema}".audit_sample_members asm
+           JOIN "${schema}".audit_samples s ON s.audit_sample_id = asm.audit_sample_id
+          WHERE asm.organization_id = $1 AND s.drawn_at <= $2`
+      ]
+    ];
+
+    for (const [surface, sql] of scoped) {
+      if (!present.has(surface)) {
+        // Not an error: probe schemas apply a subset of migrations. But
+        // it is also not a zero. Leaving the surface out of
+        // observedSurfaces is what keeps it from reading as measured.
+        continue;
+      }
+      const result = await client.query<{ count: string }>(sql, [organizationId, cutoff]);
+      const raw = result.rows[0]?.count ?? "0";
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        // count(*) is bigint and arrives as a string; Number() on a
+        // malformed value would yield NaN and quietly read as "no residue".
+        throw new Error(`observeRetentionResidue: ${surface} count is not a safe integer, got: ${raw}`);
+      }
+      counts[surface] = parsed;
+      observedSurfaces.push(surface);
+    }
+
+    const selfCounted = new Set(scoped.map(([surface]) => surface));
+    for (const [surface, count] of Object.entries(externalCounts)) {
+      // A caller-supplied number for something the database can answer
+      // would replace a real measurement with an asserted one, which is
+      // the same "trust me" this whole change exists to remove. Refused
+      // rather than merged, because a silent overwrite would make the
+      // report look measured while saying whatever the caller wanted.
+      if (selfCounted.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which this ` +
+            `function counts from the database itself`
+        );
+      }
+      if (present.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which is a table ` +
+            `in schema "${schema}". External counts are for surfaces that do not live in Postgres.`
+        );
+      }
+      if (!Number.isSafeInteger(count) || count < 0) {
+        // Same reasoning as the bigint parse above: a NaN here would land
+        // in the map, mark the surface observed, and read as "no residue".
+        throw new Error(
+          `observeRetentionResidue: external count for "${surface}" must be a non-negative safe ` +
+            `integer, got: ${String(count)}`
+        );
+      }
+      counts[surface] = count;
+      observedSurfaces.push(surface);
+    }
+
+    return { rowsPastCutoffBySurface: counts, observedSurfaces, observedTables };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Builds a schema that exercises every claim AF-63's reconciliation
+ * makes, and returns the observations for tenant A.
+ *
+ * Lives here rather than in the test because `pg` is a packages/db
+ * dependency and the tests root has no database client of its own --
+ * the same reason assertMembershipsTenantIsolation and
+ * assertFailedDocumentRateAccuracy are shaped this way.
+ *
+ * The fixture deliberately includes a table created BEHIND the retention
+ * plan's back. If observeRetentionResidue read a hand-maintained list
+ * rather than information_schema, that table would be invisible and the
+ * job would report all clear while candidate text sat in it.
+ *
+ * It also returns the observations either side of the object-storage
+ * question, because that surface is the one the job cannot reach on its
+ * own: `residue` is what a caller with no storage listing gets,
+ * `residueWithPurgedObjectStorage` and `residueWithObjectStorageResidue`
+ * are what the same tenant looks like once someone actually counted the
+ * objects. Without all three, "clean" and "residue_present" are each
+ * only reachable through a hand-built residue object, which would prove
+ * nothing about the live path.
+ */
+export async function probeRetentionReconciliation(
+  databaseUrl: string,
+  cutoff: string
+): Promise<{
+  residue: RetentionResidue;
+  residueWithObjectStorageResidue: RetentionResidue;
+  residueWithPurgedObjectStorage: RetentionResidue;
+  residueBeforeAnyData: RetentionResidue;
+  residueMissingSurfaceTable: RetentionResidue;
+  organizationId: string;
+}> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const roleB = "77777777-7777-4777-8777-777777777777";
+  const intakeA = "55555555-5555-4555-8555-555555555555";
+  const intakeB = "88888888-8888-4888-8888-888888888888";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const auditSampleId = "99999999-9999-4999-8999-999999999999";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    // REV-001: every migration in the runner's own order, minus the one
+    // deliberately held back below. This used to be a hand-picked list
+    // ending at 0016, which is the same defect AF-61's purge probe was
+    // corrected for: a probe that applies the tables someone already
+    // thought of can only measure the surfaces someone already thought
+    // of. It is also precisely why the four append-only surfaces that
+    // keep an application identifier were never observed here -- three of
+    // their migrations were not in the list at all.
+    const deferred = "0019_candidate_decisions.sql";
+    const applied = listMigrationsInRunnerOrder().filter((file) => file !== deferred);
+    if (applied.length === listMigrationsInRunnerOrder().length) {
+      throw new Error(
+        `probeRetentionReconciliation: ${deferred} must exist to be held back; the ` +
+          `missing-surface-table observation below depends on it`
+      );
+    }
+    for (const file of applied) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `recon_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
+       VALUES ($1,$2,'Eng',$5), ($3,$4,'B role',$5)`,
+      [roleA, orgA, roleB, orgB, userId]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter'), ($3,$2,'recruiter')`,
+      [orgA, userId, orgB]
+    );
+
+    // Taken while candidate_decisions does not exist yet, which is not a
+    // contrivance: this is what any schema behind on migrations looks
+    // like, and before observedSurfaces the absent table produced no
+    // count, the count defaulted to 0, and the surface read as verified
+    // empty. Captured here so the reconciliation can be held to saying
+    // "not measured" instead.
+    const residueMissingSurfaceTable = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0019_candidate_decisions.sql"), "utf8"));
+
+    // Baseline: every surface the plan covers exists, was measured, and
+    // holds nothing for tenant A -- including object storage, which is
+    // measured only because the caller supplied the listing.
+    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+
+    // Tenant A's undeleted candidate data.
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+      [intakeA, orgA, roleA, `key-a-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1,'[{"text":"Jane Doe"}]'::jsonb,1,'full')`,
+      [intakeA]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, orgA, roleA, intakeA]
+    );
+    await admin.query(
+      `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ('66666666-6666-4666-8666-666666666666',$1,$2,'python','supported',
+         '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe"}}'::jsonb)`,
+      [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (organization_id, application_id, decision, rationale, decided_by_user_id)
+       VALUES ($1,$2,'hold','Revisit after the panel',$3)`,
+      [orgA, applicationId, userId]
+    );
+    // REV-001: the four append-only surfaces that keep a candidate's
+    // application identifier. Rows here are what let a report be clean
+    // while the identifier for a real candidate remained, so the fixture
+    // has to contain them or the property is untested.
+    await admin.query(
+      `INSERT INTO audit_events (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+       VALUES ($1,$2,'decision_recorded','application',$3,'req_11111111-1111-4111-8111-111111111111')`,
+      [orgA, userId, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,'application',$2,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size,
+         eligible_count, drawn_by_user_id)
+       VALUES ($1,$2,$3,'recon-probe',1,1,$4)`,
+      [auditSampleId, orgA, roleA, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at,
+         ended_at, active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-07-01T12:00:00Z','2026-07-01T12:01:00Z',60000,false)`,
+      [orgA, applicationId, userId]
+    );
+
+    // Tenant B's data, which must not be counted against tenant A --
+    // canonical_text_extractions carries no organization_id of its own.
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'Other.pdf','application/pdf','validated',$5)`,
+      [intakeB, orgB, roleB, `key-b-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1,'[{"text":"someone else"}]'::jsonb,1,'full')`,
+      [intakeB]
+    );
+
+    // A table the retention plan knows nothing about.
+    await admin.query(
+      `CREATE TABLE "${schema}".recruiter_scratch_notes (
+         note_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+         candidate_note text NOT NULL,
+         created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+       )`
+    );
+    await admin.query(`INSERT INTO "${schema}".recruiter_scratch_notes (candidate_note) VALUES ('Jane seemed strong')`);
+
+    // Three views of the same tenant, differing only in whether anyone
+    // counted the objects in blob storage:
+    //   residue                        - nobody did, which is every caller today
+    //   residueWithPurgedObjectStorage - someone did, and it was empty
+    //   residueWithObjectStorageResidue- someone did, and two CVs are still there
+    // The middle one is why `clean` has to stay reachable, and the last
+    // one is the only way residue_present is reached without a test
+    // hand-building the residue it is supposed to be proving.
+    const residue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
+    const residueWithPurgedObjectStorage = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    const residueWithObjectStorageResidue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 2
+    });
+    return {
+      residue,
+      residueWithObjectStorageResidue,
+      residueWithPurgedObjectStorage,
+      residueBeforeAnyData,
+      residueMissingSurfaceTable,
+      organizationId: orgA
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Exercises the guards on caller-supplied counts against a live schema.
+ *
+ * An external count is the one number in the residue that nothing in the
+ * database corroborates, so the guards around it are load-bearing: a NaN
+ * that got through would mark the surface observed and read as "no
+ * residue", which is the exact green-because-nobody-looked failure the
+ * observedSurfaces field exists to close.
+ *
+ * Each case returns the thrown message, or null when the call was
+ * accepted. A test asserting a message therefore cannot be satisfied by
+ * a typo, a connection failure or any other incidental error -- those
+ * propagate out of here rather than being reported as a refusal.
+ */
+export async function probeRetentionExternalCountGuards(
+  databaseUrl: string,
+  cutoff: string
+): Promise<{
+  acceptedUnobservableSurface: RetentionResidue;
+  refusedSelfCountedSurface: string | null;
+  refusedExistingTable: string | null;
+  refusedNonInteger: string | null;
+  refusedNegative: string | null;
+}> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_guard_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  async function refusal(externalCounts: Readonly<Record<string, number>>): Promise<string | null> {
+    try {
+      await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, externalCounts);
+      return null;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("observeRetentionResidue:")) {
+        // Anything that is not this function's own refusal is a real
+        // failure and must not be reported to the caller as a guard
+        // firing.
+        throw error;
+      }
+      return error.message;
+    }
+  }
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [orgA]);
+
+    return {
+      acceptedUnobservableSurface: await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+        object_storage_documents: 7
+      }),
+      refusedSelfCountedSurface: await refusal({ file_intakes: 0 }),
+      refusedExistingTable: await refusal({ roles: 0 }),
+      refusedNonInteger: await refusal({ object_storage_documents: Number.NaN }),
+      refusedNegative: await refusal({ object_storage_documents: -1 })
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
