@@ -83,7 +83,21 @@ services:
     build:
       context: ../..
       dockerfile: infra/docker/backup.Dockerfile
-    command: ["configure"]
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set target "$$BACKUP_ENDPOINT" "$$BACKUP_ACCESS_KEY_ID" "$$BACKUP_SECRET_ACCESS_KEY" --path on >/dev/null 2>&1
+        attempts=0
+        until mc ls target >/dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 30 ]; then
+            echo 'Synthetic backup target did not become ready' >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        exec /usr/local/bin/signal-audit-backup configure
     depends_on: [backup-target]
     environment: &backup-test-environment
       APP_ENV: staging
