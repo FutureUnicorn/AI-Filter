@@ -761,7 +761,12 @@ export const recordReviewTimingSpanInputSchema = z
      * it is sent rather than derived. A tab left open overnight would
      * otherwise record eight hours of "review".
      */
-    activeMs: z.int().nonnegative(),
+    // A zero-duration span is not a measurement. sealReviewTiming already
+    // refuses to emit one, and accepting it here let a direct authenticated
+    // POST put an application into the measured sample with no measured
+    // time, pulling the assisted median down and inflating the reported
+    // review-time reduction while making the sample look larger.
+    activeMs: z.int().positive(),
     truncatedByIdle: z.boolean()
   })
   .refine((input) => Date.parse(input.endedAt) >= Date.parse(input.startedAt), {

@@ -45,7 +45,10 @@ test("a span cannot end before it started", () => {
     ...honest,
     startedAt: "2026-08-29T10:01:30.000Z",
     endedAt: "2026-08-29T10:00:00.000Z",
-    activeMs: 0
+    // One millisecond, not zero. activeMs must now be positive, so a zero
+    // here would be refused for that instead and this case would stop
+    // testing the ordering rule it was written for.
+    activeMs: 1
   });
   assert.equal(result.success, false);
   assert.deepEqual(result.error?.issues.at(0)?.path, ["endedAt"]);
@@ -78,4 +81,33 @@ test("the one-second tolerance matches the database, and stops there", () => {
     recordReviewTimingSpanInputSchema.safeParse({ ...honest, activeMs: wallClockMs + 1_001 }).success,
     false
   );
+});
+
+// A zero-duration span is not a measurement. sealReviewTiming already
+// refuses to emit one, but the contract accepted it, so a direct
+// authenticated POST could put an application into the measured sample
+// with no measured time: the assisted median falls, the reported
+// review-time reduction rises, and the sample looks larger for it. The
+// database carries the matching CHECK; this is the boundary that turns it
+// into a 400 with a reason rather than a constraint violation read as a
+// server fault.
+
+test("a zero-duration span is refused before it can reach the sample", () => {
+  const parsed = recordReviewTimingSpanInputSchema.safeParse({ ...honest, activeMs: 0 });
+  assert.equal(parsed.success, false, "activeMs: 0 must not be accepted");
+  if (!parsed.success) {
+    assert.match(
+      JSON.stringify(parsed.error.issues),
+      /activeMs/u,
+      "the refusal must name the field so a client can act on it"
+    );
+  }
+});
+
+test("a negative span is refused too, and one millisecond is still a measurement", () => {
+  assert.equal(recordReviewTimingSpanInputSchema.safeParse({ ...honest, activeMs: -1 }).success, false);
+  // The boundary is positive, not "large enough". A real one-millisecond
+  // review is implausible but it is a measurement, and the contract has no
+  // business inventing a minimum the product never agreed.
+  assert.equal(recordReviewTimingSpanInputSchema.safeParse({ ...honest, activeMs: 1 }).success, true);
 });
