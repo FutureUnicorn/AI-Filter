@@ -13,7 +13,7 @@ cleanup() {
     docker compose --project-name "$project" \
       -f "$repository_root/infra/compose/restore.yml" \
       -f "$repository_root/tests/fixtures/backups/compose.yml" \
-      logs --no-color source-seed source-storage-seed backup-init backup-once restore 2>/dev/null || true
+      logs --no-color source-seed source-storage source-storage-seed backup-target backup-init backup-once restore 2>/dev/null || true
   fi
   docker compose --project-name "$project" \
     -f "$repository_root/infra/compose/restore.yml" \
