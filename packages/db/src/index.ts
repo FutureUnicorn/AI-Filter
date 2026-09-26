@@ -15,6 +15,7 @@ import type {
   DomainPort,
   EvidenceExtractionRunRef,
   EvidenceOutcome,
+  FailedDocumentRate,
   FileIntake,
   FileIntakeStatus,
   ImportFinalizationSummary,
@@ -42,6 +43,7 @@ import {
   mapCsvRowToApplication,
   recordReviewActivity,
   sealReviewTiming,
+  summarizeFailedDocuments,
   summarizeImportRows
 } from "@signal-audit/domain";
 import { Client } from "pg";
@@ -1776,6 +1778,218 @@ function rowToApplication(row: ApplicationRow): Application {
   };
 }
 
+// ---- AF-58: failed-document rate ----
+
+/**
+ * Per-role pipeline health. Scoped by organization first, not only by
+ * role: role_id is a uuid and would be unguessable in practice, but
+ * POL-011 is a tenant boundary, not an obscurity argument, so the
+ * organization is part of the predicate rather than assumed from it.
+ *
+ * The LEFT JOIN is what distinguishes "extraction ran and found nothing"
+ * (quality = 'empty', a failure) from "extraction has not run yet" (no
+ * row at all, still in flight). An INNER JOIN would silently drop the
+ * second group and make the rate look better than it is.
+ */
+export async function getFailedDocumentRate(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<FailedDocumentRate> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      uploaded: string;
+      quarantined: string;
+      rejected: string;
+      extraction_empty: string;
+      extraction_succeeded: string;
+    }>(
+      `SELECT
+         count(*) FILTER (WHERE fi.status <> 'pending') AS uploaded,
+         count(*) FILTER (WHERE fi.status = 'quarantined') AS quarantined,
+         count(*) FILTER (WHERE fi.status = 'rejected') AS rejected,
+         count(*) FILTER (WHERE fi.status = 'validated' AND cte.quality = 'empty') AS extraction_empty,
+         count(*) FILTER (WHERE fi.status = 'validated' AND cte.quality IN ('full', 'partial'))
+           AS extraction_succeeded
+       FROM "${schema}".file_intakes fi
+       LEFT JOIN "${schema}".canonical_text_extractions cte ON cte.intake_id = fi.intake_id
+       WHERE fi.organization_id = $1 AND fi.role_id = $2`,
+      [organizationId, roleId]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      // Aggregates always produce exactly one row, so no row means the
+      // query did not run as written rather than "this role has no files".
+      throw new Error("getFailedDocumentRate: aggregate query returned no row");
+    }
+    // count(*) is bigint, which node-postgres hands back as a string.
+    // Number() on an out-of-range or malformed value would silently
+    // produce NaN or a rounded float and poison every derived figure.
+    const toCount = (value: string, column: string): number => {
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new Error(`getFailedDocumentRate: ${column} is not a safe non-negative integer, got: ${value}`);
+      }
+      return parsed;
+    };
+    return summarizeFailedDocuments(organizationId, roleId, {
+      uploaded: toCount(row.uploaded, "uploaded"),
+      quarantined: toCount(row.quarantined, "quarantined"),
+      rejected: toCount(row.rejected, "rejected"),
+      extractionEmpty: toCount(row.extraction_empty, "extraction_empty"),
+      extractionSucceeded: toCount(row.extraction_succeeded, "extraction_succeeded")
+    });
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * AF-58 review probe. The counting rules only mean anything against a
+ * real schema: the LEFT JOIN, the `FILTER` predicates and the
+ * status/quality CHECK constraints are all database behaviour, and a
+ * hand-built fake would just restate the SQL I am trying to test.
+ *
+ * Three claims, each of which was wrong under an obvious simpler query:
+ *   1. A validated intake with NO extraction row is in flight, not a
+ *      failure -- an INNER JOIN or a `cte.quality IS DISTINCT FROM 'full'`
+ *      predicate would count it as failed.
+ *   2. `pending` never counts as an uploaded document at all.
+ *   3. The result is scoped to one organization AND one role; a second
+ *      role, and a second tenant's identical data, must not leak in.
+ */
+export async function assertFailedDocumentRateAccuracy(databaseUrl: string): Promise<void> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `fdr_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleA = "33333333-3333-4333-8333-333333333333";
+  const roleOther = "44444444-4444-4444-8444-444444444444";
+  const roleB = "55555555-5555-4555-8555-555555555555";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'U')`, [
+      userId,
+      `probe_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id)
+       VALUES ($1,$2,'A role',$4), ($3,$2,'Other role',$4), ($5,$6,'B role',$4)`,
+      [roleA, orgA, roleOther, userId, roleB, orgB]
+    );
+
+    let seq = 0;
+    const intake = async (organizationId: string, roleId: string, status: string): Promise<string> => {
+      seq += 1;
+      const result = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,'cv.pdf','application/pdf',$4,$5) RETURNING intake_id`,
+        [organizationId, roleId, `key-${suffix}-${seq}`, status, userId]
+      );
+      return result.rows[0]!.intake_id;
+    };
+    const extraction = async (intakeId: string, quality: string): Promise<void> => {
+      await admin.query(
+        `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+         VALUES ($1, '[]'::jsonb, 1, $2)`,
+        [intakeId, quality]
+      );
+    };
+
+    // Role A: 1 quarantined, 1 rejected, 1 empty extraction (all failures),
+    // 1 full + 1 partial (successes), 1 validated-but-unextracted and
+    // 1 uploaded (both in flight), 1 pending (not a document at all).
+    await intake(orgA, roleA, "quarantined");
+    await intake(orgA, roleA, "rejected");
+    await extraction(await intake(orgA, roleA, "validated"), "empty");
+    await extraction(await intake(orgA, roleA, "validated"), "full");
+    await extraction(await intake(orgA, roleA, "validated"), "partial");
+    await intake(orgA, roleA, "validated"); // extraction has not run yet
+    await intake(orgA, roleA, "uploaded");
+    await intake(orgA, roleA, "pending");
+    // Noise that must not be counted: another role, and another tenant.
+    await intake(orgA, roleOther, "quarantined");
+    await intake(orgB, roleB, "quarantined");
+    // A misattributed row -- org B pointing at org A's role -- used to be
+    // insertable here, and this probe deliberately created one to prove the
+    // organization_id predicate was load-bearing. AF-28's composite foreign
+    // key on (role_id, organization_id) now rejects it at the schema level,
+    // so that scenario can no longer be constructed and the case has been
+    // removed rather than left as a test that cannot fail.
+    //
+    // The predicate itself is kept, but it is honestly defence in depth now,
+    // not the thing enforcing isolation: role_id is a globally unique
+    // primary key and the composite FK ties it to one organization, so
+    // filtering on role_id alone would already be correct. It stays because
+    // POL-011 is a tenant boundary and a query over tenant data should say
+    // which tenant it means. Removing it would fail no test today.
+
+    const rate = await getFailedDocumentRate(databaseUrl, schema, orgA, roleA);
+    const expected = {
+      uploaded: 7,
+      quarantined: 1,
+      rejected: 1,
+      extractionEmpty: 1,
+      extractionSucceeded: 2,
+      failed: 3,
+      resolved: 5,
+      inFlight: 2
+    };
+    for (const [key, want] of Object.entries(expected)) {
+      const got = (rate as unknown as Record<string, number>)[key];
+      if (got !== want) {
+        throw new Error(
+          `assertFailedDocumentRateAccuracy: ${key} expected ${want}, got ${got} (full: ${JSON.stringify(rate)})`
+        );
+      }
+    }
+    if (rate.failedRate === null || Math.abs(rate.failedRate - 3 / 5) > 1e-12) {
+      throw new Error(`expected failedRate 0.6, got ${rate.failedRate}`);
+    }
+
+    // A role with documents but none resolved has no rate at all.
+    await intake(orgA, roleOther, "uploaded");
+    const otherRole = await getFailedDocumentRate(databaseUrl, schema, orgA, roleOther);
+    if (otherRole.quarantined !== 1 || otherRole.uploaded !== 2) {
+      throw new Error(`role scoping leaked: ${JSON.stringify(otherRole)}`);
+    }
+
+    // An organization/role pair that does not exist is empty, not an error.
+    const empty = await getFailedDocumentRate(databaseUrl, schema, orgA, roleB);
+    if (empty.uploaded !== 0 || empty.failedRate !== null) {
+      throw new Error(`cross-tenant role must be empty, got: ${JSON.stringify(empty)}`);
+    }
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+
 /**
  * Scoped by BOTH role_id and organization_id, deliberately.
  *
@@ -1809,6 +2023,45 @@ export async function listApplicationsForRole(
       [organizationId, roleId]
     );
     return result.rows.map(rowToApplication);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * The population a role-level metric is measured against.
+ *
+ * Separate from listApplicationsForRole rather than `.length` on it: the
+ * only caller is a metric, and reading every candidate's name and email
+ * into memory to arrive at an integer puts PII somewhere it has no
+ * business being. Scoped by organization as well as role for the same
+ * IDOR reason listApplicationsForRole is.
+ */
+export async function countApplicationsForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<number> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ population: string }>(
+      `SELECT count(*) AS population
+         FROM "${schema}".applications
+        WHERE organization_id = $1 AND role_id = $2`,
+      [organizationId, roleId]
+    );
+    const raw = result.rows[0]?.population;
+    // count(*) is bigint, which node-postgres returns as a string. An
+    // unchecked Number() would turn a malformed value into NaN and hand
+    // summarizeMetric a population it would reject far from here.
+    const population = raw === undefined ? Number.NaN : Number(raw);
+    if (!Number.isSafeInteger(population) || population < 0) {
+      throw new Error(`countApplicationsForRole: population is not a safe non-negative integer, got: ${raw}`);
+    }
+    return population;
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -4146,6 +4399,219 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
     } catch {
       // Best-effort cleanup; the next probe uses a unique suffix.
     }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-55: review-time reduction ----
+
+/** Handle on a seeded schema, returned by createReviewTimeMetricFixture. */
+export interface ReviewTimeMetricFixture {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly otherOrganizationId: string;
+  /** 12 applications: 11 fully observed, 1 with a truncated span. */
+  readonly roleId: string;
+  /** 2 applications, both fully observed: below any sane minimum sample. */
+  readonly sparseRoleId: string;
+  /** A role belonging to the other tenant entirely. */
+  readonly otherOrganizationRoleId: string;
+  /** Holds view_audit_reports in organizationId. */
+  readonly auditorUserId: string;
+  /** Reviews candidates in organizationId; must NOT see the metric. */
+  readonly recruiterUserId: string;
+  /** Authenticated, but a member of nothing. */
+  readonly outsiderUserId: string;
+  drop(): Promise<void>;
+}
+
+/**
+ * Seeds a throwaway schema the AF-55 endpoint can be exercised against.
+ *
+ * This lives in packages/db rather than in tests/ because the migration
+ * directory and the postgres client are both internal to this package,
+ * and every other probe here is built the same way. What it deliberately
+ * does NOT do is assert anything: the claim under test is how the route
+ * behaves, so the checking belongs next to the route, not here.
+ *
+ * The shape is chosen so the interesting cases are reachable without
+ * reseeding: a role whose sample clears the minimum but whose population
+ * does not (one application is partially observed, so the reduction
+ * comes back with population_incomplete attached), a role too small to
+ * report at all, and a second tenant to point the same request at.
+ */
+export async function createReviewTimeMetricFixture(databaseUrl: string): Promise<ReviewTimeMetricFixture> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `af55_route_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const otherOrganizationId = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const drop = async (): Promise<void> => {
+    const cleaner = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await cleaner.connect();
+      await cleaner.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } finally {
+      await cleaner.end().catch(() => undefined);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [
+      organizationId,
+      otherOrganizationId
+    ]);
+
+    const createUser = async (label: string): Promise<string> => {
+      const created = await admin.query<{ user_id: string }>(
+        `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING user_id`,
+        [`${label}_${suffix}@acme.test`, label]
+      );
+      const userId = created.rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error(`fixture could not create the ${label} user`);
+      }
+      return userId;
+    };
+    const auditorUserId = await createUser("auditor");
+    const recruiterUserId = await createUser("recruiter");
+    const outsiderUserId = await createUser("outsider");
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role)
+       VALUES ($1, $2, 'auditor'), ($1, $3, 'recruiter')`,
+      [organizationId, auditorUserId, recruiterUserId]
+    );
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`, [
+      otherOrganizationId,
+      outsiderUserId
+    ]);
+
+    const createRole = async (ownerOrganizationId: string, title: string, createdBy: string): Promise<string> => {
+      const created = await admin.query<{ role_id: string }>(
+        `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, $2, $3) RETURNING role_id`,
+        [ownerOrganizationId, title, createdBy]
+      );
+      const roleId = created.rows[0]?.role_id;
+      if (roleId === undefined) {
+        throw new Error(`fixture could not create the ${title} role`);
+      }
+      return roleId;
+    };
+    const roleId = await createRole(organizationId, "Measured", recruiterUserId);
+    const sparseRoleId = await createRole(organizationId, "Sparse", recruiterUserId);
+    const otherOrganizationRoleId = await createRole(otherOrganizationId, "Other tenant", outsiderUserId);
+
+    const createIntake = async (ownerOrganizationId: string, ownerRoleId: string, key: string): Promise<string> => {
+      const created = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+        [
+          ownerOrganizationId,
+          ownerRoleId,
+          key,
+          ownerOrganizationId === organizationId ? recruiterUserId : outsiderUserId
+        ]
+      );
+      const intakeId = created.rows[0]?.intake_id;
+      if (intakeId === undefined) {
+        throw new Error("fixture could not create a file intake");
+      }
+      return intakeId;
+    };
+    const intakeId = await createIntake(organizationId, roleId, `af55/${suffix}-measured.csv`);
+    const sparseIntakeId = await createIntake(organizationId, sparseRoleId, `af55/${suffix}-sparse.csv`);
+
+    const createApplication = async (ownerRoleId: string, intake: string, row: number): Promise<string> => {
+      const created = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications
+           (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING application_id`,
+        [organizationId, ownerRoleId, intake, row, `Candidate ${row}`, `c${row}_${suffix}@acme.test`]
+      );
+      const applicationId = created.rows[0]?.application_id;
+      if (applicationId === undefined) {
+        throw new Error("fixture could not create an application");
+      }
+      return applicationId;
+    };
+
+    // Eleven applications reviewed start to finish at five minutes each,
+    // then a twelfth that was interrupted. The twelfth is the case the
+    // metric used to count as a five-minute review.
+    const measured: string[] = [];
+    for (let row = 1; row <= 12; row += 1) {
+      measured.push(await createApplication(roleId, intakeId, row));
+    }
+    let hour = 9;
+    const recordSpan = async (
+      applicationId: string,
+      activeMs: number,
+      truncatedByIdle: boolean
+    ): Promise<void> => {
+      const startedAt = new Date(Date.UTC(2026, 7, 29, hour, 0, 0));
+      const endedAt = new Date(startedAt.getTime() + activeMs + 1_000);
+      hour = hour === 20 ? 9 : hour + 1;
+      await recordReviewTimingSpan(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        reviewerUserId: recruiterUserId,
+        startedAt,
+        endedAt,
+        activeMs,
+        truncatedByIdle
+      });
+    };
+    for (const applicationId of measured.slice(0, 11)) {
+      await recordSpan(applicationId, 300_000, false);
+    }
+    const interrupted = measured[11];
+    if (interrupted === undefined) {
+      throw new Error("fixture expected twelve applications");
+    }
+    await recordSpan(interrupted, 300_000, false);
+    await recordSpan(interrupted, 400_000, true);
+
+    for (let row = 1; row <= 2; row += 1) {
+      await recordSpan(await createApplication(sparseRoleId, sparseIntakeId, row), 300_000, false);
+    }
+
+    return {
+      schema,
+      organizationId,
+      otherOrganizationId,
+      roleId,
+      sparseRoleId,
+      otherOrganizationRoleId,
+      auditorUserId,
+      recruiterUserId,
+      outsiderUserId,
+      drop
+    };
+  } catch (error) {
+    await drop().catch(() => undefined);
+    throw error;
+  } finally {
     await admin.end().catch(() => undefined);
   }
 }

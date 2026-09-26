@@ -1871,12 +1871,28 @@ export interface ReviewTimingSummary {
    * is the specific way this metric could flatter the product.
    */
   readonly medianActiveMs: number | null;
-  /** Applications with at least one usable span. The denominator. */
+  /** Applications whose review time is FULLY observed. The denominator. */
   readonly sampleSize: number;
   /** Applications in scope, whether or not they were ever opened. */
   readonly population: number;
   /** Spans excluded because an idle cutoff ended them. */
   readonly truncatedSpanCount: number;
+  /**
+   * Applications kept out of the denominator because at least one of
+   * their spans hit an idle cutoff, so their total is a lower bound
+   * rather than a measurement.
+   *
+   * Reported at application grain because truncatedSpanCount cannot
+   * answer the question that matters to a reader: how much of the scope
+   * was dropped. sampleSize + partiallyObservedCount accounts for every
+   * application that produced a span. The remainder of population is
+   * mostly applications nobody has opened, but not only those: AF-54's
+   * capture path discards a span with no active time, so a candidate
+   * opened and closed again immediately arrives here indistinguishable
+   * from one never opened. This summary sees spans, not visits, and
+   * must not be read as if it saw visits.
+   */
+  readonly partiallyObservedCount: number;
 }
 
 /**
@@ -1895,16 +1911,50 @@ export interface ReviewTimingSummary {
  * bias the baseline downward -- again in the direction that flatters a
  * later improvement -- and excluding it silently would hide how much
  * data was dropped, which is why the count is reported.
+ *
+ * The whole APPLICATION leaves the denominator, not just the span.
+ * Dropping the span alone keeps an application whose real total is
+ * unknown in the sample carrying only the part we happened to see: one
+ * five-minute visit followed by an idle-truncated one is counted as a
+ * five-minute review. That understates the median, and if every
+ * application has that shape then sampleSize still equals population,
+ * so the result carries no limitation at all and reads as a complete
+ * measurement. Understating the assisted median overstates the
+ * reduction, which is the one direction this metric must never fail in.
+ *
+ * What remains and cannot be fixed here: a long review is likelier to be
+ * interrupted than a short one, so the applications this drops are not a
+ * random subset, and the surviving median still leans short. That is why
+ * the count is published rather than only the exclusion -- a reader who
+ * sees most of the scope dropped should not treat the remainder as the
+ * role's review time.
  */
 export function summarizeReviewTiming(
   spans: readonly ReviewTimingSpan[],
   population: number
 ): ReviewTimingSummary {
   const truncatedSpanCount = spans.filter((span) => span.truncatedByIdle).length;
-  const usable = spans.filter((span) => !span.truncatedByIdle);
+  const partiallyObserved = new Set(
+    spans.filter((span) => span.truncatedByIdle).map((span) => span.applicationId)
+  );
 
   const totalByApplication = new Map<string, number>();
-  for (const span of usable) {
+  for (const span of spans) {
+    if (partiallyObserved.has(span.applicationId)) {
+      continue;
+    }
+    // A zero-duration span is not a measurement. AF-54 now refuses to
+    // accept or store one, at the contract and at the database, but rows
+    // written before those constraints existed are still readable here,
+    // and this summary is what decides whether an application counts.
+    //
+    // Excluding it rather than summing it matters in both directions: a
+    // zero would pull the assisted median down and inflate the reported
+    // review-time reduction, and it would inflate sampleSize, which is the
+    // number AF-60 uses to say whether the figure can be trusted at all.
+    if (span.activeMs <= 0) {
+      continue;
+    }
     totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
   }
 
@@ -1917,7 +1967,8 @@ export function summarizeReviewTiming(
     medianActiveMs: sampleSize === 0 ? null : median(totals),
     sampleSize,
     population,
-    truncatedSpanCount
+    truncatedSpanCount,
+    partiallyObservedCount: partiallyObserved.size
   };
 }
 
@@ -1929,6 +1980,383 @@ function median(sortedValues: readonly number[]): number {
   const lower = sortedValues[middle - 1] ?? 0;
   const upper = sortedValues[middle] ?? 0;
   return (lower + upper) / 2;
+}
+
+// ---- AF-58: failed-document rate ----
+//
+// "Share of uploaded documents that failed" needs a denominator that is
+// honest about what it does not yet know. A document that has arrived but
+// whose validation or extraction has not run yet is not a success and not
+// a failure -- counting it either way makes the rate move on its own as
+// the pipeline drains, which is the opposite of a leading indicator.
+//
+// So the rate is over documents with a TERMINAL outcome, and everything
+// still in flight is reported separately rather than folded in. AF-60
+// ("show sample sizes and limitations") wants exactly this shape: the
+// number, and enough context to know whether to trust it yet.
+
+/** Raw per-role counts, as read from file_intakes joined to extractions. */
+export interface FailedDocumentCounts {
+  /** Intakes past 'pending': a file actually arrived. */
+  readonly uploaded: number;
+  readonly quarantined: number;
+  readonly rejected: number;
+  /** Validated, extraction ran, and produced no usable text. */
+  readonly extractionEmpty: number;
+  /** Validated, extraction ran, and produced full or partial text. */
+  readonly extractionSucceeded: number;
+}
+
+export interface FailedDocumentRate extends VersionedRecord {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly uploaded: number;
+  /** quarantined + rejected + extractionEmpty. */
+  readonly failed: number;
+  readonly quarantined: number;
+  readonly rejected: number;
+  readonly extractionEmpty: number;
+  readonly extractionSucceeded: number;
+  /** Terminal outcomes only -- the denominator of `failedRate`. */
+  readonly resolved: number;
+  /** Uploaded but not yet quarantined, rejected, or extracted. */
+  readonly inFlight: number;
+  /**
+   * failed / resolved, or null when nothing has resolved yet. Null rather
+   * than 0: "no documents have finished" and "no documents failed" are
+   * different claims, and reporting the first as the second would make an
+   * empty role look perfectly healthy.
+   */
+  readonly failedRate: number | null;
+}
+
+export function summarizeFailedDocuments(
+  organizationId: string,
+  roleId: string,
+  counts: FailedDocumentCounts
+): FailedDocumentRate {
+  const values = [
+    counts.uploaded,
+    counts.quarantined,
+    counts.rejected,
+    counts.extractionEmpty,
+    counts.extractionSucceeded
+  ];
+  if (values.some((value) => !Number.isInteger(value) || value < 0)) {
+    throw new Error(`summarizeFailedDocuments requires non-negative integer counts, got: ${JSON.stringify(counts)}`);
+  }
+  const failed = counts.quarantined + counts.rejected + counts.extractionEmpty;
+  const resolved = failed + counts.extractionSucceeded;
+  if (resolved > counts.uploaded) {
+    // Every terminal state is reached by an uploaded document, so this is
+    // a contradiction in the input, not a rounding artefact. Failing here
+    // beats emitting a rate above 1 or a negative inFlight.
+    throw new Error(
+      `summarizeFailedDocuments: resolved (${resolved}) exceeds uploaded (${counts.uploaded}); counts are inconsistent`
+    );
+  }
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    organizationId,
+    roleId,
+    uploaded: counts.uploaded,
+    failed,
+    quarantined: counts.quarantined,
+    rejected: counts.rejected,
+    extractionEmpty: counts.extractionEmpty,
+    extractionSucceeded: counts.extractionSucceeded,
+    resolved,
+    inFlight: counts.uploaded - resolved,
+    failedRate: resolved === 0 ? null : failed / resolved
+  };
+}
+
+// ---- AF-60: sample sizes and limitations ----
+//
+// "Do not let a report imply more confidence than the sample supports."
+// A bare number does that by omission: 0.6 reads the same whether it came
+// from 5 resolved documents or 5,000, and a reader has no way to tell.
+//
+// So a reported metric is never a bare number here. It carries the
+// denominator it was computed over, the population that denominator was
+// drawn from, and an explicit list of the reasons it should not be read
+// at face value. When the sample cannot support a value at all, `value`
+// is null and a limitation says why -- the same choice AF-58 made for
+// failedRate, generalised, because "we cannot tell you" and "the answer
+// is zero" are different claims and only one of them is ever true of an
+// empty sample.
+//
+// The limitation codes are a closed set rather than free text: a report
+// consumer has to be able to branch on them, and prose that varies by
+// call site cannot be aggregated or translated.
+
+export const METRIC_LIMITATION_CODES = [
+  /** Nothing has resolved yet; there is no denominator to divide by. */
+  "no_sample",
+  /** A denominator exists but is too small for the stated threshold. */
+  "below_minimum_sample",
+  /** Some of the population is excluded from the denominator (e.g. still in flight). */
+  "population_incomplete",
+  /**
+   * AF-55. One side of a comparison is a figure the customer supplied
+   * rather than one this system measured. Distinct from the three codes
+   * above, which are all about how much data there is: this one says the
+   * data is not the same KIND on both sides, and no amount of extra
+   * sample fixes it.
+   */
+  "baseline_self_reported"
+] as const;
+
+export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
+
+export interface MetricLimitation {
+  readonly code: MetricLimitationCode;
+  /** Human-readable specifics, always including the numbers involved. */
+  readonly detail: string;
+}
+
+export interface MetricSample extends VersionedRecord {
+  readonly metric: string;
+  /** null when the sample cannot support a value; never a placeholder number. */
+  readonly value: number | null;
+  /** The denominator the value was actually computed over. */
+  readonly sampleSize: number;
+  /** How many entities were in scope, whether or not they reached the denominator. */
+  readonly population: number;
+  /** The smallest sampleSize this metric is willing to report a value for. */
+  readonly minimumSampleSize: number;
+  readonly limitations: readonly MetricLimitation[];
+}
+
+export interface SummarizeMetricInput {
+  readonly metric: string;
+  /** The computed value, or null if the caller already knows it is unavailable. */
+  readonly value: number | null;
+  readonly sampleSize: number;
+  readonly population: number;
+  readonly minimumSampleSize: number;
+}
+
+/**
+ * Suppression is deliberate, not advisory. A metric below its minimum
+ * sample returns `value: null` rather than the number plus a warning,
+ * because a warning beside a number is routinely dropped by whatever
+ * renders it, and the number is what gets quoted. If the sample cannot
+ * support the claim, the report must not be able to make it.
+ */
+export function summarizeMetric(input: SummarizeMetricInput): MetricSample {
+  const { metric, value, sampleSize, population, minimumSampleSize } = input;
+  if (metric.trim().length === 0) {
+    throw new Error("summarizeMetric requires a metric name");
+  }
+  for (const [name, n] of [
+    ["sampleSize", sampleSize],
+    ["population", population],
+    ["minimumSampleSize", minimumSampleSize]
+  ] as const) {
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`summarizeMetric requires a non-negative integer ${name}, got: ${n}`);
+    }
+  }
+  if (sampleSize > population) {
+    throw new Error(
+      `summarizeMetric: sampleSize (${sampleSize}) exceeds population (${population}) for ${metric}; ` +
+        "the denominator cannot be larger than the set it was drawn from"
+    );
+  }
+  if (value !== null && !Number.isFinite(value)) {
+    throw new Error(`summarizeMetric: ${metric} value must be finite or null, got: ${value}`);
+  }
+
+  const limitations: MetricLimitation[] = [];
+  if (sampleSize === 0) {
+    limitations.push({
+      code: "no_sample",
+      detail: `no ${metric} observations have resolved yet (population ${population})`
+    });
+  } else if (sampleSize < minimumSampleSize) {
+    limitations.push({
+      code: "below_minimum_sample",
+      detail: `${sampleSize} observations is below the minimum of ${minimumSampleSize} required to report ${metric}`
+    });
+  }
+  if (sampleSize < population) {
+    limitations.push({
+      code: "population_incomplete",
+      detail: `${population - sampleSize} of ${population} in scope are not yet counted toward ${metric}`
+    });
+  }
+
+  const supported = sampleSize > 0 && sampleSize >= minimumSampleSize;
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    metric,
+    value: supported ? value : null,
+    sampleSize,
+    population,
+    minimumSampleSize,
+    limitations
+  };
+}
+
+/**
+ * AF-58's failed-document rate expressed as a reportable metric. Its
+ * denominator is documents with a terminal outcome, and its population is
+ * every document that arrived -- so a role still draining reports
+ * `population_incomplete` automatically rather than relying on whoever
+ * writes the report to remember.
+ */
+export function describeFailedDocumentRate(
+  rate: FailedDocumentRate,
+  minimumSampleSize: number
+): MetricSample {
+  return summarizeMetric({
+    metric: "failed_document_rate",
+    value: rate.failedRate,
+    sampleSize: rate.resolved,
+    population: rate.uploaded,
+    minimumSampleSize
+  });
+}
+
+// ---- AF-55: review-time reduction ----
+//
+// "Compare assisted review time against the employer's own baseline
+// process. Target >= 50%."
+//
+// This is the headline number of the whole product, which makes it the
+// number most worth making hard to overstate. Two things about it are
+// structurally awkward and are represented here rather than explained
+// in a slide footnote.
+//
+// First, the two sides are not measured the same way. The assisted
+// figure is instrumented: focused milliseconds, idle time excluded,
+// summed per application (AF-54). The baseline is usually the employer
+// telling us what they think their old process cost. Those are not
+// like for like, and the difference runs one way -- a remembered "about
+// fifteen minutes a CV" includes interruptions our number deliberately
+// excludes. So the comparison flatters us by default, and the source of
+// the baseline travels with the result instead of being forgotten.
+//
+// Second, the target is 50%. A threshold attached to a metric creates
+// pressure to report a number that clears it, so nothing here takes a
+// target as an argument or returns a pass/fail: this module reports the
+// reduction and refuses to report one it cannot support. Whether the
+// number cleared a bar is a separate question asked by whoever is
+// entitled to ask it.
+
+export const REVIEW_TIME_BASELINE_SOURCES = [
+  /**
+   * The employer's own account of their pre-assist process. An estimate,
+   * not a measurement, and usually a generous one.
+   */
+  "employer_reported",
+  /**
+   * Timing spans this system recorded before assisted review was turned
+   * on for the role. Measured the same way as the assisted side.
+   *
+   * No route may accept this from a caller, and none does: a source a
+   * request can name is a caveat a request can delete. It is reachable
+   * only from a server-owned measurement, which needs spans recorded
+   * while assistance was off plus a persisted per-role record of when it
+   * was enabled, to tell those spans from the assisted ones. Neither
+   * exists yet, so today this value has no honest producer.
+   * tests/architecture/metric-exposure.test.ts holds that line.
+   */
+  "measured_preassist"
+] as const;
+
+export type ReviewTimeBaselineSource = (typeof REVIEW_TIME_BASELINE_SOURCES)[number];
+
+export interface ReviewTimeBaseline {
+  readonly source: ReviewTimeBaselineSource;
+  /** Median time per application under the employer's prior process. */
+  readonly medianActiveMs: number;
+}
+
+/**
+ * The sample this metric refuses to report below, fixed here rather than
+ * taken from the caller.
+ *
+ * describeReviewTimeReduction still takes a minimum as an argument so
+ * tests can drive the suppression boundary directly, but the reporting
+ * path must not: a threshold a request can choose is not a threshold. An
+ * endpoint that accepted `minimumSampleSize=1` would hand anyone who
+ * wanted a number the means to get one out of a single review.
+ *
+ * Ten, because this is a median. Below roughly that, one interrupted
+ * review moves the middle value by minutes, and docs/VALIDATION_STATUS.md
+ * sizes the POC at about a hundred applications per role, so ten is the
+ * order of a tenth of a role rather than a number chosen to be reachable.
+ */
+export const REVIEW_TIME_REDUCTION_MINIMUM_SAMPLE_SIZE = 10;
+
+/**
+ * Assisted review time against a baseline, as a reportable metric.
+ *
+ * The value is the fraction of baseline time removed: 0.5 means half the
+ * time, 1 would mean instant, and it is deliberately allowed to go
+ * NEGATIVE when assisted review is slower. Clamping at zero is the
+ * obvious defensive move and it would be the wrong one -- "we made
+ * review 20% slower" is the single most important thing this metric can
+ * ever say, and a floor at zero would render it as "no improvement" and
+ * lose it.
+ *
+ * The denominator handed to summarizeMetric is applications whose review
+ * time is fully observed, not spans and not applications. AF-54 drops
+ * any application with an idle-truncated span, so a partially observed
+ * review shows up as `population_incomplete` rather than as a short
+ * complete one -- see summarizeReviewTiming for why the alternative
+ * silently overstates this metric.
+ */
+export function describeReviewTimeReduction(
+  assisted: ReviewTimingSummary,
+  baseline: ReviewTimeBaseline,
+  minimumSampleSize: number
+): MetricSample {
+  if (!Number.isFinite(baseline.medianActiveMs) || baseline.medianActiveMs <= 0) {
+    // Not a suppressed metric but a throw: a zero or negative baseline
+    // makes the ratio meaningless rather than unavailable, and returning
+    // `value: null` here would hide a caller bug behind the same
+    // "insufficient data" banner that honest small samples get.
+    throw new Error(
+      `describeReviewTimeReduction requires a positive baseline medianActiveMs, got: ${baseline.medianActiveMs}`
+    );
+  }
+
+  const assistedMedian = assisted.medianActiveMs;
+  const sample = summarizeMetric({
+    metric: "review_time_reduction",
+    value:
+      assistedMedian === null
+        ? null
+        : (baseline.medianActiveMs - assistedMedian) / baseline.medianActiveMs,
+    sampleSize: assisted.sampleSize,
+    population: assisted.population,
+    minimumSampleSize
+  });
+
+  if (baseline.source !== "employer_reported") {
+    return sample;
+  }
+  // Attached even when the value is suppressed. The caveat is a property
+  // of how the comparison was constructed, not of whether this
+  // particular sample happened to be big enough, and a reader who sees
+  // the limitation appear and disappear with sample size would
+  // reasonably conclude it was about sample size.
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "baseline_self_reported",
+        detail:
+          `the ${baseline.medianActiveMs}ms baseline is the employer's own estimate of their prior process, ` +
+          "not a measurement taken by this system; it likely includes interruptions that the assisted " +
+          "figure excludes, which biases the comparison in favour of a larger reduction"
+      }
+    ]
+  };
 }
 
 // ---- AF-54: the capture half ----
