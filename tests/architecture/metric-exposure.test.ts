@@ -40,7 +40,18 @@ const AWAITING_A_CALLER: Readonly<Record<string, string>> = {
   // requireMembershipLookupVisible, none of which exist on this stack),
   // so it would be rewritten during the replay onto develop and reviewed
   // in a form that does not survive.
-  describeQualifiedPreservation: "AF-59 files it into the role audit report; AF-90 delivers that report"
+  describeQualifiedPreservation: "AF-59 files it into the role audit report; AF-90 delivers that report",
+  // AF-57's precision metric. Same consumer as AF-56's preservation
+  // figure: AF-59's role-level audit report files it, and AF-90's
+  // share link is what puts that report in front of an employer.
+  // Neither has a route, so nothing under apps/ can call this yet.
+  // 
+  // Note that AF-57 renames this metric when its denominator rests
+  // on inferred examination, so what a route would expose is
+  // evidence_precision_<dataset> or its _examination_inferred
+  // variant. That is the report's problem to present, and another
+  // reason to wire it where the report lives rather than here.
+  describeEvidencePrecision: "AF-59 files it into the role audit report; AF-90 delivers that report"
 };
 
 function metricFunctions(): readonly string[] {
