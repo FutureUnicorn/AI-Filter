@@ -61,6 +61,22 @@ CREATE INDEX IF NOT EXISTS review_timing_spans_application_idx
 CREATE INDEX IF NOT EXISTS review_timing_spans_organization_idx
   ON review_timing_spans (organization_id);
 
+-- A zero-duration span is not a measurement, and the producer
+-- (sealReviewTiming) already refuses to emit one. The inline
+-- "active_ms >= 0" above let a direct SQL or API writer record one anyway,
+-- which would enter the measured sample with no measured time: the
+-- assisted median falls, the reported reduction rises, and the sample
+-- appears larger. One invariant, enforced at every layer that can write.
+--
+-- Added by ALTER rather than tightened inline, because this file is
+-- re-applied on every migrate and the existence guard on the table
+-- definition would skip an inline change on a database that already has
+-- the table.
+ALTER TABLE review_timing_spans
+  DROP CONSTRAINT IF EXISTS review_timing_spans_active_is_measured;
+ALTER TABLE review_timing_spans
+  ADD CONSTRAINT review_timing_spans_active_is_measured CHECK (active_ms > 0);
+
 DROP TRIGGER IF EXISTS review_timing_spans_append_only ON review_timing_spans;
 CREATE TRIGGER review_timing_spans_append_only
   BEFORE UPDATE OR DELETE ON review_timing_spans
