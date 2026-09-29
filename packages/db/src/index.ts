@@ -3857,11 +3857,21 @@ export async function recordAuditSample(
       // resolves and the insert succeeds against an erased candidate.
       //
       // One query for the whole draw rather than one per id, and the row
-      // count is what decides. Checking each id in turn would take the
-      // locks in caller-supplied order, and two concurrent draws over
-      // overlapping samples could then each hold a row the other needs.
-      // A single statement takes them in one go, so there is no interleaving
-      // to deadlock on.
+      // count is what decides.
+      //
+      // An earlier version of this comment said a per-id loop could
+      // deadlock two concurrent draws over overlapping samples. That was
+      // wrong, and Pradeep caught it: FOR SHARE does not conflict with
+      // FOR SHARE, so two draws take these locks in any order without
+      // blocking each other. Verified rather than reasoned about -- two
+      // sessions taking FOR SHARE on the same two rows in opposite order
+      // both proceed.
+      //
+      // The single statement is still the right shape, for duller
+      // reasons: one round trip instead of one per sampled id, and the
+      // count against the distinct id count is the direct way to say
+      // "every one of these must still be live", which a loop would have
+      // to reconstruct.
       //
       // FOR SHARE, matching the evidence and decision writers: it conflicts
       // with the erasure's FOR UPDATE, so either this commits first and the
