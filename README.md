@@ -101,6 +101,60 @@ and a validated PDF/DOCX `sourceIntakeId`; see
 
 Return the local database and storage to the known synthetic state with
 `pnpm dev:reset`. Destructive commands refuse staging and production targets.
+
+### Entering a deployment for the first time
+
+Authentication here is invite-only by design: a sign-in link is only ever
+mailed to an address that already holds a membership, and an invite can only
+be issued by somebody who already owns an organization. A freshly migrated
+database has neither, so one command creates the first organization, user and
+owner membership:
+
+Locally, against the database `pnpm dev:infra` starts:
+
+```bash
+pnpm bootstrap:owner --organization "Acme" --email owner@acme.test --name "Dana Ops"
+```
+
+In a hosted deployment, as a compose service, because `postgres` sits only on
+the `private` network (`internal: true`, no published port) and nothing
+outside the project can reach it:
+
+```bash
+docker compose --profile tools run --rm bootstrap \
+  --organization "Acme" --email owner@acme.test --name "Dana Ops"
+```
+
+Both run the same script with the same arguments; the second runs it inside
+the deployment, with the deployment's own configuration. Unlike `pnpm db:seed`
+it is not refused in production.
+
+This is deliberately a command and not an HTTP route. Whatever creates the
+first owner cannot itself sit behind authentication, so as a route it would be
+an unauthenticated privilege-granting endpoint that has to be disabled after
+first use — and "we remembered to disable it" is not a security control.
+Requiring database credentials instead puts the authorization on something the
+deployment already protects. It writes no synthetic fixtures. Re-running it
+converges rather than duplicating: an organization of that name is reused, the
+user is matched by email, and the owner membership is upserted (a run that
+promotes an existing non-owner member says so). The email is validated with
+the same schema the sign-in endpoint parses with, so this command cannot
+create an owner that endpoint would refuse to mail.
+
+From there the loop is inside the product:
+
+1. Open `/` and request a sign-in link for that email. In a local environment
+   the console sender prints it to the web process's stderr; hosted
+   environments require `MAGIC_LINK_EMAIL_*` and mail it for real.
+2. The link lands on `/roles`, which resolves the organization from your own
+   memberships — no `?organizationId=` to hand-assemble.
+3. Owners and admins can invite the rest of the team from that page, which is
+   `POST /api/invites`. Redeeming an invite creates the account and its
+   membership in one transaction.
+
+Uploading application files still has no UI (`POST /api/roles/:roleId/files`
+and the steps after it are reachable only by an HTTP client), so the import
+page is not linked from the roles list rather than being linked to a dead end.
 Preview, staging, production-shaped validation, secrets, cleanup, cost controls,
 and administrator-audit requirements are documented in
 [`docs/engineering/environments.md`](docs/engineering/environments.md).

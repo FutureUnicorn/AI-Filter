@@ -1,0 +1,18 @@
+-- AF-97 review #88 round 5, REV-004: a retry after the 503 delivery-failure
+-- response falsely reports success.
+--
+-- POST /api/invites commits the token row and its audit events, then tries
+-- to send the mail, and only answers 503 if that send fails. A client that
+-- retries on 503 -- the conventional response to one -- sends the same
+-- Idempotency-Key, lands in createInviteMagicLinkToken's existing "same
+-- fingerprint" replay branch, and gets back 202 with no attempt to send
+-- anything, because that branch has never known whether the first attempt's
+-- mail actually went out.
+--
+-- Nullable and set only on a confirmed send, for the same reason
+-- idempotency_key and replace_existing_role are nullable: a plain login
+-- token is never retried through this path and never sets it. A replay
+-- whose token still has delivered_at IS NULL means the invite was created
+-- but nothing was ever successfully sent for it, so the route can answer
+-- 503 again instead of 202.
+ALTER TABLE magic_link_tokens ADD COLUMN IF NOT EXISTS delivered_at timestamptz;
