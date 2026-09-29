@@ -279,7 +279,12 @@ test("the survival summary lists exactly the surfaces that survive, no more and 
       // which is not the same as being classified as surfaces of their
       // own. Both are append-only and both keep the identifier.
       "audit_sample_members",
-      "review_timing_spans"
+      "review_timing_spans",
+      // AF-66 REV-002. Exempt until now, on the basis that entity_id was
+      // "an identifier rather than candidate text" -- true, and not the
+      // question retention asks. Its sibling support_access_grants stays
+      // exempt and genuinely is, now that its free-text reason is gone.
+      "support_access_events"
     ]
   );
 });
@@ -348,7 +353,12 @@ test("once deletion is enforced, the survivors are still named as the exception"
       // which is not the same as being classified as surfaces of their
       // own. Both are append-only and both keep the identifier.
       "audit_sample_members",
-      "review_timing_spans"
+      "review_timing_spans",
+      // AF-66 REV-002. Exempt until now, on the basis that entity_id was
+      // "an identifier rather than candidate text" -- true, and not the
+      // question retention asks. Its sibling support_access_grants stays
+      // exempt and genuinely is, now that its free-text reason is gone.
+      "support_access_events"
     ]
   );
 });

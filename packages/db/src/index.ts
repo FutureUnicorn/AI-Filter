@@ -4727,6 +4727,13 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
   const importedIntakeId = "55555555-5555-4555-8555-555555555557";
   const importedApplicationId = "44444444-4444-4444-8444-444444444448";
   const auditSampleId = "88888888-8888-4888-8888-888888888888";
+  // AF-66 REV-002. Support access needs two platform operators, because
+  // a grant may not be self-granted, and they are deliberately NOT
+  // members of the tenant: a support operator who held a membership
+  // would be indistinguishable from the customer's own staff.
+  const supportOperator = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+  const supportGrantor = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const supportGrantId = "bbbbbbbb-3333-4333-8333-bbbbbbbbbbbb";
   const outcomeId = "66666666-6666-4666-8666-666666666666";
   const decisionId = "77777777-7777-4777-8777-777777777777";
   // Doubles as the request_id body: audit_events CHECKs request_id
@@ -4958,6 +4965,31 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
        VALUES ($1,$2,'application',$3,'openai','gpt-x','p1','s1','evidence','r1')`,
       [extractionRunId, org, applicationId]
     );
+    // AF-66 REV-002: an operator looking at this candidate's application.
+    // The reason is a code and a ticket key rather than free text, which
+    // is what makes the grant itself hold nothing candidate-derived; the
+    // EVENT still names the application, which is why it is a surface.
+    for (const [platformUserId, suffixHint] of [
+      [supportOperator, "op"],
+      [supportGrantor, "gr"]
+    ] as const) {
+      await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'S')`, [
+        platformUserId,
+        `ret_${suffix}_${suffixHint}@platform.test`
+      ]);
+      await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1)`, [platformUserId]);
+    }
+    await admin.query(
+      `INSERT INTO support_access_grants (grant_id, organization_id, operator_user_id, reason_code,
+         ticket_reference, granted_by_user_id, expires_at)
+       VALUES ($1,$2,$3,'stuck_upload','AF-66',$4, clock_timestamp() + interval '1 hour')`,
+      [supportGrantId, org, supportOperator, supportGrantor]
+    );
+    await admin.query(
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ($1,$2,$3,'application',$4)`,
+      [supportGrantId, org, supportOperator, applicationId]
+    );
 
     // 1. The append-only surfaces. P0001 is what RAISE EXCEPTION in
     //    reject_append_only_mutation() reports.
@@ -5032,6 +5064,16 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       { sqlstate: "P0001" },
       `UPDATE review_timing_spans SET reviewer_user_id = '${userId}'
         WHERE application_id = '${timedApplicationId}'`
+    );
+    await expectRejected(
+      "support_access_events:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM support_access_events WHERE grant_id = '${supportGrantId}'`
+    );
+    await expectRejected(
+      "support_access_events:redact",
+      { sqlstate: "P0001" },
+      `UPDATE support_access_events SET entity_id = 'redacted' WHERE grant_id = '${supportGrantId}'`
     );
 
     // 2. The referential blockers, each named by the constraint that
@@ -5326,6 +5368,14 @@ export async function observeRetentionResidue(
         `SELECT count(*) FROM "${schema}".audit_sample_members asm
            JOIN "${schema}".audit_samples s ON s.audit_sample_id = asm.audit_sample_id
           WHERE asm.organization_id = $1 AND s.drawn_at <= $2`
+      ],
+      // AF-66 REV-002: every look a support operator took, named by
+      // entity_type and entity_id. When the look was at a candidate's
+      // application, that is the candidate's identifier.
+      [
+        "support_access_events",
+        `SELECT count(*) FROM "${schema}".support_access_events
+          WHERE organization_id = $1 AND accessed_at <= $2`
       ]
     ];
 
@@ -5673,6 +5723,315 @@ export async function probeRetentionExternalCountGuards(
       refusedNonInteger: await refusal({ object_storage_documents: Number.NaN }),
       refusedNegative: await refusal({ object_storage_documents: -1 })
     };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-66: prove the support-access constraints against the real schema ----
+
+/**
+ * Each case gets its own primary key. Reusing one would make a
+ * duplicate-key error masquerade as the constraint under test, and
+ * several cases would read as enforced while never running -- the exact
+ * way an earlier probe in this file gave a false pass.
+ */
+export async function assertSupportAccessIntegrity(databaseUrl: string): Promise<Record<string, string>> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `support_probe_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const operator = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const authoriser = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  // REV-001: an ordinary account, the kind every customer's recruiter has.
+  // Nothing about it says platform staff, which is the point.
+  const outsider = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  // REV-001 offboarding: two more operators, both revoked partway through.
+  const departingOperator = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const departingGrantor = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const rejections: Record<string, string> = {};
+
+  const expectRejected = async (label: string, sql: string, params: unknown[] = []): Promise<void> => {
+    try {
+      await admin.query(sql, params);
+      throw new Error(`assertSupportAccessIntegrity: "${label}" was ACCEPTED but must be rejected`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("assertSupportAccessIntegrity:")) {
+        throw error;
+      }
+      // REV-004: the SQLSTATE, not only the message. Which table a
+      // refusal names is the whole finding there, and "did an append-only
+      // trigger fire or did a foreign key" is a distinction a substring
+      // match on prose would make badly.
+      const sqlstate = (error as { code?: unknown }).code;
+      rejections[label] = message;
+      rejections[`${label}:sqlstate`] = typeof sqlstate === "string" ? sqlstate : "none";
+    }
+  };
+
+  // Values are inlined rather than parameterised because every one is a
+  // hard-coded literal in this probe, and several cases need SQL-level
+  // expressions (clock_timestamp() + interval) that a bind parameter
+  // cannot carry.
+  const insertGrant = (grantId: string, columns: string, values: string): string =>
+    `INSERT INTO support_access_grants (grant_id, ${columns}) VALUES ('${grantId}', ${values})`;
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0022_support_access.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Op'), ($3,$4,'Auth'), ($5,$6,'Customer')`,
+      [
+        operator,
+        `op_${suffix}@acme.test`,
+        authoriser,
+        `auth_${suffix}@acme.test`,
+        outsider,
+        `recruiter_${suffix}@customer.test`
+      ]
+    );
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Leaving'), ($3,$4,'Leaving')`, [
+      departingOperator,
+      `leaving_op_${suffix}@acme.test`,
+      departingGrantor,
+      `leaving_auth_${suffix}@acme.test`
+    ]);
+
+    // The allowlist, seeded before any grant: with the operator foreign key
+    // in place, a fixture that creates users but no platform_operators row
+    // would have every grant below refused for the wrong reason. The
+    // outsider is deliberately NOT seeded.
+    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2), ($3), ($4)`, [
+      operator,
+      authoriser,
+      departingOperator,
+      departingGrantor
+    ]);
+
+    const base = `organization_id, operator_user_id, reason_code, ticket_reference, granted_by_user_id, expires_at`;
+
+    await expectRejected(
+      "self_granted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000001",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-101', '${operator}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    // REV-002: the free-text reason is gone, so "a reason of tabs and
+    // newlines" is no longer the shape that has to be refused. These two
+    // are: a code outside the closed set, and a ticket reference loose
+    // enough to hold the sentence the column was just relieved of.
+    await expectRejected(
+      "reason_code_outside_the_closed_set",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000002",
+        base,
+        `'${orgA}', '${operator}', 'looking into a stuck import', 'AF-101', '${authoriser}', ` +
+          `clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "ticket_reference_holding_free_text",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000012",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'Jane Doe stuck upload', '${authoriser}', ` +
+          `clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "window_too_long",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000003",
+        base,
+        `'${orgA}', '${operator}', 'incident_investigation', 'AF-105', '${authoriser}', clock_timestamp() + interval '25 hours'`
+      )
+    );
+    await expectRejected(
+      "expires_before_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000004",
+        base,
+        `'${orgA}', '${operator}', 'incident_investigation', 'AF-106', '${authoriser}', clock_timestamp() - interval '1 hour'`
+      )
+    );
+
+    // REV-001: an ordinary user named as the operator. users is global, so
+    // before the allowlist any customer account satisfied the foreign key,
+    // and two colluding accounts could grant each other cross-tenant access
+    // past every other constraint in this migration.
+    await expectRejected(
+      "operator_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000005",
+        base,
+        `'${orgA}', '${outsider}', 'stuck_upload', 'AF-101', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+
+    // REV-001: an allowlisted operator authorised by an ordinary account.
+    // Without the grantor on the allowlist too, an operator and their own
+    // spare customer account satisfy not_self_granted, so dual custody
+    // would mean only that a second account existed.
+    await expectRejected(
+      "grantor_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000006",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-101', '${outsider}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+
+    // A valid grant for org A, used for the remaining cases.
+    const liveGrant = "10000000-0000-4000-8000-00000000000a";
+    await admin.query(
+      insertGrant(
+        liveGrant,
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-102', '${authoriser}', clock_timestamp() + interval '2 hours'`
+      )
+    );
+
+    // An event must not be able to cite a grant issued for another tenant.
+    await expectRejected(
+      "event_cites_other_org_grant",
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${liveGrant}', '${orgB}', '${operator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    // REV-001: an event naming a different person than the grant it cites.
+    // The log would then attribute to one operator an access that only
+    // another's grant authorised.
+    await expectRejected(
+      "event_operator_not_grant_operator",
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${liveGrant}', '${orgA}', '${authoriser}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    await expectRejected(
+      "event_blank_entity_id",
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${liveGrant}', '${orgA}', '${operator}', 'application', '   ')`
+    );
+
+    const eventId = "20000000-0000-4000-8000-000000000001";
+    await admin.query(
+      `INSERT INTO support_access_events (support_access_event_id, grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${eventId}', '${liveGrant}', '${orgA}', '${operator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    await expectRejected("event_delete", `DELETE FROM support_access_events WHERE support_access_event_id = '${eventId}'`);
+    await expectRejected(
+      "event_update",
+      `UPDATE support_access_events SET entity_id = 'something-else' WHERE support_access_event_id = '${eventId}'`
+    );
+
+    // REV-001 offboarding. A grant issued while the operator was active,
+    // then the operator leaves. The old grant must be untouched and still
+    // usable within its window; only NEW grants naming them are refused.
+    const grantBeforeLeaving = "10000000-0000-4000-8000-00000000000b";
+    await admin.query(
+      insertGrant(
+        grantBeforeLeaving,
+        base,
+        `'${orgA}', '${departingOperator}', 'stuck_upload', 'AF-103', '${departingGrantor}', clock_timestamp() + interval '2 hours'`
+      )
+    );
+    const before = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    await admin.query(`UPDATE platform_operators SET revoked_at = clock_timestamp() WHERE user_id IN ($1, $2)`, [
+      departingOperator,
+      departingGrantor
+    ]);
+    await expectRejected(
+      "revoked_operator_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000007",
+        base,
+        `'${orgA}', '${departingOperator}', 'stuck_upload', 'AF-107', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "revoked_grantor_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000008",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-108', '${departingGrantor}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    const after = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    if (before.rows[0]?.row === undefined || before.rows[0].row !== after.rows[0]?.row) {
+      throw new Error("assertSupportAccessIntegrity: revoking an operator changed a grant issued before they left");
+    }
+    // Recorded under an "accepted:" key: this is a path that must SUCCEED,
+    // and the probe throws above if the grant itself was altered.
+    await admin.query(
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${grantBeforeLeaving}', '${orgA}', '${departingOperator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    rejections["accepted:event_under_grant_issued_before_leaving"] = "accepted";
+
+    // The application qualifies every table with its schema and does not set
+    // search_path, so the trigger's own lookup must not depend on the
+    // inserting session's. Inserted here from a session pointed elsewhere.
+    await admin.query(`SET search_path TO public`);
+    await admin.query(
+      `INSERT INTO "${schema}".support_access_grants (grant_id, ${base})
+       VALUES ('10000000-0000-4000-8000-00000000000c', '${orgA}', '${operator}', 'stuck_upload', 'AF-104',
+               '${authoriser}', clock_timestamp() + interval '1 hour')`
+    );
+    await admin.query(`SET search_path TO "${schema}"`);
+    rejections["accepted:grant_inserted_with_another_search_path"] = "accepted";
+
+    await expectRejected("grant_delete", `DELETE FROM support_access_grants WHERE grant_id = '${liveGrant}'`);
+    await expectRejected(
+      "grant_reason_amended",
+      `UPDATE support_access_grants SET reason_code = 'incident_investigation' WHERE grant_id = '${liveGrant}'`
+    );
+    await expectRejected(
+      "grant_window_extended",
+      `UPDATE support_access_grants SET expires_at = expires_at + interval '1 hour' WHERE grant_id = '${liveGrant}'`
+    );
+
+    // REV-004: deleting the organization must be refused BY THE FOREIGN
+    // KEY, not by a cascade running into an append-only trigger.
+    //
+    // Both organization_id columns carried ON DELETE CASCADE. The delete
+    // was refused either way, so nothing was ever at risk -- but the
+    // cascade issues a DELETE against a table whose trigger rejects
+    // DELETE, so the operator got "support_access_grants is append-only"
+    // naming a table they had not mentioned, instead of a foreign key
+    // violation naming organizations. 0006 and 0016 each hit this and
+    // removed the clause; this case is what stops 0022 drifting back.
+    await expectRejected("organization_deleted", `DELETE FROM organizations WHERE organization_id = '${orgA}'`);
+
+    // Revocation is the one permitted update, and it is one-way.
+    await admin.query(`UPDATE support_access_grants SET revoked_at = clock_timestamp() WHERE grant_id = '${liveGrant}'`);
+    await expectRejected(
+      "revocation_undone",
+      `UPDATE support_access_grants SET revoked_at = NULL WHERE grant_id = '${liveGrant}'`
+    );
+
+    return rejections;
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

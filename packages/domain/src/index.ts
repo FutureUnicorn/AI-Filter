@@ -2237,6 +2237,233 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-66: support-access logging ----
+//
+// "Any time a founder/operator looks at a specific tenant's data for
+// support reasons, it's logged with a reason -- least-privilege, not
+// silent access."
+//
+// The load-bearing word is "any", and it is what makes this a
+// fail-closed authorization decision rather than a logging feature. A
+// log written on a best-effort basis after the read has happened does
+// not support the claim: every time the write failed, the access would
+// be silent. So authorizeSupportAccess denies unless a live grant is
+// produced, and the caller has nothing to pass that means "I looked
+// already".
+//
+// Support access is deliberately NOT a membership. Granting an operator
+// a membership row would work and would be wrong in a way that is hard
+// to undo -- the operator would become indistinguishable from the
+// customer's own staff in every capability check, audit event and RLS
+// policy. Nothing here consults memberships, and a support grant confers
+// no capability: it authorises looking, and only at the tenant named.
+
+export type SupportAccessDenialReason =
+  | "no_grant"
+  | "grant_expired"
+  | "grant_revoked"
+  | "grant_for_other_organization"
+  | "grant_for_other_operator"
+  /**
+   * REV-003: a timestamp on the grant, or the clock it is compared
+   * against, is not a date this code can read. Its own reason rather
+   * than being folded into grant_expired, because the two call for
+   * different action: an expired grant is the system working, and a
+   * grant whose expiry cannot be parsed means something upstream wrote
+   * or mapped a row wrong, which is a bug someone has to go and find.
+   */
+  | "grant_malformed";
+
+/**
+ * Why an operator is looking, as a closed set rather than free text.
+ *
+ * REV-002, raised independently by both reviewers. The previous design
+ * stored a free-text reason and redacted it through redactPii on the
+ * way in, and the retention exemption for support_access_grants rested
+ * on that redaction making the column PII-free. It does not: redactPii
+ * masks email-shaped and phone-shaped substrings, and a support note
+ * says "looking at Jane Doe's stuck upload". The name went in
+ * unchanged, into a table that is exempt from retention, rejects DELETE
+ * and rejects any UPDATE to the reason. There was no way to get it back
+ * out.
+ *
+ * Redaction was the wrong tool for the job. A redactor is a filter that
+ * has to recognise every shape of identifier a human might type, and
+ * names, addresses and dates of birth have no shape. So the free text
+ * is gone rather than better filtered: an operator picks a code and
+ * cites a ticket, and the sentence describing the situation lives in the
+ * ticketing system, which has its own retention policy and its own
+ * deletion story.
+ *
+ * This is a real loss of detail at the grant, and it is the right trade.
+ * The support log's job is to answer "who looked at this tenant, when,
+ * under what authority, and where is the paper trail" -- all four of
+ * which survive. It was never the place to keep the narrative.
+ */
+export const SUPPORT_ACCESS_REASON_CODES = [
+  /** A file intake that did not progress through validation or extraction. */
+  "stuck_upload",
+  /** A CSV import that failed or produced wrong rows. */
+  "failed_import",
+  /** Evidence extraction errored or produced an unusable result. */
+  "extraction_failure",
+  /** A defect the customer reported that needs their data to reproduce. */
+  "customer_reported_defect",
+  /** An active incident where this tenant's data is in scope. */
+  "incident_investigation",
+  /** A data subject exercising a right that requires locating their records. */
+  "data_subject_request"
+] as const;
+
+export type SupportAccessReasonCode = (typeof SUPPORT_ACCESS_REASON_CODES)[number];
+
+/**
+ * A ticket key: letters, then a hyphen, then digits. Deliberately narrow.
+ *
+ * The point of citing a ticket is that the detail lives somewhere with
+ * its own retention, so this column must not become a second free-text
+ * field wearing a pattern. Anything a person might type a name into
+ * fails this.
+ */
+export const SUPPORT_ACCESS_TICKET_REFERENCE_PATTERN = /^[A-Z][A-Z0-9]*-[0-9]+$/u;
+
+export interface SupportAccessGrant {
+  readonly grantId: string;
+  readonly organizationId: string;
+  readonly operatorUserId: string;
+  /** Why, from a closed set. See SUPPORT_ACCESS_REASON_CODES. */
+  readonly reasonCode: SupportAccessReasonCode;
+  /** Where the detail lives, under that system's own retention. */
+  readonly ticketReference: string;
+  readonly grantedByUserId: string;
+  readonly grantedAt: string;
+  readonly expiresAt: string;
+  readonly revokedAt?: string | undefined;
+}
+
+export interface SupportAccessRequest {
+  readonly organizationId: string;
+  readonly operatorUserId: string;
+  readonly entityType: string;
+  readonly entityId: string;
+}
+
+export type SupportAccessDecision =
+  | { readonly allowed: true; readonly grantId: string }
+  | { readonly allowed: false; readonly denialReason: SupportAccessDenialReason };
+
+/**
+ * The longest a single grant may run. Renewal is a new grant, which
+ * means a new reason and a new authoriser -- an extension would let one
+ * decision made once cover an arbitrarily long period.
+ */
+export const SUPPORT_ACCESS_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Fail-closed by construction: every path that is not an explicit,
+ * live, matching grant returns a denial. The denial reasons are a closed
+ * set because "why was I denied" is a question an operator will ask at
+ * 3am, and free text cannot be branched on or counted.
+ *
+ * `now` is passed rather than read, so a decision is reproducible and a
+ * test can sit exactly on an expiry boundary.
+ */
+export function authorizeSupportAccess(
+  grant: SupportAccessGrant | undefined,
+  request: SupportAccessRequest,
+  now: Date
+): SupportAccessDecision {
+  if (grant === undefined) {
+    return { allowed: false, denialReason: "no_grant" };
+  }
+  if (grant.organizationId !== request.organizationId) {
+    // Checked before expiry so that a stale grant for tenant A can never
+    // be reported as merely "expired" when it was also the wrong tenant.
+    return { allowed: false, denialReason: "grant_for_other_organization" };
+  }
+  if (grant.operatorUserId !== request.operatorUserId) {
+    return { allowed: false, denialReason: "grant_for_other_operator" };
+  }
+  // REV-003: parse before comparing, and deny when the parse fails.
+  //
+  // Date.parse returns NaN for a string it cannot read, and every
+  // comparison with NaN is false, so the previous `Date.parse(x) <=
+  // now.getTime()` form skipped its own denial and fell through to
+  // allowed. A grant whose expiry was corrupt or badly mapped became a
+  // grant with no expiry, and a revocation stored as "" was ignored.
+  // These two checks are the only place this function takes loosely
+  // typed input -- strings off a database row -- so they were the only
+  // place it could fail open, and they did.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    // The same hole one level up: an Invalid Date makes every comparison
+    // below false no matter what the grant says. The clock is an
+    // argument here precisely so a caller controls it, which makes it
+    // input like any other.
+    return { allowed: false, denialReason: "grant_malformed" };
+  }
+  if (grant.revokedAt !== undefined) {
+    const revokedAtMs = Date.parse(grant.revokedAt);
+    if (!Number.isFinite(revokedAtMs)) {
+      // A present but unreadable revocation is treated as a reason to
+      // deny, not as an absent one. Someone wrote something into that
+      // column, and the only safe reading of "this grant may have been
+      // revoked" is that it was.
+      return { allowed: false, denialReason: "grant_malformed" };
+    }
+    if (revokedAtMs <= nowMs) {
+      return { allowed: false, denialReason: "grant_revoked" };
+    }
+  }
+  const expiresAtMs = Date.parse(grant.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return { allowed: false, denialReason: "grant_malformed" };
+  }
+  // <= rather than <: a grant is dead at its expiry instant, not one
+  // millisecond after. The boundary is the case someone will test.
+  if (expiresAtMs <= nowMs) {
+    return { allowed: false, denialReason: "grant_expired" };
+  }
+  return { allowed: true, grantId: grant.grantId };
+}
+
+export interface SupportAccessReason {
+  readonly reasonCode: SupportAccessReasonCode;
+  readonly ticketReference: string;
+}
+
+/**
+ * The write boundary for a grant's stated reason.
+ *
+ * There is deliberately no redactor parameter and no free text to pass
+ * through one. A redactor has to recognise every shape of identifier a
+ * human might type, and the most common kind in a support note -- a
+ * name -- has no shape. The previous version of this function took
+ * `redactPii` and returned "Looking at Jane Doe's stuck upload"
+ * unchanged, which is what made the retention exemption on
+ * support_access_grants false.
+ *
+ * Mirrors 0022's CHECKs rather than replacing them: the database is
+ * what a direct INSERT has to get past, and this is what a caller gets
+ * a readable error from.
+ */
+export function validateSupportAccessReason(reason: SupportAccessReason): void {
+  if (!(SUPPORT_ACCESS_REASON_CODES as readonly string[]).includes(reason.reasonCode)) {
+    throw new Error(
+      `a support access reason code must be one of ${SUPPORT_ACCESS_REASON_CODES.join(", ")}, ` +
+        `got: ${reason.reasonCode}`
+    );
+  }
+  if (!SUPPORT_ACCESS_TICKET_REFERENCE_PATTERN.test(reason.ticketReference)) {
+    // Narrow on purpose. A looser pattern would let this column become
+    // the free-text field that was just removed, and it would be exempt
+    // from retention and unredactable in exactly the same way.
+    throw new Error(
+      `a support access ticket reference must look like ABC-123, got: ${reason.ticketReference}`
+    );
+  }
+}
+
 // ---- AF-63: deletion reconciliation ----
 //
 // "Scheduled job confirms every store that should be empty actually is;
@@ -2371,7 +2598,30 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "inference_kill_switch",
   "import_finalizations",
   "audit_samples",
-  "af11_synthetic_environment_fixture"
+  "af11_synthetic_environment_fixture",
+  // AF-66. Holds operator activity and no candidate content.
+  //
+  // REV-002 is why this reads differently from how it used to. The
+  // exemption previously rested on the grant's free-text reason being
+  // redacted through redactPii on the way in, and that redaction does
+  // not cover names, so the basis was false. The free text is gone: a
+  // grant now carries a reason code from a closed set and a ticket
+  // reference matched against a narrow pattern, and there is no column
+  // here a candidate identifier can be written into. The exemption is
+  // true because of the shape of the table rather than because of a
+  // filter someone has to keep ahead of.
+  //
+  // support_access_events is NOT here. It carries entity_type and
+  // entity_id, and an operator opening a candidate's application writes
+  // that application's identifier into it, so it is a planned surface
+  // alongside audit_events.
+  "support_access_grants",
+  // AF-66 REV-001. The allowlist of platform staff who may be named on a
+  // support grant. It holds a user_id and when that person was revoked,
+  // nothing else: no tenant, no candidate, no free text. Exempt because it
+  // is access-control configuration, and purging it would make every
+  // historical grant name an operator the schema no longer recognises.
+  "platform_operators"
 ]);
 
 /**
@@ -2395,6 +2645,25 @@ export function assertRetentionExemptionsAreLive(): void {
         `claims it is accounted for.`
     );
   }
+}
+
+export type RetentionClassification = "planned" | "exempt" | "unclassified";
+
+/**
+ * Whether the retention plan accounts for a table at all.
+ *
+ * Exported so the architecture suite can assert that every table any
+ * migration creates is classified one way or the other. AF-63 catches an
+ * unclassified table at runtime, which is the right backstop but a slow
+ * one -- it needs a database, a scheduled run and someone reading the
+ * report. This makes the same omission fail at build time, when the
+ * person adding the table is still holding it.
+ */
+export function classifyRetentionTable(table: string): RetentionClassification {
+  if (RETENTION_SURFACES.some((surface) => surface === table)) {
+    return "planned";
+  }
+  return RETENTION_EXEMPT_TABLES.has(table) ? "exempt" : "unclassified";
 }
 
 export function reconcileRetention(
@@ -2650,7 +2919,20 @@ export const RETENTION_SURFACES = [
   // checking for the difference. Both are append-only and both keep an
   // application identifier past any cutoff.
   "audit_sample_members",
-  "review_timing_spans"
+  "review_timing_spans",
+  // AF-66 REV-002. Every look an operator takes, named by entity_type
+  // and entity_id. When that look is at a candidate's application, the
+  // identifier written here is the candidate's, which is the same
+  // polymorphic pair that put audit_events and evidence_extraction_runs
+  // on this list. It was previously exempt, on a basis that named
+  // entity_id as "an identifier rather than candidate text" -- true, and
+  // not the question retention asks.
+  //
+  // Its sibling support_access_grants stays exempt and genuinely is:
+  // after REV-002 it holds a reason code from a closed set and a ticket
+  // reference, and there is no column on it a candidate identifier can
+  // reach.
+  "support_access_events"
 ] as const;
 
 export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
@@ -2835,6 +3117,19 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "identifier this is behavioural data linking a named reviewer to a named candidate at a " +
       "specific time, which is more than an aggregate input to AF-55's median. Another of the four " +
       "uncascaded foreign keys pinning applications."
+  },
+  support_access_events: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, which is a candidate's application identifier whenever a support operator " +
+      "opened that application, alongside the operator and the moment they looked",
+    detail:
+      "Append-only (0022_support_access.sql): DELETE and UPDATE are both rejected, deliberately, " +
+      "because an access log the operator can edit answers nothing -- the one person with a motive " +
+      "to remove a row is the person the row is about. That is the right design and it means the " +
+      "identifier cannot be removed. Its sibling support_access_grants is exempt rather than " +
+      "planned: after REV-002 a grant holds a reason code from a closed set and a ticket reference, " +
+      "and no candidate identifier can reach it."
   },
   evidence_extraction_runs: {
     disposition: "blocked_append_only",

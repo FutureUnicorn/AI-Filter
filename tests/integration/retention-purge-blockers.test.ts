@@ -37,7 +37,8 @@ const PROBED_SURFACES: readonly RetentionSurface[] = [
   "audit_events",
   "evidence_extraction_runs",
   "audit_sample_members",
-  "review_timing_spans"
+  "review_timing_spans",
+  "support_access_events"
 ];
 
 function databaseUrl(): string {
@@ -380,8 +381,8 @@ test("every table carrying an entity_type/entity_id pair is a planned retention 
   // over an empty set.
   assert.deepEqual(
     polymorphic,
-    ["audit_events", "evidence_extraction_runs"],
-    "the column read must still find the two known polymorphic tables"
+    ["audit_events", "evidence_extraction_runs", "support_access_events"],
+    "the column read must still find every known polymorphic table"
   );
 
   const unaccounted = polymorphic
@@ -511,4 +512,15 @@ test("the two newly classified surfaces refuse both deletion and redaction", asy
   assert.match(failures["audit_sample_members:redact"] ?? "", /append-only: UPDATE is not allowed/);
   assert.match(failures["review_timing_spans:delete"] ?? "", /append-only: DELETE is not allowed/);
   assert.match(failures["review_timing_spans:redact"] ?? "", /append-only: UPDATE is not allowed/);
+});
+
+test("a support operator's look at a candidate cannot be deleted or blanked either", async () => {
+  // AF-66 REV-002. support_access_events was exempt from retention on
+  // the basis that entity_id is "an identifier rather than candidate
+  // text", which is true and is not the question. The guard above caught
+  // it on the column read, without anyone having to notice: the table
+  // has the polymorphic pair, so it had to be classified or argued away.
+  const { failures } = await assertRetentionPurgeBlockers(databaseUrl());
+  assert.match(failures["support_access_events:delete"] ?? "", /append-only: DELETE is not allowed/);
+  assert.match(failures["support_access_events:redact"] ?? "", /append-only: UPDATE is not allowed/);
 });
