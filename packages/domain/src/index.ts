@@ -1841,146 +1841,6 @@ export function selectAuditSample(
     sampledApplicationIds: ordered.slice(0, Math.max(0, size)).map((candidate) => candidate.applicationId)
   };
 }
-
-// ---- AF-53: keyboard-first review navigation ----
-//
-// "Recruiters reviewing hundreds of applications need keyboard-driven
-// navigation between cards and source context, not mouse-only review."
-//
-// The decision layer lives here, in a pure function, for a reason worth
-// stating: this repository has no DOM test infrastructure -- no jsdom,
-// no testing-library, tests run under node --test. Keyboard handling
-// written directly into a component would therefore be shipped
-// untested, and the parts most likely to be wrong are not the event
-// plumbing but the RULES: which keys are claimed, when they are not
-// claimed, and where the boundaries are. Those are decidable without a
-// browser, so they are decided here and exhaustively tested, and the
-// component is left as thin glue over them.
-
-export type ReviewKeyAction =
-  | "next"
-  | "previous"
-  | "first"
-  | "last"
-  | "open"
-  | "reveal-source"
-  | "help"
-  | "none";
-
-export interface ReviewKeyEvent {
-  readonly key: string;
-  readonly ctrlKey?: boolean;
-  readonly metaKey?: boolean;
-  readonly altKey?: boolean;
-  /**
-   * True when focus is inside a text field or contenteditable region.
-   * The caller determines this from the DOM; this module will not guess.
-   */
-  readonly editingText?: boolean;
-}
-
-/**
- * Two refusals come before any binding is considered, and they matter
- * more than the bindings do.
- *
- * A shortcut that fires while a recruiter is typing a correction
- * rationale eats their input -- and AF-50 requires that rationale, so
- * the damage lands on the one field the system insists on. `editingText`
- * suppresses everything.
- *
- * A shortcut that fires with Ctrl, Meta or Alt held steals a browser or
- * operating-system binding: Cmd+K, Ctrl+F, Alt+Left. An application
- * that takes those is harder to use with a keyboard, not easier, which
- * inverts the ticket. Shift is NOT in that list on purpose -- `?` and
- * `G` require it on most layouts, so refusing Shift would refuse two of
- * the bindings below.
- */
-export function resolveReviewKeyAction(event: ReviewKeyEvent): ReviewKeyAction {
-  if (event.editingText === true) {
-    return "none";
-  }
-  if (event.ctrlKey === true || event.metaKey === true || event.altKey === true) {
-    return "none";
-  }
-  switch (event.key) {
-    case "j":
-    case "ArrowDown":
-      return "next";
-    case "k":
-    case "ArrowUp":
-      return "previous";
-    case "g":
-    case "Home":
-      return "first";
-    case "G":
-    case "End":
-      return "last";
-    case "Enter":
-      return "open";
-    case "s":
-      return "reveal-source";
-    case "?":
-      return "help";
-    default:
-      return "none";
-  }
-}
-
-/**
- * Clamped, never wrapped.
- *
- * A review queue that loops from the last candidate back to the first
- * re-presents people who have already been looked at as though they are
- * new, and gives no signal that the list ended. In a tool whose whole
- * purpose is that a human actually saw each candidate, silently
- * restarting is the wrong failure. Reaching the end and staying there
- * is legible; wrapping is not.
- */
-export function nextReviewIndex(action: ReviewKeyAction, currentIndex: number, itemCount: number): number {
-  if (itemCount <= 0) {
-    return -1;
-  }
-  const clamp = (index: number): number => Math.min(Math.max(index, 0), itemCount - 1);
-  switch (action) {
-    case "next":
-      return clamp(currentIndex + 1);
-    case "previous":
-      return clamp(currentIndex - 1);
-    case "first":
-      return 0;
-    case "last":
-      return itemCount - 1;
-    case "open":
-    case "reveal-source":
-    case "help":
-    case "none":
-      return clamp(currentIndex);
-    default:
-      return clamp(currentIndex);
-  }
-}
-
-export interface ReviewShortcut {
-  readonly keys: readonly string[];
-  readonly description: string;
-}
-
-/**
- * Published so the UI renders the same list the resolver implements,
- * rather than a hand-maintained copy that drifts. A keyboard interface
- * nobody can discover is a mouse-only interface with extra steps, so
- * this is part of the feature rather than documentation of it.
- */
-export const REVIEW_SHORTCUTS: readonly ReviewShortcut[] = [
-  { keys: ["j", "↓"], description: "Next" },
-  { keys: ["k", "↑"], description: "Previous" },
-  { keys: ["g", "Home"], description: "First" },
-  { keys: ["G", "End"], description: "Last" },
-  { keys: ["Enter"], description: "Open the focused item" },
-  { keys: ["s"], description: "Reveal the source citation for the focused card" },
-  { keys: ["?"], description: "Show these shortcuts" }
-];
-
 // ---- AF-54: capture recruiter review timing ----
 //
 // "Time-per-application in the review queue, needed as the baseline for
@@ -2011,12 +1871,28 @@ export interface ReviewTimingSummary {
    * is the specific way this metric could flatter the product.
    */
   readonly medianActiveMs: number | null;
-  /** Applications with at least one usable span. The denominator. */
+  /** Applications whose review time is FULLY observed. The denominator. */
   readonly sampleSize: number;
   /** Applications in scope, whether or not they were ever opened. */
   readonly population: number;
   /** Spans excluded because an idle cutoff ended them. */
   readonly truncatedSpanCount: number;
+  /**
+   * Applications kept out of the denominator because at least one of
+   * their spans hit an idle cutoff, so their total is a lower bound
+   * rather than a measurement.
+   *
+   * Reported at application grain because truncatedSpanCount cannot
+   * answer the question that matters to a reader: how much of the scope
+   * was dropped. sampleSize + partiallyObservedCount accounts for every
+   * application that produced a span. The remainder of population is
+   * mostly applications nobody has opened, but not only those: AF-54's
+   * capture path discards a span with no active time, so a candidate
+   * opened and closed again immediately arrives here indistinguishable
+   * from one never opened. This summary sees spans, not visits, and
+   * must not be read as if it saw visits.
+   */
+  readonly partiallyObservedCount: number;
 }
 
 /**
@@ -2035,16 +1911,50 @@ export interface ReviewTimingSummary {
  * bias the baseline downward -- again in the direction that flatters a
  * later improvement -- and excluding it silently would hide how much
  * data was dropped, which is why the count is reported.
+ *
+ * The whole APPLICATION leaves the denominator, not just the span.
+ * Dropping the span alone keeps an application whose real total is
+ * unknown in the sample carrying only the part we happened to see: one
+ * five-minute visit followed by an idle-truncated one is counted as a
+ * five-minute review. That understates the median, and if every
+ * application has that shape then sampleSize still equals population,
+ * so the result carries no limitation at all and reads as a complete
+ * measurement. Understating the assisted median overstates the
+ * reduction, which is the one direction this metric must never fail in.
+ *
+ * What remains and cannot be fixed here: a long review is likelier to be
+ * interrupted than a short one, so the applications this drops are not a
+ * random subset, and the surviving median still leans short. That is why
+ * the count is published rather than only the exclusion -- a reader who
+ * sees most of the scope dropped should not treat the remainder as the
+ * role's review time.
  */
 export function summarizeReviewTiming(
   spans: readonly ReviewTimingSpan[],
   population: number
 ): ReviewTimingSummary {
   const truncatedSpanCount = spans.filter((span) => span.truncatedByIdle).length;
-  const usable = spans.filter((span) => !span.truncatedByIdle);
+  const partiallyObserved = new Set(
+    spans.filter((span) => span.truncatedByIdle).map((span) => span.applicationId)
+  );
 
   const totalByApplication = new Map<string, number>();
-  for (const span of usable) {
+  for (const span of spans) {
+    if (partiallyObserved.has(span.applicationId)) {
+      continue;
+    }
+    // A zero-duration span is not a measurement. AF-54 now refuses to
+    // accept or store one, at the contract and at the database, but rows
+    // written before those constraints existed are still readable here,
+    // and this summary is what decides whether an application counts.
+    //
+    // Excluding it rather than summing it matters in both directions: a
+    // zero would pull the assisted median down and inflate the reported
+    // review-time reduction, and it would inflate sampleSize, which is the
+    // number AF-60 uses to say whether the figure can be trusted at all.
+    if (span.activeMs <= 0) {
+      continue;
+    }
     totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
   }
 
@@ -2057,7 +1967,8 @@ export function summarizeReviewTiming(
     medianActiveMs: sampleSize === 0 ? null : median(totals),
     sampleSize,
     population,
-    truncatedSpanCount
+    truncatedSpanCount,
+    partiallyObservedCount: partiallyObserved.size
   };
 }
 
@@ -2702,6 +2613,11 @@ export interface CandidateAdjudication {
   readonly blindToWorkflowOutput: boolean;
 }
 
+/**
+ * One row per application, describing what the reviewer actually got.
+ * A second row for the same `applicationId` is rejected rather than
+ * merged: see `summarizeQualifiedPreservation`.
+ */
 export interface SurfacedCandidate {
   readonly applicationId: string;
   /**
@@ -2757,6 +2673,25 @@ export function summarizeQualifiedPreservation(
 
   const evidenceByApplication = new Map<string, EvidenceStrengthSummary | null>();
   for (const candidate of surfaced) {
+    if (evidenceByApplication.has(candidate.applicationId)) {
+      // Rejected for the same reason as a duplicate adjudication, and at
+      // the same point: before anything has been counted. Letting the
+      // last row win made the North Star safety metric depend on input
+      // order, so a `cited` row followed by a `none` row for one
+      // candidate reported a miss while the same two rows the other way
+      // round reported a save.
+      //
+      // No merge rule is defined instead, because a second row for one
+      // application does not mean the candidate was surfaced twice; it
+      // means the caller's queue-to-evidence join fanned out, and
+      // neither row is known to be what the reviewer saw. Picking the
+      // strongest would let a broken join turn misses into saves, and
+      // picking the weakest would invent losses. Both answer a question
+      // the input cannot support.
+      throw new Error(
+        `summarizeQualifiedPreservation received two surfaced rows for ${candidate.applicationId}`
+      );
+    }
     evidenceByApplication.set(candidate.applicationId, candidate.evidence);
   }
 
@@ -2865,6 +2800,14 @@ export const REVIEW_TIME_BASELINE_SOURCES = [
   /**
    * Timing spans this system recorded before assisted review was turned
    * on for the role. Measured the same way as the assisted side.
+   *
+   * No route may accept this from a caller, and none does: a source a
+   * request can name is a caveat a request can delete. It is reachable
+   * only from a server-owned measurement, which needs spans recorded
+   * while assistance was off plus a persisted per-role record of when it
+   * was enabled, to tell those spans from the assisted ones. Neither
+   * exists yet, so today this value has no honest producer.
+   * tests/architecture/metric-exposure.test.ts holds that line.
    */
   "measured_preassist"
 ] as const;
@@ -2878,6 +2821,23 @@ export interface ReviewTimeBaseline {
 }
 
 /**
+ * The sample this metric refuses to report below, fixed here rather than
+ * taken from the caller.
+ *
+ * describeReviewTimeReduction still takes a minimum as an argument so
+ * tests can drive the suppression boundary directly, but the reporting
+ * path must not: a threshold a request can choose is not a threshold. An
+ * endpoint that accepted `minimumSampleSize=1` would hand anyone who
+ * wanted a number the means to get one out of a single review.
+ *
+ * Ten, because this is a median. Below roughly that, one interrupted
+ * review moves the middle value by minutes, and docs/VALIDATION_STATUS.md
+ * sizes the POC at about a hundred applications per role, so ten is the
+ * order of a tenth of a role rather than a number chosen to be reachable.
+ */
+export const REVIEW_TIME_REDUCTION_MINIMUM_SAMPLE_SIZE = 10;
+
+/**
  * Assisted review time against a baseline, as a reportable metric.
  *
  * The value is the fraction of baseline time removed: 0.5 means half the
@@ -2888,11 +2848,12 @@ export interface ReviewTimeBaseline {
  * ever say, and a floor at zero would render it as "no improvement" and
  * lose it.
  *
- * The denominator handed to summarizeMetric is applications with usable
- * timing, not spans. AF-54 drops idle-truncated spans, so an application
- * whose only visit was truncated never reaches the sample -- which shows
- * up as `population_incomplete` rather than quietly shrinking the base
- * the median was drawn from.
+ * The denominator handed to summarizeMetric is applications whose review
+ * time is fully observed, not spans and not applications. AF-54 drops
+ * any application with an idle-truncated span, so a partially observed
+ * review shows up as `population_incomplete` rather than as a short
+ * complete one -- see summarizeReviewTiming for why the alternative
+ * silently overstates this metric.
  */
 export function describeReviewTimeReduction(
   assisted: ReviewTimingSummary,
@@ -2941,5 +2902,169 @@ export function describeReviewTimeReduction(
           "figure excludes, which biases the comparison in favour of a larger reduction"
       }
     ]
+  };
+}
+
+// ---- AF-54: the capture half ----
+//
+// summarizeReviewTiming above consumes spans. Nothing produced one until
+// this existed: the table, the recorder and the summary were all in
+// place and no recruiter action created a row, so the baseline the
+// ticket asks for was always going to be empty.
+//
+// The split is the one AF-53 drew, for the same reason. This repository
+// has no jsdom, so anything decided inside a React effect cannot be
+// tested. Every rule about what counts as review time lives in these
+// functions, which are pure and clock-free -- the caller passes the time
+// in -- and apps/web/src/lib/review-timing.ts does only the parts that
+// genuinely need a browser: subscribing to events, reading the clock,
+// and sending the result.
+
+/**
+ * Two minutes without an interaction and the reviewer is no longer
+ * reviewing, whatever the tab still says.
+ *
+ * The exact number is a judgement, so what matters is which way it errs.
+ * Too long and a coffee break lands in the baseline, inflating the
+ * "before" and flattering any later improvement; too short and a
+ * reviewer who reads carefully before touching anything gets chopped
+ * into truncated fragments. Truncated spans are excluded from the median
+ * and counted in the open, so erring short costs sample size visibly
+ * while erring long corrupts the number silently. Two minutes is the
+ * short side of that trade on purpose.
+ */
+export const REVIEW_IDLE_CUTOFF_MS = 120_000;
+
+/**
+ * One visit in progress.
+ *
+ * `countedUntilMs` is the last instant that counts as review, and it is
+ * the only place duration is held. There is no separate accumulator,
+ * because a span never pauses: it starts when the page becomes visible
+ * and ends when it stops being visible, so active time within one span
+ * is exactly `countedUntilMs - startedAtMs` and a second field holding
+ * the same fact could only ever disagree with it.
+ *
+ * `lastActivityAtMs` is the last instant the reviewer proved they were
+ * there, which is a different thing and is why both are kept.
+ */
+export interface ReviewTimingState {
+  readonly startedAtMs: number;
+  readonly countedUntilMs: number;
+  readonly lastActivityAtMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** Exactly the fields the recorder needs, and no reviewer among them. */
+export interface ReviewTimingSpanDraft {
+  readonly startedAtMs: number;
+  readonly endedAtMs: number;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** A settled state and, when one just ended, the span it produced. */
+export interface ReviewTimingTransition {
+  readonly state: ReviewTimingState;
+  readonly completed: ReviewTimingSpanDraft | undefined;
+}
+
+export function beginReviewTiming(atMs: number): ReviewTimingState {
+  return { startedAtMs: atMs, countedUntilMs: atMs, lastActivityAtMs: atMs, truncatedByIdle: false };
+}
+
+/**
+ * Advance the span to `atMs`, or conclude the reviewer had already left.
+ *
+ * The idle cutoff is applied here rather than by a timer, so the answer
+ * does not depend on whether a tick happened to fire. A reviewer who
+ * walked away an hour ago and whose tab is only now closing gets the
+ * same span either way.
+ *
+ * When the cutoff has passed, time is counted only up to the last
+ * interaction -- the grace window itself is not counted. That is the
+ * difference between a truncated span being a lower bound on the review,
+ * which is what it is described as and what makes it safe to exclude,
+ * and it being the review plus up to two minutes of absence.
+ *
+ * What the flag cannot tell you, for whoever tries to refine this. A
+ * truncated span covers two situations this producer cannot separate:
+ * the reviewer broke off mid-candidate and came back, and the reviewer
+ * finished, sat a while, and closed the tab. The obvious discriminator
+ * is that a truncated span which is the LAST one for its application,
+ * with a decision recorded afterwards, is the second case. That is a
+ * real improvement to the exclusion rule and it is worth having, but it
+ * is worth being clear about what it does not do: it does not make the
+ * underlying signal less ambiguous. A reviewer reading a long CV without
+ * scrolling or clicking is indistinguishable from an empty chair, and
+ * that is equally true BELOW the cutoff, where the silent stretch is
+ * counted as review and no flag is raised at all. No threshold and no
+ * discriminator fixes that, which is why the count of excluded
+ * applications is published rather than the exclusion being presented as
+ * clean. Agreed with AF-55, which consumes these spans.
+ */
+export function settleReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingState {
+  if (state.truncatedByIdle) {
+    return state;
+  }
+  if (atMs <= state.lastActivityAtMs + REVIEW_IDLE_CUTOFF_MS) {
+    // Math.max, not assignment: a clock that jumps backwards must not
+    // un-count time already counted.
+    return { ...state, countedUntilMs: Math.max(state.countedUntilMs, atMs) };
+  }
+  return { ...state, countedUntilMs: state.lastActivityAtMs, truncatedByIdle: true };
+}
+
+/**
+ * The reviewer did something at `atMs`.
+ *
+ * If the cutoff had already passed, that span is finished and this
+ * interaction opens a new one. Handing the finished span back rather
+ * than resuming it is what stops a reviewer returning from lunch from
+ * having the lunch counted, and stops the opposite failure: a span that
+ * truncated once and then silently measures nothing for the rest of the
+ * visit.
+ */
+export function recordReviewActivity(state: ReviewTimingState, atMs: number): ReviewTimingTransition {
+  const settled = settleReviewTiming(state, atMs);
+  if (!settled.truncatedByIdle) {
+    return {
+      state: { ...settled, lastActivityAtMs: Math.max(settled.lastActivityAtMs, atMs) },
+      completed: undefined
+    };
+  }
+  return { state: beginReviewTiming(atMs), completed: toSpanDraft(settled) };
+}
+
+/**
+ * Close the span at `atMs`, or report that there is nothing to send.
+ *
+ * `undefined` for a span that measured no time, and that is not merely
+ * an optimization. An application whose only spans were empty would
+ * still enter summarizeReviewTiming's denominator carrying a total of
+ * zero, pulling the median toward "reviews take no time" -- the exact
+ * number that function refuses to report. Dropping them at the source is
+ * what keeps the sample made of measurements.
+ */
+export function sealReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingSpanDraft | undefined {
+  const draft = toSpanDraft(settleReviewTiming(state, atMs));
+  return draft.activeMs > 0 ? draft : undefined;
+}
+
+/**
+ * `endedAtMs` is the counted frontier, never the caller's clock, and
+ * `activeMs` is measured against the same instant.
+ *
+ * That is what makes `activeMs <= endedAtMs - startedAtMs` true by
+ * construction rather than by hope. Migration 0021 asserts the same
+ * bound as a CHECK, and a producer that can only emit conforming spans
+ * is worth more than one that is merely rejected when it does not.
+ */
+function toSpanDraft(state: ReviewTimingState): ReviewTimingSpanDraft {
+  return {
+    startedAtMs: state.startedAtMs,
+    endedAtMs: state.countedUntilMs,
+    activeMs: state.countedUntilMs - state.startedAtMs,
+    truncatedByIdle: state.truncatedByIdle
   };
 }
