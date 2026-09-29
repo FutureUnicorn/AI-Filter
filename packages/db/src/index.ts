@@ -3849,6 +3849,40 @@ export async function recordAuditSample(
       if (auditSampleId === undefined) {
         throw new Error("recording an audit sample did not produce a draw row");
       }
+      // REV-009 (Pradeep): AF-62 classifies audit_sample_members as
+      // candidate-identifying residue that erasure cannot remove, so a
+      // member row must not be able to appear after the receipt was
+      // written. The foreign key does not stop it: erasure redacts the
+      // application in place rather than deleting it, so the key still
+      // resolves and the insert succeeds against an erased candidate.
+      //
+      // One query for the whole draw rather than one per id, and the row
+      // count is what decides. Checking each id in turn would take the
+      // locks in caller-supplied order, and two concurrent draws over
+      // overlapping samples could then each hold a row the other needs.
+      // A single statement takes them in one go, so there is no interleaving
+      // to deadlock on.
+      //
+      // FOR SHARE, matching the evidence and decision writers: it conflicts
+      // with the erasure's FOR UPDATE, so either this commits first and the
+      // members exist before the erasure and are reported as residue, or it
+      // waits, re-reads under READ COMMITTED, finds redacted_at set, and
+      // refuses.
+      if (input.sampledApplicationIds.length > 0 && (await applicationsHaveRedactedAt(client, schema))) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE organization_id = $1 AND application_id = ANY($2::uuid[]) AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.organizationId, [...new Set(input.sampledApplicationIds)]]
+        );
+        const distinct = new Set(input.sampledApplicationIds).size;
+        if ((live.rowCount ?? 0) !== distinct) {
+          throw new Error(
+            `recordAuditSample: ${distinct - (live.rowCount ?? 0)} of ${distinct} sampled application(s) in ` +
+              `organization ${input.organizationId} are erased or missing; a draw cannot name an erased candidate`
+          );
+        }
+      }
       for (const applicationId of input.sampledApplicationIds) {
         await client.query(
           `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, application_id)
@@ -4127,20 +4161,57 @@ export async function recordReviewTimingSpan(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    await client.query(
-      `INSERT INTO "${schema}".review_timing_spans
-         (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        input.organizationId,
-        input.applicationId,
-        input.reviewerUserId,
-        input.startedAt,
-        input.endedAt,
-        input.activeMs,
-        input.truncatedByIdle
-      ]
-    );
+    // REV-009 (Pradeep): a transaction, where there was a bare INSERT.
+    //
+    // The timing route already calls getApplicationById first, and that now
+    // hides erased rows, which covers the non-racing case. It is a snapshot
+    // read on a different connection though, so an erasure committing
+    // between the two let the insert through -- and the foreign key does not
+    // catch it, because erasure redacts the application in place rather than
+    // deleting it. The row that lands ties an erased candidate's
+    // application_id to a named reviewer and a duration, in an append-only
+    // table, after their receipt said what survived.
+    //
+    // A lock only holds for the life of a transaction, so the guard is
+    // worthless without one: BEGIN, take FOR SHARE on the application, then
+    // insert. FOR SHARE conflicts with the erasure's FOR UPDATE, so either
+    // this commits first and the span is reported as residue, or it waits,
+    // re-reads under READ COMMITTED, finds redacted_at set, and refuses.
+    await client.query("BEGIN");
+    try {
+      if (await applicationsHaveRedactedAt(client, schema)) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
+        );
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `recordReviewTimingSpan: application ${input.applicationId} in organization ` +
+              `${input.organizationId} is erased or missing`
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO "${schema}".review_timing_spans
+           (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.reviewerUserId,
+          input.startedAt,
+          input.endedAt,
+          input.activeMs,
+          input.truncatedByIdle
+        ]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -7682,6 +7753,16 @@ export interface EvidenceWriteRacingErasureObservations {
   readonly evidenceRecordedDuringErasure: boolean;
   /** Lock waiters seen before the erasure was released, so the race was really exercised. */
   readonly writersBlockedBeforeRelease: number;
+  /**
+   * REV-009 (Pradeep): what recordReviewTimingSpan threw, or null. A span
+   * ties an erased candidate's application_id to a named reviewer and a
+   * duration, in an append-only table.
+   */
+  readonly timingError: string | null;
+  readonly timingRowsAfterErasure: number;
+  /** REV-009: what recordAuditSample threw, or null. */
+  readonly auditSampleError: string | null;
+  readonly auditSampleMemberRowsAfterErasure: number;
 }
 
 /**
@@ -7732,20 +7813,12 @@ export async function assertEvidenceWriteRacingErasure(
     await gate.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql",
-      "0017_evidence_corrections.sql",
-      "0018_correction_attribution.sql",
-      "0019_candidate_decisions.sql",
-      "0023_candidate_data_erasure.sql"
-    ]) {
+    // Every migration in the runner's order, not a hand-picked list. The
+    // list ended at 0023 and included no review_timing_spans or
+    // audit_sample_members, so REV-009's two writers could not have been
+    // raced here at all -- the same shape corrected in the other probes in
+    // this file.
+    for (const file of listMigrationsInRunnerOrder()) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
@@ -7863,7 +7936,34 @@ export async function assertEvidenceWriteRacingErasure(
       })
     );
 
-    // All three writers are waiting on a row lock held by the parked erasure, so
+    // REV-009: the two writers AF-62's own plan now classifies as
+    // unerasable identifier residue. Raced on the same barrier as the other
+    // three, because "the route checks first" is a snapshot read on another
+    // connection and this is the window it does not cover.
+    const timing = settle(
+      recordReviewTimingSpan(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        reviewerUserId: userId,
+        startedAt: new Date("2026-08-29T12:00:00.000Z"),
+        endedAt: new Date("2026-08-29T12:01:00.000Z"),
+        activeMs: 60_000,
+        truncatedByIdle: false
+      })
+    );
+    const auditSample = settle(
+      recordAuditSample(databaseUrl, schema, {
+        organizationId: org,
+        roleId,
+        seed: "race-probe",
+        requestedSize: 1,
+        eligibleCount: 1,
+        drawnByUserId: userId,
+        sampledApplicationIds: [applicationId]
+      })
+    );
+
+    // All five writers are waiting on a row lock held by the parked erasure, so
     // whatever check they made before the wait was made against a snapshot
     // in which redacted_at was still NULL.
     const writersBlockedBeforeRelease = await poll(
@@ -7872,16 +7972,12 @@ export async function assertEvidenceWriteRacingErasure(
         WHERE NOT l.granted AND l.locktype IN ('transactionid', 'tuple')
           AND a.query LIKE '%' || $1 || '%'`,
       [`"${schema}".`],
-      3
+      5
     );
 
     await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
-    const [erasureError, evidenceError, decisionError, correctionError] = await Promise.all([
-      erasure,
-      evidence,
-      decision,
-      correction
-    ]);
+    const [erasureError, evidenceError, decisionError, correctionError, timingError, auditSampleError] =
+      await Promise.all([erasure, evidence, decision, correction, timing, auditSample]);
     if (erasureError !== null) {
       throw new Error(`assertEvidenceWriteRacingErasure: the erasure itself failed: ${erasureError}`);
     }
@@ -7893,6 +7989,14 @@ export async function assertEvidenceWriteRacingErasure(
     );
     const decisionRows = await admin.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM candidate_decisions WHERE application_id = $1`,
+      [applicationId]
+    );
+    const timingRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM review_timing_spans WHERE application_id = $1`,
+      [applicationId]
+    );
+    const auditSampleRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_sample_members WHERE application_id = $1`,
       [applicationId]
     );
     const receipt = await admin.query<{ executed_at: Date }>(
@@ -7911,7 +8015,11 @@ export async function assertEvidenceWriteRacingErasure(
       decisionRowsAfterErasure: Number.parseInt(decisionRows.rows[0]?.count ?? "", 10),
       evidenceRecordedDuringErasure:
         lastEvidence !== null && executedAt !== null && lastEvidence.getTime() >= executedAt.getTime(),
-      writersBlockedBeforeRelease
+      writersBlockedBeforeRelease,
+      timingError,
+      timingRowsAfterErasure: Number.parseInt(timingRows.rows[0]?.count ?? "", 10),
+      auditSampleError,
+      auditSampleMemberRowsAfterErasure: Number.parseInt(auditSampleRows.rows[0]?.count ?? "", 10)
     };
   } finally {
     try {
