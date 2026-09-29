@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1247,6 +1247,283 @@ export async function seedOrganizationMembership(
       [input.organizationId, userId, input.role]
     );
     return { userId };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+// ---- AF-100: the database half of the shared HTTP route harness ----
+//
+// provisionRouteProbeSchema and provisionFileIntakeRouteSchema above are each
+// scoped to one feature's migrations and one seeded actor, which is why every
+// route ticket that wanted request-level coverage had to add a third. This one
+// is deliberately general: it applies the whole chain a session-gated write
+// endpoint needs and seeds one member per role, so a test picks the capability
+// it is exercising instead of provisioning for it.
+//
+// It lives in packages/db for the same reason the two above do -- `pg` is a
+// dependency of this package and tests do not import it directly.
+//
+// What "the authorization check stays real" does NOT mean (PR #90 review,
+// REV-001). This harness connects with `databaseUrl` as given, which in every
+// caller so far is the Postgres image's bootstrap superuser -- the same role
+// production runs as today. `getMembershipsForUser`'s own comment documents
+// why that matters here specifically: 0004_tenant_scoped_rls.sql's policy on
+// `app.current_org_id` is enforced against the role, and no application code
+// sets that setting before this lookup, so under a role RLS actually applies
+// to the query returns zero rows and every route answers not_found. A
+// superuser bypasses RLS unconditionally, so this harness's route requests
+// exercise `authorizeResourceAccess`'s logic -- the capability table, the
+// no_membership/insufficient_capability split -- but not tenant isolation
+// enforced by the database itself, because nothing here can reach that
+// enforcement without also reaching `requireMembershipLookupVisibleOnce`'s
+// deliberate throw, which is not a bug to route around: it is the guard
+// AF-83 REV-002 added so this exact failure mode fails loudly instead of as
+// a silent not_found. Making every route request in this harness pass under
+// a genuinely restricted role is the AF-18 multi-tenant RLS work the schema's
+// own migration comment defers, not something a test-harness ticket should
+// take on as a side effect. `assertMembershipReadFailsLoudlyUnderRls` and
+// `assertMagicLinkRlsSafety` below already cover that guard directly, against
+// a real NOSUPERUSER NOBYPASSRLS role built for exactly this question; that
+// coverage does not need duplicating here, and duplicating it badly (an
+// authorization test suite where every request 500s before reaching the
+// assertion) would be worse than the gap it claims to close.
+//
+// Migrations now include 0004_tenant_scoped_rls.sql (see
+// listMigrationFilesInRunnerOrder below), so the schema's shape matches
+// production; the tests below simply cannot make that migration's policy
+// bind, for the reason above.
+
+export interface ApiRouteProbeMember {
+  readonly userId: string;
+  readonly email: string;
+}
+
+export interface ApiRouteProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly intakeId: string;
+  readonly applicationId: string;
+  /** The criterion the seeded pipeline evidence was filed under. */
+  readonly criterionId: string;
+  /** One member per role, so a test names the capability rather than the user. */
+  readonly members: Readonly<Record<MembershipRole, ApiRouteProbeMember>>;
+  /**
+   * A real, session-capable user who belongs to a DIFFERENT organization.
+   *
+   * Seeded by default because "authenticated but not a member here" is the
+   * case a route test most often has to distinguish from "not signed in", and
+   * a test that has to provision a second tenant itself usually does not.
+   */
+  readonly outsider: ApiRouteProbeMember;
+  readonly outsiderOrganizationId: string;
+}
+
+/**
+ * Every `.sql` file directly under `packages/db/migrations`, in the same
+ * order `infra/compose/runtime.yml`'s `migrate` service applies them: a
+ * `for migration in /migrations/*.sql` shell glob, which expands
+ * lexicographically. `Array.prototype.sort()`'s default UTF-16 comparison
+ * agrees with that for this filename charset, so this is the runner's
+ * order, not an approximation of it.
+ *
+ * PR #90 review, REV-002: this replaced a hand-picked list that its own
+ * comment called "the full set" while actually being 11 of 25 migrations,
+ * chosen for what two specific endpoints happened to need. That shape has
+ * produced a wrong result four separate times in this repository (AF-61,
+ * AF-62 and AF-63's probes each undercounted a surface their hand-picked
+ * list omitted, and REV-001 below is the fifth: the omission there was
+ * 0004_tenant_scoped_rls.sql). A probe that applies the tables somebody
+ * already thought of can only observe what somebody already thought of, and
+ * the failure is always silent and always looks like a pass. Applying every
+ * migration removes the list to omit something from.
+ */
+function listMigrationFilesInRunnerOrder(): readonly string[] {
+  return readdirSync(MIGRATIONS_DIRECTORY)
+    .filter((entry) => entry.endsWith(".sql"))
+    .sort();
+}
+
+export async function provisionApiRouteSchema(
+  databaseUrl: string,
+  options: { readonly criterionId?: string } = {}
+): Promise<ApiRouteProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `api_route_probe_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const outsiderOrganizationId = "22222222-2222-4222-8222-222222222222";
+  const criterionId = options.criterionId ?? "postgres";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of listMigrationFilesInRunnerOrder()) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Route Harness Org')`, [
+      organizationId
+    ]);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Other Tenant')`, [
+      outsiderOrganizationId
+    ]);
+
+    const seedMember = async (
+      organization: string,
+      role: MembershipRole,
+      label: string
+    ): Promise<ApiRouteProbeMember> => {
+      const email = `${label}_${suffix}@acme.test`;
+      const inserted = await admin.query<{ user_id: string }>(
+        `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING user_id`,
+        [email, `Route Harness ${role}`]
+      );
+      const userId = inserted.rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error(`provisionApiRouteSchema did not produce a user row for ${role}`);
+      }
+      await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, $3)`, [
+        organization,
+        userId,
+        role
+      ]);
+      return { userId, email };
+    };
+
+    const members = {
+      owner: await seedMember(organizationId, "owner", "owner"),
+      admin: await seedMember(organizationId, "admin", "admin"),
+      recruiter: await seedMember(organizationId, "recruiter", "recruiter"),
+      auditor: await seedMember(organizationId, "auditor", "auditor")
+    } as const;
+    const outsider = await seedMember(outsiderOrganizationId, "recruiter", "outsider");
+
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Route Harness Role', $2)
+       RETURNING role_id`,
+      [organizationId, members.owner.userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    const intake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+       VALUES ($1, $2, $3, 'candidates.csv', 'text/csv', $4)
+       RETURNING intake_id`,
+      [organizationId, roleId, `api-route/${suffix}/candidates.csv`, members.recruiter.userId]
+    );
+    const intakeId = intake.rows[0]?.intake_id;
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications
+         (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Casey Harness', $4)
+       RETURNING application_id`,
+      [organizationId, roleId, intakeId, `casey_${suffix}@acme.test`]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    if (roleId === undefined || intakeId === undefined || applicationId === undefined) {
+      throw new Error("provisionApiRouteSchema did not produce a role, intake and application");
+    }
+
+    // One pipeline-authored outcome, so a correction has something to
+    // supersede. Written here rather than through recordEvidenceOutcome
+    // because that opens a pooled connection against the schema this
+    // function is still building.
+    const outcome = {
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      kind: "supported",
+      organizationId,
+      candidateId: applicationId,
+      criterionId,
+      citation: {
+        document: "candidates.csv",
+        pageOrSection: "Experience",
+        offset: 0,
+        quote: "Ran Postgres in production for four years."
+      }
+    };
+    await admin.query(
+      `INSERT INTO evidence_outcomes (organization_id, application_id, criterion_id, kind, outcome)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [organizationId, applicationId, criterionId, "supported", JSON.stringify(outcome)]
+    );
+
+    return {
+      schema,
+      organizationId,
+      roleId,
+      intakeId,
+      applicationId,
+      criterionId,
+      members,
+      outsider,
+      outsiderOrganizationId
+    };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Read rows straight out of a probe schema.
+ *
+ * The harness's whole point is to check what a real request left behind, and
+ * the package's own readers answer only the questions their features needed --
+ * `listCandidateDecisionsForApplication` returns the derived history, not the
+ * `decided_by_user_id` column a test wants to compare against the session
+ * user. Rather than add a bespoke reader per assertion, tests get this.
+ *
+ * Reads only. The guard is not about untrusted input (callers are test files)
+ * but about what this export can become: a general writer here would be a way
+ * to put rows in the database without going through the writers whose
+ * constraints and transactions are the thing under test.
+ *
+ * Three layers, because the first one alone did not hold. Review of PR #90
+ * (REV-001) showed the leading-SELECT regex checks only how the string starts:
+ * with no parameters `pg` uses the simple query protocol, which runs several
+ * statements in one call, so `SELECT 1; DELETE FROM memberships` passed the
+ * regex and emptied the table. Measured, not reasoned about.
+ *
+ *   1. The regex, kept as a fast and legible first refusal.
+ *   2. A NAMED statement, which forces the extended query protocol. Postgres
+ *      rejects multiple commands in a prepared statement, so a second
+ *      statement cannot be appended at all -- including a `COMMIT` that would
+ *      end layer 3 and let what follows run read-write. Named rather than
+ *      parameterised because an empty `values` array still selects the simple
+ *      protocol; the name is unique per call so nothing collides in the
+ *      session's prepared-statement cache.
+ *   3. A READ ONLY transaction, which is what refuses a write that needs no
+ *      second statement -- `WITH d AS (DELETE ... RETURNING *) SELECT * FROM d`
+ *      begins with SELECT nowhere but is a delete, and a SELECT over a
+ *      volatile function can write too. The database decides, not a pattern.
+ */
+export async function readProbeRows<TRow extends Record<string, unknown>>(
+  databaseUrl: string,
+  schema: string,
+  sql: string,
+  parameters: readonly unknown[] = []
+): Promise<readonly TRow[]> {
+  assertSafeSchema(schema);
+  if (!/^\s*select\s/iu.test(sql)) {
+    throw new Error("readProbeRows runs SELECT statements only; use the package's writers to change rows");
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN READ ONLY");
+    // SET is permitted inside a read-only transaction; it changes the session,
+    // not the database.
+    await client.query(`SET search_path TO "${schema}"`);
+    const result = await client.query<TRow>({
+      name: `probe_read_${randomBytes(8).toString("hex")}`,
+      text: sql,
+      values: [...parameters]
+    });
+    // Rollback rather than commit: a read-only transaction has nothing to
+    // persist, and saying so leaves no doubt about the intent.
+    await client.query("ROLLBACK");
+    return result.rows;
   } finally {
     await client.end().catch(() => undefined);
   }

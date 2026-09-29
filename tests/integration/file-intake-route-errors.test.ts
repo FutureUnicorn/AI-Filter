@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import moduleHooks from "node:module";
 import test from "node:test";
 
 import { dropProbeSchema, getFileIntakeById, provisionFileIntakeRouteSchema } from "../../packages/db/src/index.ts";
 import { ALLOWED_SNIFFED_MIME_TYPES } from "../../packages/domain/src/index.ts";
-import { SESSION_COOKIE_NAME, createSessionToken } from "../../packages/security/src/index.ts";
 import { storageControl } from "../support/ingestion-storage-stub.ts";
+import {
+  applyRouteEnvironment,
+  loadRouteHandler,
+  registerModuleRedirect,
+  requireRouteDatabase,
+  routeRequest
+} from "../support/route-harness.ts";
 
 /**
  * PR #83 review round 2. Sai's note was "cover the endpoint behavior, not just
@@ -27,130 +32,42 @@ import { storageControl } from "../support/ingestion-storage-stub.ts";
  * the `instanceof` checks under test are the ones that run in production.
  */
 
-const SESSION_SECRET = "intake-route-test-session-secret-at-least-32-chars";
 const REAL_HASH = "a".repeat(64);
 
-function requireDatabase(): string {
-  const databaseUrl = process.env.SIGNAL_AUDIT_RLS_DATABASE_URL;
-  if (databaseUrl === undefined || databaseUrl.length === 0) {
-    assert.fail(
-      "SIGNAL_AUDIT_RLS_DATABASE_URL must be set so the file-intake routes run against real Postgres. " +
-        "Locally: run `pnpm dev:infra`, then point it at signal_audit_local (see README.md)."
-    );
-  }
-  return databaseUrl;
-}
-
-let hooksRegistered = false;
-
 /**
- * Two jobs in one hook, both needed before a route file can be imported here.
+ * AF-100: the mechanism this file used to carry -- the resolution hook, the
+ * runtime-built specifier, the genuine NextRequest, the environment -- now
+ * lives in tests/support/route-harness.ts, which is the repository's one way
+ * to drive a route. Only the part that is specific to these tests is left
+ * here: the stub standing in for object storage, and this file's own probe,
+ * which seeds an intake rather than the harness's application chain.
  *
- * The extension retry is the same one magic-link-route.test.ts installs:
- * apps/web uses extensionless relative imports and bundler-resolved package
- * subpaths, neither of which Node resolves on its own.
- *
- * The redirect points `@signal-audit/ingestion` at the stub. It is scoped to
- * that one specifier, so every other import in the route, including the
- * database and the domain rules, stays real.
+ * Registered at module scope, before any route is imported: Node caches a
+ * module the first time a route asks for it, so a redirect installed later
+ * would silently not apply.
  */
-function registerRouteResolution(): void {
-  const stubUrl = new URL("../support/ingestion-storage-stub.ts", import.meta.url).href;
-  moduleHooks.registerHooks({
-    resolve(specifier, context, nextResolve) {
-      if (specifier === "@signal-audit/ingestion") {
-        return { url: stubUrl, shortCircuit: true };
-      }
-      try {
-        return nextResolve(specifier, context);
-      } catch (error) {
-        if (/\.[cm]?[jt]sx?$/u.test(specifier)) {
-          throw error;
-        }
-        for (const extension of [".ts", ".js"]) {
-          try {
-            return nextResolve(`${specifier}${extension}`, context);
-          } catch {
-            continue;
-          }
-        }
-        throw error;
-      }
-    }
-  });
+registerModuleRedirect("@signal-audit/ingestion", new URL("../support/ingestion-storage-stub.ts", import.meta.url).href);
+
+const VALIDATE_ROUTE = "roles/[roleId]/files/[intakeId]/validate";
+const CSV_PREVIEW_ROUTE = "roles/[roleId]/files/[intakeId]/csv-preview";
+
+/** Drive one of these routes as a signed-in member of the probe's organization. */
+async function postAsMember(
+  route: string,
+  probe: { readonly roleId: string; readonly intakeId: string; readonly userId: string },
+  body?: unknown
+): Promise<Response> {
+  const handler = await loadRouteHandler(route, "POST");
+  assert.ok(handler !== undefined, `apps/web/src/app/api/${route}/route.ts exports no POST`);
+  const params = { roleId: probe.roleId, intakeId: probe.intakeId };
+  const request = routeRequest({ route, method: "POST", params, as: "recruiter", body }, probe.userId);
+  return handler(request, { params: Promise.resolve(params) });
 }
-
-interface PostRouteModule {
-  POST(request: unknown, context: { params: Promise<Record<string, string>> }): Promise<Response>;
-}
-
-/** Imported through a runtime-built specifier for the reason spelled out in
- * magic-link-route.test.ts: a static import would pull apps/web into
- * tests/tsconfig.json, which reads its ESM route files as CommonJS. */
-async function loadRoute(relativePath: string): Promise<PostRouteModule> {
-  if (!hooksRegistered) {
-    registerRouteResolution();
-    hooksRegistered = true;
-  }
-  return (await import(new URL(relativePath, import.meta.url).href)) as PostRouteModule;
-}
-
-function applyRouteEnvironment(databaseUrl: string, schema: string): void {
-  Object.assign(process.env, {
-    APP_ENV: "test",
-    DEPLOYMENT_COMMIT_SHA: "0000000",
-    DATABASE_URL: databaseUrl,
-    DATABASE_SCHEMA: schema,
-    STORAGE_ENDPOINT: "http://localhost:9000",
-    STORAGE_REGION: "us-east-1",
-    STORAGE_BUCKET: "signal-audit-test",
-    STORAGE_ACCESS_KEY_ID: "test-access-key",
-    STORAGE_SECRET_ACCESS_KEY: "test-secret-access-key",
-    STORAGE_FORCE_PATH_STYLE: "true",
-    WEB_PORT: "3000",
-    WORKER_PORT: "3001",
-    PUBLIC_APP_ORIGIN: "http://localhost:3000",
-    SESSION_SECRET
-  });
-}
-
-/**
- * The genuine NextRequest, loaded from apps/web's own installed Next.
- *
- * readSessionUserId reads `request.cookies.get(...)`, which is Next's API and
- * not the WHATWG Request's. Hand-rolling a `cookies` object would be faking
- * the exact surface every one of these handlers authenticates through, so the
- * real class is used and only its module path is resolved by hand: `next` is
- * installed under apps/web, which a test at the repository root cannot reach
- * by bare specifier.
- */
-const nextServerUrl = new URL("../../apps/web/node_modules/next/server.js", import.meta.url).href;
-const { NextRequest } = (await import(nextServerUrl)) as {
-  NextRequest: new (url: string, init?: RequestInit) => NextRequestLike;
-};
-
-interface NextRequestLike extends Request {
-  readonly cookies: { get(name: string): { value: string } | undefined };
-}
-
-function authorizedRequest(url: string, userId: string, body?: unknown): NextRequestLike {
-  return new NextRequest(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      cookie: `${SESSION_COOKIE_NAME}=${encodeURIComponent(createSessionToken(userId, SESSION_SECRET))}`
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) })
-  });
-}
-
-const VALIDATE_ROUTE = "../../apps/web/src/app/api/roles/[roleId]/files/[intakeId]/validate/route.ts";
-const CSV_PREVIEW_ROUTE = "../../apps/web/src/app/api/roles/[roleId]/files/[intakeId]/csv-preview/route.ts";
 
 // ---- Finding 1: the unwired archiveUninspectable flag ----
 
 test("a DOCX whose central directory cannot be read is quarantined by the validate route", async () => {
-  const databaseUrl = requireDatabase();
+  const databaseUrl = requireRouteDatabase();
   const probe = await provisionFileIntakeRouteSchema(databaseUrl, {
     declaredFilename: "resume.docx",
     declaredMimeType: ALLOWED_SNIFFED_MIME_TYPES.docx
@@ -171,14 +88,7 @@ test("a DOCX whose central directory cannot be read is quarantined by the valida
       }
     };
 
-    const route = await loadRoute(VALIDATE_ROUTE);
-    const response = await route.POST(
-      authorizedRequest(
-        `http://localhost:3000/api/roles/${probe.roleId}/files/${probe.intakeId}/validate`,
-        probe.userId
-      ),
-      { params: Promise.resolve({ roleId: probe.roleId, intakeId: probe.intakeId }) }
-    );
+    const response = await postAsMember(VALIDATE_ROUTE, probe);
     assert.equal(response.status, 200, await response.clone().text());
 
     const stored = await getFileIntakeById(databaseUrl, probe.schema, probe.intakeId);
@@ -195,7 +105,7 @@ test("a DOCX whose central directory cannot be read is quarantined by the valida
 // ---- Finding 2: typed errors that no caller handled ----
 
 test("an object over the read cap makes the validate route answer 413 and quarantine the intake", async () => {
-  const databaseUrl = requireDatabase();
+  const databaseUrl = requireRouteDatabase();
   const probe = await provisionFileIntakeRouteSchema(databaseUrl, {
     declaredFilename: "huge.pdf",
     declaredMimeType: ALLOWED_SNIFFED_MIME_TYPES.pdf
@@ -204,14 +114,7 @@ test("an object over the read cap makes the validate route answer 413 and quaran
     applyRouteEnvironment(databaseUrl, probe.schema);
     storageControl.behaviour = { kind: "too_large", limitBytes: 1024, observedBytes: 8192 };
 
-    const route = await loadRoute(VALIDATE_ROUTE);
-    const response = await route.POST(
-      authorizedRequest(
-        `http://localhost:3000/api/roles/${probe.roleId}/files/${probe.intakeId}/validate`,
-        probe.userId
-      ),
-      { params: Promise.resolve({ roleId: probe.roleId, intakeId: probe.intakeId }) }
-    );
+    const response = await postAsMember(VALIDATE_ROUTE, probe);
 
     // 500 was the old answer. It is the wrong one twice over: it says the
     // server failed when the client's object is the problem, and it invites
@@ -226,7 +129,7 @@ test("an object over the read cap makes the validate route answer 413 and quaran
 });
 
 test("an object replaced after validation makes a reader answer 409 and quarantine the intake", async () => {
-  const databaseUrl = requireDatabase();
+  const databaseUrl = requireRouteDatabase();
   const probe = await provisionFileIntakeRouteSchema(databaseUrl, {
     declaredFilename: "candidates.csv",
     declaredMimeType: "text/csv",
@@ -239,15 +142,7 @@ test("an object replaced after validation makes a reader answer 409 and quaranti
     applyRouteEnvironment(databaseUrl, probe.schema);
     storageControl.behaviour = { kind: "changed", actual: "b".repeat(64) };
 
-    const route = await loadRoute(CSV_PREVIEW_ROUTE);
-    const response = await route.POST(
-      authorizedRequest(
-        `http://localhost:3000/api/roles/${probe.roleId}/files/${probe.intakeId}/csv-preview`,
-        probe.userId,
-        {}
-      ),
-      { params: Promise.resolve({ roleId: probe.roleId, intakeId: probe.intakeId }) }
-    );
+    const response = await postAsMember(CSV_PREVIEW_ROUTE, probe, {});
     assert.equal(response.status, 409, await response.clone().text());
 
     const stored = await getFileIntakeById(databaseUrl, probe.schema, probe.intakeId);
@@ -278,7 +173,7 @@ test("an object replaced after validation makes a reader answer 409 and quaranti
  * fix rather than a per-route patch.
  */
 test("an oversized read from a post-validation reader answers 413 and quarantines the intake", async () => {
-  const databaseUrl = requireDatabase();
+  const databaseUrl = requireRouteDatabase();
   const probe = await provisionFileIntakeRouteSchema(databaseUrl, {
     declaredFilename: "candidates.csv",
     declaredMimeType: "text/csv",
@@ -291,15 +186,7 @@ test("an oversized read from a post-validation reader answers 413 and quarantine
     applyRouteEnvironment(databaseUrl, probe.schema);
     storageControl.behaviour = { kind: "too_large", limitBytes: 1024, observedBytes: 99_999 };
 
-    const route = await loadRoute(CSV_PREVIEW_ROUTE);
-    const response = await route.POST(
-      authorizedRequest(
-        `http://localhost:3000/api/roles/${probe.roleId}/files/${probe.intakeId}/csv-preview`,
-        probe.userId,
-        {}
-      ),
-      { params: Promise.resolve({ roleId: probe.roleId, intakeId: probe.intakeId }) }
-    );
+    const response = await postAsMember(CSV_PREVIEW_ROUTE, probe, {});
     assert.equal(response.status, 413, await response.clone().text());
 
     const stored = await getFileIntakeById(databaseUrl, probe.schema, probe.intakeId);
