@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import type {
   Application,
   AuditAction,
-  CandidateDecision,
   CandidateDataErasureTrigger,
+  CandidateDecision,
   CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -27,6 +27,9 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  PrivacyRequestKind,
+  PrivacyRequestStatus,
+  PrivacyRequestSubjectKind,
   RetentionResidue,
   ReviewTimingSpan,
   Role,
@@ -37,20 +40,26 @@ import type {
   User
 } from "@signal-audit/domain";
 import {
-  CANDIDATE_DATA_ERASURE_PLACEHOLDER,
-  CONTRACT_SCHEMA_VERSION,
   beginReviewTiming,
+  CANDIDATE_DATA_ERASURE_PLACEHOLDER,
+  canExtendPrivacyRequest,
   canonicalizeCsvColumnMapping,
-  compareApplicationsBySourceOrder,
   classifyCsvImportRow,
+  compareApplicationsBySourceOrder,
+  computePrivacyRequestDueDate,
+  CONTRACT_SCHEMA_VERSION,
   erasedStorageKey,
+  isPrivacyRequestOverdue,
+  isPrivacyRequestTerminal,
   mapCsvRowToApplication,
   planCandidateDataErasure,
   recordReviewActivity,
   sealReviewTiming,
   summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
-  summarizeImportRows
+  summarizeImportRows,
+  validatePrivacyRequestExtensionMonths,
+  validatePrivacyRequestTransition
 } from "@signal-audit/domain";
 import { Client } from "pg";
 
@@ -7925,6 +7934,904 @@ export async function assertEvidenceWriteRacingErasure(
       // Best-effort cleanup; the next probe uses a unique suffix.
     }
     await gate.end().catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+
+// ---- AF-64: privacy export/delete requests ----
+
+export interface RecordPrivacyRequestInput {
+  readonly organizationId: string;
+  readonly subjectKind: PrivacyRequestSubjectKind;
+  /** Required for a candidate request, absent for an employer one. */
+  readonly applicationId?: string | undefined;
+  readonly requestKind: PrivacyRequestKind;
+  readonly receivedAt: Date;
+  readonly receivedByUserId: string;
+}
+
+export interface RecordedPrivacyRequest {
+  readonly requestId: string;
+  readonly dueAt: string;
+}
+
+/**
+ * Files a request and starts its clock.
+ *
+ * The due date is computed here rather than defaulted in the schema so it
+ * is derived from the same calendar-month rule the domain states and the
+ * CHECK constraint enforces. Three readings of one deadline that have to
+ * agree, and the constraint is what catches it when they do not.
+ */
+export async function recordPrivacyRequest(
+  databaseUrl: string,
+  schema: string,
+  input: RecordPrivacyRequestInput
+): Promise<RecordedPrivacyRequest> {
+  assertSafeSchema(schema);
+  const dueAt = computePrivacyRequestDueDate(input.receivedAt);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    const inserted = await client.query<{ request_id: string; due_at: Date }>(
+      `INSERT INTO "${schema}".privacy_requests
+         (organization_id, subject_kind, application_id, request_kind, received_at, due_at, received_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING request_id, due_at`,
+      [
+        input.organizationId,
+        input.subjectKind,
+        input.applicationId ?? null,
+        input.requestKind,
+        input.receivedAt.toISOString(),
+        dueAt,
+        input.receivedByUserId
+      ]
+    );
+    const row = inserted.rows[0];
+    if (row === undefined) {
+      throw new Error("recordPrivacyRequest: insert returned no row");
+    }
+    await client.query(
+      `INSERT INTO "${schema}".privacy_request_events (request_id, from_status, to_status, note, actor_user_id)
+       VALUES ($1, NULL, 'received', $2, $3)`,
+      [row.request_id, `${input.requestKind} request received from ${input.subjectKind}`, input.receivedByUserId]
+    );
+    await client.query("COMMIT");
+    return { requestId: row.request_id, dueAt: row.due_at.toISOString() };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface AdvancePrivacyRequestInput {
+  readonly organizationId: string;
+  readonly requestId: string;
+  readonly toStatus: PrivacyRequestStatus;
+  readonly note: string;
+  readonly actorUserId: string;
+  /** Required when moving to refused. */
+  readonly refusalReason?: string | undefined;
+  /** What the requester was told. Recorded when moving to completed. */
+  readonly outcome?: unknown;
+}
+
+/**
+ * Moves a request along, refusing transitions the lifecycle does not allow.
+ *
+ * The transition is validated against the status read inside the
+ * transaction, under FOR UPDATE, rather than one the caller supplies.
+ * Two operators resolving the same request concurrently would otherwise
+ * both read "received", both consider their move legal, and the second
+ * would overwrite the first's resolution along with its attribution.
+ */
+export async function advancePrivacyRequest(
+  databaseUrl: string,
+  schema: string,
+  input: AdvancePrivacyRequestInput
+): Promise<{ readonly fromStatus: PrivacyRequestStatus }> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    const current = await client.query<{ status: PrivacyRequestStatus }>(
+      `SELECT status FROM "${schema}".privacy_requests
+        WHERE request_id = $1 AND organization_id = $2
+        FOR UPDATE`,
+      [input.requestId, input.organizationId]
+    );
+    const from = current.rows[0]?.status;
+    if (from === undefined) {
+      throw new Error(
+        `advancePrivacyRequest: no request ${input.requestId} in organization ${input.organizationId}`
+      );
+    }
+    validatePrivacyRequestTransition(from, input.toStatus);
+
+    const resolving = input.toStatus === "completed" || input.toStatus === "refused";
+    await client.query(
+      `UPDATE "${schema}".privacy_requests
+          SET status = $1,
+              resolved_at = CASE WHEN $1 IN ('completed', 'refused') THEN CURRENT_TIMESTAMP ELSE resolved_at END,
+              refusal_reason = COALESCE($2, refusal_reason),
+              outcome = COALESCE($3::jsonb, outcome),
+              resolved_by_user_id = CASE WHEN $4 THEN $5 ELSE resolved_by_user_id END
+        WHERE request_id = $6 AND organization_id = $7`,
+      [
+        input.toStatus,
+        input.refusalReason ?? null,
+        input.outcome === undefined ? null : JSON.stringify(input.outcome),
+        resolving,
+        input.actorUserId,
+        input.requestId,
+        input.organizationId
+      ]
+    );
+    await client.query(
+      `INSERT INTO "${schema}".privacy_request_events (request_id, from_status, to_status, note, actor_user_id)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [input.requestId, from, input.toStatus, input.note, input.actorUserId]
+    );
+    await client.query("COMMIT");
+    return { fromStatus: from };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface ExtendPrivacyRequestInput {
+  readonly organizationId: string;
+  readonly requestId: string;
+  /** 1 or 2. Article 12(3) allows at most two further months. */
+  readonly extensionMonths: number;
+  /** Why the request needs longer. Recorded, and told to the data subject. */
+  readonly reason: string;
+  readonly actorUserId: string;
+}
+
+export interface ExtendedPrivacyRequest {
+  readonly extensionId: string;
+  readonly previousDueAt: string;
+  readonly dueAt: string;
+  readonly extendedAt: string;
+}
+
+/**
+ * REV-001: grants an Article 12(3) extension, the only thing that
+ * legitimately moves a request's due date.
+ *
+ * There is deliberately no `now` in the input. Whether an extension is
+ * timely is judged against the database clock, read once inside the
+ * transaction, and that same instant is what gets written. A caller-supplied
+ * time would satisfy both canExtendPrivacyRequest and the
+ * privacy_requests_extension_is_timely CHECK while being days stale, which
+ * is exactly the backdated extension 0024_privacy_requests.sql says the
+ * schema refuses. The value is carried as text so it is written back at the
+ * database's own precision rather than truncated to a JavaScript Date.
+ *
+ * Locking matches advancePrivacyRequest: one FOR UPDATE on the request row,
+ * scoped by the organization pair, and every write below is to that row or
+ * references it. So an extension and a transition on the same request
+ * serialise, and whichever runs second re-reads the other's result: an
+ * extension after a completion is refused as terminal, a second extension
+ * is refused as already extended, with UNIQUE (request_id) on
+ * privacy_request_extensions behind it.
+ */
+export async function extendPrivacyRequest(
+  databaseUrl: string,
+  schema: string,
+  input: ExtendPrivacyRequestInput
+): Promise<ExtendedPrivacyRequest> {
+  assertSafeSchema(schema);
+  validatePrivacyRequestExtensionMonths(input.extensionMonths);
+  if (!/[^\s]/u.test(input.reason)) {
+    throw new Error("extendPrivacyRequest: an extension requires a non-whitespace reason");
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    const current = await client.query<{
+      status: PrivacyRequestStatus;
+      received_at: Date;
+      due_at: Date;
+      extended_at: Date | null;
+    }>(
+      `SELECT status, received_at, due_at, extended_at
+         FROM "${schema}".privacy_requests
+        WHERE request_id = $1 AND organization_id = $2
+        FOR UPDATE`,
+      [input.requestId, input.organizationId]
+    );
+    const request = current.rows[0];
+    if (request === undefined) {
+      throw new Error(
+        `extendPrivacyRequest: no request ${input.requestId} in organization ${input.organizationId}`
+      );
+    }
+    if (isPrivacyRequestTerminal(request.status)) {
+      throw new Error(
+        `extendPrivacyRequest: request ${input.requestId} is ${request.status}, which is terminal; ` +
+          `an answered request has no deadline left to extend`
+      );
+    }
+    if (request.extended_at !== null) {
+      throw new Error(
+        `extendPrivacyRequest: request ${input.requestId} was already extended; ` +
+          `Article 12(3) allows one extension of at most two further months`
+      );
+    }
+
+    const clock = await client.query<{ now_text: string; now: Date }>(
+      `SELECT now_value::text AS now_text, now_value AS now
+         FROM (SELECT clock_timestamp() AS now_value) AS clock`
+    );
+    const dbNow = clock.rows[0];
+    if (dbNow === undefined) {
+      throw new Error("extendPrivacyRequest: could not read the database clock");
+    }
+    if (!canExtendPrivacyRequest(request.received_at, dbNow.now)) {
+      throw new Error(
+        `extendPrivacyRequest: request ${input.requestId} was received ${request.received_at.toISOString()} ` +
+          `and its first month has passed; an extension recorded now would be a late response backdated`
+      );
+    }
+    const dueAt = computePrivacyRequestDueDate(request.received_at, input.extensionMonths);
+
+    await client.query(
+      `UPDATE "${schema}".privacy_requests
+          SET extended_at = $1::timestamptz, extension_reason = $2, due_at = $3
+        WHERE request_id = $4 AND organization_id = $5`,
+      [dbNow.now_text, input.reason, dueAt, input.requestId, input.organizationId]
+    );
+    const extension = await client.query<{ extension_id: string }>(
+      `INSERT INTO "${schema}".privacy_request_extensions
+         (request_id, organization_id, extension_months, reason, previous_due_at, new_due_at, actor_user_id,
+          extended_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz)
+       RETURNING extension_id`,
+      [
+        input.requestId,
+        input.organizationId,
+        input.extensionMonths,
+        input.reason,
+        request.due_at.toISOString(),
+        dueAt,
+        input.actorUserId,
+        dbNow.now_text
+      ]
+    );
+    const extensionId = extension.rows[0]?.extension_id;
+    if (extensionId === undefined) {
+      throw new Error("extendPrivacyRequest: extension insert returned no row");
+    }
+    await client.query("COMMIT");
+    return {
+      extensionId,
+      previousDueAt: request.due_at.toISOString(),
+      dueAt,
+      extendedAt: dbNow.now.toISOString()
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface OverduePrivacyRequest {
+  readonly requestId: string;
+  readonly requestKind: PrivacyRequestKind;
+  readonly status: PrivacyRequestStatus;
+  readonly receivedAt: string;
+  readonly dueAt: string;
+}
+
+/**
+ * Open requests past their deadline.
+ *
+ * Filtered in SQL by due date and open status, then confirmed through the
+ * same domain predicate the rest of the system uses, so a query that
+ * drifts from the rule cannot quietly widen or narrow what counts as a
+ * breach.
+ */
+export async function listOverduePrivacyRequests(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  now: Date
+): Promise<readonly OverduePrivacyRequest[]> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{
+      request_id: string;
+      request_kind: PrivacyRequestKind;
+      status: PrivacyRequestStatus;
+      received_at: Date;
+      due_at: Date;
+    }>(
+      `SELECT request_id, request_kind, status, received_at, due_at
+         FROM "${schema}".privacy_requests
+        WHERE organization_id = $1
+          AND status IN ('received', 'in_progress')
+          AND due_at < $2
+        ORDER BY due_at ASC`,
+      [organizationId, now.toISOString()]
+    );
+    return result.rows
+      .map((row) => ({
+        requestId: row.request_id,
+        requestKind: row.request_kind,
+        status: row.status,
+        receivedAt: row.received_at.toISOString(),
+        dueAt: row.due_at.toISOString()
+      }))
+      .filter((request) => isPrivacyRequestOverdue(request, now));
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+export interface PrivacyRequestObservations {
+  /** The database's own calendar-month arithmetic, for the awkward date. */
+  readonly databaseDueDateForJanuary31: string;
+  /** What the domain computed for the same instant. They must agree. */
+  readonly domainDueDateForJanuary31: string;
+  readonly overdueRequestIds: readonly string[];
+  readonly completedRequestIsNotOverdue: boolean;
+  readonly eventCount: number;
+  readonly transitionsRecorded: readonly string[];
+  /** Negative controls: every one of these must be refused, by message. */
+  readonly lateExtensionRejection: string;
+  readonly reopenCompletedRejection: string;
+  readonly eventUpdateRejection: string;
+  readonly candidateWithoutApplicationRejection: string;
+  readonly employerWithApplicationRejection: string;
+  readonly unattributedResolutionRejection: string;
+  readonly crossTenantRejection: string;
+}
+
+/**
+ * Proves the request lifecycle against the real migrations.
+ *
+ * The deadline is the part worth proving rather than reading: the domain
+ * computes it in JavaScript and the CHECK constraint recomputes it in SQL,
+ * and the two only agree if both clamp the end of the month the same way.
+ * 31 January is the date that separates a correct implementation from one
+ * that looks correct.
+ */
+export async function assertPrivacyRequestLifecycle(
+  databaseUrl: string
+): Promise<PrivacyRequestObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `privacy_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const otherOrg = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const roleId = "33333333-3333-4333-8333-333333333333";
+  const intakeId = "55555555-5555-4555-8555-555555555555";
+  const applicationId = "44444444-4444-4444-8444-444444444444";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`assertPrivacyRequestLifecycle: "${label}" SUCCEEDED but must be refused`);
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0024_privacy_requests.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [
+      org,
+      otherOrg
+    ]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `privacy_${suffix}@acme.test`
+    ]);
+    await admin.query(
+      `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
+      [roleId, org, userId]
+    );
+    await admin.query(
+      `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+         declared_mime_type, status, created_by_user_id)
+       VALUES ($1,$2,$3,$4,'cv.pdf','application/pdf','imported',$5)`,
+      [intakeId, org, roleId, `key-${suffix}`, userId]
+    );
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Jane Doe','jane@example.test')`,
+      [applicationId, org, roleId, intakeId]
+    );
+
+    // The awkward date: a calendar month after 31 January is 28 February,
+    // not 2 March.
+    const january31 = new Date("2026-01-31T09:00:00.000Z");
+    const databaseDue = await admin.query<{ due: Date }>(
+      `SELECT ($1::timestamptz + INTERVAL '1 month') AS due`,
+      [january31.toISOString()]
+    );
+
+    // An old request, deliberately past its deadline.
+    const overdue = await recordPrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      subjectKind: "candidate",
+      applicationId,
+      requestKind: "delete",
+      receivedAt: january31,
+      receivedByUserId: userId
+    });
+    // A second request that gets answered, to show completion clears the clock.
+    const answered = await recordPrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      subjectKind: "employer",
+      requestKind: "export",
+      receivedAt: january31,
+      receivedByUserId: userId
+    });
+    await advancePrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: answered.requestId,
+      toStatus: "in_progress",
+      note: "gathering the export",
+      actorUserId: userId
+    });
+    await advancePrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: answered.requestId,
+      toStatus: "completed",
+      note: "export delivered",
+      actorUserId: userId,
+      outcome: { kind: "export", complete: true }
+    });
+
+    const now = new Date("2026-06-01T00:00:00.000Z");
+    const stillOverdue = await listOverduePrivacyRequests(databaseUrl, schema, org, now);
+
+    const events = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM privacy_request_events`
+    );
+    const transitions = await admin.query<{ from_status: string | null; to_status: string }>(
+      `SELECT from_status, to_status FROM privacy_request_events
+        WHERE request_id = $1 ORDER BY occurred_at`,
+      [answered.requestId]
+    );
+
+    // --- negative controls ---
+    const lateExtensionRejection = await expectRejected("extension:after_the_month", () =>
+      admin.query(
+        `UPDATE privacy_requests
+            SET extended_at = received_at + INTERVAL '2 months',
+                extension_reason = 'backdated',
+                due_at = received_at + INTERVAL '3 months'
+          WHERE request_id = $1`,
+        [overdue.requestId]
+      )
+    );
+    const reopenCompletedRejection = await expectRejected("transition:completed_to_in_progress", () =>
+      advancePrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: answered.requestId,
+        toStatus: "in_progress",
+        note: "reopening",
+        actorUserId: userId
+      })
+    );
+    const eventUpdateRejection = await expectRejected("events:update", () =>
+      admin.query(`UPDATE privacy_request_events SET note = 'rewritten'`)
+    );
+    const candidateWithoutApplicationRejection = await expectRejected("candidate:no_application", () =>
+      admin.query(
+        `INSERT INTO privacy_requests
+           (organization_id, subject_kind, request_kind, due_at, received_by_user_id)
+         VALUES ($1,'candidate','delete', CURRENT_TIMESTAMP + INTERVAL '1 month', $2)`,
+        [org, userId]
+      )
+    );
+    const employerWithApplicationRejection = await expectRejected("employer:names_application", () =>
+      admin.query(
+        `INSERT INTO privacy_requests
+           (organization_id, subject_kind, application_id, request_kind, due_at, received_by_user_id)
+         VALUES ($1,'employer',$2,'export', CURRENT_TIMESTAMP + INTERVAL '1 month', $3)`,
+        [org, applicationId, userId]
+      )
+    );
+    const unattributedResolutionRejection = await expectRejected("completed:no_resolver", () =>
+      admin.query(
+        `INSERT INTO privacy_requests
+           (organization_id, subject_kind, request_kind, status, resolved_at, due_at, received_by_user_id)
+         VALUES ($1,'employer','export','completed', CURRENT_TIMESTAMP,
+                 CURRENT_TIMESTAMP + INTERVAL '1 month', $2)`,
+        [org, userId]
+      )
+    );
+    const crossTenantRejection = await expectRejected("advance:cross_tenant", () =>
+      advancePrivacyRequest(databaseUrl, schema, {
+        organizationId: otherOrg,
+        requestId: overdue.requestId,
+        toStatus: "in_progress",
+        note: "another tenant",
+        actorUserId: userId
+      })
+    );
+
+    return {
+      databaseDueDateForJanuary31: (databaseDue.rows[0]?.due ?? new Date(0)).toISOString(),
+      domainDueDateForJanuary31: overdue.dueAt,
+      overdueRequestIds: stillOverdue.map((request) => request.requestId),
+      completedRequestIsNotOverdue: !stillOverdue.some((r) => r.requestId === answered.requestId),
+      eventCount: Number.parseInt(events.rows[0]?.count ?? "", 10),
+      transitionsRecorded: transitions.rows.map((row) => `${row.from_status ?? "none"}->${row.to_status}`),
+      lateExtensionRejection,
+      reopenCompletedRejection,
+      eventUpdateRejection,
+      candidateWithoutApplicationRejection,
+      employerWithApplicationRejection,
+      unattributedResolutionRejection,
+      crossTenantRejection
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+export interface PrivacyRequestExtensionObservations {
+  /** A timely extension, as returned and as stored. */
+  readonly granted: ExtendedPrivacyRequest;
+  readonly expectedDueAt: string;
+  readonly storedDueAt: string;
+  readonly storedExtendedAt: string | null;
+  readonly storedExtensionReason: string | null;
+  readonly ledgerRow: {
+    readonly extensionMonths: number;
+    readonly previousDueAt: string;
+    readonly newDueAt: string;
+    readonly actorUserId: string;
+    readonly extendedAtMatchesRequest: boolean;
+  } | null;
+  /** An in_progress request is still open, so it can be extended too. */
+  readonly inProgressGranted: boolean;
+  /** Refusals from extendPrivacyRequest itself, by message. */
+  readonly alreadyExtendedRejection: string;
+  readonly completedRejection: string;
+  readonly refusedRejection: string;
+  readonly outOfWindowRejection: string;
+  readonly zeroMonthsRejection: string;
+  readonly threeMonthsRejection: string;
+  readonly crossTenantRejection: string;
+  /** Refused requests must be left exactly as they were. */
+  readonly outOfWindowDueAtUnchanged: boolean;
+  readonly ledgerRowsForAlreadyExtended: number;
+  /** The database's own backstops, for a writer that bypasses the function. */
+  readonly secondLedgerRowRejection: string;
+  /** REV-003: a raw backdated extension after the statutory month. */
+  readonly backdatedExtensionRejection: string;
+  readonly zeroMonthsLedgerRejection: string;
+  readonly ledgerUpdateRejection: string;
+}
+
+/**
+ * REV-001: proves extendPrivacyRequest against the real migrations and the
+ * real database clock.
+ *
+ * Timing is controlled through received_at, not through a clock the test
+ * supplies: extendPrivacyRequest reads clock_timestamp() itself, so a
+ * request received 10 days ago is inside its first month and one received
+ * 40 days ago is past it, whatever the time is when this runs.
+ */
+export async function assertPrivacyRequestExtension(
+  databaseUrl: string
+): Promise<PrivacyRequestExtensionObservations> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `privacy_ext_probe_${suffix}`;
+  const org = "11111111-1111-4111-8111-111111111111";
+  const otherOrg = "22222222-2222-4222-8222-222222222222";
+  const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const day = 24 * 60 * 60 * 1000;
+
+  const expectRejected = async (label: string, run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`assertPrivacyRequestExtension: "${label}" SUCCEEDED but must be refused`);
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql",
+      "0014_canonical_text_extractions.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0024_privacy_requests.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [
+      org,
+      otherOrg
+    ]);
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
+      userId,
+      `privacy_ext_${suffix}@acme.test`
+    ]);
+
+    const databaseNow = await admin.query<{ now: Date }>(`SELECT clock_timestamp() AS now`);
+    const now = (databaseNow.rows[0]?.now ?? new Date()).getTime();
+    const file = (receivedAt: Date): Promise<RecordedPrivacyRequest> =>
+      recordPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        subjectKind: "employer",
+        requestKind: "export",
+        receivedAt,
+        receivedByUserId: userId
+      });
+
+    // --- the positive path ---
+    const receivedRecently = new Date(now - 10 * day);
+    const timely = await file(receivedRecently);
+    const granted = await extendPrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: timely.requestId,
+      extensionMonths: 2,
+      reason: "a complex request spanning several roles",
+      actorUserId: userId
+    });
+    const stored = await admin.query<{ due_at: Date; extended_at: Date | null; extension_reason: string | null }>(
+      `SELECT due_at, extended_at, extension_reason FROM privacy_requests WHERE request_id = $1`,
+      [timely.requestId]
+    );
+    const ledger = await admin.query<{
+      extension_months: number;
+      previous_due_at: Date;
+      new_due_at: Date;
+      actor_user_id: string;
+      matches: boolean;
+    }>(
+      `SELECT e.extension_months, e.previous_due_at, e.new_due_at, e.actor_user_id,
+              e.extended_at = r.extended_at AS matches
+         FROM privacy_request_extensions e
+         JOIN privacy_requests r USING (request_id)
+        WHERE e.request_id = $1`,
+      [timely.requestId]
+    );
+    const ledgerRow = ledger.rows[0];
+
+    const stillOpen = await file(receivedRecently);
+    await advancePrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: stillOpen.requestId,
+      toStatus: "in_progress",
+      note: "gathering the export",
+      actorUserId: userId
+    });
+    const inProgress = await extendPrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: stillOpen.requestId,
+      extensionMonths: 1,
+      reason: "waiting on a second system",
+      actorUserId: userId
+    });
+
+    // --- refusals ---
+    const alreadyExtendedRejection = await expectRejected("extend:twice", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: timely.requestId,
+        extensionMonths: 1,
+        reason: "and a little more",
+        actorUserId: userId
+      })
+    );
+    const ledgerCount = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM privacy_request_extensions WHERE request_id = $1`,
+      [timely.requestId]
+    );
+
+    const completed = await file(receivedRecently);
+    await advancePrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: completed.requestId,
+      toStatus: "completed",
+      note: "export delivered",
+      actorUserId: userId,
+      outcome: { kind: "export", complete: true }
+    });
+    const completedRejection = await expectRejected("extend:completed", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: completed.requestId,
+        extensionMonths: 1,
+        reason: "after the fact",
+        actorUserId: userId
+      })
+    );
+    const refused = await file(receivedRecently);
+    await advancePrivacyRequest(databaseUrl, schema, {
+      organizationId: org,
+      requestId: refused.requestId,
+      toStatus: "refused",
+      note: "manifestly unfounded",
+      actorUserId: userId,
+      refusalReason: "manifestly unfounded"
+    });
+    const refusedRejection = await expectRejected("extend:refused", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: refused.requestId,
+        extensionMonths: 1,
+        reason: "after the fact",
+        actorUserId: userId
+      })
+    );
+
+    const late = await file(new Date(now - 40 * day));
+    const outOfWindowRejection = await expectRejected("extend:out_of_window", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: late.requestId,
+        extensionMonths: 2,
+        reason: "we ran out of time",
+        actorUserId: userId
+      })
+    );
+    const lateAfter = await admin.query<{ due_at: Date; extended_at: Date | null }>(
+      `SELECT due_at, extended_at FROM privacy_requests WHERE request_id = $1`,
+      [late.requestId]
+    );
+
+    const fresh = await file(receivedRecently);
+    const zeroMonthsRejection = await expectRejected("extend:zero_months", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: fresh.requestId,
+        extensionMonths: 0,
+        reason: "no extra time at all",
+        actorUserId: userId
+      })
+    );
+    const threeMonthsRejection = await expectRejected("extend:three_months", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: org,
+        requestId: fresh.requestId,
+        extensionMonths: 3,
+        reason: "past the statutory ceiling",
+        actorUserId: userId
+      })
+    );
+    const crossTenantRejection = await expectRejected("extend:cross_tenant", () =>
+      extendPrivacyRequest(databaseUrl, schema, {
+        organizationId: otherOrg,
+        requestId: fresh.requestId,
+        extensionMonths: 1,
+        reason: "another tenant",
+        actorUserId: userId
+      })
+    );
+
+    // --- the database's own backstops ---
+    const secondLedgerRowRejection = await expectRejected("ledger:second_row", () =>
+      admin.query(
+        `INSERT INTO privacy_request_extensions
+           (request_id, organization_id, extension_months, reason, previous_due_at, new_due_at, actor_user_id)
+         VALUES ($1, $2, 1, 'bypassing the function', now(), now() + INTERVAL '1 day', $3)`,
+        [timely.requestId, org, userId]
+      )
+    );
+    // REV-003: the exact attack the timeliness CHECK did not stop. The
+    // request was received over a month ago, so an extension is late. A
+    // direct writer sets extended_at to received_at + 1 month and due_at
+    // to received_at + 3 months: every CHECK on the row is satisfied,
+    // because they compare two values the same writer chose. The clock is
+    // the only thing that can refuse it.
+    const backdatedExtensionRejection = await expectRejected("extend:backdated_after_deadline", () =>
+      admin.query(
+        `UPDATE privacy_requests
+            SET extended_at = received_at + INTERVAL '1 month',
+                extension_reason = 'recorded late, dated early',
+                due_at = received_at + INTERVAL '3 months'
+          WHERE request_id = $1`,
+        [late.requestId]
+      )
+    );
+
+    const zeroMonthsLedgerRejection = await expectRejected("ledger:zero_months", () =>
+      admin.query(
+        `INSERT INTO privacy_request_extensions
+           (request_id, organization_id, extension_months, reason, previous_due_at, new_due_at, actor_user_id)
+         VALUES ($1, $2, 0, 'bypassing the function', now(), now() + INTERVAL '1 day', $3)`,
+        [fresh.requestId, org, userId]
+      )
+    );
+    const ledgerUpdateRejection = await expectRejected("ledger:update", () =>
+      admin.query(`UPDATE privacy_request_extensions SET reason = 'rewritten'`)
+    );
+
+    const storedRow = stored.rows[0];
+    return {
+      granted,
+      expectedDueAt: computePrivacyRequestDueDate(receivedRecently, 2),
+      storedDueAt: (storedRow?.due_at ?? new Date(0)).toISOString(),
+      storedExtendedAt: storedRow?.extended_at?.toISOString() ?? null,
+      storedExtensionReason: storedRow?.extension_reason ?? null,
+      ledgerRow:
+        ledgerRow === undefined
+          ? null
+          : {
+              extensionMonths: ledgerRow.extension_months,
+              previousDueAt: ledgerRow.previous_due_at.toISOString(),
+              newDueAt: ledgerRow.new_due_at.toISOString(),
+              actorUserId: ledgerRow.actor_user_id,
+              extendedAtMatchesRequest: ledgerRow.matches
+            },
+      inProgressGranted: inProgress.dueAt === computePrivacyRequestDueDate(receivedRecently, 1),
+      alreadyExtendedRejection,
+      completedRejection,
+      refusedRejection,
+      outOfWindowRejection,
+      zeroMonthsRejection,
+      threeMonthsRejection,
+      crossTenantRejection,
+      outOfWindowDueAtUnchanged:
+        lateAfter.rows[0]?.due_at.toISOString() === late.dueAt && lateAfter.rows[0]?.extended_at === null,
+      ledgerRowsForAlreadyExtended: Number.parseInt(ledgerCount.rows[0]?.count ?? "", 10),
+      secondLedgerRowRejection,
+      backdatedExtensionRejection,
+      zeroMonthsLedgerRejection,
+      ledgerUpdateRejection
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
     await admin.end().catch(() => undefined);
   }
 }
