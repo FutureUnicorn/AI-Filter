@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  generateAuditReportShareToken,
+  hashAuditReportShareToken
+} from "../../packages/security/src/index.ts";
+
 import { assertAuditReportShareLinkSecurity } from "../../packages/db/src/index.ts";
 
 // AF-90. One probe builds live, expired, revoked and unknown links against
@@ -164,4 +169,38 @@ test("an unusable clock refuses the link rather than serving it", async () => {
     true,
     "a refused resolve must not record a view"
   );
+});
+
+// ---- moved from tests/unit/audit-report-share-link.test.ts ----
+//
+// These reach packages/security, which imports @signal-audit/contracts by
+// package specifier. test:integration runs build:packages first;
+// test:unit:ts does not, so from cold they failed with
+// ERR_MODULE_NOT_FOUND in CI's unit job while passing locally, because
+// `pnpm check` runs typecheck first and typecheck builds dist.
+
+test("share tokens carry at least the 128 bits OWASP asks of a reference token", () => {
+  // base64url of 32 random bytes: 256 bits of entropy, 43 characters with
+  // no padding. Asserted on the encoding rather than on a byte count,
+  // because the encoding is what actually reaches the URL.
+  const { token, tokenHash } = generateAuditReportShareToken();
+  assert.equal(token.length, 43);
+  assert.match(token, /^[A-Za-z0-9_-]+$/u, "must be URL-safe with no padding");
+  const bitsOfEntropy = 32 * 8;
+  assert.ok(bitsOfEntropy >= 128);
+  assert.equal(tokenHash, hashAuditReportShareToken(token));
+  assert.match(tokenHash, /^[0-9a-f]{64}$/u);
+});
+
+test("two generated tokens differ, so the generator is not a constant", () => {
+  // The control for the test above: a fixed token would satisfy every
+  // shape assertion there.
+  const seen = new Set(Array.from({ length: 50 }, () => generateAuditReportShareToken().token));
+  assert.equal(seen.size, 50);
+});
+
+test("the raw token is not recoverable from what gets stored", () => {
+  const { token, tokenHash } = generateAuditReportShareToken();
+  assert.notEqual(tokenHash, token);
+  assert.ok(!tokenHash.includes(token));
 });

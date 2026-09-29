@@ -53,8 +53,23 @@ test("every table any migration creates is classified by the retention plan", ()
 });
 
 test("AF-66's own tables are classified, which is the case that prompted this suite", () => {
+  // REV-002 split these two apart, and the split is the finding.
+  //
+  // A grant is exempt because of its shape: after the free-text reason
+  // was replaced by a code from a closed set and a ticket key, there is
+  // no column on it a candidate identifier can reach. That is a claim
+  // about the table rather than about a redactor someone has to keep
+  // ahead of, which is what the old exemption rested on.
+  //
+  // An event is planned, because it names what was opened. When an
+  // operator opens a candidate's application, entity_id is that
+  // candidate's application identifier -- the same polymorphic pair that
+  // put audit_events and evidence_extraction_runs in the plan.
   assert.equal(classifyRetentionTable("support_access_grants"), "exempt");
-  assert.equal(classifyRetentionTable("support_access_events"), "exempt");
+  assert.equal(classifyRetentionTable("support_access_events"), "planned");
+  // platform_operators holds a user_id and a revocation time: platform
+  // staff, no tenant, no candidate, no free text.
+  assert.equal(classifyRetentionTable("platform_operators"), "exempt");
 });
 
 test("a table nobody has classified reports as unclassified", () => {

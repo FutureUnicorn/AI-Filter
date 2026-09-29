@@ -11,10 +11,14 @@ import {
   shareLinkDisclosureNotice
 } from "../../packages/domain/src/index.ts";
 import type { ShareLinkResolution } from "../../packages/domain/src/index.ts";
-import {
-  generateAuditReportShareToken,
-  hashAuditReportShareToken
-} from "../../packages/security/src/index.ts";
+
+// The three token-generation tests that were here now live in
+// tests/integration/audit-report-share-link.test.ts. They reach
+// packages/security, which imports @signal-audit/contracts by package
+// specifier, and test:unit:ts does not build the workspace -- so they ran
+// only where dist happened to exist already and failed in CI's unit job
+// from cold. tests/architecture/unit-tests-need-no-build.test.ts is what
+// caught it.
 
 // AF-90. The endpoint is unauthenticated by definition, so the properties
 // worth asserting are the negative ones -- what a caller cannot learn, and
@@ -59,31 +63,8 @@ test("the rendered failure never leaks the internal reason", () => {
   assert.doesNotMatch(SHARE_LINK_UNAVAILABLE_MESSAGE, /revok|expir|not found|invalid token/iu);
 });
 
-test("share tokens carry at least the 128 bits OWASP asks of a reference token", () => {
-  // base64url of 32 random bytes: 256 bits of entropy, 43 characters with
-  // no padding. Asserted on the encoding rather than on a byte count,
-  // because the encoding is what actually reaches the URL.
-  const { token, tokenHash } = generateAuditReportShareToken();
-  assert.equal(token.length, 43);
-  assert.match(token, /^[A-Za-z0-9_-]+$/u, "must be URL-safe with no padding");
-  const bitsOfEntropy = 32 * 8;
-  assert.ok(bitsOfEntropy >= 128);
-  assert.equal(tokenHash, hashAuditReportShareToken(token));
-  assert.match(tokenHash, /^[0-9a-f]{64}$/u);
-});
 
-test("two generated tokens differ, so the generator is not a constant", () => {
-  // The control for the test above: a fixed token would satisfy every
-  // shape assertion there.
-  const seen = new Set(Array.from({ length: 50 }, () => generateAuditReportShareToken().token));
-  assert.equal(seen.size, 50);
-});
 
-test("the raw token is not recoverable from what gets stored", () => {
-  const { token, tokenHash } = generateAuditReportShareToken();
-  assert.notEqual(tokenHash, token);
-  assert.ok(!tokenHash.includes(token));
-});
 
 test("the disclosure notice states the reconstruction-key caveat", () => {
   // A leaked link exposes role-level metrics, not named candidates -- but

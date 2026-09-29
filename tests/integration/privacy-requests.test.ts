@@ -33,7 +33,17 @@ test("an extension recorded after the first month is refused by the database", a
   // how a late response gets relabelled as a compliant one, so the
   // constraint refuses it even for a direct SQL writer.
   const observed = await observe();
-  assert.match(observed.lateExtensionRejection, /privacy_requests_extension_is_timely/);
+  // REV-003 moved the enforcement from the CHECK to a trigger that owns
+  // extended_at from the database clock. The CHECK compared two values one
+  // writer controlled, so it could be satisfied by backdating; the trigger
+  // cannot. This asserts the rule rather than the mechanism, so it holds
+  // across that change, and accepts either refusal.
+  assert.match(
+    observed.lateExtensionRejection,
+    /privacy_requests_extension_is_timely|within one month of receipt/u,
+    "a late extension must be refused by the database, whichever guard catches it"
+  );
+  assert.notEqual(observed.lateExtensionRejection, "", "it must actually be refused");
 });
 
 test("an answered request stops being overdue; an unanswered one does not", async () => {
