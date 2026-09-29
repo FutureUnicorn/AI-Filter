@@ -27,7 +27,20 @@ const AWAITING_A_CALLER: Readonly<Record<string, string>> = {
   // (getFailedDocumentRate), but no route exposes it. Wiring it is a
   // second public endpoint and a second authorization decision, which
   // belongs to AF-58 rather than to the review-time ticket that found it.
-  describeFailedDocumentRate: "AF-58 needs its own reporting route"
+  describeFailedDocumentRate: "AF-58 needs its own reporting route",
+  // AF-56's North Star safety metric. Its consumer is AF-59's role-level
+  // audit report, which files it under qualified_candidate_preservation,
+  // and AF-90's share link is what delivers that report to an employer.
+  // Neither has a route, so there is nothing under apps/ that could call
+  // this yet -- the gap is the report's, not this ticket's.
+  //
+  // Listed rather than wired here deliberately. A route written on this
+  // branch would be written against conventions develop has since
+  // replaced (withServerOperation, pooled clients,
+  // requireMembershipLookupVisible, none of which exist on this stack),
+  // so it would be rewritten during the replay onto develop and reviewed
+  // in a form that does not survive.
+  describeQualifiedPreservation: "AF-59 files it into the role audit report; AF-90 delivers that report"
 };
 
 function metricFunctions(): readonly string[] {
