@@ -20,6 +20,25 @@ x-runtime-environment: &runtime-environment
   SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
   WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
 
+x-backup-environment: &backup-environment
+  APP_ENV: ${APP_ENV:?APP_ENV is required}
+  DEPLOYMENT_COMMIT_SHA: ${DEPLOYMENT_COMMIT_SHA:?DEPLOYMENT_COMMIT_SHA is required}
+  PGHOST: postgres
+  PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+  PGUSER: ${POSTGRES_USER:?POSTGRES_USER is required}
+  PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:?STORAGE_BUCKET is required}
+  STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:?STORAGE_ACCESS_KEY_ID is required}
+  STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:?STORAGE_SECRET_ACCESS_KEY is required}
+  BACKUP_ENDPOINT: ${BACKUP_ENDPOINT:-}
+  BACKUP_REGION: ${BACKUP_REGION:-}
+  BACKUP_BUCKET: ${BACKUP_BUCKET:-}
+  BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-}
+  BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
+  BACKUP_PATH_STYLE: ${BACKUP_PATH_STYLE:-auto}
+  BACKUP_CONTROL_OWNER: ${BACKUP_CONTROL_OWNER:-}
+  BACKUP_ENCRYPTION_REFERENCE: ${BACKUP_ENCRYPTION_REFERENCE:-}
+
 services:
   postgres:
     image: postgres:17.10-alpine3.23
@@ -96,7 +115,15 @@ services:
           PGOPTIONS="-c search_path=$$DATABASE_SCHEMA" psql -v ON_ERROR_STOP=1 --file "$$migration"
         done
     volumes:
-      - ../../packages/db/migrations:/migrations:ro
+      # AF-93 PR #85 review (Copilot): DEPLOY_SOURCE_DIRECTORY lets the preview
+      # deploy job run cli.mjs (and this compose file) from a TRUSTED
+      # default-branch checkout while mounting the PR's own untrusted
+      # revision's migrations -- a preview must run that PR's own migrations
+      # for correctness, so this stays pointed at the PR checkout even though
+      # the orchestration script itself no longer is. Unset (every other
+      # caller: local/staging/production/manual preview) resolves relative to
+      # this compose file's own location exactly as before.
+      - ${DEPLOY_SOURCE_DIRECTORY:-../..}/packages/db/migrations:/migrations:ro
     networks: [private]
     security_opt: ["no-new-privileges:true"]
 
@@ -122,13 +149,71 @@ services:
         case "$$DATABASE_SCHEMA" in (*[!a-z0-9_]*|'') echo 'Unsafe DATABASE_SCHEMA' >&2; exit 2;; esac
         PGOPTIONS="-c search_path=$$DATABASE_SCHEMA" psql -v ON_ERROR_STOP=1 --file /fixtures/synthetic.sql
     volumes:
-      - ../../tests/fixtures/environment:/fixtures:ro
+      - ${DEPLOY_SOURCE_DIRECTORY:-../..}/tests/fixtures/environment:/fixtures:ro
     networks: [private]
+    security_opt: ["no-new-privileges:true"]
+
+  backup-init:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["configure"]
+    restart: "no"
+    environment:
+      <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_ADMIN_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_ADMIN_SECRET_ACCESS_KEY:-}
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=70,gid=70
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  backup:
+    profiles: [backups]
+    build:
+      context: ../..
+      dockerfile: infra/docker/backup.Dockerfile
+    command: ["loop"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *backup-environment
+      BACKUP_ACCESS_KEY_ID: ${BACKUP_WRITER_ACCESS_KEY_ID:-}
+      BACKUP_SECRET_ACCESS_KEY: ${BACKUP_WRITER_SECRET_ACCESS_KEY:-}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/signal-audit-backup", "health"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    networks: [public, private]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1770,uid=70,gid=70
+    volumes:
+      - backup-work:/var/lib/signal-audit-backup
+    mem_limit: ${BACKUP_MEMORY_LIMIT:-512m}
+    cpus: ${BACKUP_CPU_LIMIT:-0.50}
+    cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
 
   web:
     build:
-      context: ../..
+      # AF-93 PR #85 review (Copilot): the preview deploy job runs cli.mjs
+      # from a trusted default-branch checkout but must still BUILD the
+      # exact, untrusted PR revision under test. DEPLOY_SOURCE_DIRECTORY
+      # (an absolute path when set) points the build -- and only the build --
+      # at that untrusted checkout, so the attacker-controlled Dockerfile and
+      # source are never mistaken for orchestration code with access to
+      # PREVIEW_STATE_DIRECTORY or other previews' state.
+      context: ${DEPLOY_SOURCE_DIRECTORY:-../..}
       dockerfile: infra/docker/runtime.Dockerfile
       target: web
     restart: unless-stopped
@@ -161,7 +246,7 @@ services:
 
   worker:
     build:
-      context: ../..
+      context: ${DEPLOY_SOURCE_DIRECTORY:-../..}
       dockerfile: infra/docker/runtime.Dockerfile
       target: worker
     restart: unless-stopped
@@ -212,3 +297,4 @@ networks:
 volumes:
   postgres-data: {}
   storage-data: {}
+  backup-work: {}

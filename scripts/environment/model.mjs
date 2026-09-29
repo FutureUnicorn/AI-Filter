@@ -1,6 +1,29 @@
 import crypto from "node:crypto";
+import path from "node:path";
 
 const hostedEnvironments = new Set(["staging", "production"]);
+
+/**
+ * AF-93 PR #85 review (hemnaath04, REV-002, blocking). Where preview
+ * credential state lives is the single most consequential fact in the
+ * high-severity fix this ticket shipped: get it wrong and every other
+ * preview's database/storage secrets are readable from the untrusted PR
+ * checkout that builds and runs cli.mjs. The original guard test only
+ * asserted that the string `process.env.PREVIEW_STATE_DIRECTORY` appeared
+ * somewhere in cli.mjs -- satisfied by a reference nothing reads from.
+ *
+ * Extracted as its own exported, source-independent function so a test can
+ * call it directly with a synthetic `source` and assert the RESOLVED path,
+ * the same way derivePreviewEnvironment below is tested -- no docker, no
+ * subprocess, and no way for an unused reference to the env var to pass.
+ */
+export function resolvePreviewStateDirectory(repositoryRoot, source = process.env) {
+  const configured = source.PREVIEW_STATE_DIRECTORY;
+  if (configured !== undefined && configured.trim() !== "") {
+    return path.resolve(configured);
+  }
+  return path.join(repositoryRoot, ".runtime");
+}
 
 export function validateCommitSha(value) {
   if (!/^[a-f0-9]{7,64}$/u.test(value ?? "")) {

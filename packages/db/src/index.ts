@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1263,6 +1263,36 @@ export async function seedOrganizationMembership(
 //
 // It lives in packages/db for the same reason the two above do -- `pg` is a
 // dependency of this package and tests do not import it directly.
+//
+// What "the authorization check stays real" does NOT mean (PR #90 review,
+// REV-001). This harness connects with `databaseUrl` as given, which in every
+// caller so far is the Postgres image's bootstrap superuser -- the same role
+// production runs as today. `getMembershipsForUser`'s own comment documents
+// why that matters here specifically: 0004_tenant_scoped_rls.sql's policy on
+// `app.current_org_id` is enforced against the role, and no application code
+// sets that setting before this lookup, so under a role RLS actually applies
+// to the query returns zero rows and every route answers not_found. A
+// superuser bypasses RLS unconditionally, so this harness's route requests
+// exercise `authorizeResourceAccess`'s logic -- the capability table, the
+// no_membership/insufficient_capability split -- but not tenant isolation
+// enforced by the database itself, because nothing here can reach that
+// enforcement without also reaching `requireMembershipLookupVisibleOnce`'s
+// deliberate throw, which is not a bug to route around: it is the guard
+// AF-83 REV-002 added so this exact failure mode fails loudly instead of as
+// a silent not_found. Making every route request in this harness pass under
+// a genuinely restricted role is the AF-18 multi-tenant RLS work the schema's
+// own migration comment defers, not something a test-harness ticket should
+// take on as a side effect. `assertMembershipReadFailsLoudlyUnderRls` and
+// `assertMagicLinkRlsSafety` below already cover that guard directly, against
+// a real NOSUPERUSER NOBYPASSRLS role built for exactly this question; that
+// coverage does not need duplicating here, and duplicating it badly (an
+// authorization test suite where every request 500s before reaching the
+// assertion) would be worse than the gap it claims to close.
+//
+// Migrations now include 0004_tenant_scoped_rls.sql (see
+// listMigrationFilesInRunnerOrder below), so the schema's shape matches
+// production; the tests below simply cannot make that migration's policy
+// bind, for the reason above.
 
 export interface ApiRouteProbeMember {
   readonly userId: string;
@@ -1291,29 +1321,29 @@ export interface ApiRouteProbe {
 }
 
 /**
- * The full set, in dependency order.
+ * Every `.sql` file directly under `packages/db/migrations`, in the same
+ * order `infra/compose/runtime.yml`'s `migrate` service applies them: a
+ * `for migration in /migrations/*.sql` shell glob, which expands
+ * lexicographically. `Array.prototype.sort()`'s default UTF-16 comparison
+ * agrees with that for this filename charset, so this is the runner's
+ * order, not an approximation of it.
  *
- * Trimming it is not safe in either direction: 0020_candidate_decisions.sql's
- * composite foreign key onto applications needs the unique constraint
- * 0016_applications_and_import_finalization.sql adds, and that one needs
- * 0013_file_intakes.sql. The first-decision probe's comment records the same
- * finding. 0022_idempotent_requests.sql is here because every mutating
- * endpoint this harness drives requires an Idempotency-Key, so a schema
- * without it fails at the first POST.
+ * PR #90 review, REV-002: this replaced a hand-picked list that its own
+ * comment called "the full set" while actually being 11 of 25 migrations,
+ * chosen for what two specific endpoints happened to need. That shape has
+ * produced a wrong result four separate times in this repository (AF-61,
+ * AF-62 and AF-63's probes each undercounted a surface their hand-picked
+ * list omitted, and REV-001 below is the fifth: the omission there was
+ * 0004_tenant_scoped_rls.sql). A probe that applies the tables somebody
+ * already thought of can only observe what somebody already thought of, and
+ * the failure is always silent and always looks like a pass. Applying every
+ * migration removes the list to omit something from.
  */
-const API_ROUTE_MIGRATIONS = [
-  "0002_organizations_users_memberships.sql",
-  "0006_evidence_extraction_runs.sql",
-  "0009_roles.sql",
-  "0013_file_intakes.sql",
-  "0016_applications_and_import_finalization.sql",
-  "0017_evidence_outcomes.sql",
-  "0018_evidence_corrections.sql",
-  "0019_correction_attribution.sql",
-  "0020_candidate_decisions.sql",
-  "0021_single_decision_root.sql",
-  "0022_idempotent_requests.sql"
-] as const;
+function listMigrationFilesInRunnerOrder(): readonly string[] {
+  return readdirSync(MIGRATIONS_DIRECTORY)
+    .filter((entry) => entry.endsWith(".sql"))
+    .sort();
+}
 
 export async function provisionApiRouteSchema(
   databaseUrl: string,
@@ -1329,7 +1359,7 @@ export async function provisionApiRouteSchema(
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const migration of API_ROUTE_MIGRATIONS) {
+    for (const migration of listMigrationFilesInRunnerOrder()) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
     }
 

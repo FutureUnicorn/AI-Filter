@@ -440,6 +440,40 @@ test("readProbeRows still reads, with and without parameters", async () => {
   });
 });
 
+// ---- What this harness's authorization tests do not cover, pinned rather
+// than only documented (PR #90 review, REV-001) ----
+//
+// route-harness.ts's header and provisionApiRouteSchema's doc comment both
+// explain why: this harness connects as whatever role its database URL
+// names, which today is the bootstrap superuser production also runs as, and
+// a superuser bypasses row-level security unconditionally. That is a claim
+// about the environment this suite runs in, not about the code under test,
+// and a comment saying so can go stale silently -- exactly the failure mode
+// this file exists to stop tolerating elsewhere. So it is checked here: if a
+// future change points this harness at a role RLS actually applies to, every
+// authorization test above would start failing for a different reason than
+// its name says (an internal_error from requireMembershipLookupVisibleOnce,
+// not the authorization decision it claims to test), and this is the test
+// that would explain why.
+interface RlsActiveRow extends Record<string, unknown> {
+  readonly active: boolean;
+}
+
+test("this harness's connection bypasses RLS, which is why its authorization tests do not exercise it", async () => {
+  await withApiRouteHarness(async (harness) => {
+    const result = await harness.rows<RlsActiveRow>(
+      `SELECT row_security_active(format('%I.memberships', $1::text)::regclass) AS active`,
+      [harness.probe.schema]
+    );
+    assert.equal(
+      result[0]?.active,
+      false,
+      "row-level security is active for this harness's connection; every authorization test above needs re-checking " +
+        "against requireMembershipLookupVisibleOnce, which now throws before authorization logic runs at all"
+    );
+  });
+});
+
 // ---- The second human-attributed writer ----
 
 test("a correction appends a row naming the corrector and leaves the original in place", async () => {

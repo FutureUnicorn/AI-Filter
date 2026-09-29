@@ -34,30 +34,48 @@ const packageManifest = JSON.parse(
   fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8")
 ) as { scripts: Record<string, string> };
 
+// AF-74: the Python suite is hand-registered in test:python the same way,
+// and was covered by nothing -- a new tests/test_*.py file could sit in the
+// tree and never run, which is direction 1 above with a different extension.
 const SUITES = [
-  { directory: "tests/unit", script: "test:unit:ts" },
-  { directory: "tests/integration", script: "test:integration" },
-  { directory: "tests/architecture", script: "test:architecture" }
+  { directory: "tests/unit", script: "test:unit:ts", isTestFile: isTypeScriptTest },
+  { directory: "tests/integration", script: "test:integration", isTestFile: isTypeScriptTest },
+  { directory: "tests/architecture", script: "test:architecture", isTestFile: isTypeScriptTest },
+  { directory: "tests", script: "test:python", isTestFile: isPythonTest }
 ] as const;
 
-function listTestFiles(directory: string): readonly string[] {
+function isTypeScriptTest(name: string): boolean {
+  return name.endsWith(".test.ts");
+}
+
+function isPythonTest(name: string): boolean {
+  return name.startsWith("test_") && name.endsWith(".py");
+}
+
+function listTestFiles(
+  directory: string,
+  isTestFile: (name: string) => boolean
+): readonly string[] {
   return fs
     .readdirSync(path.join(repositoryRoot, directory))
-    .filter((name) => name.endsWith(".test.ts"))
+    .filter(isTestFile)
     .map((name) => `${directory}/${name}`)
     .sort();
 }
 
-/** Paths the script actually passes to `node --test`, for one directory. */
+/** Paths the script actually passes to its runner, for one directory. */
 function registeredFiles(script: string, directory: string): readonly string[] {
   const command = packageManifest.scripts[script] ?? "";
-  const pattern = new RegExp(`${directory}/[A-Za-z0-9._-]+\\.test\\.ts`, "g");
+  const pattern =
+    script === "test:python"
+      ? new RegExp(`${directory}/test_[A-Za-z0-9_]+\\.py`, "g")
+      : new RegExp(`${directory}/[A-Za-z0-9._-]+\\.test\\.ts`, "g");
   return command.match(pattern) ?? [];
 }
 
-for (const { directory, script } of SUITES) {
+for (const { directory, script, isTestFile } of SUITES) {
   test(`every ${directory} file is registered in ${script}`, () => {
-    const files = listTestFiles(directory);
+    const files = listTestFiles(directory, isTestFile);
     assert.ok(files.length > 0, `expected at least one test file under ${directory}`);
     const registered = new Set(registeredFiles(script, directory));
     for (const file of files) {
@@ -69,12 +87,13 @@ for (const { directory, script } of SUITES) {
   });
 
   test(`every file registered in ${script} exists on disk`, () => {
-    const onDisk = new Set(listTestFiles(directory));
+    const onDisk = new Set(listTestFiles(directory, isTestFile));
     for (const file of registeredFiles(script, directory)) {
       assert.ok(
         onDisk.has(file),
         `${script} registers ${file}, which does not exist. node --test skips a missing path without warning and still exits 0, ` +
-          `so this suite would report success while running nothing for that file`
+          `so this suite would report success while running nothing for that file. ` +
+          `(pytest fails loudly on a missing path instead, so for test:python this is a stale registration to tidy, not a silent hole.)`
       );
     }
   });

@@ -1,0 +1,97 @@
+[
+  {
+    "account_id": "northwind-robotics",
+    "company": "Northwind Robotics (SYNTHETIC)",
+    "headcount": 240,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 430,
+    "ats_platform": "lever",
+    "ats_fraud_tooling": "absent",
+    "buyer_title": "head_of_talent",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/northwind/about", "observed_on": "2026-09-08"},
+      {"claim": "hiring_volume", "source": "intro call notes, 2026-09-08", "observed_on": "2026-09-08"},
+      {"claim": "ats", "source": "https://jobs.example.invalid/northwind (Lever-hosted board)", "observed_on": "2026-09-08"},
+      {"claim": "buyer", "source": "https://example.invalid/northwind/team", "observed_on": "2026-09-08"}
+    ]
+  },
+  {
+    "account_id": "harborline-analytics",
+    "company": "Harborline Analytics (SYNTHETIC)",
+    "headcount": 610,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 280,
+    "ats_platform": "greenhouse",
+    "ats_fraud_tooling": "available_not_enabled",
+    "buyer_title": "recruiting_operations_lead",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/harborline/press", "observed_on": "2026-09-01"},
+      {"claim": "hiring_volume", "source": "discovery call notes, 2026-09-02", "observed_on": "2026-09-02"},
+      {"claim": "ats", "source": "application form footer, checked 2026-09-01", "observed_on": "2026-09-01"},
+      {"claim": "buyer", "source": "https://example.invalid/harborline/team", "observed_on": "2026-09-01"}
+    ]
+  },
+  {
+    "account_id": "solstice-payments",
+    "company": "Solstice Payments (SYNTHETIC)",
+    "headcount": 180,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 520,
+    "ats_platform": "ashby",
+    "ats_fraud_tooling": "native",
+    "buyer_title": "head_of_recruiting",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/solstice/about", "observed_on": "2026-09-05"},
+      {"claim": "hiring_volume", "source": "https://example.invalid/solstice/careers", "observed_on": "2026-09-05"},
+      {"claim": "ats", "source": "candidate-facing fraud-check step observed 2026-09-05", "observed_on": "2026-09-05"},
+      {"claim": "buyer", "source": "https://example.invalid/solstice/team", "observed_on": "2026-09-05"}
+    ]
+  },
+  {
+    "account_id": "kestrel-health",
+    "company": "Kestrel Health (SYNTHETIC)",
+    "headcount": 95,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 310,
+    "ats_platform": "workable",
+    "ats_fraud_tooling": "unknown",
+    "buyer_title": "talent_acquisition_lead",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/kestrel/about", "observed_on": "2026-09-10"},
+      {"claim": "hiring_volume", "source": "https://example.invalid/kestrel/careers", "observed_on": "2026-09-10"},
+      {"claim": "buyer", "source": "https://example.invalid/kestrel/team", "observed_on": "2026-09-10"}
+    ]
+  },
+  {
+    "account_id": "granite-loop-systems",
+    "company": "Granite Loop Systems (SYNTHETIC)",
+    "headcount": 140,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 260,
+    "ats_platform": "jazzhr",
+    "ats_fraud_tooling": "absent",
+    "buyer_title": "head_of_talent",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/graniteloop/about", "observed_on": "2026-02-11"},
+      {"claim": "hiring_volume", "source": "https://example.invalid/graniteloop/careers", "observed_on": "2026-02-11"},
+      {"claim": "ats", "source": "https://apply.example.invalid/graniteloop", "observed_on": "2026-02-11"},
+      {"claim": "buyer", "source": "https://example.invalid/graniteloop/team", "observed_on": "2026-02-11"}
+    ]
+  },
+  {
+    "account_id": "tidewater-labs",
+    "company": "Tidewater Labs (SYNTHETIC)",
+    "headcount": 2400,
+    "remote_technical_hiring": true,
+    "applications_per_requisition": 900,
+    "ats_platform": "lever",
+    "ats_fraud_tooling": "absent",
+    "buyer_title": "vp_talent",
+    "claims": [
+      {"claim": "headcount", "source": "https://example.invalid/tidewater/about", "observed_on": "2026-09-12"},
+      {"claim": "hiring_volume", "source": "https://example.invalid/tidewater/careers", "observed_on": "2026-09-12"},
+      {"claim": "ats", "source": "https://jobs.example.invalid/tidewater", "observed_on": "2026-09-12"},
+      {"claim": "buyer", "source": "https://example.invalid/tidewater/team", "observed_on": "2026-09-12"}
+    ]
+  }
+]

@@ -10,6 +10,15 @@ Update this file as evidence comes in. Do not move a gate to "passed" on a verba
 | 4 — Retention | ≥60% of paying customers reuse the workflow on another eligible role within 60 days | Not started |
 | 5 — Economics | ≥75% gross margin; manual ops <15 min/100 applications; CAC payback <12 months | Not started |
 
+## Sourcing the Gate 1 interviews
+
+Interviewees come from the target account list, not from whoever answers
+first. The qualification rules, the evidence each account owes, and the
+`scripts/target_accounts.py` check that enforces both live in
+[`validation/target-account-list.md`](validation/target-account-list.md)
+([AF-74](https://hemnaathusa.atlassian.net/browse/AF-74)). The register is
+currently empty: 0 of 30 accounts qualified.
+
 ## Hard floors (do not loosen these to keep momentum)
 
 - Candidate proof-step completion below 60% → stop and redesign, not "mixed but okay."

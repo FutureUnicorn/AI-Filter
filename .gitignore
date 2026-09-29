@@ -34,3 +34,13 @@ Thumbs.db
 # real applicant data must never be committed to this repo
 *.applicant.txt
 data/
+
+# prospect research belongs in the CRM, not in git -- see
+# docs/validation/target-account-list.md. Excluded by directory, the way
+# data/ above is: a dated copy, a second-quarter register or an underscore
+# instead of a hyphen must not be committable. Only the synthetic example
+# comes back.
+docs/validation/*.json
+!docs/validation/*.example.json
+*accounts*.json
+!docs/validation/target-accounts.example.json

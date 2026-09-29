@@ -28,6 +28,20 @@
  * session token, the database. Nothing here stubs a route's collaborators;
  * a test that needs to (object storage, say) redirects that one specifier
  * with `registerModuleRedirect`.
+ *
+ * One qualification on "the authorization check" (PR #90 review, REV-001):
+ * this harness connects as whatever role its database URL names, which today
+ * is the same bootstrap superuser production runs as, so a request here
+ * exercises `authorizeResourceAccess`'s capability logic but not tenant
+ * isolation enforced by row-level security -- a superuser bypasses RLS
+ * unconditionally. That gap is not this harness's to close: `packages/db`'s
+ * `provisionApiRouteSchema` doc comment has the full account of why (in
+ * short, no route today sets `app.current_org_id` before the membership
+ * lookup, so a genuinely restricted role would 500 on every request here
+ * rather than exercise anything, and closing that is the AF-18 multi-tenant
+ * RLS work the schema's own migration already defers). `assertMembershipReadFailsLoudlyUnderRls`
+ * and `assertMagicLinkRlsSafety` in `packages/db` cover that guard directly,
+ * against a role built for the question.
  */
 import assert from "node:assert/strict";
 import moduleHooks from "node:module";

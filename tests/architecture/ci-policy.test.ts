@@ -20,6 +20,62 @@ const productionGatePath = path.join(
 const ci = fs.readFileSync(ciPath, "utf8");
 const productionGate = fs.readFileSync(productionGatePath, "utf8");
 
+const workflowsDirectory = path.join(repositoryRoot, ".github", "workflows");
+const workflows = fs
+  .readdirSync(workflowsDirectory)
+  .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
+  .map((name) => ({
+    name,
+    text: fs.readFileSync(path.join(workflowsDirectory, name), "utf8")
+  }));
+
+/**
+ * A workflow can reach the production Compose project if it runs on the
+ * production runner, drives the production environment CLI, or deploys
+ * through the `production` GitHub environment. Any one of those is enough
+ * to touch `signal_audit_production` and replay its migrations.
+ */
+function reachesProduction(workflow: string): boolean {
+  return (
+    workflow.includes("signal-audit-production") ||
+    /cli\.mjs\s+production/u.test(workflow) ||
+    /^\s*environment:\s*\n\s+name:\s*production\s*$/mu.test(workflow)
+  );
+}
+
+/**
+ * The concurrency block declared at workflow level, if any. Anchored to column
+ * zero on purpose: the same block nested under a job covers only that job, so
+ * a second job in the same run could still deploy outside the group.
+ */
+function topLevelConcurrency(workflow: string): string | undefined {
+  return /^concurrency:\n((?:[ \t]+\S.*\n)+)/mu.exec(workflow)?.[1];
+}
+
+function assertSerialisesProduction(concurrency: string | undefined, source: string): void {
+  assert.notEqual(
+    concurrency,
+    undefined,
+    `${source} must declare a top-level concurrency block`
+  );
+  assert.match(
+    concurrency ?? "",
+    /^\s+group: production\s*$/mu,
+    `${source} must join the constant production group`
+  );
+  assert.doesNotMatch(
+    concurrency ?? "",
+    /\$\{\{/u,
+    `${source}: the group must be a constant -- an expression makes it per-revision, which serialises nothing`
+  );
+  // False would let a newer revision cancel a deployment mid-migration.
+  assert.match(
+    concurrency ?? "",
+    /^\s+cancel-in-progress: false\s*$/mu,
+    `${source} must not cancel an in-flight production deployment`
+  );
+}
+
 test("CI exposes every AF-12 check and a fail-closed aggregate gate", () => {
   for (const job of [
     "lint",
@@ -91,4 +147,38 @@ test("production eligibility is success-only and tied to the tested main SHA", (
   assert.match(productionGate, /needs: eligibility/u);
   assert.match(productionGate, /environment:\s+name: production/u);
   assert.match(productionGate, /secrets\.POSTGRES_PASSWORD/u);
+});
+
+test("production deployments are serialised across revisions, not per revision", () => {
+  // AF-95. Every production run must land in one concurrency group whatever
+  // revision triggered it, so two green pushes to main cannot deploy at once
+  // against the same volume and replay migrations concurrently. Keying the
+  // group on head_sha gives each push its own group and serialises nothing;
+  // that the single signal-audit-production runner currently hides this is
+  // infrastructure, not a property of this repository.
+  assertSerialisesProduction(topLevelConcurrency(productionGate), "production-gate.yml");
+});
+
+test("every workflow that can reach production joins that same group", () => {
+  // Review REV-001 on AF-95: the assertion above pins the text of one file,
+  // which is a weaker claim than the guarantee. Concurrency groups are
+  // repository-wide, so "only one thing deploys production at a time" holds
+  // only if every workflow able to touch the production Compose project joins
+  // group `production`. A second deploying workflow with no concurrency block
+  // at all would satisfy the per-file assertion and break the guarantee --
+  // and production-gate.yml itself records that AF-11's real deployment job
+  // is still to be added.
+  const productionWorkflows = workflows.filter((workflow) => reachesProduction(workflow.text));
+
+  // Without this the loop below passes vacuously if the detection above ever
+  // stops recognising a production workflow.
+  assert.equal(
+    productionWorkflows.some((workflow) => workflow.name === "production-gate.yml"),
+    true,
+    "production-gate.yml must be detected as production-reaching, or this test proves nothing"
+  );
+
+  for (const workflow of productionWorkflows) {
+    assertSerialisesProduction(topLevelConcurrency(workflow.text), workflow.name);
+  }
 });

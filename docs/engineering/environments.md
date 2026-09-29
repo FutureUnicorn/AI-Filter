@@ -25,6 +25,7 @@ infrastructure until the product evidence gate passes.
 | Runtime | host web/worker or Compose | same Docker build path | same Docker build path | same Docker build path |
 | Cost control | local machine | CPU/memory ceilings + TTL | ceilings + provider budget reference | ceilings + provider budget/cap reference |
 | Administration | developer | preview deployment runner | named staging role | protected environment + named role + provider audit reference |
+| Backups | disabled | disabled; disposable | off-host when approved | off-host when approved |
 | Deploy source | working tree | exact PR SHA after green CI | exact green `develop` SHA | exact green `main` SHA |
 
 `NODE_ENV` does not identify these environments. `APP_ENV` must be one of
@@ -79,9 +80,94 @@ domain.
 ## Preview lifecycle
 
 Preview deployment is triggered by a completed successful `CI` workflow for a
-same-repository pull request. The workflow checks out
-`workflow_run.head_sha`, verifies the checked-out SHA, and deploys through a
-runner labelled `signal-audit-preview`.
+same-repository pull request based on `develop` or `main`. The workflow checks
+out `workflow_run.head_sha`, verifies the checked-out SHA, and deploys through
+a runner labelled `signal-audit-preview`.
+
+AF-93: deploy is scoped this way so an unbounded number of stacked PRs cannot
+each try to stand up a full preview stack on the one preview host. Cleanup is
+deliberately NOT scoped the same way -- it runs for every closed PR regardless
+of base branch, since a PR's base can be retargeted after its preview was
+created, and `preview down` already no-ops safely when there is nothing to
+remove. Gating cleanup on a mutable property is what created the leak in the
+first place. Deploy also verifies the source pull request is still open
+(a live API check, not the `workflow_run` event's snapshot) immediately before
+calling `preview up`, since a CI run that started before the PR closed can
+complete after it, which the event payload alone cannot distinguish.
+
+Every checkout that orchestration code runs FROM (deploy's trusted
+default-branch checkout, and cleanup's and sweep's) also sets `clean: false`
+-- `actions/checkout` defaults to wiping every gitignored file, and the
+preview state directory (the record of which previews exist) is gitignored,
+so the default checkout destroyed that record before each job could read it.
+The one exception is deploy's second checkout, `pr-source` (the untrusted PR
+revision, see below): it is never executed and carries no state of its own
+between runs, only Docker build input that should be exactly the tested
+SHA's tree every time, so it deliberately keeps the default `clean: true`.
+
+Preview state -- one JSON file per PR carrying its generated database and
+storage credentials -- lives at `PREVIEW_STATE_DIRECTORY`
+(`scripts/environment/cli.mjs`), a fixed, runner-persistent path OUTSIDE
+every job's git checkout, set once at the workflow level so deploy, cleanup,
+and sweep all agree on it. Falling back to an in-repo `.runtime/` when the
+variable is unset keeps local, manual `pnpm preview:*` usage on a
+developer's own machine unchanged.
+
+This state root moved with this change (from inside the checkout to
+`PREVIEW_STATE_DIRECTORY`). Since this workflow has never fired -- confirmed
+via the GitHub Actions API, which returns no recorded runs, consistent with
+these files existing only on `develop` and not yet on the default branch --
+there should be nothing at the old in-workspace path to strand. If that
+changes before this promotes, confirm on the runner that the old
+`<workspace>/.runtime/previews` is empty and `docker compose ls` shows no
+`signal-audit-pr-` projects before relying on the new path; see "Preview
+leak" under Troubleshooting below for locating a project by that prefix.
+
+That alone is not enough, and the deploy job is structured around the
+reason: `scripts/environment/cli.mjs` -- the orchestration script that reads
+`PREVIEW_STATE_DIRECTORY` and shells out to Docker -- must never itself be
+code the PR under test controls. Running it from the PR's own checkout would
+let a modified `cli.mjs` read that variable directly and exfiltrate every
+OTHER preview's credentials (or run arbitrary commands as the runner user),
+regardless of where the credential files live. So deploy checks out TWO
+revisions: the default branch (trusted, where `cli.mjs` and this workflow's
+own commands run from) into the job's main workspace, and the PR's own
+tested SHA into a `pr-source` subdirectory that is never executed directly
+-- only consumed as `DEPLOY_SOURCE_DIRECTORY`, the Docker build context for
+`infra/compose/runtime.yml`'s `web`/`worker` services, and the mount source
+for the `migrate`/`seed` bind mounts (which must still run that PR's own
+migrations for correctness). Every other caller of that compose file --
+local development, staging, production, manual `pnpm preview:*` -- leaves
+`DEPLOY_SOURCE_DIRECTORY` unset and gets the previous, single-checkout
+behavior unchanged.
+
+This closes the orchestration-script attack surface Copilot's review
+identified. It does not, on its own, sandbox the `docker build` step itself
+-- a PR's own Dockerfile still executes build instructions on the shared
+runner host during that build. That is the open question of untrusted code
+executing on a persistent, reused self-hosted runner, tracked separately,
+and needs the same kind of infrastructure decision (ephemeral build
+runners, or tighter Docker daemon sandboxing) to close fully.
+
+One consequence worth stating plainly (PR #85 review, hemnaath04, REV-005):
+because `cli.mjs` resolves `infra/compose/runtime.yml` from its own
+(trusted, default-branch) checkout, a preview always runs the DEFAULT
+BRANCH's compose topology -- service definitions, resource limits, network
+and security settings -- never the PR's own edits to that file. Only the
+Dockerfile (via `DEPLOY_SOURCE_DIRECTORY`, itself relative to whatever the
+compose file's `build.context` says), migrations, and fixtures come from
+the PR. This is deliberate, not an oversight: letting an untrusted PR
+control the compose file directly (volumes, `security_opt`, network mode)
+would reopen the exact credential-exposure and arbitrary-execution risk the
+checkout split exists to close. The practical implication is that a PR
+which edits the compose file -- for example adding an environment variable
+a service needs -- gets a preview that does not reflect that edit, in a way
+that will not reproduce locally. The deploy job verifies (via
+`docker compose config`, against the actual resolved configuration rather
+than the compose file's source text) that both `web` and `worker`
+`build.context` resolve to the untrusted checkout before deploying, so a
+regression here fails the job loudly instead of silently building the wrong
+revision.
 
 Each preview receives:
 
@@ -89,8 +175,9 @@ Each preview receives:
 - database schema: `pr_<PR>_<SHA>` inside its own disposable Postgres instance;
 - bucket: `signal-audit-preview-pr-<PR>-<SHA>` inside its own disposable MinIO instance;
 - randomly generated database and storage credentials;
-- a state file under ignored `.runtime/previews/` with mode `0600` where the
-  operating system supports POSIX permissions;
+- a state file under `PREVIEW_STATE_DIRECTORY` (or ignored `.runtime/previews/`
+  locally) with mode `0600` where the operating system supports POSIX
+  permissions;
 - a deployment URL associated with GitHub's PR-specific environment.
 
 Manual validation commands are:
@@ -121,7 +208,9 @@ credentials, and staging URLs.
 Configure a GitHub environment named `staging`, a self-hosted runner labelled
 `signal-audit-staging`, and the variables/secrets listed below. The runner host
 must expose the web container through the URL in `STAGING_URL` and must retain
-the `signal-audit-staging` Compose volumes.
+the `signal-audit-staging` Compose volumes. When AF-68 backups are enabled, the
+runner must also allow encrypted egress to the approved off-host S3-compatible
+backup endpoint.
 
 ## Production-shaped validation
 
@@ -139,6 +228,30 @@ The `production` GitHub environment must:
 - record deployment approvals and runs in GitHub; and
 - link to the hosting provider's audit log for host/console administration.
 
+Production deployments are serialised by a constant `production` concurrency
+group with `cancel-in-progress: false`, so no two runs deploy at once against
+the same Compose project, volume, and database. Concurrency groups are
+repository-wide, so this holds only if *every* workflow that can reach the
+production environment joins that group; the architecture suite enforces that
+across `.github/workflows/`, not just for `production-gate.yml`.
+
+What it guarantees precisely: one run deploys, at most one revision waits, and a
+later green revision replaces the waiting one — the evicted revision never
+deploys. That is GitHub's default `queue: single`, and it is the intended trade
+for an empty validation environment, where putting every intermediate revision
+through it buys nothing. `queue: max` is the documented opt-in if every green
+revision must reach production.
+
+The cost, worth knowing before an approval sits unactioned: because the
+`production` environment requires a named approving reviewer, a run parked on
+that approval holds the group for the whole approval window, and no newer
+revision advances — not even its cheap `ubuntu-latest` eligibility job.
+
+Do not key the group on the revision. That gives each push its own group and
+serialises nothing, leaving the guarantee to rest on there being exactly one
+`signal-audit-production` runner. Adding a second production runner for capacity
+is safe on this axis only while the group stays constant.
+
 Production does not run the synthetic seed command. Reset, seed, and destructive
 local commands reject `APP_ENV=production`.
 
@@ -155,6 +268,7 @@ Preview variables:
 | `AF11_ENABLE_HOSTED_ENVIRONMENTS` | explicit deployment enablement |
 | `PREVIEW_BASE_DOMAIN` | wildcard preview DNS suffix |
 | `PREVIEW_TTL_HOURS` | orphan lifetime, normally `72` |
+| `PREVIEW_STATE_DIRECTORY` | optional; overrides the default per-runner-workspace preview state path. Set this to a host-level absolute path (for example `/var/lib/signal-audit/preview-state`) if the `signal-audit-preview` runner label ever backs more than one runner process on the same host -- otherwise each process gets an independent, empty state directory and cleanup dispatched to the wrong one silently finds nothing to remove (PR #85 review, REV-011). |
 
 Staging and production environment secrets:
 
@@ -164,6 +278,10 @@ Staging and production environment secrets:
 | `POSTGRES_PASSWORD` | environment-only secret, at least 20 characters |
 | `STORAGE_ACCESS_KEY_ID` | environment-only storage identity |
 | `STORAGE_SECRET_ACCESS_KEY` | environment-only secret, at least 20 characters |
+| `BACKUP_ADMIN_ACCESS_KEY_ID` | short-lived deploy identity for bucket creation, privacy, versioning, and lifecycle controls |
+| `BACKUP_ADMIN_SECRET_ACCESS_KEY` | admin secret, at least 20 characters; supplied only to one-shot `backup-init` |
+| `BACKUP_WRITER_ACCESS_KEY_ID` | long-running identity limited to encrypted object read/write/list and ordinary delete markers |
+| `BACKUP_WRITER_SECRET_ACCESS_KEY` | writer secret, at least 20 characters; explicitly denied bucket administration and version deletion |
 
 Staging and production environment variables:
 
@@ -175,6 +293,18 @@ Staging and production environment variables:
 | `ADMIN_AUDIT_REFERENCE` | provider audit-log identifier/URL |
 | `ADMIN_ROLE_ALLOWLIST` | named role/group, never a shared account |
 | `STAGING_URL` / `PRODUCTION_URL` | private validation endpoint |
+| `BACKUP_ENABLED` | `true` only after AF-68 controls and values are approved; otherwise `false` |
+| `BACKUP_ENDPOINT` / `BACKUP_REGION` / `BACKUP_BUCKET` | HTTPS off-host destination and dedicated bucket |
+| `BACKUP_INTERVAL_SECONDS` | team-approved recovery-point interval; no repository default |
+| `BACKUP_RETENTION_DAYS` | team-approved retention window; no repository default |
+| `BACKUP_PATH_STYLE` | provider-compatible `auto`, `on`, or `off` |
+| `BACKUP_CONTROL_OWNER` | accountable person/team |
+| `BACKUP_ENCRYPTION_REFERENCE` | provider SSE-S3/KMS control evidence, never key material |
+
+The backup destination must be a different failure domain from the Compose
+host and its PostgreSQL/MinIO volumes. See
+[`../operations/backups.md`](../operations/backups.md) for the backup set,
+retention rules, privacy boundary, health signal, and AF-69 restore handoff.
 
 Do not copy values between environments. Secret values must never appear in Git,
 Jira, screenshots, workflow output, or shell history.
