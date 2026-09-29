@@ -39,12 +39,15 @@ import type {
 import {
   CANDIDATE_DATA_ERASURE_PLACEHOLDER,
   CONTRACT_SCHEMA_VERSION,
+  beginReviewTiming,
   canonicalizeCsvColumnMapping,
   compareApplicationsBySourceOrder,
   classifyCsvImportRow,
   erasedStorageKey,
   mapCsvRowToApplication,
   planCandidateDataErasure,
+  recordReviewActivity,
+  sealReviewTiming,
   summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
   summarizeImportRows
@@ -2034,6 +2037,45 @@ export async function listApplicationsForRole(
       [organizationId, roleId]
     );
     return result.rows.map(rowToApplication);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * The population a role-level metric is measured against.
+ *
+ * Separate from listApplicationsForRole rather than `.length` on it: the
+ * only caller is a metric, and reading every candidate's name and email
+ * into memory to arrive at an integer puts PII somewhere it has no
+ * business being. Scoped by organization as well as role for the same
+ * IDOR reason listApplicationsForRole is.
+ */
+export async function countApplicationsForRole(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  roleId: string
+): Promise<number> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ population: string }>(
+      `SELECT count(*) AS population
+         FROM "${schema}".applications
+        WHERE organization_id = $1 AND role_id = $2`,
+      [organizationId, roleId]
+    );
+    const raw = result.rows[0]?.population;
+    // count(*) is bigint, which node-postgres returns as a string. An
+    // unchecked Number() would turn a malformed value into NaN and hand
+    // summarizeMetric a population it would reject far from here.
+    const population = raw === undefined ? Number.NaN : Number(raw);
+    if (!Number.isSafeInteger(population) || population < 0) {
+      throw new Error(`countApplicationsForRole: population is not a safe non-negative integer, got: ${raw}`);
+    }
+    return population;
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -4148,6 +4190,27 @@ export async function listReviewTimingSpansForRole(
   }
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The name of the constraint a query violated, or undefined when the
+ * query failed for some other reason entirely.
+ *
+ * pg puts this on the error for check, foreign key, unique and not-null
+ * violations. Reading it is what separates "the bound I am testing
+ * rejected this" from "something rejected this", and those are not the
+ * same result.
+ */
+function violatedConstraint(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("constraint" in error)) {
+    return undefined;
+  }
+  const { constraint } = error as { readonly constraint?: unknown };
+  return typeof constraint === "string" ? constraint : undefined;
+}
+
 /**
  * AF-54: proves a review-timing span cannot record a duration it did
  * not measure, cannot cross tenants, and cannot be edited afterwards.
@@ -4156,7 +4219,8 @@ export async function listReviewTimingSpansForRole(
  * hex-safe. A first pass at this used ids beginning with `t`, which is
  * not a hex digit -- every case failed with "invalid input syntax for
  * type uuid" and would have read as "all rejected" from the exit status
- * alone.
+ * alone. Naming the expected constraint for each case is what makes
+ * that class of mistake impossible rather than merely fixed once.
  */
 export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<void> {
   const suffix = randomBytes(4).toString("hex");
@@ -4250,17 +4314,64 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
       throw new Error("the idle flag must survive the round trip; a summary cannot exclude what it cannot see");
     }
 
+    // 1b. The span the client producer actually emits is insertable.
+    //     Worth doing against real Postgres rather than trusting the
+    //     arithmetic: the producer's worst case is an abandoned tab, and
+    //     that is precisely the shape that would trip the wall-clock
+    //     CHECK if endedAt were the moment of closing rather than the
+    //     last interaction.
+    const abandonedStartMs = Date.parse("2026-08-29T12:00:00Z");
+    const abandoned = sealReviewTiming(
+      recordReviewActivity(beginReviewTiming(abandonedStartMs), abandonedStartMs + 45_000).state,
+      abandonedStartMs + 8 * 60 * 60 * 1_000
+    );
+    if (abandoned === undefined || !abandoned.truncatedByIdle) {
+      throw new Error("a tab abandoned for eight hours must still yield a truncated span to record");
+    }
+    await recordReviewTimingSpan(databaseUrl, schema, {
+      organizationId: orgA,
+      applicationId,
+      reviewerUserId: reviewerId,
+      startedAt: new Date(abandoned.startedAtMs),
+      endedAt: new Date(abandoned.endedAtMs),
+      activeMs: abandoned.activeMs,
+      truncatedByIdle: abandoned.truncatedByIdle
+    });
+
+    // A zero-duration span is not a measurement. sealReviewTiming refuses
+    //    to emit one; this proves the database refuses to store one too, so
+    //    a direct writer cannot put an application into the measured sample
+    //    with no measured time, which would lower the assisted median and
+    //    inflate the reported review-time reduction.
+    let zeroDurationRejection = "";
+    try {
+      await admin.query(
+        `INSERT INTO review_timing_spans
+           (application_id, organization_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ($1, $2, $3, now() - INTERVAL '5 minutes', now(), 0, false)`,
+        [applicationId, orgA, reviewerId]
+      );
+    } catch (error) {
+      zeroDurationRejection = error instanceof Error ? error.message : String(error);
+    }
+    if (!/review_timing_spans_active_is_measured/u.test(zeroDurationRejection)) {
+      throw new Error(
+        `a zero-duration span must be refused by the database; got: ${zeroDurationRejection || "accepted"}`
+      );
+    }
+
     // 2. A span cannot claim more active time than the wall clock it
     //    sits inside. This is the check that catches a client sending a
     //    fabricated duration, which would quietly corrupt the baseline.
-    const rejections: Array<[string, string, string, string, string, number]> = [
+    const rejections: Array<[string, string, string, string, string, number, string]> = [
       [
         "eight hours of activity inside ninety seconds",
         "ea000001-4444-4444-8444-444444444444",
         orgA,
         "2026-08-29T14:00:00Z",
         "2026-08-29T14:01:30Z",
-        28_800_000
+        28_800_000,
+        "review_timing_spans_active_within_wall_clock"
       ],
       [
         "negative active time",
@@ -4268,7 +4379,12 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgA,
         "2026-08-29T15:00:00Z",
         "2026-08-29T15:01:00Z",
-        -5
+        -5,
+        // Either constraint is a correct refusal. active_is_measured
+        // (active_ms > 0) subsumes the original >= 0 check and fires first
+        // for a negative, so this asserts the rule, that negative active
+        // time is refused, rather than which guard happens to catch it.
+        "review_timing_spans_active_(ms_check|is_measured)"
       ],
       [
         "a span that ended before it started",
@@ -4276,7 +4392,16 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgA,
         "2026-08-29T16:00:00.500Z",
         "2026-08-29T16:00:00.000Z",
-        0
+        1,
+        // The claim worth checking mechanically: this reversal is caught
+        // by the ordering constraint specifically, not shadowed by either
+        // of the others. One millisecond of active time satisfies the
+        // wall-clock bound (1 <= -500 + 1000) and satisfies
+        // active_is_measured (1 > 0), so it has to be this constraint or
+        // none. It was zero until active_is_measured was added, which
+        // would have made that new constraint fire first and hidden what
+        // this case is actually testing.
+        "review_timing_spans_ordered"
       ],
       [
         "another tenant timing this application",
@@ -4284,11 +4409,19 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
         orgB,
         "2026-08-29T17:00:00Z",
         "2026-08-29T17:01:00Z",
-        60_000
+        60_000,
+        "review_timing_spans_application_id_organization_id_fkey"
       ]
     ];
-    for (const [label, id, organizationId, startedAt, endedAt, activeMs] of rejections) {
-      let rejected = false;
+    // Which constraint rejected it, not merely that something did. A
+    // bare catch here would have been satisfied by the typo that
+    // actually happened during this probe's first pass -- ids beginning
+    // with `t`, every case failing on "invalid input syntax for type
+    // uuid" -- and reported all four bounds as holding. Fixing the ids
+    // left that trap armed for the next edit; naming the constraint
+    // disarms it.
+    for (const [label, id, organizationId, startedAt, endedAt, activeMs, constraint] of rejections) {
+      let tripped: string | undefined;
       try {
         await admin.query(
           `INSERT INTO review_timing_spans
@@ -4297,17 +4430,29 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
            VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
           [id, organizationId, applicationId, reviewerId, startedAt, endedAt, activeMs]
         );
-      } catch {
-        rejected = true;
+      } catch (error) {
+        tripped = violatedConstraint(error);
+        if (tripped === undefined) {
+          throw new Error(`${label} failed for a reason that is not a constraint: ${describeError(error)}`, {
+            cause: error
+          });
+        }
       }
-      if (!rejected) {
-        throw new Error(`${label} must not be recordable as review timing`);
+      // constraint may name a single guard or a set of acceptable ones,
+      // for the cases where two constraints both correctly refuse and
+      // which fires first is not the property under test.
+      if (tripped === undefined || !new RegExp(`^${constraint}$`, "u").test(tripped)) {
+        throw new Error(
+          tripped === undefined
+            ? `${label} must not be recordable as review timing`
+            : `${label} must be caught by ${constraint}, but ${tripped} fired first`
+        );
       }
     }
 
     // 3. A reviewer with no standing in this tenant cannot be recorded
     //    as having reviewed.
-    let outsiderRejected = false;
+    let outsiderTripped: string | undefined;
     try {
       await admin.query(
         `INSERT INTO review_timing_spans
@@ -4316,11 +4461,15 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
          VALUES ('ea000005-4444-4444-8444-444444444444', $1, $2, $3, $4, $5, 60000, false)`,
         [orgA, applicationId, outsiderId, "2026-08-29T18:00:00Z", "2026-08-29T18:01:00Z"]
       );
-    } catch {
-      outsiderRejected = true;
+    } catch (error) {
+      outsiderTripped = violatedConstraint(error);
     }
-    if (!outsiderRejected) {
-      throw new Error("a reviewer with no membership in this organization must not be recordable");
+    if (outsiderTripped !== "review_timing_spans_organization_id_reviewer_user_id_fkey") {
+      throw new Error(
+        `a reviewer with no membership in this organization must be rejected by the membership foreign key, got ${
+          outsiderTripped ?? "no rejection"
+        }`
+      );
     }
 
     // 4. Nothing edits or erases a recorded span. Checked with rows
@@ -4335,14 +4484,18 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
       `DELETE FROM review_timing_spans`,
       `TRUNCATE review_timing_spans`
     ]) {
-      let rejected = false;
+      let message: string | undefined;
       try {
         await admin.query(statement);
-      } catch {
-        rejected = true;
+      } catch (error) {
+        message = describeError(error);
       }
-      if (!rejected) {
-        throw new Error(`a recorded timing span must be immutable; permitted: ${statement}`);
+      // The trigger's own words. A syntax error or a missing table would
+      // otherwise read as "immutability holds".
+      if (message === undefined || !message.includes("review_timing_spans is append-only")) {
+        throw new Error(
+          `a recorded timing span must be immutable; ${statement} gave ${message ?? "no error at all"}`
+        );
       }
     }
   } finally {
@@ -4354,6 +4507,220 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
     await admin.end().catch(() => undefined);
   }
 }
+
+// ---- AF-55: review-time reduction ----
+
+/** Handle on a seeded schema, returned by createReviewTimeMetricFixture. */
+export interface ReviewTimeMetricFixture {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly otherOrganizationId: string;
+  /** 12 applications: 11 fully observed, 1 with a truncated span. */
+  readonly roleId: string;
+  /** 2 applications, both fully observed: below any sane minimum sample. */
+  readonly sparseRoleId: string;
+  /** A role belonging to the other tenant entirely. */
+  readonly otherOrganizationRoleId: string;
+  /** Holds view_audit_reports in organizationId. */
+  readonly auditorUserId: string;
+  /** Reviews candidates in organizationId; must NOT see the metric. */
+  readonly recruiterUserId: string;
+  /** Authenticated, but a member of nothing. */
+  readonly outsiderUserId: string;
+  drop(): Promise<void>;
+}
+
+/**
+ * Seeds a throwaway schema the AF-55 endpoint can be exercised against.
+ *
+ * This lives in packages/db rather than in tests/ because the migration
+ * directory and the postgres client are both internal to this package,
+ * and every other probe here is built the same way. What it deliberately
+ * does NOT do is assert anything: the claim under test is how the route
+ * behaves, so the checking belongs next to the route, not here.
+ *
+ * The shape is chosen so the interesting cases are reachable without
+ * reseeding: a role whose sample clears the minimum but whose population
+ * does not (one application is partially observed, so the reduction
+ * comes back with population_incomplete attached), a role too small to
+ * report at all, and a second tenant to point the same request at.
+ */
+export async function createReviewTimeMetricFixture(databaseUrl: string): Promise<ReviewTimeMetricFixture> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `af55_route_${suffix}`;
+  const organizationId = "11111111-1111-4111-8111-111111111111";
+  const otherOrganizationId = "22222222-2222-4222-8222-222222222222";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  const drop = async (): Promise<void> => {
+    const cleaner = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    try {
+      await cleaner.connect();
+      await cleaner.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } finally {
+      await cleaner.end().catch(() => undefined);
+    }
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0015_applications_and_import_finalization.sql",
+      "0016_evidence_outcomes.sql",
+      "0017_evidence_corrections.sql",
+      "0018_correction_attribution.sql",
+      "0019_candidate_decisions.sql",
+      "0020_audit_samples.sql",
+      "0021_review_timing.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'A'), ($2, 'B')`, [
+      organizationId,
+      otherOrganizationId
+    ]);
+
+    const createUser = async (label: string): Promise<string> => {
+      const created = await admin.query<{ user_id: string }>(
+        `INSERT INTO users (email, display_name) VALUES ($1, $2) RETURNING user_id`,
+        [`${label}_${suffix}@acme.test`, label]
+      );
+      const userId = created.rows[0]?.user_id;
+      if (userId === undefined) {
+        throw new Error(`fixture could not create the ${label} user`);
+      }
+      return userId;
+    };
+    const auditorUserId = await createUser("auditor");
+    const recruiterUserId = await createUser("recruiter");
+    const outsiderUserId = await createUser("outsider");
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role)
+       VALUES ($1, $2, 'auditor'), ($1, $3, 'recruiter')`,
+      [organizationId, auditorUserId, recruiterUserId]
+    );
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner')`, [
+      otherOrganizationId,
+      outsiderUserId
+    ]);
+
+    const createRole = async (ownerOrganizationId: string, title: string, createdBy: string): Promise<string> => {
+      const created = await admin.query<{ role_id: string }>(
+        `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, $2, $3) RETURNING role_id`,
+        [ownerOrganizationId, title, createdBy]
+      );
+      const roleId = created.rows[0]?.role_id;
+      if (roleId === undefined) {
+        throw new Error(`fixture could not create the ${title} role`);
+      }
+      return roleId;
+    };
+    const roleId = await createRole(organizationId, "Measured", recruiterUserId);
+    const sparseRoleId = await createRole(organizationId, "Sparse", recruiterUserId);
+    const otherOrganizationRoleId = await createRole(otherOrganizationId, "Other tenant", outsiderUserId);
+
+    const createIntake = async (ownerOrganizationId: string, ownerRoleId: string, key: string): Promise<string> => {
+      const created = await admin.query<{ intake_id: string }>(
+        `INSERT INTO file_intakes
+           (organization_id, role_id, storage_key, declared_filename, declared_mime_type, created_by_user_id)
+         VALUES ($1, $2, $3, 'a.csv', 'text/csv', $4) RETURNING intake_id`,
+        [
+          ownerOrganizationId,
+          ownerRoleId,
+          key,
+          ownerOrganizationId === organizationId ? recruiterUserId : outsiderUserId
+        ]
+      );
+      const intakeId = created.rows[0]?.intake_id;
+      if (intakeId === undefined) {
+        throw new Error("fixture could not create a file intake");
+      }
+      return intakeId;
+    };
+    const intakeId = await createIntake(organizationId, roleId, `af55/${suffix}-measured.csv`);
+    const sparseIntakeId = await createIntake(organizationId, sparseRoleId, `af55/${suffix}-sparse.csv`);
+
+    const createApplication = async (ownerRoleId: string, intake: string, row: number): Promise<string> => {
+      const created = await admin.query<{ application_id: string }>(
+        `INSERT INTO applications
+           (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING application_id`,
+        [organizationId, ownerRoleId, intake, row, `Candidate ${row}`, `c${row}_${suffix}@acme.test`]
+      );
+      const applicationId = created.rows[0]?.application_id;
+      if (applicationId === undefined) {
+        throw new Error("fixture could not create an application");
+      }
+      return applicationId;
+    };
+
+    // Eleven applications reviewed start to finish at five minutes each,
+    // then a twelfth that was interrupted. The twelfth is the case the
+    // metric used to count as a five-minute review.
+    const measured: string[] = [];
+    for (let row = 1; row <= 12; row += 1) {
+      measured.push(await createApplication(roleId, intakeId, row));
+    }
+    let hour = 9;
+    const recordSpan = async (
+      applicationId: string,
+      activeMs: number,
+      truncatedByIdle: boolean
+    ): Promise<void> => {
+      const startedAt = new Date(Date.UTC(2026, 7, 29, hour, 0, 0));
+      const endedAt = new Date(startedAt.getTime() + activeMs + 1_000);
+      hour = hour === 20 ? 9 : hour + 1;
+      await recordReviewTimingSpan(databaseUrl, schema, {
+        organizationId,
+        applicationId,
+        reviewerUserId: recruiterUserId,
+        startedAt,
+        endedAt,
+        activeMs,
+        truncatedByIdle
+      });
+    };
+    for (const applicationId of measured.slice(0, 11)) {
+      await recordSpan(applicationId, 300_000, false);
+    }
+    const interrupted = measured[11];
+    if (interrupted === undefined) {
+      throw new Error("fixture expected twelve applications");
+    }
+    await recordSpan(interrupted, 300_000, false);
+    await recordSpan(interrupted, 400_000, true);
+
+    for (let row = 1; row <= 2; row += 1) {
+      await recordSpan(await createApplication(sparseRoleId, sparseIntakeId, row), 300_000, false);
+    }
+
+    return {
+      schema,
+      organizationId,
+      otherOrganizationId,
+      roleId,
+      sparseRoleId,
+      otherOrganizationRoleId,
+      auditorUserId,
+      recruiterUserId,
+      outsiderUserId,
+      drop
+    };
+  } catch (error) {
+    await drop().catch(() => undefined);
+    throw error;
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
 
 // ---- AF-61: prove the retention purge blockers against the real schema ----
 
