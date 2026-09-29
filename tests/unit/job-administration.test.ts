@@ -98,6 +98,7 @@ const NO_GRANT: JobAdministrationAccess = { grant: undefined, now: NOW };
 
 function request(overrides: Partial<JobAdministrationRequest> = {}): JobAdministrationRequest {
   return {
+    organizationId: ORG,
     jobId: "job-1",
     action: "retry",
     reason: "provider returned 503 for two hours; queue has drained since",
@@ -328,7 +329,7 @@ test("the dead-letter outcome ignores anything passed after the criterion", () =
   assert.equal(buildEvidenceCard(withText, "2026-08-29T12:00:00.000Z").explanation, DEAD_LETTER_EXPLANATION);
 });
 
-test("the minimal administration request carries exactly the four fields the type allows", () => {
+test("the minimal administration request carries exactly the five fields the type allows", () => {
   // REV-005. This checks the FIXTURE, which is all a runtime test can see:
   // it cannot fail when JobAdministrationRequest gains a field. What does
   // fail then is JobAdministrationRequestKeysAreFixed in
@@ -336,5 +337,90 @@ test("the minimal administration request carries exactly the four fields the typ
   // typecheck runs in the gate. Kept so the fixture stays minimal, and
   // renamed so it no longer claims to prove the property of the type.
   const keys = Object.keys(request()).sort();
-  assert.deepEqual(keys, ["action", "jobId", "operatorUserId", "reason"]);
+  assert.deepEqual(keys, ["action", "jobId", "operatorUserId", "organizationId", "reason"]);
+});
+
+// ---- REV-008 (Pradeep): nothing about the job before authorization ----
+//
+// The REV-001 fix took the tenant from job.organizationId, so the job had
+// to be resolved before authorization could run. Every individual branch
+// was correct; only the order was wrong, and no test asserted the order --
+// only the outcomes. A caller with no grant at all got job_not_stuck,
+// job_mismatch or not_authorized depending on whether the id they named
+// happened to be a currently-stuck job, which tells them something about
+// another tenant's pipeline health before anyone checked they were allowed
+// to ask.
+
+test("a caller with no grant learns nothing about whether the job exists", () => {
+  // The oracle, stated as an equality rather than three separate
+  // assertions: whatever the job is, the answer has to be the same.
+  const answers = [
+    authorizeJobAdministration(undefined, request(), NO_GRANT),
+    authorizeJobAdministration(stuck(), request(), NO_GRANT),
+    authorizeJobAdministration(stuck({ terminal: true }), request(), NO_GRANT),
+    authorizeJobAdministration(stuck(), request({ jobId: "job-B" }), NO_GRANT)
+  ];
+  for (const answer of answers) {
+    assert.deepEqual(
+      answer,
+      { allowed: false, refusal: "not_authorized", supportAccessDenial: "no_grant" },
+      "an unauthorized caller must get one answer, whatever the job turns out to be"
+    );
+  }
+});
+
+test("an expired or revoked grant learns nothing either", () => {
+  // The grant existed once, which is a different path through
+  // authorizeSupportAccess and could have been ordered differently.
+  const dead = [
+    { grant: grant({ expiresAt: "2026-08-29T11:59:59.999Z" }), now: NOW },
+    { grant: grant({ revokedAt: "2026-08-29T11:30:00.000Z" }), now: NOW }
+  ];
+  for (const access of dead) {
+    const present = authorizeJobAdministration(stuck(), request(), access);
+    const absent = authorizeJobAdministration(undefined, request(), access);
+    assert.equal(present.allowed, false);
+    assert.deepEqual(present, absent, "a dead grant must not distinguish a real job from a missing one");
+  }
+});
+
+test("a valid grant for one tenant cannot administer another tenant's job", () => {
+  // The other half of moving the tenant onto the request. The grant and
+  // the claim agree, so authorization passes; the job belongs to somebody
+  // else, and that has to refuse.
+  const foreignJob = stuck({ organizationId: "22222222-2222-4222-8222-222222222222" });
+  const decision = authorizeJobAdministration(foreignJob, request(), LIVE);
+  assert.equal(decision.allowed, false);
+  assert.equal(
+    decision.allowed ? undefined : decision.refusal,
+    "job_not_stuck",
+    "and it must refuse as job_not_stuck, not a distinct code that rebuilds the oracle one layer in"
+  );
+});
+
+test("a claim that does not match the grant is refused before the job is read", () => {
+  const decision = authorizeJobAdministration(
+    stuck(),
+    request({ organizationId: "22222222-2222-4222-8222-222222222222" }),
+    LIVE
+  );
+  assert.deepEqual(decision, {
+    allowed: false,
+    refusal: "not_authorized",
+    supportAccessDenial: "grant_for_other_organization"
+  });
+});
+
+test("an authorized operator still gets the real answers, so the checks above are not blanket denials", () => {
+  // The control. If authorization refused everything, every assertion
+  // above would pass and mean nothing.
+  assert.equal(authorizeJobAdministration(undefined, request(), LIVE).allowed, false);
+  assert.equal(
+    authorizeJobAdministration(undefined, request(), LIVE).allowed
+      ? undefined
+      : authorizeJobAdministration(undefined, request(), LIVE).refusal,
+    "job_not_stuck"
+  );
+  const allowed = authorizeJobAdministration(stuck({ attempts: 1 }), request({ action: "retry" }), LIVE);
+  assert.equal(allowed.allowed, true);
 });
