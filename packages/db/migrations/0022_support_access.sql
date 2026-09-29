@@ -20,13 +20,41 @@
 
 CREATE TABLE IF NOT EXISTS support_access_grants (
   grant_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+  -- REV-004: no ON DELETE clause, so the default NO ACTION applies.
+  -- A cascade here could never succeed -- the trigger below rejects
+  -- DELETE -- and all it did was change the error an operator sees when
+  -- they try to remove an organization, from a foreign key violation
+  -- naming organizations to "support_access_grants is append-only"
+  -- naming a table they never mentioned. 0006 and 0016 hit this and
+  -- removed the clause for the same reason.
+  organization_id uuid NOT NULL REFERENCES organizations (organization_id),
   operator_user_id uuid NOT NULL REFERENCES users (user_id),
-  -- Why. Mirrors 0018's rule exactly: at least one non-whitespace
-  -- character, checked with a character-class predicate rather than
-  -- length(trim(...)), because Postgres's trim() strips spaces only and
-  -- would accept a reason of tabs and newlines.
-  reason text NOT NULL CHECK (reason ~ '[^[:space:]]'),
+  -- REV-002: why, from a closed set, plus where the detail lives.
+  --
+  -- This was one free-text column, redacted through redactPii on the way
+  -- in, and the retention exemption on this table rested on that
+  -- redaction making it PII-free. redactPii masks email-shaped and
+  -- phone-shaped substrings; a support note says "looking at Jane Doe's
+  -- stuck upload", and the name landed here unchanged -- in a table
+  -- exempt from retention, that rejects DELETE, and whose trigger
+  -- rejects any UPDATE to the reason. There was no way to get it out.
+  --
+  -- A filter that has to recognise every shape of identifier a human
+  -- might type was the wrong tool. Names, addresses and dates of birth
+  -- have no shape. So there is no free text to filter any more: the
+  -- narrative lives in the ticketing system, which has its own retention.
+  reason_code text NOT NULL CHECK (reason_code IN (
+    'stuck_upload',
+    'failed_import',
+    'extraction_failure',
+    'customer_reported_defect',
+    'incident_investigation',
+    'data_subject_request'
+  )),
+  -- Narrow on purpose. A looser pattern would let this become the
+  -- free-text column that was just removed, exempt and unredactable in
+  -- exactly the same way.
+  ticket_reference text NOT NULL CHECK (ticket_reference ~ '^[A-Z][A-Z0-9]*-[0-9]+$'),
   -- Who authorised it. Never the operator themselves: an access an
   -- operator can grant to themselves is not a control, and the whole
   -- point of naming a second person is that someone else knew.
@@ -77,7 +105,9 @@ $support_access_grants_key$;
 CREATE TABLE IF NOT EXISTS support_access_events (
   support_access_event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   grant_id uuid NOT NULL REFERENCES support_access_grants (grant_id),
-  organization_id uuid NOT NULL REFERENCES organizations (organization_id) ON DELETE CASCADE,
+  -- REV-004, same as on the grants table: a cascade into an append-only
+  -- table can only ever change the error message.
+  organization_id uuid NOT NULL REFERENCES organizations (organization_id),
   operator_user_id uuid NOT NULL REFERENCES users (user_id),
   entity_type text NOT NULL CHECK (entity_type ~ '[^[:space:]]'),
   entity_id text NOT NULL CHECK (entity_id ~ '[^[:space:]]'),
@@ -120,7 +150,8 @@ BEGIN
   IF NEW.grant_id IS DISTINCT FROM OLD.grant_id
      OR NEW.organization_id IS DISTINCT FROM OLD.organization_id
      OR NEW.operator_user_id IS DISTINCT FROM OLD.operator_user_id
-     OR NEW.reason IS DISTINCT FROM OLD.reason
+     OR NEW.reason_code IS DISTINCT FROM OLD.reason_code
+     OR NEW.ticket_reference IS DISTINCT FROM OLD.ticket_reference
      OR NEW.granted_by_user_id IS DISTINCT FROM OLD.granted_by_user_id
      OR NEW.granted_at IS DISTINCT FROM OLD.granted_at
      OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
@@ -142,3 +173,226 @@ DROP TRIGGER IF EXISTS support_access_grants_reject_truncate ON support_access_g
 CREATE TRIGGER support_access_grants_reject_truncate
   BEFORE TRUNCATE ON support_access_grants
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- REV-001: who counts as an operator.
+--
+-- users is one global table shared by every tenant, so REFERENCES users
+-- on the two actor columns accepted any account at all, including a
+-- customer's own recruiter. Two colluding customer accounts could then
+-- write a grant naming each other and pass every constraint above. The
+-- allowlist is the missing noun: platform staff, as a set the schema can
+-- check.
+--
+-- The grantor is held to it as well as the operator. With the operator
+-- alone on the list, support_access_grants_not_self_granted would be
+-- satisfied by an operator and their own spare customer account, so "a
+-- second person knew" would mean only "a second account existed". Support
+-- access is platform-side approval (it is deliberately not a membership,
+-- see the header), so the second person is platform staff too.
+--
+-- What this cannot prove: that two allowlisted rows are two people. One
+-- human with two allowlisted accounts still satisfies every constraint
+-- here. Who is on the list is a governance decision made outside the
+-- schema, and no constraint can check it.
+--
+-- Rows are expected to be permanent. A grant references its operator and
+-- grantor, and grants are append-only apart from revocation, so a row that
+-- has ever been named cannot be deleted without breaking that history.
+CREATE TABLE IF NOT EXISTS platform_operators (
+  user_id uuid PRIMARY KEY REFERENCES users (user_id) ON DELETE RESTRICT
+);
+
+-- Added by ALTER rather than inline in the support_access_grants
+-- definition, because that statement is skipped wholesale on a database
+-- where the table already exists, and an inline constraint would never
+-- reach it.
+DO $support_access_grants_operator_fks$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_operator_is_platform_operator'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_operator_is_platform_operator
+      FOREIGN KEY (operator_user_id) REFERENCES platform_operators (user_id);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_grantor_is_platform_operator'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_grantor_is_platform_operator
+      FOREIGN KEY (granted_by_user_id) REFERENCES platform_operators (user_id);
+  END IF;
+END
+$support_access_grants_operator_fks$;
+
+-- REV-001: an event must name the operator its grant was issued to.
+--
+-- The composite key on support_access_events ties an event to its grant's
+-- tenant but not to its grant's operator, so operator B could log an access
+-- citing operator A's grant, and the log would attribute to B what only A
+-- was authorised to do. A false entry in an access log is worse than a
+-- missing one, because it reads as evidence. authorizeSupportAccess refuses
+-- the mismatch, but only in the application layer, which is what a direct
+-- writer walks around. This makes it a database fact, and because a grant's
+-- operator must be on platform_operators, it makes every event's operator an
+-- allowlisted one too. The key has to exist before the foreign key using it.
+DO $support_access_grants_operator_key$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_grants', current_schema())::regclass
+       AND conname = 'support_access_grants_id_org_operator_key'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD CONSTRAINT support_access_grants_id_org_operator_key
+      UNIQUE (grant_id, organization_id, operator_user_id);
+  END IF;
+END
+$support_access_grants_operator_key$;
+
+DO $support_access_events_operator_fk$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.support_access_events', current_schema())::regclass
+       AND conname = 'support_access_events_operator_matches_grant'
+  ) THEN
+    ALTER TABLE support_access_events
+      ADD CONSTRAINT support_access_events_operator_matches_grant
+      FOREIGN KEY (grant_id, organization_id, operator_user_id)
+      REFERENCES support_access_grants (grant_id, organization_id, operator_user_id);
+  END IF;
+END
+$support_access_events_operator_fk$;
+
+-- REV-001: offboarding.
+--
+-- An allowlist nobody can be removed from is not least privilege, and a
+-- row here can never be deleted once it has been named on a grant. So
+-- leaving is recorded, not deleted: revoked_at stops the person being
+-- named on a NEW grant, as operator or as grantor. Existing grants and
+-- their events are left exactly as they are. Someone leaving does not
+-- retroactively unauthorise access they legitimately performed, and
+-- history must not change. To cut off a live session as well, revoke the
+-- grant itself, which support_access_grants already allows.
+ALTER TABLE platform_operators ADD COLUMN IF NOT EXISTS revoked_at timestamptz;
+
+-- A trigger rather than a CHECK, because the rule reads another table and a
+-- CHECK cannot. Both operator rows are share-locked before they are read,
+-- so a revocation committing concurrently is either seen here or waits for
+-- this grant, rather than both passing under READ COMMITTED. search_path is
+-- pinned to the schema this migration ran in, so the unqualified table
+-- name resolves the same way whatever search_path the inserting session
+-- happens to have.
+CREATE OR REPLACE FUNCTION reject_grant_naming_revoked_operator() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path FROM CURRENT
+AS $$
+BEGIN
+  PERFORM 1 FROM platform_operators
+    WHERE user_id IN (NEW.operator_user_id, NEW.granted_by_user_id)
+    ORDER BY user_id
+    FOR SHARE;
+  IF EXISTS (
+    SELECT 1 FROM platform_operators WHERE user_id = NEW.operator_user_id AND revoked_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'support_access_grants: operator % has been revoked from platform_operators and cannot be granted access',
+      NEW.operator_user_id;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM platform_operators WHERE user_id = NEW.granted_by_user_id AND revoked_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'support_access_grants: grantor % has been revoked from platform_operators and cannot authorise access',
+      NEW.granted_by_user_id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS support_access_grants_operators_not_revoked ON support_access_grants;
+CREATE TRIGGER support_access_grants_operators_not_revoked
+  BEFORE INSERT ON support_access_grants
+  FOR EACH ROW EXECUTE FUNCTION reject_grant_naming_revoked_operator();
+
+-- REV-002 and REV-004 upgrade path.
+--
+-- The table definition above is skipped wholesale on a database that
+-- already ran an earlier version of this file, so every change to an
+-- existing table has to be stated again as an ALTER. The migrate service
+-- replays this file on every run, so each step is written to be a no-op
+-- the second time.
+--
+-- The creating statement is deliberately not named in this comment:
+-- tests/architecture/retention-classification.test.ts reads table names
+-- out of the migrations with a regex, and spelling it here makes the
+-- next word look like a table.
+
+DO $support_access_upgrade$
+BEGIN
+  -- REV-002: replace the free-text reason.
+  --
+  -- The old column is dropped rather than converted. Its contents are
+  -- the problem: they are operator free text that may name candidates,
+  -- and there is no mapping from a sentence to a reason code that does
+  -- not either invent one or keep the text. A pre-merge branch has no
+  -- rows worth preserving, and keeping them would defeat the change.
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'support_access_grants'
+       AND column_name = 'reason_code'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD COLUMN reason_code text NOT NULL DEFAULT 'incident_investigation';
+    ALTER TABLE support_access_grants ALTER COLUMN reason_code DROP DEFAULT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'support_access_grants'
+       AND column_name = 'ticket_reference'
+  ) THEN
+    ALTER TABLE support_access_grants
+      ADD COLUMN ticket_reference text NOT NULL DEFAULT 'AF-0';
+    ALTER TABLE support_access_grants ALTER COLUMN ticket_reference DROP DEFAULT;
+  END IF;
+  ALTER TABLE support_access_grants DROP COLUMN IF EXISTS reason;
+END
+$support_access_upgrade$;
+
+ALTER TABLE support_access_grants
+  DROP CONSTRAINT IF EXISTS support_access_grants_reason_code_check;
+ALTER TABLE support_access_grants
+  ADD CONSTRAINT support_access_grants_reason_code_check CHECK (reason_code IN (
+    'stuck_upload',
+    'failed_import',
+    'extraction_failure',
+    'customer_reported_defect',
+    'incident_investigation',
+    'data_subject_request'
+  ));
+
+ALTER TABLE support_access_grants
+  DROP CONSTRAINT IF EXISTS support_access_grants_ticket_reference_check;
+ALTER TABLE support_access_grants
+  ADD CONSTRAINT support_access_grants_ticket_reference_check
+  CHECK (ticket_reference ~ '^[A-Z][A-Z0-9]*-[0-9]+$');
+
+-- REV-004: drop and re-add the two organization_id foreign keys by name,
+-- so a database that already has these tables loses the ON DELETE
+-- CASCADE too. Named explicitly rather than discovered, because
+-- dropping "whatever foreign key is on this column" would also drop a
+-- future one nobody meant to touch.
+ALTER TABLE support_access_grants
+  DROP CONSTRAINT IF EXISTS support_access_grants_organization_id_fkey;
+ALTER TABLE support_access_grants
+  ADD CONSTRAINT support_access_grants_organization_id_fkey
+  FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);
+
+ALTER TABLE support_access_events
+  DROP CONSTRAINT IF EXISTS support_access_events_organization_id_fkey;
+ALTER TABLE support_access_events
+  ADD CONSTRAINT support_access_events_organization_id_fkey
+  FOREIGN KEY (organization_id) REFERENCES organizations (organization_id);

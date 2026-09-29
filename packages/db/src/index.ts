@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +26,7 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
+  RetentionResidue,
   ReviewTimingSpan,
   Role,
   RoleStatus,
@@ -4252,63 +4253,235 @@ export async function assertReviewTimingIntegrity(databaseUrl: string): Promise<
 
 // ---- AF-61: prove the retention purge blockers against the real schema ----
 
+export interface RetentionPurgeProbe {
+  /**
+   * Every purge the plan calls blocked, mapped to the database's own
+   * rejection message.
+   */
+  readonly failures: Record<string, string>;
+  /**
+   * Every purge the plan calls possible, mapped to the number of rows it
+   * actually removed. A surface the plan calls blocked while the
+   * database deletes it happily is wrong in the other direction: the
+   * privacy notice then overstates what is retained, which is still a
+   * false statement to a candidate.
+   */
+  readonly permitted: Record<string, number>;
+  /**
+   * REV-004: every migration file the probe applied, in the order it
+   * applied them, so a test can check that it is the whole directory in the
+   * runner's order rather than a hand-picked subset.
+   */
+  readonly appliedMigrations: readonly string[];
+  /**
+   * REV-004: every foreign key in the fully migrated schema, read from
+   * pg_constraint rather than from anyone's memory of the migrations. The
+   * hand-picked migration list is how five blockers on applications were
+   * reported as two: nothing failed when the schema gained a table that
+   * references a planned surface.
+   */
+  readonly foreignKeys: readonly RetentionForeignKey[];
+  /** Column names per table, so an exemption can prove what a table does not hold. */
+  readonly tableColumns: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface RetentionForeignKey {
+  readonly referencing: string;
+  readonly referenced: string;
+  readonly constraint: string;
+}
+
 /**
- * The domain's retention plan claims certain surfaces cannot be purged.
- * This proves it, rather than leaving the claim resting on my reading of
- * the migrations -- the same two-readings-must-agree shape as AF-57's
- * card/metric check, applied to a claim that will end up in a privacy
- * notice.
+ * Every migration, in the order infra/compose/runtime.yml applies them.
  *
- * If a future migration ever unblocks one of these paths, the assertion
- * that it still fails is what makes that visible. A retention plan that
- * says "blocked" about something now deletable is a different kind of
- * wrong, but still wrong.
+ * That runner is a shell glob over /migrations/*.sql, which sorts
+ * bytewise, and it replays every file on every run with no manifest. Two
+ * things make a naive "apply everything" wrong. readdirSync's order is the
+ * filesystem's, not sorted: APFS happens to return it sorted and ext4,
+ * which CI runs on, does not, so an unsorted loop passes locally and runs
+ * 0016 before 0015 in CI. And the sort must be the default code-unit sort,
+ * never localeCompare, because bytewise is what the runner does and this
+ * branch has two files sharing the 0009 prefix, which have to run in the
+ * order every environment has run them.
  */
-export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<Record<string, string>> {
+export function listMigrationsInRunnerOrder(): readonly string[] {
+  return readdirSync(MIGRATIONS_DIRECTORY)
+    .filter((file) => /^\d{4}_[a-z0-9_]+\.sql$/u.test(file))
+    .sort();
+}
+
+/**
+ * The domain's retention plan claims a disposition for every surface.
+ * This proves each one against a real Postgres, rather than leaving the
+ * claim resting on my reading of the migrations -- the same
+ * two-readings-must-agree shape as AF-57's card/metric check, applied to
+ * a claim that will end up in a privacy notice.
+ *
+ * Both directions are proved, not just the blocked one. The first
+ * revision of this probe covered evidence_outcomes, applications and
+ * file_intakes only, and the three surfaces it left to unit tests
+ * reading the plan's own static content included two the plan had
+ * wrong: canonical_text_extractions and import_rows are directly
+ * deletable, because nothing references them and no trigger guards
+ * them. Only the cascade route through file_intakes is blocked, and
+ * reasoning from that route alone is what produced the wrong
+ * disposition. Asserting the permitted deletes is what stops that
+ * recurring.
+ *
+ * If a future migration ever unblocks a blocked path, or pins a
+ * currently free one, the assertion here is what makes it visible.
+ */
+export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise<RetentionPurgeProbe> {
   const suffix = randomBytes(4).toString("hex");
   const schema = `ret_probe_${suffix}`;
   const org = "11111111-1111-4111-8111-111111111111";
   const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const roleId = "33333333-3333-4333-8333-333333333333";
   const intakeId = "55555555-5555-4555-8555-555555555555";
+  // A second intake with the same dependents but no application, so the
+  // cascade the plan describes can be shown to work where nothing pins
+  // the parent. Without it "cascades from file_intakes" is a claim about
+  // a path no test ever walks.
+  const freeIntakeId = "55555555-5555-4555-8555-555555555556";
   const applicationId = "44444444-4444-4444-8444-444444444444";
+  // A second application carrying a decision and no evidence, so the
+  // candidate_decisions foreign key can be shown to block on its own.
+  // On the first application the evidence_outcomes constraint is checked
+  // first and is all the error names, which is how it stayed hidden.
+  const decidedApplicationId = "44444444-4444-4444-8444-444444444445";
+  // REV-003: three more, one per remaining blocker, each pinned by that
+  // dependent and nothing else. The detail once named two blockers
+  // because nobody enumerated the schema; there are five, and a blocker
+  // without its own application is one this probe cannot tell apart.
+  const sampledApplicationId = "44444444-4444-4444-8444-444444444446";
+  const timedApplicationId = "44444444-4444-4444-8444-444444444447";
+  // On its own intake, so its processed ledger row does not change what
+  // "import_rows:delete" removes from the first intake.
+  const importedIntakeId = "55555555-5555-4555-8555-555555555557";
+  const importedApplicationId = "44444444-4444-4444-8444-444444444448";
+  const auditSampleId = "88888888-8888-4888-8888-888888888888";
+  // AF-66 REV-002. Support access needs two platform operators, because
+  // a grant may not be self-granted, and they are deliberately NOT
+  // members of the tenant: a support operator who held a membership
+  // would be indistinguishable from the customer's own staff.
+  const supportOperator = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+  const supportGrantor = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const supportGrantId = "bbbbbbbb-3333-4333-8333-bbbbbbbbbbbb";
   const outcomeId = "66666666-6666-4666-8666-666666666666";
+  const decisionId = "77777777-7777-4777-8777-777777777777";
+  // Doubles as the request_id body: audit_events CHECKs request_id
+  // against req_ + a version-4 UUID, so reusing this one keeps the seed
+  // honest instead of inventing a second literal that has to match.
+  const auditEventId = "99999999-9999-4999-8999-999999999999";
+  const extractionRunId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const failures: Record<string, string> = {};
+  const permitted: Record<string, number> = {};
 
-  const expectRejected = async (label: string, sql: string): Promise<void> => {
+  const countRows = async (sql: string, params: readonly unknown[]): Promise<number> => {
+    const result = await admin.query<{ count: string }>(sql, [...params]);
+    return Number(result.rows[0]?.count ?? 0);
+  };
+
+  /**
+   * A bare catch here would record any error as a retention blocker,
+   * including a typo: "relation does not exist" is SQLSTATE 42P01 and
+   * reads exactly like a refusal. So the caller states which refusal it
+   * expects, and for a referential one, which constraint had to be the
+   * refusing party.
+   */
+  const expectRejected = async (
+    label: string,
+    expected: { readonly sqlstate: string; readonly constraint?: string },
+    sql: string
+  ): Promise<void> => {
+    let refusal: unknown;
+    let refused = false;
     try {
       await admin.query(sql);
-      throw new Error(`assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.startsWith("assertRetentionPurgeBlockers:")) {
-        throw error;
-      }
-      failures[label] = message;
+      refused = true;
+      refusal = error;
     }
+    if (!refused) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" SUCCEEDED but the retention plan says it is blocked`
+      );
+    }
+    const sqlstate = (refusal as { code?: unknown }).code;
+    const constraint = (refusal as { constraint?: unknown }).constraint;
+    const message = refusal instanceof Error ? refusal.message : String(refusal);
+    if (sqlstate !== expected.sqlstate) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused with SQLSTATE ${String(sqlstate)}, ` +
+          `expected ${expected.sqlstate}. The probe is testing something other than it thinks: ${message}`
+      );
+    }
+    if (expected.constraint !== undefined && constraint !== expected.constraint) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" was refused by constraint ${String(constraint)}, ` +
+          `expected ${expected.constraint}: ${message}`
+      );
+    }
+    failures[label] = message;
+  };
+
+  /**
+   * The mirror of the above, for a surface the plan says can be purged.
+   * Guarded on rows being present first: a DELETE matching nothing
+   * violates no foreign key and fires no row trigger, so it reports
+   * success for a reason that proves nothing at all.
+   */
+  const expectPermitted = async (
+    label: string,
+    deleteSql: string,
+    countSql: string,
+    params: readonly unknown[]
+  ): Promise<void> => {
+    const before = await countRows(countSql, params);
+    if (before === 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" needs rows present; a DELETE affecting none of them ` +
+          `succeeds without proving the surface is purgeable`
+      );
+    }
+    const deleted = await admin.query(deleteSql, [...params]);
+    const after = await countRows(countSql, params);
+    if (after !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: "${label}" reported success but ${after} row(s) are still there`
+      );
+    }
+    permitted[label] = deleted.rowCount ?? 0;
   };
 
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql"
-    ]) {
+    // REV-004: the whole schema, as the migrate service builds it, not the
+    // tables someone already thought of. A blocker nobody listed a
+    // migration for is a blocker this probe could never find.
+    const appliedMigrations = listMigrationsInRunnerOrder();
+    for (const file of appliedMigrations) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
+    // Applying every migration brings in 0004_tenant_scoped_rls.sql, which
+    // puts FORCE ROW LEVEL SECURITY on memberships. Seeding a membership
+    // without a tenant then works only because the probe happens to connect
+    // as a superuser, which bypasses RLS. Setting the tenant makes the seed
+    // hold under an ordinary role too, instead of depending on that.
+    await admin.query(`SELECT set_config('app.current_org_id', $1, false)`, [org]);
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
     await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'A')`, [
       userId,
       `ret_${suffix}@acme.test`
+    ]);
+    // candidate_decisions requires the decider to hold a membership in
+    // the organization, not merely to exist as a user.
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter')`, [
+      org,
+      userId
     ]);
     await admin.query(
       `INSERT INTO roles (role_id, organization_id, title, created_by_user_id) VALUES ($1,$2,'Eng',$3)`,
@@ -4317,14 +4490,29 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     await admin.query(
       `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
          declared_mime_type, status, created_by_user_id)
-       VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
-      [intakeId, org, roleId, `key-${suffix}`, userId]
+       VALUES ($1,$2,$3,$4,'candidates.csv','text/csv','imported',$5)`,
+      [importedIntakeId, org, roleId, `key-${suffix}-imported`, userId]
     );
-    await admin.query(
-      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
-       VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
-      [intakeId]
-    );
+    for (const intake of [intakeId, freeIntakeId]) {
+      await admin.query(
+        `INSERT INTO file_intakes (intake_id, organization_id, role_id, storage_key, declared_filename,
+           declared_mime_type, status, created_by_user_id)
+         VALUES ($1,$2,$3,$4,'Jane_Doe_CV.pdf','application/pdf','validated',$5)`,
+        [intake, org, roleId, `key-${suffix}-${intake.slice(-1)}`, userId]
+      );
+      await admin.query(
+        `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+         VALUES ($1, '[{"text":"Jane Doe, Python engineer"}]'::jsonb, 1, 'full')`,
+        [intake]
+      );
+      // A failed row, because failure_reason is the column that holds
+      // candidate text: it quotes the row it could not parse.
+      await admin.query(
+        `INSERT INTO import_rows (intake_id, row_number, outcome, failure_reason)
+         VALUES ($1, 1, 'failed', 'could not parse: Jane Doe,jane@example.test')`,
+        [intake]
+      );
+    }
     await admin.query(
       `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
          candidate_full_name, candidate_email)
@@ -4332,31 +4520,334 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
       [applicationId, org, roleId, intakeId]
     );
     await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,2,'Jo Roe','jo@example.test')`,
+      [decidedApplicationId, org, roleId, intakeId]
+    );
+    for (const [pinnedId, row] of [
+      [sampledApplicationId, 3],
+      [timedApplicationId, 4]
+    ] as const) {
+      await admin.query(
+        `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+           candidate_full_name, candidate_email)
+         VALUES ($1,$2,$3,$4,$5,'Pat Poe','pat${row}@example.test')`,
+        [pinnedId, org, roleId, intakeId, row]
+      );
+    }
+    await admin.query(
+      `INSERT INTO applications (application_id, organization_id, role_id, intake_id, source_row_number,
+         candidate_full_name, candidate_email)
+       VALUES ($1,$2,$3,$4,1,'Sam Soe','sam@example.test')`,
+      [importedApplicationId, org, roleId, importedIntakeId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size, eligible_count,
+         drawn_by_user_id)
+       VALUES ($1,$2,$3,'ret-probe',1,1,$4)`,
+      [auditSampleId, org, roleId, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, org, sampledApplicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at, ended_at,
+         active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-08-29T12:00:00Z','2026-08-29T12:01:00Z',60000,false)`,
+      [org, timedApplicationId, userId]
+    );
+    // What every CSV import writes: the processed ledger row for the
+    // application it created. Its FK is ON DELETE SET NULL, and the CHECK
+    // that a processed row keeps its application_id is what refuses.
+    await admin.query(
+      `INSERT INTO import_rows (intake_id, row_number, outcome, application_id) VALUES ($1,1,'processed',$2)`,
+      [importedIntakeId, importedApplicationId]
+    );
+    await admin.query(
       `INSERT INTO evidence_outcomes (evidence_outcome_id, organization_id, application_id, criterion_id, kind, outcome)
        VALUES ($1,$2,$3,'python','supported',
          '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe, Python engineer"}}'::jsonb)`,
       [outcomeId, org, applicationId]
     );
+    await admin.query(
+      `INSERT INTO candidate_decisions (decision_id, organization_id, application_id, decision, rationale,
+         decided_by_user_id)
+       VALUES ($1,$2,$3,'decline','Jo Roe has no Python depth on the CV',$4)`,
+      [decisionId, org, decidedApplicationId, userId]
+    );
+    // REV-001: the two surfaces whose link to a candidate is a
+    // polymorphic entity_type/entity_id text pair rather than a foreign
+    // key. Written exactly as production writes them -- the recorded
+    // action is per-application, so the entity IS the application -- so
+    // that what the probe proves is the ordinary case and not a
+    // hypothetical one. No foreign key means pg_constraint cannot see
+    // the association at all, which is why evidence_extraction_runs was
+    // missing from the plan and audit_events was in it under a
+    // disposition that said it held nothing candidate-derived.
+    await admin.query(
+      `INSERT INTO audit_events (audit_event_id, organization_id, actor_user_id, action, entity_type,
+         entity_id, request_id)
+       VALUES ($1,$2,$3,'decision_recorded','application',$4,$5)`,
+      [auditEventId, org, userId, decidedApplicationId, `req_${auditEventId}`]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (run_id, organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,$2,'application',$3,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [extractionRunId, org, applicationId]
+    );
+    // AF-66 REV-002: an operator looking at this candidate's application.
+    // The reason is a code and a ticket key rather than free text, which
+    // is what makes the grant itself hold nothing candidate-derived; the
+    // EVENT still names the application, which is why it is a surface.
+    for (const [platformUserId, suffixHint] of [
+      [supportOperator, "op"],
+      [supportGrantor, "gr"]
+    ] as const) {
+      await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'S')`, [
+        platformUserId,
+        `ret_${suffix}_${suffixHint}@platform.test`
+      ]);
+      await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1)`, [platformUserId]);
+    }
+    await admin.query(
+      `INSERT INTO support_access_grants (grant_id, organization_id, operator_user_id, reason_code,
+         ticket_reference, granted_by_user_id, expires_at)
+       VALUES ($1,$2,$3,'stuck_upload','AF-66',$4, clock_timestamp() + interval '1 hour')`,
+      [supportGrantId, org, supportOperator, supportGrantor]
+    );
+    await admin.query(
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ($1,$2,$3,'application',$4)`,
+      [supportGrantId, org, supportOperator, applicationId]
+    );
 
+    // 1. The append-only surfaces. P0001 is what RAISE EXCEPTION in
+    //    reject_append_only_mutation() reports.
     await expectRejected(
       "evidence_outcomes:delete",
+      { sqlstate: "P0001" },
       `DELETE FROM evidence_outcomes WHERE evidence_outcome_id = '${outcomeId}'`
     );
     await expectRejected(
       "evidence_outcomes:redact",
+      { sqlstate: "P0001" },
       `UPDATE evidence_outcomes SET outcome = '{"kind":"supported","criterionId":"python"}'::jsonb
         WHERE evidence_outcome_id = '${outcomeId}'`
     );
     await expectRejected(
+      "candidate_decisions:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM candidate_decisions WHERE decision_id = '${decisionId}'`
+    );
+    await expectRejected(
+      "candidate_decisions:redact",
+      { sqlstate: "P0001" },
+      `UPDATE candidate_decisions SET rationale = 'redacted' WHERE decision_id = '${decisionId}'`
+    );
+    // REV-001. Both directions on both polymorphic surfaces, because the
+    // plan's claim is that the application identifier can be neither
+    // removed nor blanked. audit_events raises through
+    // reject_audit_event_mutation and evidence_extraction_runs through
+    // the generic reject_append_only_mutation; both report P0001.
+    await expectRejected(
+      "audit_events:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_events WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "audit_events:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_events SET entity_id = 'redacted' WHERE audit_event_id = '${auditEventId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM evidence_extraction_runs WHERE run_id = '${extractionRunId}'`
+    );
+    await expectRejected(
+      "evidence_extraction_runs:redact",
+      { sqlstate: "P0001" },
+      `UPDATE evidence_extraction_runs SET entity_id = 'redacted' WHERE run_id = '${extractionRunId}'`
+    );
+    // The two that declare the link properly and were still unclassified.
+    // Their rows are the ones seeded to pin sampledApplicationId and
+    // timedApplicationId, and the refusals here are why those pins hold:
+    // the dependent cannot be deleted first to clear the way.
+    await expectRejected(
+      "audit_sample_members:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM audit_sample_members WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "audit_sample_members:redact",
+      { sqlstate: "P0001" },
+      `UPDATE audit_sample_members SET application_id = '${applicationId}'
+        WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM review_timing_spans WHERE application_id = '${timedApplicationId}'`
+    );
+    await expectRejected(
+      "review_timing_spans:redact",
+      { sqlstate: "P0001" },
+      `UPDATE review_timing_spans SET reviewer_user_id = '${userId}'
+        WHERE application_id = '${timedApplicationId}'`
+    );
+    await expectRejected(
+      "support_access_events:delete",
+      { sqlstate: "P0001" },
+      `DELETE FROM support_access_events WHERE grant_id = '${supportGrantId}'`
+    );
+    await expectRejected(
+      "support_access_events:redact",
+      { sqlstate: "P0001" },
+      `UPDATE support_access_events SET entity_id = 'redacted' WHERE grant_id = '${supportGrantId}'`
+    );
+
+    // 2. The referential blockers, each named by the constraint that
+    //    refused rather than by a substring of the message. One
+    //    application per blocker because Postgres reports only the first
+    //    constraint it checks, so one row carrying several dependents
+    //    would prove one of them and hide the rest.
+    await expectRejected(
       "applications:delete",
+      { sqlstate: "23503", constraint: "evidence_outcomes_application_id_organization_id_fkey" },
       `DELETE FROM applications WHERE application_id = '${applicationId}'`
     );
     await expectRejected(
+      "applications:delete_pinned_only_by_a_decision",
+      { sqlstate: "23503", constraint: "candidate_decisions_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${decidedApplicationId}'`
+    );
+    // REV-003: the other three, each on an application nothing else
+    // pins. Proved to be single-dependent first, because a second
+    // dependent would let the refusal come from the wrong constraint and
+    // still name the right one only by the luck of check order.
+    const pinnedBy: ReadonlyArray<readonly [string, string]> = [
+      [applicationId, "evidence_outcomes"],
+      [decidedApplicationId, "candidate_decisions"],
+      [sampledApplicationId, "audit_sample_members"],
+      [timedApplicationId, "review_timing_spans"],
+      [importedApplicationId, "import_rows"]
+    ];
+    for (const [pinnedId, onlyDependent] of pinnedBy) {
+      const dependents = await admin.query<{ source: string; count: string }>(
+        `SELECT source, count(*)::text AS count FROM (
+           SELECT 'evidence_outcomes' AS source FROM evidence_outcomes WHERE application_id = $1
+           UNION ALL SELECT 'candidate_decisions' FROM candidate_decisions WHERE application_id = $1
+           UNION ALL SELECT 'audit_sample_members' FROM audit_sample_members WHERE application_id = $1
+           UNION ALL SELECT 'review_timing_spans' FROM review_timing_spans WHERE application_id = $1
+           UNION ALL SELECT 'import_rows' FROM import_rows WHERE application_id = $1
+         ) AS d GROUP BY source ORDER BY source`,
+        [pinnedId]
+      );
+      const found = dependents.rows.map((row) => `${row.source}=${row.count}`).join(", ");
+      if (found !== `${onlyDependent}=1`) {
+        throw new Error(
+          `assertRetentionPurgeBlockers: application ${pinnedId} must be pinned only by one ${onlyDependent} row, ` +
+            `found: ${found || "none"}`
+        );
+      }
+    }
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_audit_sample",
+      { sqlstate: "23503", constraint: "audit_sample_members_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${sampledApplicationId}'`
+    );
+    await expectRejected(
+      "applications:delete_pinned_only_by_a_timing_span",
+      { sqlstate: "23503", constraint: "review_timing_spans_application_id_organization_id_fkey" },
+      `DELETE FROM applications WHERE application_id = '${timedApplicationId}'`
+    );
+    // 23514, not 23503: the FK itself would allow the delete by nulling
+    // the reference, and it is the ledger's CHECK that refuses the null.
+    await expectRejected(
+      "applications:delete_pinned_only_by_an_import_row",
+      { sqlstate: "23514", constraint: "import_rows_check" },
+      `DELETE FROM applications WHERE application_id = '${importedApplicationId}'`
+    );
+    await expectRejected(
       "file_intakes:delete",
+      { sqlstate: "23503", constraint: "applications_intake_id_fkey" },
       `DELETE FROM file_intakes WHERE intake_id = '${intakeId}'`
     );
 
-    // The candidate's data is all still here, which is the point.
+    // 3. The surfaces the plan says are purgeable, proved by purging
+    //    them. Nothing references either table and neither carries a
+    //    trigger, so the row goes directly, whatever the cascade route
+    //    through file_intakes does.
+    await expectPermitted(
+      "canonical_text_extractions:delete",
+      `DELETE FROM canonical_text_extractions WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM canonical_text_extractions WHERE intake_id = $1`,
+      [intakeId]
+    );
+    await expectPermitted(
+      "import_rows:delete",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [intakeId]
+    );
+
+    // 3b. The ordering the plan states: purge import_rows, and the
+    //     application it was the only thing pinning then goes. Without
+    //     this, "import_rows must be purged before applications" is a
+    //     claim no test walks, and it doubles as the control that the
+    //     import-row application was pinned by nothing else.
+    await expectPermitted(
+      "import_rows:delete_processed_row",
+      `DELETE FROM import_rows WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM import_rows WHERE intake_id = $1`,
+      [importedIntakeId]
+    );
+    await expectPermitted(
+      "applications:delete_after_import_rows_purged",
+      `DELETE FROM applications WHERE application_id = $1`,
+      `SELECT count(*)::text AS count FROM applications WHERE application_id = $1`,
+      [importedApplicationId]
+    );
+
+    // 4. The cascade the plan describes is real, shown on the intake
+    //    nothing pins. This is the route that IS blocked for the first
+    //    intake, and asserting it here is what keeps the plan's
+    //    explanation of why honest.
+    const cascading = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (cascading !== 2) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: the cascade check needs both dependents present, found ${cascading}`
+      );
+    }
+    await expectPermitted(
+      "file_intakes:delete_when_unreferenced",
+      `DELETE FROM file_intakes WHERE intake_id = $1`,
+      `SELECT count(*)::text AS count FROM file_intakes WHERE intake_id = $1`,
+      [freeIntakeId]
+    );
+    const orphaned = await countRows(
+      `SELECT ((SELECT count(*) FROM canonical_text_extractions WHERE intake_id = $1)
+             + (SELECT count(*) FROM import_rows WHERE intake_id = $1))::text AS count`,
+      [freeIntakeId]
+    );
+    if (orphaned !== 0) {
+      throw new Error(
+        `assertRetentionPurgeBlockers: deleting an unreferenced file_intake left ${orphaned} dependent row(s), ` +
+          `so the plan's "cascades from file_intakes" is wrong`
+      );
+    }
+    permitted["canonical_text_extractions:cascade_from_file_intakes"] = 1;
+    permitted["import_rows:cascade_from_file_intakes"] = 1;
+
+    // 5. The candidate's identity survived every blocked path, which is
+    //    the finding the privacy statement is written from.
     const surviving = await admin.query<{ candidate_full_name: string }>(
       `SELECT candidate_full_name FROM applications WHERE application_id = $1`,
       [applicationId]
@@ -4364,7 +4855,26 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
     if (surviving.rows[0]?.candidate_full_name !== "Jane Doe") {
       throw new Error("assertRetentionPurgeBlockers: expected the candidate row to have survived every purge attempt");
     }
-    return failures;
+    const foreignKeys = await admin.query<RetentionForeignKey>(
+      `SELECT rel.relname AS referencing, ref.relname AS referenced, c.conname AS constraint
+         FROM pg_constraint c
+         JOIN pg_class rel ON rel.oid = c.conrelid
+         JOIN pg_class ref ON ref.oid = c.confrelid
+         JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE c.contype = 'f' AND n.nspname = $1
+        ORDER BY 2, 1, 3`,
+      [schema]
+    );
+    const columns = await admin.query<{ table_name: string; column_name: string }>(
+      `SELECT table_name, column_name FROM information_schema.columns
+        WHERE table_schema = $1 ORDER BY table_name, column_name`,
+      [schema]
+    );
+    const tableColumns: Record<string, string[]> = {};
+    for (const row of columns.rows) {
+      (tableColumns[row.table_name] ??= []).push(row.column_name);
+    }
+    return { failures, permitted, appliedMigrations, foreignKeys: foreignKeys.rows, tableColumns };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
@@ -4393,13 +4903,29 @@ export async function assertRetentionPurgeBlockers(databaseUrl: string): Promise
  * their own, so they are scoped through file_intakes rather than counted
  * globally -- counting them across tenants would make one noisy tenant
  * look like everyone's problem.
+ *
+ * `observedSurfaces` names what this call actually measured, and it is
+ * the reason the result cannot quietly overstate itself. Two surfaces
+ * would otherwise come back as an implicit zero: object_storage_documents,
+ * which is not in Postgres at all and is the only surface the plan calls
+ * purgeable, and any surface whose table is missing from this schema.
+ * Both are now absent from observedSurfaces instead, and reconcileRetention
+ * turns that into a not_observed finding rather than a clean bill of health.
+ *
+ * `externalCounts` is how a surface outside Postgres gets measured: a
+ * caller that lists blob storage for this tenant passes
+ * `{ object_storage_documents: n }` and the residue_present branch becomes
+ * reachable for real. A count is only accepted for a surface this
+ * function cannot see itself, so a caller cannot paper over a table that
+ * is right there to be counted.
  */
 export async function observeRetentionResidue(
   databaseUrl: string,
   schema: string,
   organizationId: string,
-  cutoff: string
-): Promise<{ rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] }> {
+  cutoff: string,
+  externalCounts: Readonly<Record<string, number>> = {}
+): Promise<RetentionResidue> {
   assertSafeSchema(schema);
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
@@ -4418,6 +4944,7 @@ export async function observeRetentionResidue(
     // missing table there is not residue.
     const present = new Set(observedTables);
     const counts: Record<string, number> = {};
+    const observedSurfaces: string[] = [];
     const scoped: ReadonlyArray<readonly [string, string]> = [
       ["file_intakes", `SELECT count(*) FROM "${schema}".file_intakes WHERE organization_id = $1 AND created_at <= $2`],
       [
@@ -4440,11 +4967,56 @@ export async function observeRetentionResidue(
       [
         "candidate_decisions",
         `SELECT count(*) FROM "${schema}".candidate_decisions WHERE organization_id = $1 AND decided_at <= $2`
+      ],
+      // REV-001: the four surfaces that keep a candidate's application
+      // identifier in an append-only table. All four were previously
+      // either exempt or absent from the plan, so a tenant could
+      // reconcile clean while every one of them still held rows past the
+      // cutoff -- which is the one outcome this job exists to prevent.
+      //
+      // Each anchors on the timestamp the DATABASE owns, never one a
+      // caller supplies. review_timing_spans is the case that matters:
+      // started_at and ended_at come from the browser, and anchoring
+      // retention on either would let a client decide when its own rows
+      // fall out of scope. recorded_at defaults to clock_timestamp().
+      [
+        "audit_events",
+        `SELECT count(*) FROM "${schema}".audit_events WHERE organization_id = $1 AND occurred_at <= $2`
+      ],
+      [
+        "evidence_extraction_runs",
+        `SELECT count(*) FROM "${schema}".evidence_extraction_runs
+          WHERE organization_id = $1 AND created_at <= $2`
+      ],
+      [
+        "review_timing_spans",
+        `SELECT count(*) FROM "${schema}".review_timing_spans WHERE organization_id = $1 AND recorded_at <= $2`
+      ],
+      // audit_sample_members has no timestamp of its own: it is one row
+      // per candidate in a draw, and the draw carries the time. Joined
+      // rather than left uncounted, because the members are the half
+      // that names candidates.
+      [
+        "audit_sample_members",
+        `SELECT count(*) FROM "${schema}".audit_sample_members asm
+           JOIN "${schema}".audit_samples s ON s.audit_sample_id = asm.audit_sample_id
+          WHERE asm.organization_id = $1 AND s.drawn_at <= $2`
+      ],
+      // AF-66 REV-002: every look a support operator took, named by
+      // entity_type and entity_id. When the look was at a candidate's
+      // application, that is the candidate's identifier.
+      [
+        "support_access_events",
+        `SELECT count(*) FROM "${schema}".support_access_events
+          WHERE organization_id = $1 AND accessed_at <= $2`
       ]
     ];
 
     for (const [surface, sql] of scoped) {
       if (!present.has(surface)) {
+        // Not an error: probe schemas apply a subset of migrations. But
+        // it is also not a zero. Leaving the surface out of
+        // observedSurfaces is what keeps it from reading as measured.
         continue;
       }
       const result = await client.query<{ count: string }>(sql, [organizationId, cutoff]);
@@ -4456,9 +5028,41 @@ export async function observeRetentionResidue(
         throw new Error(`observeRetentionResidue: ${surface} count is not a safe integer, got: ${raw}`);
       }
       counts[surface] = parsed;
+      observedSurfaces.push(surface);
     }
 
-    return { rowsPastCutoffBySurface: counts, observedTables };
+    const selfCounted = new Set(scoped.map(([surface]) => surface));
+    for (const [surface, count] of Object.entries(externalCounts)) {
+      // A caller-supplied number for something the database can answer
+      // would replace a real measurement with an asserted one, which is
+      // the same "trust me" this whole change exists to remove. Refused
+      // rather than merged, because a silent overwrite would make the
+      // report look measured while saying whatever the caller wanted.
+      if (selfCounted.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which this ` +
+            `function counts from the database itself`
+        );
+      }
+      if (present.has(surface)) {
+        throw new Error(
+          `observeRetentionResidue: refusing an external count for "${surface}", which is a table ` +
+            `in schema "${schema}". External counts are for surfaces that do not live in Postgres.`
+        );
+      }
+      if (!Number.isSafeInteger(count) || count < 0) {
+        // Same reasoning as the bigint parse above: a NaN here would land
+        // in the map, mark the surface observed, and read as "no residue".
+        throw new Error(
+          `observeRetentionResidue: external count for "${surface}" must be a non-negative safe ` +
+            `integer, got: ${String(count)}`
+        );
+      }
+      counts[surface] = count;
+      observedSurfaces.push(surface);
+    }
+
+    return { rowsPastCutoffBySurface: counts, observedSurfaces, observedTables };
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -4477,13 +5081,25 @@ export async function observeRetentionResidue(
  * plan's back. If observeRetentionResidue read a hand-maintained list
  * rather than information_schema, that table would be invisible and the
  * job would report all clear while candidate text sat in it.
+ *
+ * It also returns the observations either side of the object-storage
+ * question, because that surface is the one the job cannot reach on its
+ * own: `residue` is what a caller with no storage listing gets,
+ * `residueWithPurgedObjectStorage` and `residueWithObjectStorageResidue`
+ * are what the same tenant looks like once someone actually counted the
+ * objects. Without all three, "clean" and "residue_present" are each
+ * only reachable through a hand-built residue object, which would prove
+ * nothing about the live path.
  */
 export async function probeRetentionReconciliation(
   databaseUrl: string,
   cutoff: string
 ): Promise<{
-  residue: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
-  residueBeforeAnyData: { rowsPastCutoffBySurface: Record<string, number>; observedTables: string[] };
+  residue: RetentionResidue;
+  residueWithObjectStorageResidue: RetentionResidue;
+  residueWithPurgedObjectStorage: RetentionResidue;
+  residueBeforeAnyData: RetentionResidue;
+  residueMissingSurfaceTable: RetentionResidue;
   organizationId: string;
 }> {
   const suffix = randomBytes(4).toString("hex");
@@ -4496,22 +5112,30 @@ export async function probeRetentionReconciliation(
   const intakeA = "55555555-5555-4555-8555-555555555555";
   const intakeB = "88888888-8888-4888-8888-888888888888";
   const applicationId = "44444444-4444-4444-8444-444444444444";
+  const auditSampleId = "99999999-9999-4999-8999-999999999999";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
 
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql"
-    ]) {
+    // REV-001: every migration in the runner's own order, minus the one
+    // deliberately held back below. This used to be a hand-picked list
+    // ending at 0016, which is the same defect AF-61's purge probe was
+    // corrected for: a probe that applies the tables someone already
+    // thought of can only measure the surfaces someone already thought
+    // of. It is also precisely why the four append-only surfaces that
+    // keep an application identifier were never observed here -- three of
+    // their migrations were not in the list at all.
+    const deferred = "0019_candidate_decisions.sql";
+    const applied = listMigrationsInRunnerOrder().filter((file) => file !== deferred);
+    if (applied.length === listMigrationsInRunnerOrder().length) {
+      throw new Error(
+        `probeRetentionReconciliation: ${deferred} must exist to be held back; the ` +
+          `missing-surface-table observation below depends on it`
+      );
+    }
+    for (const file of applied) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
@@ -4524,9 +5148,28 @@ export async function probeRetentionReconciliation(
        VALUES ($1,$2,'Eng',$5), ($3,$4,'B role',$5)`,
       [roleA, orgA, roleB, orgB, userId]
     );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1,$2,'recruiter'), ($3,$2,'recruiter')`,
+      [orgA, userId, orgB]
+    );
 
-    // Baseline: the plan's surfaces exist but hold nothing for tenant A.
-    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
+    // Taken while candidate_decisions does not exist yet, which is not a
+    // contrivance: this is what any schema behind on migrations looks
+    // like, and before observedSurfaces the absent table produced no
+    // count, the count defaulted to 0, and the surface read as verified
+    // empty. Captured here so the reconciliation can be held to saying
+    // "not measured" instead.
+    const residueMissingSurfaceTable = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0019_candidate_decisions.sql"), "utf8"));
+
+    // Baseline: every surface the plan covers exists, was measured, and
+    // holds nothing for tenant A -- including object storage, which is
+    // measured only because the caller supplied the listing.
+    const residueBeforeAnyData = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
 
     // Tenant A's undeleted candidate data.
     await admin.query(
@@ -4551,6 +5194,42 @@ export async function probeRetentionReconciliation(
        VALUES ('66666666-6666-4666-8666-666666666666',$1,$2,'python','supported',
          '{"kind":"supported","criterionId":"python","citation":{"quote":"Jane Doe"}}'::jsonb)`,
       [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO candidate_decisions (organization_id, application_id, decision, rationale, decided_by_user_id)
+       VALUES ($1,$2,'hold','Revisit after the panel',$3)`,
+      [orgA, applicationId, userId]
+    );
+    // REV-001: the four append-only surfaces that keep a candidate's
+    // application identifier. Rows here are what let a report be clean
+    // while the identifier for a real candidate remained, so the fixture
+    // has to contain them or the property is untested.
+    await admin.query(
+      `INSERT INTO audit_events (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+       VALUES ($1,$2,'decision_recorded','application',$3,'req_11111111-1111-4111-8111-111111111111')`,
+      [orgA, userId, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO evidence_extraction_runs (organization_id, entity_type, entity_id, provider, model,
+         prompt_version, extraction_schema_version, extraction_schema_name, rubric_version)
+       VALUES ($1,'application',$2,'openai','gpt-x','p1','s1','evidence','r1')`,
+      [orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO audit_samples (audit_sample_id, organization_id, role_id, seed, requested_size,
+         eligible_count, drawn_by_user_id)
+       VALUES ($1,$2,$3,'recon-probe',1,1,$4)`,
+      [auditSampleId, orgA, roleA, userId]
+    );
+    await admin.query(
+      `INSERT INTO audit_sample_members (audit_sample_id, organization_id, application_id) VALUES ($1,$2,$3)`,
+      [auditSampleId, orgA, applicationId]
+    );
+    await admin.query(
+      `INSERT INTO review_timing_spans (organization_id, application_id, reviewer_user_id, started_at,
+         ended_at, active_ms, truncated_by_idle)
+       VALUES ($1,$2,$3,'2026-07-01T12:00:00Z','2026-07-01T12:01:00Z',60000,false)`,
+      [orgA, applicationId, userId]
     );
 
     // Tenant B's data, which must not be counted against tenant A --
@@ -4577,8 +5256,106 @@ export async function probeRetentionReconciliation(
     );
     await admin.query(`INSERT INTO "${schema}".recruiter_scratch_notes (candidate_note) VALUES ('Jane seemed strong')`);
 
+    // Three views of the same tenant, differing only in whether anyone
+    // counted the objects in blob storage:
+    //   residue                        - nobody did, which is every caller today
+    //   residueWithPurgedObjectStorage - someone did, and it was empty
+    //   residueWithObjectStorageResidue- someone did, and two CVs are still there
+    // The middle one is why `clean` has to stay reachable, and the last
+    // one is the only way residue_present is reached without a test
+    // hand-building the residue it is supposed to be proving.
     const residue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff);
-    return { residue, residueBeforeAnyData, organizationId: orgA };
+    const residueWithPurgedObjectStorage = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 0
+    });
+    const residueWithObjectStorageResidue = await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+      object_storage_documents: 2
+    });
+    return {
+      residue,
+      residueWithObjectStorageResidue,
+      residueWithPurgedObjectStorage,
+      residueBeforeAnyData,
+      residueMissingSurfaceTable,
+      organizationId: orgA
+    };
+  } finally {
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch {
+      // Best-effort cleanup; the next probe uses a unique suffix.
+    }
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Exercises the guards on caller-supplied counts against a live schema.
+ *
+ * An external count is the one number in the residue that nothing in the
+ * database corroborates, so the guards around it are load-bearing: a NaN
+ * that got through would mark the surface observed and read as "no
+ * residue", which is the exact green-because-nobody-looked failure the
+ * observedSurfaces field exists to close.
+ *
+ * Each case returns the thrown message, or null when the call was
+ * accepted. A test asserting a message therefore cannot be satisfied by
+ * a typo, a connection failure or any other incidental error -- those
+ * propagate out of here rather than being reported as a refusal.
+ */
+export async function probeRetentionExternalCountGuards(
+  databaseUrl: string,
+  cutoff: string
+): Promise<{
+  acceptedUnobservableSurface: RetentionResidue;
+  refusedSelfCountedSurface: string | null;
+  refusedExistingTable: string | null;
+  refusedNonInteger: string | null;
+  refusedNegative: string | null;
+}> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `recon_guard_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+
+  async function refusal(externalCounts: Readonly<Record<string, number>>): Promise<string | null> {
+    try {
+      await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, externalCounts);
+      return null;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("observeRetentionResidue:")) {
+        // Anything that is not this function's own refusal is a real
+        // failure and must not be reported to the caller as a guard
+        // firing.
+        throw error;
+      }
+      return error.message;
+    }
+  }
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0009_roles.sql",
+      "0012_file_intakes.sql",
+      "0013_file_intake_validation.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [orgA]);
+
+    return {
+      acceptedUnobservableSurface: await observeRetentionResidue(databaseUrl, schema, orgA, cutoff, {
+        object_storage_documents: 7
+      }),
+      refusedSelfCountedSurface: await refusal({ file_intakes: 0 }),
+      refusedExistingTable: await refusal({ roles: 0 }),
+      refusedNonInteger: await refusal({ object_storage_documents: Number.NaN }),
+      refusedNegative: await refusal({ object_storage_documents: -1 })
+    };
   } finally {
     try {
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
@@ -4604,6 +5381,12 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
   const orgB = "22222222-2222-4222-8222-222222222222";
   const operator = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const authoriser = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  // REV-001: an ordinary account, the kind every customer's recruiter has.
+  // Nothing about it says platform staff, which is the point.
+  const outsider = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  // REV-001 offboarding: two more operators, both revoked partway through.
+  const departingOperator = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const departingGrantor = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   const rejections: Record<string, string> = {};
 
@@ -4616,7 +5399,13 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       if (message.startsWith("assertSupportAccessIntegrity:")) {
         throw error;
       }
+      // REV-004: the SQLSTATE, not only the message. Which table a
+      // refusal names is the whole finding there, and "did an append-only
+      // trigger fire or did a foreign key" is a distinction a substring
+      // match on prose would make badly.
+      const sqlstate = (error as { code?: unknown }).code;
       rejections[label] = message;
+      rejections[`${label}:sqlstate`] = typeof sqlstate === "string" ? sqlstate : "none";
     }
   };
 
@@ -4640,26 +5429,64 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A'), ($2,'B')`, [orgA, orgB]);
     await admin.query(
-      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Op'), ($3,$4,'Auth')`,
-      [operator, `op_${suffix}@acme.test`, authoriser, `auth_${suffix}@acme.test`]
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Op'), ($3,$4,'Auth'), ($5,$6,'Customer')`,
+      [
+        operator,
+        `op_${suffix}@acme.test`,
+        authoriser,
+        `auth_${suffix}@acme.test`,
+        outsider,
+        `recruiter_${suffix}@customer.test`
+      ]
     );
+    await admin.query(`INSERT INTO users (user_id, email, display_name) VALUES ($1,$2,'Leaving'), ($3,$4,'Leaving')`, [
+      departingOperator,
+      `leaving_op_${suffix}@acme.test`,
+      departingGrantor,
+      `leaving_auth_${suffix}@acme.test`
+    ]);
 
-    const base = `organization_id, operator_user_id, reason, granted_by_user_id, expires_at`;
+    // The allowlist, seeded before any grant: with the operator foreign key
+    // in place, a fixture that creates users but no platform_operators row
+    // would have every grant below refused for the wrong reason. The
+    // outsider is deliberately NOT seeded.
+    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2), ($3), ($4)`, [
+      operator,
+      authoriser,
+      departingOperator,
+      departingGrantor
+    ]);
+
+    const base = `organization_id, operator_user_id, reason_code, ticket_reference, granted_by_user_id, expires_at`;
 
     await expectRejected(
       "self_granted",
       insertGrant(
         "10000000-0000-4000-8000-000000000001",
         base,
-        `'${orgA}', '${operator}', 'looking into a stuck import', '${operator}', clock_timestamp() + interval '1 hour'`
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-101', '${operator}', clock_timestamp() + interval '1 hour'`
       )
     );
+    // REV-002: the free-text reason is gone, so "a reason of tabs and
+    // newlines" is no longer the shape that has to be refused. These two
+    // are: a code outside the closed set, and a ticket reference loose
+    // enough to hold the sentence the column was just relieved of.
     await expectRejected(
-      "whitespace_reason",
+      "reason_code_outside_the_closed_set",
       insertGrant(
         "10000000-0000-4000-8000-000000000002",
         base,
-        `'${orgA}', '${operator}', E'\t\n ', '${authoriser}', clock_timestamp() + interval '1 hour'`
+        `'${orgA}', '${operator}', 'looking into a stuck import', 'AF-101', '${authoriser}', ` +
+          `clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "ticket_reference_holding_free_text",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000012",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'Jane Doe stuck upload', '${authoriser}', ` +
+          `clock_timestamp() + interval '1 hour'`
       )
     );
     await expectRejected(
@@ -4667,7 +5494,7 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       insertGrant(
         "10000000-0000-4000-8000-000000000003",
         base,
-        `'${orgA}', '${operator}', 'long support session', '${authoriser}', clock_timestamp() + interval '25 hours'`
+        `'${orgA}', '${operator}', 'incident_investigation', 'AF-105', '${authoriser}', clock_timestamp() + interval '25 hours'`
       )
     );
     await expectRejected(
@@ -4675,7 +5502,33 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       insertGrant(
         "10000000-0000-4000-8000-000000000004",
         base,
-        `'${orgA}', '${operator}', 'time travel', '${authoriser}', clock_timestamp() - interval '1 hour'`
+        `'${orgA}', '${operator}', 'incident_investigation', 'AF-106', '${authoriser}', clock_timestamp() - interval '1 hour'`
+      )
+    );
+
+    // REV-001: an ordinary user named as the operator. users is global, so
+    // before the allowlist any customer account satisfied the foreign key,
+    // and two colluding accounts could grant each other cross-tenant access
+    // past every other constraint in this migration.
+    await expectRejected(
+      "operator_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000005",
+        base,
+        `'${orgA}', '${outsider}', 'stuck_upload', 'AF-101', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+
+    // REV-001: an allowlisted operator authorised by an ordinary account.
+    // Without the grantor on the allowlist too, an operator and their own
+    // spare customer account satisfy not_self_granted, so dual custody
+    // would mean only that a second account existed.
+    await expectRejected(
+      "grantor_not_allowlisted",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000006",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-101', '${outsider}', clock_timestamp() + interval '1 hour'`
       )
     );
 
@@ -4685,7 +5538,7 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       insertGrant(
         liveGrant,
         base,
-        `'${orgA}', '${operator}', 'investigating a stuck import', '${authoriser}', clock_timestamp() + interval '2 hours'`
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-102', '${authoriser}', clock_timestamp() + interval '2 hours'`
       )
     );
 
@@ -4694,6 +5547,14 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       "event_cites_other_org_grant",
       `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
        VALUES ('${liveGrant}', '${orgB}', '${operator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    // REV-001: an event naming a different person than the grant it cites.
+    // The log would then attribute to one operator an access that only
+    // another's grant authorised.
+    await expectRejected(
+      "event_operator_not_grant_operator",
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${liveGrant}', '${orgA}', '${authoriser}', 'application', '44444444-4444-4444-8444-444444444444')`
     );
     await expectRejected(
       "event_blank_entity_id",
@@ -4712,15 +5573,89 @@ export async function assertSupportAccessIntegrity(databaseUrl: string): Promise
       `UPDATE support_access_events SET entity_id = 'something-else' WHERE support_access_event_id = '${eventId}'`
     );
 
+    // REV-001 offboarding. A grant issued while the operator was active,
+    // then the operator leaves. The old grant must be untouched and still
+    // usable within its window; only NEW grants naming them are refused.
+    const grantBeforeLeaving = "10000000-0000-4000-8000-00000000000b";
+    await admin.query(
+      insertGrant(
+        grantBeforeLeaving,
+        base,
+        `'${orgA}', '${departingOperator}', 'stuck_upload', 'AF-103', '${departingGrantor}', clock_timestamp() + interval '2 hours'`
+      )
+    );
+    const before = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    await admin.query(`UPDATE platform_operators SET revoked_at = clock_timestamp() WHERE user_id IN ($1, $2)`, [
+      departingOperator,
+      departingGrantor
+    ]);
+    await expectRejected(
+      "revoked_operator_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000007",
+        base,
+        `'${orgA}', '${departingOperator}', 'stuck_upload', 'AF-107', '${authoriser}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    await expectRejected(
+      "revoked_grantor_new_grant",
+      insertGrant(
+        "10000000-0000-4000-8000-000000000008",
+        base,
+        `'${orgA}', '${operator}', 'stuck_upload', 'AF-108', '${departingGrantor}', clock_timestamp() + interval '1 hour'`
+      )
+    );
+    const after = await admin.query<{ row: string }>(
+      `SELECT row_to_json(g)::text AS row FROM support_access_grants g WHERE grant_id = $1`,
+      [grantBeforeLeaving]
+    );
+    if (before.rows[0]?.row === undefined || before.rows[0].row !== after.rows[0]?.row) {
+      throw new Error("assertSupportAccessIntegrity: revoking an operator changed a grant issued before they left");
+    }
+    // Recorded under an "accepted:" key: this is a path that must SUCCEED,
+    // and the probe throws above if the grant itself was altered.
+    await admin.query(
+      `INSERT INTO support_access_events (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ('${grantBeforeLeaving}', '${orgA}', '${departingOperator}', 'application', '44444444-4444-4444-8444-444444444444')`
+    );
+    rejections["accepted:event_under_grant_issued_before_leaving"] = "accepted";
+
+    // The application qualifies every table with its schema and does not set
+    // search_path, so the trigger's own lookup must not depend on the
+    // inserting session's. Inserted here from a session pointed elsewhere.
+    await admin.query(`SET search_path TO public`);
+    await admin.query(
+      `INSERT INTO "${schema}".support_access_grants (grant_id, ${base})
+       VALUES ('10000000-0000-4000-8000-00000000000c', '${orgA}', '${operator}', 'stuck_upload', 'AF-104',
+               '${authoriser}', clock_timestamp() + interval '1 hour')`
+    );
+    await admin.query(`SET search_path TO "${schema}"`);
+    rejections["accepted:grant_inserted_with_another_search_path"] = "accepted";
+
     await expectRejected("grant_delete", `DELETE FROM support_access_grants WHERE grant_id = '${liveGrant}'`);
     await expectRejected(
       "grant_reason_amended",
-      `UPDATE support_access_grants SET reason = 'a better sounding reason' WHERE grant_id = '${liveGrant}'`
+      `UPDATE support_access_grants SET reason_code = 'incident_investigation' WHERE grant_id = '${liveGrant}'`
     );
     await expectRejected(
       "grant_window_extended",
       `UPDATE support_access_grants SET expires_at = expires_at + interval '1 hour' WHERE grant_id = '${liveGrant}'`
     );
+
+    // REV-004: deleting the organization must be refused BY THE FOREIGN
+    // KEY, not by a cascade running into an append-only trigger.
+    //
+    // Both organization_id columns carried ON DELETE CASCADE. The delete
+    // was refused either way, so nothing was ever at risk -- but the
+    // cascade issues a DELETE against a table whose trigger rejects
+    // DELETE, so the operator got "support_access_grants is append-only"
+    // naming a table they had not mentioned, instead of a foreign key
+    // violation naming organizations. 0006 and 0016 each hit this and
+    // removed the clause; this case is what stops 0022 drifting back.
+    await expectRejected("organization_deleted", `DELETE FROM organizations WHERE organization_id = '${orgA}'`);
 
     // Revocation is the one permitted update, and it is one-way.
     await admin.query(`UPDATE support_access_grants SET revoked_at = clock_timestamp() WHERE grant_id = '${liveGrant}'`);

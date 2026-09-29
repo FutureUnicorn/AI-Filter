@@ -172,7 +172,8 @@ test("a stuck import stays inFlight whether or not a dead-letter was attempted",
         grantId: "grant-1",
         organizationId,
         operatorUserId: "op-1",
-        reason: "customer reported a stuck upload",
+        reasonCode: "stuck_upload",
+        ticketReference: "AF-202",
         grantedByUserId: "op-2",
         grantedAt: "2026-08-29T11:00:00.000Z",
         expiresAt: "2026-08-29T13:00:00.000Z"
@@ -187,4 +188,52 @@ test("a stuck import stays inFlight whether or not a dead-letter was attempted",
   assert.deepEqual(after, before);
   assert.equal(after.inFlight, 1, "the stuck import is still in flight");
   assert.equal(after.failed, 0, "and it is still not counted as failed, which is ticket (b), not fixed here");
+});
+
+// ---- REV-002: the refusal is right only while there is nowhere to land ----
+//
+// Sai's REV-002 asks whether refusing dead_letter for an import job is a
+// gap or a decision. It is a decision, and the argument for it was only
+// in a comment: a dead-letter on an import would write a per-criterion
+// evidence outcome, which changes nothing about the intake, so the next
+// sweep finds it stuck again and the failed-document rate still counts
+// it inFlight. Returning `allowed` would claim work was terminated when
+// it was not.
+//
+// The test above shows that nothing was written when we refuse. It does
+// not show the counterfactual, which is the actual argument. This does:
+// there is no count an import dead-letter could increment, asserted over
+// the shape of FailedDocumentCounts rather than in prose.
+//
+// It is deliberately self-expiring. The moment someone adds the terminal
+// "abandoned" intake state this refusal is waiting for, this test fails
+// and points at authorizeJobAdministration, which is exactly where the
+// refusal then has to be revisited.
+
+test("there is no failed-document count an import dead-letter could land in", () => {
+  const counts: FailedDocumentCounts = {
+    uploaded: 1,
+    quarantined: 0,
+    rejected: 0,
+    extractionEmpty: 0,
+    extractionSucceeded: 0
+  };
+  assert.deepEqual(
+    Object.keys(counts).sort(),
+    ["extractionEmpty", "extractionSucceeded", "quarantined", "rejected", "uploaded"],
+    "FailedDocumentCounts gained or lost a field. If it gained a terminal import state, " +
+      "dead_letter_unsupported_for_import in authorizeJobAdministration is no longer justified " +
+      "and has to be revisited rather than left refusing."
+  );
+
+  // Every terminal count this metric recognises is reached by document
+  // processing, not by an operator's decision: quarantined and rejected
+  // come from validation, extractionEmpty from extraction producing
+  // nothing. None of them is a state an admin action can put an intake
+  // into, which is why an allowed import dead-letter would be a claim
+  // with no row behind it.
+  const rate = summarizeFailedDocuments("org-1", "role-1", counts);
+  assert.equal(rate.inFlight, 1);
+  assert.equal(rate.failed, 0);
+  assert.equal(rate.failedRate, null, "nothing has resolved, so there is no rate to report yet");
 });
