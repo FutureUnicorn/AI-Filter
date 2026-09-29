@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { probeErasedCandidateReconciliation } from "../../packages/db/src/index.ts";
-import { planRetention, reconcileRetention } from "../../packages/domain/src/index.ts";
+import { RETENTION_SURFACES, planRetention, reconcileRetention } from "../../packages/domain/src/index.ts";
 
 // REV-002 / AF-62 / AF-63.
 // A candidate whose data was completely erased must not be reported as
@@ -71,7 +71,22 @@ test("erasing a candidate completely clears residue on redactable surfaces and r
   assert.deepEqual(reportAfter.findings, []);
   assert.equal(
     reportAfter.statement,
-    "Every surface the retention plan covers is empty past the cutoff, and no table is unclassified."
+    // "was measured and is empty", not "is empty". AF-63 added the
+    // distinction and it is the whole point of observedSurfaces: a
+    // surface nobody counted reads as empty otherwise.
+    "Every surface the retention plan covers was measured and is empty past the cutoff, and no table is unclassified."
+  );
+
+  // And the claim above is only worth anything if every surface really was
+  // measured. This probe used to apply a hand-picked list of migrations
+  // ending at 0023, so audit_events, audit_sample_members,
+  // review_timing_spans and support_access_events did not exist in its
+  // schema at all, observeRetentionResidue skipped them as not-present,
+  // and "clean" was partly clean by omission.
+  assert.deepEqual(
+    [...observed.residueAfterErasure.observedSurfaces].sort(),
+    [...RETENTION_SURFACES].sort(),
+    "every planned surface has to have been counted, or clean means less than it says"
   );
 });
 
