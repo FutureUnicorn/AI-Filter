@@ -3,11 +3,11 @@ import test from "node:test";
 
 import {
   SUPPORT_ACCESS_MAX_WINDOW_MS,
+  SUPPORT_ACCESS_REASON_CODES,
   authorizeSupportAccess,
-  prepareSupportAccessReason
+  validateSupportAccessReason
 } from "../../packages/domain/src/index.ts";
 import type { SupportAccessGrant, SupportAccessRequest } from "../../packages/domain/src/index.ts";
-import { redactPii } from "../../packages/security/src/index.ts";
 
 // AF-66: "Any time a founder/operator looks at a specific tenant's data
 // for support reasons, it's logged with a reason -- least-privilege, not
@@ -24,7 +24,8 @@ function grant(overrides: Partial<SupportAccessGrant> = {}): SupportAccessGrant 
     grantId: "99999999-9999-4999-8999-999999999999",
     organizationId: ORG,
     operatorUserId: OPERATOR,
-    reason: "investigating a stuck import reported by the customer",
+    reasonCode: "stuck_upload",
+    ticketReference: "AF-101",
     grantedByUserId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     grantedAt: "2026-08-29T11:00:00.000Z",
     expiresAt: "2026-08-29T13:00:00.000Z",
@@ -103,42 +104,117 @@ test("the maximum window is a day, so a forgotten grant is not a standing hole",
   assert.equal(SUPPORT_ACCESS_MAX_WINDOW_MS, 24 * 60 * 60 * 1000);
 });
 
-test("a reason naming a candidate is redacted before it is stored, using the REAL redactor", () => {
-  // "Looking at jane@example.test's stuck upload" is the natural thing to
-  // type, and it would quietly make the support log a candidate-data
-  // store -- one that outlives retention, because it is an audit record.
-  //
-  // Deliberately the production redactPii rather than a stub: my first
-  // version of this test used a hand-rolled /\S+@\S+/ and passed for the
-  // wrong reason, because that pattern also swallows the trailing "'s".
-  // A stub proves the plumbing; only the real one proves the pairing.
-  const prepared = prepareSupportAccessReason("checking jane@example.test stuck upload", redactPii);
-  assert.ok(!prepared.includes("jane@example.test"), `email survived redaction: ${prepared}`);
-  assert.match(prepared, /checking .* stuck upload/, "the operator's actual reason must survive");
-});
+// ---- REV-002: the redaction never covered the common case ----
+//
+// Both reviewers found this independently. The tests here used to pass
+// an email and a phone number through redactPii and assert they were
+// masked, which is true and is not the question. A support note says
+// "looking at Jane Doe's stuck upload", and a name has no shape for a
+// redactor to match. The retention exemption on support_access_grants
+// rested on that redaction, in a table that rejects DELETE and rejects
+// any UPDATE to the reason, so the name went in and could not come out.
+//
+// The free text is gone rather than better filtered. These tests now
+// pin that, including the demonstration that the old approach was not
+// salvageable.
 
-test("a phone number in a reason is redacted too, not just an email", () => {
-  const prepared = prepareSupportAccessReason("customer called +1 555 010 4477 about this", redactPii);
-  assert.ok(!prepared.includes("555 010 4477"), `phone survived redaction: ${prepared}`);
-});
+// The demonstration that redactPii leaves a name untouched lives in
+// tests/integration/support-access-integrity.test.ts, not here.
+// packages/security imports @signal-audit/contracts by package specifier,
+// so anything reaching redactPii needs built dist, and test:unit:ts does
+// not build. See the architecture guard added alongside this.
 
-test("a reason that is only whitespace is rejected, not defaulted", () => {
-  // A support access whose stated reason is blank is exactly the silent
-  // access this ticket exists to prevent, wearing a row.
-  for (const reason of ["", "   ", "\t\n"]) {
-    assert.throws(
-      () => prepareSupportAccessReason(reason, (value) => value),
-      /at least one non-whitespace character/
+test("a grant carries no field a candidate's name can be written into", () => {
+  // The structural claim the retention exemption now rests on, asserted
+  // over the object rather than over one column: every value on a grant
+  // is a uuid, a reason code from a closed set, a ticket key, or a
+  // timestamp. None of them is free text.
+  const values = Object.entries(grant());
+  for (const [field, value] of values) {
+    if (field === "reasonCode") {
+      assert.ok((SUPPORT_ACCESS_REASON_CODES as readonly string[]).includes(value as string));
+      continue;
+    }
+    if (field === "ticketReference") {
+      assert.match(value as string, /^[A-Z][A-Z0-9]*-[0-9]+$/u);
+      continue;
+    }
+    assert.match(
+      value as string,
+      /^[0-9a-fA-F-]+$|^\d{4}-\d{2}-\d{2}T/u,
+      `${field} is neither an identifier nor a timestamp, so it may be free text`
     );
   }
 });
 
-test("a reason that becomes empty ONLY after redaction is also rejected", () => {
-  // The case a length check on the input would miss: the operator typed
-  // an email address and nothing else, so what survives redaction says
-  // nothing about why.
+test("a reason code outside the closed set is refused", () => {
   assert.throws(
-    () => prepareSupportAccessReason("jane@example.test", () => "   "),
-    /at least one non-whitespace character/
+    () =>
+      validateSupportAccessReason({
+        reasonCode: "looking into a stuck import" as never,
+        ticketReference: "AF-101"
+      }),
+    /must be one of/
   );
+});
+
+test("a ticket reference loose enough to hold a sentence is refused", () => {
+  // The way this change could be undone without anyone editing it: put
+  // the narrative in the other column. The pattern is what stops that,
+  // so it gets the name case explicitly.
+  for (const reference of ["Jane Doe stuck upload", "af-101", "AF101", "", "AF-", "AF-101 Jane"]) {
+    assert.throws(
+      () => validateSupportAccessReason({ reasonCode: "stuck_upload", ticketReference: reference }),
+      /must look like ABC-123/,
+      `"${reference}" must not be accepted as a ticket reference`
+    );
+  }
+});
+
+test("every declared reason code is actually accepted", () => {
+  // So the validator cannot pass the tests above by refusing everything.
+  for (const reasonCode of SUPPORT_ACCESS_REASON_CODES) {
+    validateSupportAccessReason({ reasonCode, ticketReference: "AF-101" });
+  }
+});
+
+// ---- REV-003: the time checks were the one place this failed open ----
+
+test("an expiry that does not parse denies rather than falling through to allowed", () => {
+  // Date.parse returns NaN, every comparison with NaN is false, and the
+  // old form skipped its own denial and reached `allowed: true`. A grant
+  // with a corrupt expiry was a grant with no expiry.
+  assert.deepEqual(authorizeSupportAccess(grant({ expiresAt: "not-a-date" }), REQUEST, NOW), {
+    allowed: false,
+    denialReason: "grant_malformed"
+  });
+});
+
+test("a revocation stored as an unparseable value is treated as a revocation, not as absent", () => {
+  // The only safe reading of "someone wrote something into revoked_at".
+  for (const revokedAt of ["", "   ", "yesterday"]) {
+    assert.deepEqual(
+      authorizeSupportAccess(grant({ revokedAt }), REQUEST, NOW),
+      { allowed: false, denialReason: "grant_malformed" },
+      `revokedAt ${JSON.stringify(revokedAt)} must not be ignored`
+    );
+  }
+});
+
+test("an invalid clock denies, because now is an argument and therefore input", () => {
+  // The same hole one level up. With an Invalid Date, every comparison
+  // in the function is false no matter what the grant says.
+  assert.deepEqual(authorizeSupportAccess(grant(), REQUEST, new Date("nonsense")), {
+    allowed: false,
+    denialReason: "grant_malformed"
+  });
+});
+
+test("a live grant with well-formed timestamps is still allowed", () => {
+  // The control for the three above: they must not be passing because
+  // the function now denies everything.
+  assert.deepEqual(authorizeSupportAccess(grant(), REQUEST, NOW), {
+    allowed: true,
+    grantId: "99999999-9999-4999-8999-999999999999"
+  });
 });
