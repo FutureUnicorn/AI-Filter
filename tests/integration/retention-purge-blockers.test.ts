@@ -239,6 +239,27 @@ const REFERENCE_EXEMPTIONS: ReadonlyArray<{
   readonly reason: string;
 }> = [
   {
+    referencing: "candidate_data_erasures",
+    referenced: "applications",
+    columns: [
+      "application_id",
+      "erasure_id",
+      "erasure_trigger",
+      "executed_at",
+      "organization_id",
+      "requested_by_user_id",
+      "residue",
+      "surfaces_erased"
+    ],
+    reason:
+      "AF-62's erasure receipt. It references applications so a receipt cannot name one that never " +
+      "existed. surfaces_erased and residue are surface names and counts, not anything copied out of " +
+      "the rows being erased, so nothing here is candidate content -- but application_id is a " +
+      "candidate identifier and the row is retained deliberately, because it is the proof the erasure " +
+      "happened. See APPLICATION_LINKED_EXEMPTIONS for the full argument. The column list is what " +
+      "makes this self-expiring: a receipt that grows a column has to be looked at again."
+  },
+  {
     referencing: "import_finalizations",
     referenced: "file_intakes",
     columns: ["created_at", "finalization_id", "idempotency_key", "intake_id", "mapping"],
@@ -467,7 +488,18 @@ test("the identifier really cannot be deleted or blanked on either polymorphic s
 const APPLICATION_LINKED_EXEMPTIONS: ReadonlyArray<{
   readonly table: string;
   readonly reason: string;
-}> = [];
+}> = [
+  {
+    table: "candidate_data_erasures",
+    reason:
+      "AF-62's erasure receipt, and the one table on this list whose exemption does not rest on the " +
+      "identifier being harmless. It rests on what the row is for: it records that a candidate's data " +
+      "WAS erased, on whose authority, and what survived. Purging it destroys the only evidence that " +
+      "the deletion it documents ever happened, which is the demonstrability the erasure exists to " +
+      "satisfy in the first place. Every other exemption argued from the data being uninteresting, and " +
+      "AF-61 REV-001 is the record of how badly that argument goes."
+  }
+];
 
 test("every table carrying application_id is a planned retention surface", async () => {
   const { tableColumns } = await assertRetentionPurgeBlockers(databaseUrl());
@@ -481,6 +513,10 @@ test("every table carrying application_id is a planned retention surface", async
   // has to be classified or argued away.
   assert.deepEqual(linked, [
     "audit_sample_members",
+    // AF-62's erasure receipt. Listed here as a table that carries the
+    // identifier, and exempted below on what the row is for, so the two
+    // facts stay separate: it is not that this identifier is harmless.
+    "candidate_data_erasures",
     "candidate_decisions",
     "evidence_outcomes",
     "import_rows",
