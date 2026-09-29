@@ -38,7 +38,19 @@ CREATE TABLE IF NOT EXISTS privacy_requests (
   due_at timestamptz NOT NULL,
   extended_at timestamptz,
   extension_reason text,
-  completed_at timestamptz,
+  -- REV-002: resolved_at, not completed_at.
+  --
+  -- The point of recording a due date is to answer "were we compliant on
+  -- this request" afterwards, and half of that was unanswerable from the
+  -- row. A completed request carried its own timestamp; a refused one
+  -- carried none, so establishing when a refusal happened meant joining
+  -- privacy_request_events for the occurred_at of the transition. Two
+  -- terminal states, two different queries, and only one of them obvious.
+  --
+  -- resolved_by_user_id was already symmetric across both terminal states,
+  -- which is what makes the timestamp's asymmetry an oversight rather than
+  -- a design. The CHECK below now mirrors that one exactly.
+  resolved_at timestamptz,
   refusal_reason text,
   -- What the requester was actually told, including any residue AF-62
   -- could not erase. Null until the request is resolved.
@@ -53,8 +65,8 @@ CREATE TABLE IF NOT EXISTS privacy_requests (
     CHECK ((subject_kind = 'candidate') = (application_id IS NOT NULL)),
   -- A resolved request has a resolver and a timestamp; an open one has
   -- neither. Without this, "completed" is a word rather than a record.
-  CONSTRAINT privacy_requests_completion_is_recorded
-    CHECK ((status = 'completed') = (completed_at IS NOT NULL)),
+  CONSTRAINT privacy_requests_resolution_is_recorded
+    CHECK ((status IN ('completed', 'refused')) = (resolved_at IS NOT NULL)),
   CONSTRAINT privacy_requests_refusal_has_a_reason
     CHECK ((status = 'refused') = (refusal_reason IS NOT NULL)),
   CONSTRAINT privacy_requests_resolution_is_attributed
@@ -134,10 +146,32 @@ CREATE TRIGGER privacy_request_events_reject_truncate
 -- request_id is already the primary key, so this adds no new restriction.
 -- It exists so privacy_request_extensions can name the pair in a composite
 -- foreign key and make a cross-tenant extension unrepresentable.
-ALTER TABLE privacy_requests
-  DROP CONSTRAINT IF EXISTS privacy_requests_id_org_key;
-ALTER TABLE privacy_requests
-  ADD CONSTRAINT privacy_requests_id_org_key UNIQUE (request_id, organization_id);
+-- Added only when absent, never dropped and re-added.
+--
+-- The drop-then-add form is this repo's usual way of making a constraint
+-- replay-safe, and it is wrong for this one: privacy_request_extensions
+-- below declares a composite foreign key against this exact key, so once
+-- that table exists the DROP fails with "cannot drop constraint ...
+-- because other objects depend on it". The migrate service replays every
+-- .sql file on every run, so this file applied cleanly the first time and
+-- failed on every run after -- including any `pnpm db:migrate` on an
+-- environment that already had it.
+--
+-- A guarded ADD is the right shape wherever a constraint is referenced by
+-- something else, which is the same reason 0022_support_access.sql guards
+-- its own composite key rather than dropping it.
+DO $privacy_requests_id_org_key$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = format('%I.privacy_requests', current_schema())::regclass
+       AND conname = 'privacy_requests_id_org_key'
+  ) THEN
+    ALTER TABLE privacy_requests
+      ADD CONSTRAINT privacy_requests_id_org_key UNIQUE (request_id, organization_id);
+  END IF;
+END
+$privacy_requests_id_org_key$;
 
 CREATE TABLE IF NOT EXISTS privacy_request_extensions (
   extension_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -262,3 +296,31 @@ DROP TRIGGER IF EXISTS privacy_request_extensions_reject_truncate ON privacy_req
 CREATE TRIGGER privacy_request_extensions_reject_truncate
   BEFORE TRUNCATE ON privacy_request_extensions
   FOR EACH STATEMENT EXECUTE FUNCTION reject_append_only_mutation();
+
+-- REV-002 upgrade path. The table definition above is skipped wholesale on
+-- a database that already ran an earlier version of this file, so the
+-- rename has to be stated again as an ALTER. Written to be a no-op the
+-- second time, since the migrate service replays this file on every run.
+DO $privacy_requests_resolved_at$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'privacy_requests'
+       AND column_name = 'completed_at'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'privacy_requests'
+       AND column_name = 'resolved_at'
+  ) THEN
+    ALTER TABLE privacy_requests RENAME COLUMN completed_at TO resolved_at;
+  END IF;
+END
+$privacy_requests_resolved_at$;
+
+ALTER TABLE privacy_requests
+  DROP CONSTRAINT IF EXISTS privacy_requests_completion_is_recorded;
+ALTER TABLE privacy_requests
+  DROP CONSTRAINT IF EXISTS privacy_requests_resolution_is_recorded;
+ALTER TABLE privacy_requests
+  ADD CONSTRAINT privacy_requests_resolution_is_recorded
+  CHECK ((status IN ('completed', 'refused')) = (resolved_at IS NOT NULL));

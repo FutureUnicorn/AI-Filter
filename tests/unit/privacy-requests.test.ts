@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  PRIVACY_REQUEST_MAX_EXTENSION_MONTHS,
-  PRIVACY_REQUEST_RESPONSE_MONTHS,
   addCalendarMonths,
   canExtendPrivacyRequest,
   computePrivacyRequestDueDate,
   describeDeletionRequestOutcome,
   describeExportRequestOutcome,
+  describePrivacyRequestTimeliness,
   isPrivacyRequestOverdue,
   isPrivacyRequestTerminal,
   planCandidateDataErasure,
+  PRIVACY_REQUEST_MAX_EXTENSION_MONTHS,
+  PRIVACY_REQUEST_RESPONSE_MONTHS,
   summarizeCandidateDataErasureResidue,
   validatePrivacyRequestExtensionMonths,
   validatePrivacyRequestTransition
@@ -140,7 +141,17 @@ test("a deletion request is not reported as satisfied while residue remains", ()
   // The case this exists for: answering "yes, deleted" to someone who
   // explicitly asked, while their verbatim quote is still stored, is the
   // false statement AF-61 and AF-62 were both built to avoid.
-  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"));
+  // The run outcome is required with no default (AF-62 REV-008), and the
+  // values here are the BEST case on purpose: the intake was erased, the
+  // object was deleted, nothing still references it. The answer is still
+  // not complete, because the append-only surfaces are what block it --
+  // which is the point. Passing a pessimistic outcome would let this test
+  // pass for the wrong reason.
+  const residue = summarizeCandidateDataErasureResidue(planCandidateDataErasure("retention_expiry"), {
+    intakeErased: true,
+    objectStorageDeleted: true,
+    applicationsStillReferencingIntake: 0
+  });
   const outcome = describeDeletionRequestOutcome(residue);
   assert.equal(outcome.kind, "delete");
   assert.equal(outcome.complete, false, "residue is outstanding, so the answer is not complete");
@@ -154,4 +165,104 @@ test("an export request is answerable in full, and must name its surfaces", () =
   assert.equal(outcome.complete, true);
   assert.match(outcome.statement, /applications; evidence_outcomes/);
   assert.throws(() => describeExportRequestOutcome([]), /must name the surfaces/);
+});
+
+// ---- REV-002: the retrospective half of the deadline ----
+//
+// isPrivacyRequestOverdue answers "is this still open and past due",
+// which is the operational half and is correct. The half a regulator or
+// an internal audit asks -- was this request answered in time -- had no
+// support, and the data only carried half of it: a completed request
+// recorded completed_at, a refused one recorded nothing, so dating a
+// refusal meant joining privacy_request_events. resolved_by_user_id was
+// already symmetric across both terminal states, which is what made the
+// timestamp an oversight rather than a design.
+
+function resolved(
+  status: "completed" | "refused",
+  resolvedAt: string
+): PrivacyRequestClock {
+  return {
+    status,
+    receivedAt: "2026-01-05T09:00:00.000Z",
+    dueAt: "2026-02-05T09:00:00.000Z",
+    resolvedAt
+  };
+}
+
+test("a request answered before its deadline reads as on time, whichever way it was answered", () => {
+  // Both terminal states, because the asymmetry was the finding.
+  for (const status of ["completed", "refused"] as const) {
+    assert.equal(
+      describePrivacyRequestTimeliness(resolved(status, "2026-02-01T09:00:00.000Z")),
+      "on_time",
+      `a ${status} request answered four days early must read as on time`
+    );
+  }
+});
+
+test("a request answered after its deadline reads as late, and keeps reading late forever", () => {
+  for (const status of ["completed", "refused"] as const) {
+    assert.equal(describePrivacyRequestTimeliness(resolved(status, "2026-02-06T09:00:00.000Z")), "late");
+  }
+  // The distinction from isPrivacyRequestOverdue, stated: that one goes
+  // false the moment a request is resolved, whatever the resolution cost.
+  // A late answer must not launder itself into compliance by being given.
+  const lateButAnswered = resolved("completed", "2026-03-01T09:00:00.000Z");
+  assert.equal(isPrivacyRequestOverdue(lateButAnswered, new Date("2026-06-01T09:00:00.000Z")), false);
+  assert.equal(describePrivacyRequestTimeliness(lateButAnswered), "late");
+});
+
+test("answering exactly on the deadline is answering in time", () => {
+  assert.equal(describePrivacyRequestTimeliness(resolved("completed", "2026-02-05T09:00:00.000Z")), "on_time");
+});
+
+test("an unresolved request is unresolved, not compliant and not a breach", () => {
+  // Three outcomes rather than a boolean. Collapsing "not answered yet"
+  // into either side would either count an open request as compliant or
+  // count it as a breach twice, once here and once via
+  // isPrivacyRequestOverdue.
+  for (const status of ["received", "in_progress"] as const) {
+    assert.equal(
+      describePrivacyRequestTimeliness({
+        status,
+        receivedAt: "2026-01-05T09:00:00.000Z",
+        dueAt: "2026-02-05T09:00:00.000Z"
+      }),
+      "unresolved"
+    );
+  }
+});
+
+test("a terminal request with no resolution timestamp is refused, not passed", () => {
+  // The schema forbids it -- privacy_requests_resolution_is_recorded is an
+  // equivalence -- so reaching this means the value came from somewhere
+  // other than that table. Answering on_time would be an unearned pass for
+  // a request nobody can date.
+  assert.throws(
+    () =>
+      describePrivacyRequestTimeliness({
+        status: "refused",
+        receivedAt: "2026-01-05T09:00:00.000Z",
+        dueAt: "2026-02-05T09:00:00.000Z"
+      }),
+    /must carry resolvedAt/
+  );
+});
+
+test("an unreadable timestamp is refused rather than taken as on time", () => {
+  // NaN compares false against everything, so an unparseable value would
+  // silently take the on_time branch. Same fail-open shape AF-66 REV-003
+  // removed from authorizeSupportAccess.
+  assert.throws(() => describePrivacyRequestTimeliness(resolved("completed", "not-a-date")), /readable timestamps/);
+  assert.throws(
+    () =>
+      describePrivacyRequestTimeliness({
+        status: "completed",
+        receivedAt: "2026-01-05T09:00:00.000Z",
+        dueAt: "nonsense",
+        resolvedAt: "2026-02-01T09:00:00.000Z"
+      }),
+    /readable timestamps/
+  );
 });
