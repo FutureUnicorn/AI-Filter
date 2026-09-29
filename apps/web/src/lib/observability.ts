@@ -34,6 +34,12 @@ export const WEB_OPERATIONS = [
   // rubric.* already sit in.
   "organization.list",
   "invite.create",
+  // Review #88 round 5, REV-002: the invite-accept action moved off
+  // POST /api/auth/magic-link/redeem (the token can no longer reach that
+  // route's JSON body, see auth/confirm/accept/route.ts) into its own
+  // route, which needs its own name for the same reason invite.create has
+  // one rather than collapsing into web.request.
+  "auth.invite_confirm.accept",
   "web.request"
 ] as const;
 

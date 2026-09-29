@@ -1,5 +1,11 @@
 import { loadEnvironmentConfig } from "@signal-audit/config";
-import { getUserByEmail, peekMagicLinkTokenIsInvite, redeemMagicLinkToken } from "@signal-audit/db";
+import {
+  getUserByEmail,
+  peekInviteDetails,
+  peekMagicLinkTokenIsInvite,
+  redeemMagicLinkToken,
+  type InvitePeek
+} from "@signal-audit/db";
 import { createSessionToken, hashMagicLinkToken, verifyMagicLinkToken } from "@signal-audit/security";
 
 import { readSessionSecret } from "./session";
@@ -41,6 +47,39 @@ export async function isRedeemableInviteToken(token: string): Promise<boolean> {
   const config = loadEnvironmentConfig(process.env);
   return peekMagicLinkTokenIsInvite(config.database.url, config.database.schema, hashMagicLinkToken(token));
 }
+
+/**
+ * What `/auth/confirm` needs to render before the person clicks (review
+ * #88 round 5, REV-003): which organization, which role, and -- the case
+ * that matters most -- whether accepting replaces a role they already
+ * hold. Undefined for anything that is not a currently-live invite token.
+ */
+export async function peekInviteConfirmationDetails(token: string): Promise<InvitePeek | undefined> {
+  const config = loadEnvironmentConfig(process.env);
+  return peekInviteDetails(config.database.url, config.database.schema, hashMagicLinkToken(token));
+}
+
+/**
+ * The cookie `GET /auth/redeem` sets in place of the query string it used
+ * to put the raw invite token in (review #88 round 5, REV-002): that
+ * redirect target is what the browser actually navigates to and renders,
+ * not an intermediate the browser never shows, so the token was in the
+ * address bar, in history, and in the `Referer` of any cross-origin
+ * subresource `/auth/confirm` loaded. `HttpOnly` keeps it out of reach of
+ * any script running on that page; `path` scopes it to the two routes that
+ * ever need it, so it is never attached to a request anywhere else in the
+ * app.
+ */
+export const INVITE_CONFIRM_COOKIE_NAME = "invite_confirm_token";
+export const INVITE_CONFIRM_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  path: "/auth/confirm",
+  // Short: this cookie only ever needs to survive from the redirect to the
+  // click that follows it, not anywhere near the token's own expiry.
+  maxAge: 10 * 60
+} as const;
 
 export async function redeemMagicLinkForSession(token: string): Promise<MagicLinkRedemption> {
   const config = loadEnvironmentConfig(process.env);

@@ -4,7 +4,13 @@ import { SESSION_COOKIE_NAME } from "@signal-audit/security";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
-import { SESSION_COOKIE_OPTIONS, isRedeemableInviteToken, redeemMagicLinkForSession } from "../../../lib/magic-link";
+import {
+  INVITE_CONFIRM_COOKIE_NAME,
+  INVITE_CONFIRM_COOKIE_OPTIONS,
+  SESSION_COOKIE_OPTIONS,
+  isRedeemableInviteToken,
+  redeemMagicLinkForSession
+} from "../../../lib/magic-link";
 import { captureServerError, withServerOperation } from "../../../lib/observability";
 
 export const dynamic = "force-dynamic";
@@ -60,14 +66,19 @@ async function handleGET(request: NextRequest): Promise<Response> {
     // Non-mutating (review #88, REV-011): a still-live invite token defers
     // to a confirmation step instead of being consumed by this GET, so a
     // mail scanner's prefetch cannot provision or change a membership on
-    // the invitee's behalf. The token stays in the query string here only
-    // because this redirect is same-origin and server-issued, never shown
-    // to the browser as the page it lands on -- unlike the outcomes below,
-    // which deliberately drop it.
+    // the invitee's behalf.
+    //
+    // The token travels in an HttpOnly cookie, not the query string (review
+    // #88 round 5, REV-002): the browser follows this redirect, so
+    // `/auth/confirm` genuinely is the page it lands on and renders --
+    // putting the token there would put a live bearer credential in the
+    // address bar, in history (which survives the later navigation away),
+    // and in the `Referer` of any cross-origin subresource that page loads.
+    // Scoped to `/auth/confirm` so it is never attached anywhere else.
     if (await isRedeemableInviteToken(token)) {
-      const confirmUrl = new URL("/auth/confirm", origin);
-      confirmUrl.searchParams.set("token", token);
-      return NextResponse.redirect(confirmUrl, { headers });
+      const response = NextResponse.redirect(new URL("/auth/confirm", origin), { headers });
+      response.cookies.set(INVITE_CONFIRM_COOKIE_NAME, token, INVITE_CONFIRM_COOKIE_OPTIONS);
+      return response;
     }
 
     const redemption = await redeemMagicLinkForSession(token);

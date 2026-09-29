@@ -431,7 +431,8 @@ async function provisionInvitedMembership(
   email: string,
   organizationId: string,
   role: MembershipRole,
-  replaceExistingRole: boolean
+  replaceExistingRole: boolean,
+  tokenHash: string
 ): Promise<void> {
   const displayName = email.split("@")[0] || email;
   const userResult = await client.query<{ user_id: string }>(
@@ -478,11 +479,12 @@ async function provisionInvitedMembership(
   // membership the caller never agreed to replace. FOR UPDATE locks this
   // row for the rest of the transaction, so a concurrent grant cannot land
   // between this check and the upsert.
-  const currentMembership = await client.query<{ role: MembershipRole }>(
-    `SELECT role FROM "${schema}".memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+  const currentMembership = await client.query<{ membership_id: string; role: MembershipRole }>(
+    `SELECT membership_id, role FROM "${schema}".memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
     [organizationId, userId]
   );
   const currentRole = currentMembership.rows[0]?.role;
+  const membershipId = currentMembership.rows[0]?.membership_id;
   if (currentRole !== undefined && currentRole !== role && !replaceExistingRole) {
     throw new Error(
       `invite would change ${email}'s role in organization ${organizationId} from ${currentRole} to ${role} ` +
@@ -527,6 +529,91 @@ async function provisionInvitedMembership(
      ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
+
+  // Review #88 round 5, REV-001: written here, not at invite creation,
+  // because this is the only point where `currentRole` is a value the
+  // transaction actually holds a lock on and is about to act on -- the
+  // `from` in this row is true at the instant it is written, which a
+  // creation-time read committed and released long before redemption
+  // cannot promise. `membershipId` is already in hand from the same
+  // locked SELECT above, so there is no second read to go stale between.
+  //
+  // No audit row at all when currentRole is undefined (a brand new
+  // membership) or already equals role (previewInviteEffect's "unchanged"
+  // case redeemed with nothing to say): neither is a role change.
+  if (currentRole !== undefined && currentRole !== role && membershipId !== undefined) {
+    // The actor and request id for this row are recovered from the
+    // `membership_invite` row this same token's creation already wrote,
+    // rather than threaded through as a fresh parameter, for the same
+    // reason that row is written at creation and not here: the admin who
+    // authorized this is only known to have been a member at the moment
+    // they acted, and audit_events' own membership trigger (below) checks
+    // that against the *current* member set, not a historical one. Using
+    // the recorded authorizer keeps this row honestly attributed to who
+    // actually decided, rather than to the invitee whose click merely
+    // triggered this transaction -- consistent with why redemption itself
+    // has never been the place authorship is recorded in this system.
+    // to_regclass never throws for a name that does not resolve, unlike
+    // selecting from the table itself would -- which matters inside this
+    // transaction, since a failed statement here would abort the
+    // membership upsert already committed to it, not just this lookup.
+    // audit_events does not exist at all in some deliberately reduced
+    // probe schemas (assertMagicLinkRlsSafety applies only prefixes
+    // `0002`-`0004` and `0027`, to isolate RLS mechanics from the audit
+    // trail this table belongs to); checked rather than assumed present.
+    const auditEventsExists = await client.query<{ exists: boolean }>(
+      `SELECT to_regclass('"${schema}".audit_events') IS NOT NULL AS exists`
+    );
+    let actor: { actor_user_id: string; request_id: string } | undefined;
+    if (auditEventsExists.rows[0]?.exists === true) {
+      const authorization = await client.query<{ actor_user_id: string; request_id: string }>(
+        `SELECT actor_user_id, request_id FROM "${schema}".audit_events
+          WHERE organization_id = $1 AND entity_type = 'membership_invite' AND entity_id = $2
+          LIMIT 1`,
+        [organizationId, tokenHash]
+      );
+      actor = authorization.rows[0];
+    }
+    if (actor === undefined) {
+      // No membership_invite row to attribute this to: either audit_events
+      // does not exist in this schema (above), or this token was
+      // constructed directly via createMagicLinkToken rather than through
+      // createInviteMagicLinkToken, which is the only thing that ever
+      // writes one. That second case is exactly as unaudited today as
+      // createMagicLinkToken itself always was -- it writes no
+      // membership_invite row either, so there was never an authorization
+      // record to lose. Every invite POST /api/invites actually mints
+      // goes through createInviteMagicLinkToken, which always writes this
+      // row in the same transaction as the token, so this branch is
+      // reachable only from direct package-level use (tests, tooling),
+      // never from that route. Skipped, not thrown: refusing the role
+      // change here would make a legitimate, merely-unattributed change
+      // impossible instead.
+    } else {
+      // The roles travel in entity_id because audit_events has no column
+      // for them, and adding one to an append-only table is not a change
+      // to make in passing. Semantic content in entity_id has precedent
+      // here: the kill-switch path writes "engaged"/"disengaged" rather
+      // than an id. The membership id leads the value so the row still
+      // joins.
+      //
+      // audit_events' own trigger requires actor_user_id to currently be a
+      // member of organizationId (0006_audit_events_delete_and_membership_fixes.sql).
+      // If the admin who authorized this has since left the organization,
+      // this INSERT -- and so this whole redemption -- fails loudly rather
+      // than silently applying a role change with no valid attribution
+      // left to record. That is a real, accepted narrowing versus
+      // redeeming unconditionally: an authorization this system can no
+      // longer stand behind does not get to take effect merely because
+      // nobody updated the link.
+      await client.query(
+        `INSERT INTO "${schema}".audit_events
+           (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+         VALUES ($1, $2, 'admin_action', 'membership_role_change', $3, $4)`,
+        [organizationId, actor.actor_user_id, `${membershipId}:${currentRole}->${role}`, actor.request_id]
+      );
+    }
+  }
 }
 
 /**
@@ -802,29 +889,6 @@ export interface CreateInviteMagicLinkTokenInput {
     readonly requestId: string;
   };
   /**
-   * Present when this invite replaces an existing member's role, so the
-   * effect lands in the audit trail and not only the intent.
-   *
-   * Review #88, REV-002: the `membership_invite` row records that an invite
-   * was minted. It does not record that member X went from `recruiter` to
-   * `auditor`, and redemption writes no audit row at all -- so the durable
-   * half of the trail carried the act and not its consequence, on exactly
-   * the invariant AF-20 and POL-001 exist for.
-   *
-   * It is recorded here, at creation, rather than at redemption, because
-   * this is where the accountable human is. The person clicking the link is
-   * not the person who decided; `magic_link_tokens` does not carry an
-   * inviter, and audit_events' membership trigger would reject a row naming
-   * an actor who has since been offboarded, turning an old invite into an
-   * unredeemable one. The admin who authorized the change is the honest
-   * actor and is known right here.
-   */
-  readonly roleChange?: {
-    readonly membershipId: string;
-    readonly from: MembershipRole;
-    readonly to: MembershipRole;
-  };
-  /**
    * The caller's Idempotency-Key, honoured rather than merely validated
    * (review #88, REV-007). A retry after a timeout must not mint a second
    * live credential, a second audit trail and a second email for one
@@ -854,9 +918,19 @@ export interface CreateInviteMagicLinkTokenInput {
 
 export type CreateInviteOutcome =
   | { readonly outcome: "created" }
-  /** This exact request, replayed under the same key: nothing was written
-   * and nothing should be sent. */
-  | { readonly outcome: "replayed" }
+  /**
+   * This exact request, replayed under the same key: nothing was written,
+   * and nothing should be sent again for a delivery that already
+   * succeeded.
+   *
+   * `delivered` is false when the first attempt's token and audit rows
+   * committed but its mail send never confirmed (review #88 round 5,
+   * REV-004) -- a client retrying the 503 that response produces must not
+   * be told 202, since nothing has ever gone out for this invite and the
+   * conventional response to a 503 is exactly the retry that would land
+   * here.
+   */
+  | { readonly outcome: "replayed"; readonly delivered: boolean }
   /** The key was reused for a different request. Refused, not replayed:
    * silently discarding the second request would tell its caller it
    * succeeded when nothing was created for it. */
@@ -932,19 +1006,22 @@ export async function createInviteMagicLinkToken(
         // that won the race. Read back what actually claimed the key and
         // compare, the same distinction claimIdempotentRequest draws
         // between `replay` and `fingerprint_mismatch`.
-        const existing = await client.query<{ idempotency_fingerprint: string | null }>(
-          `SELECT idempotency_fingerprint FROM "${schema}".magic_link_tokens
+        const existing = await client.query<{
+          idempotency_fingerprint: string | null;
+          delivered_at: Date | null;
+        }>(
+          `SELECT idempotency_fingerprint, delivered_at FROM "${schema}".magic_link_tokens
             WHERE organization_id = $1 AND idempotency_key = $2`,
           [input.invite.organizationId, input.idempotencyKey]
         );
-        const existingFingerprint = existing.rows[0]?.idempotency_fingerprint;
-        if (existingFingerprint === undefined) {
+        const existingRow = existing.rows[0];
+        if (existingRow?.idempotency_fingerprint === undefined) {
           // Only reachable if the row was deleted between the two
           // statements, which nothing here does. Reported rather than
           // silently treated as either outcome.
           throw new Error("invite idempotency record vanished between claim and read");
         }
-        if (existingFingerprint !== fingerprint) {
+        if (existingRow.idempotency_fingerprint !== fingerprint) {
           // A different request reused this key. Refused, not replayed:
           // treating it as a replay would answer 202 for an invite that
           // was never created, which is the exact failure mode reported
@@ -953,7 +1030,7 @@ export async function createInviteMagicLinkToken(
           return { outcome: "conflict" };
         }
         await client.query("COMMIT");
-        return { outcome: "replayed" };
+        return { outcome: "replayed", delivered: existingRow.delivered_at !== null };
       }
       await appendAuditEvent(
         databaseUrl,
@@ -968,35 +1045,57 @@ export async function createInviteMagicLinkToken(
         },
         client
       );
-      if (input.roleChange !== undefined) {
-        // Same transaction as the token, so an authorized role change cannot
-        // exist without the record of who authorized it.
-        //
-        // The roles travel in entity_id because audit_events has no column
-        // for them, and adding one to an append-only table is not a change to
-        // make in passing. Semantic content in entity_id has precedent here:
-        // the kill-switch path writes "engaged"/"disengaged" rather than an
-        // id. The membership id leads the value so the row still joins.
-        await appendAuditEvent(
-          databaseUrl,
-          schema,
-          {
-            organizationId: input.invite.organizationId,
-            actorUserId: input.audit.actorUserId,
-            action: "admin_action",
-            entityType: "membership_role_change",
-            entityId: `${input.roleChange.membershipId}:${input.roleChange.from}->${input.roleChange.to}`,
-            requestId: input.audit.requestId
-          },
-          client
-        );
-      }
+      // Review #88 round 5, REV-001: no `membership_role_change` row is
+      // written here. The role this invite names is only a request until
+      // redemption actually applies it -- redemption can be hours later,
+      // can be refused by `provisionInvitedMembership`'s own guards, or can
+      // never happen at all if the link expires unclicked -- so a row
+      // written here from `previewInviteEffect`'s creation-time read would
+      // assert a transition that has not occurred, from a `from` value
+      // nothing holds a lock on past the moment it was read. Two admins
+      // racing a preview and a redemption could make it record a transition
+      // whose stated starting point was never true at the instant anything
+      // changed. `provisionInvitedMembership` writes the real row, from the
+      // value it locks and actually applies, in the same transaction as the
+      // update it describes -- see the call there for how it recovers the
+      // authorizing actor and request id from this `membership_invite` row.
       await client.query("COMMIT");
       return { outcome: "created" };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     }
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Records that an invite's mail actually went out.
+ *
+ * Review #88 round 5, REV-004: `POST /api/invites` commits the token and
+ * its audit rows before attempting delivery, then answers 503 if the send
+ * fails. Nothing previously distinguished that state from a normal
+ * created-and-sent invite, so a client retrying the 503 -- the
+ * conventional response to one -- replayed into a 202 that claimed
+ * delivery which never happened. Called once, after `sendMagicLink`
+ * confirms; a replay of an invite this was never called for reports
+ * `delivered: false` and the route can answer 503 again instead.
+ *
+ * `IS NULL` in the WHERE clause rather than an unconditional SET: this
+ * marks the first confirmed send, not the most recent call, though nothing
+ * in this route currently calls it more than once per token.
+ */
+export async function markInviteDelivered(databaseUrl: string, schema: string, tokenHash: string): Promise<void> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `UPDATE "${schema}".magic_link_tokens
+          SET delivered_at = clock_timestamp()
+        WHERE token_hash = $1 AND delivered_at IS NULL`,
+      [tokenHash]
+    );
   } finally {
     client.release();
   }
@@ -1042,6 +1141,73 @@ export async function peekMagicLinkTokenIsInvite(
   }
 }
 
+export interface InvitePeek {
+  readonly organizationName: string;
+  readonly role: MembershipRole;
+  /** The invitee's current role, present only when accepting would replace
+   * it with `role` -- undefined for a brand new membership or a role that
+   * already matches, exactly the distinction `previewInviteEffect` draws
+   * at creation. */
+  readonly replacesRole?: MembershipRole;
+}
+
+/**
+ * The detail `/auth/confirm` renders so accepting an invite is an informed
+ * action, not just an explicit one (review #88 round 5, REV-003).
+ *
+ * REV-011's confirmation step establishes that consuming an invite takes a
+ * deliberate click. It does not by itself make that click informed: a
+ * member being replaced into a different role saw the same generic
+ * sentence as someone joining a new organization, and could not tell an
+ * invitation from a change to access they already hold. This is the same
+ * non-mutating peek `peekMagicLinkTokenIsInvite` performs -- a plain read,
+ * advisory only, superseded by whatever `redeemMagicLinkForSession` finds
+ * when the accept action actually runs.
+ *
+ * Returns undefined for anything that is not a currently-live invite
+ * token, the same cases `peekMagicLinkTokenIsInvite` reports `false` for:
+ * the caller falls through to the real redemption either way, which
+ * produces the right invalid/expired/consumed/no_account outcome.
+ */
+export async function peekInviteDetails(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<InvitePeek | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_name: string;
+      role: MembershipRole;
+      current_role: MembershipRole | null;
+    }>(
+      `SELECT o.name AS organization_name, t.role AS role, m.role AS current_role
+         FROM "${schema}".magic_link_tokens t
+         INNER JOIN "${schema}".organizations o ON o.organization_id = t.organization_id
+         LEFT JOIN "${schema}".users u ON u.email = t.email
+         LEFT JOIN "${schema}".memberships m ON m.user_id = u.user_id AND m.organization_id = t.organization_id
+        WHERE t.token_hash = $1
+          AND t.organization_id IS NOT NULL
+          AND t.role IS NOT NULL
+          AND t.consumed_at IS NULL
+          AND t.expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      organizationName: row.organization_name,
+      role: row.role,
+      ...(row.current_role !== null && row.current_role !== row.role ? { replacesRole: row.current_role } : {})
+    };
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Atomic single-use redemption: the UPDATE only ever matches a row once,
  * so two concurrent redemption attempts on the same token cannot both
@@ -1080,7 +1246,8 @@ export async function redeemMagicLinkToken(
             record.email.toLowerCase(),
             record.invite.organizationId,
             record.invite.role,
-            redeemedRow.replace_existing_role === true
+            redeemedRow.replace_existing_role === true,
+            tokenHash
           );
         }
         await client.query("COMMIT");
@@ -1929,7 +2096,12 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
       "0024_invite_idempotency_fingerprint.sql",
       // The persisted replaceExistingRole intent redemption enforces
       // (review #88, REV-010) -- same reasoning as the two migrations above.
-      "0027_invite_role_replacement_intent.sql"
+      "0027_invite_role_replacement_intent.sql",
+      // Tracks whether an invite's mail actually sent, so a replay of one
+      // that never delivered can be told apart from a real repeat send
+      // (review #88 round 5, REV-004) -- same reasoning as the migrations
+      // above.
+      "0028_invite_delivery_tracking.sql"
     ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));

@@ -20,7 +20,7 @@ import {
   createSessionToken,
   hashMagicLinkToken
 } from "../../packages/security/src/index.ts";
-import { loadWebRoute } from "../support/web-route-loader.ts";
+import { loadWebRoute, registerWebRouteResolution } from "../support/web-route-loader.ts";
 
 /**
  * AF-97: can a human get into a freshly migrated deployment at all.
@@ -131,9 +131,28 @@ const { NextRequest } = (await import(nextServerUrl)) as {
   NextRequest: new (url: string, init?: RequestInit) => Request;
 };
 
+/** Review #88 round 5, REV-002: the cookie name is read from the module
+ * that defines it rather than hardcoded here, so a rename cannot silently
+ * make this test stop checking anything.
+ *
+ * Registered before this import, not after: magic-link.ts itself imports
+ * "./session" extensionless, which plain Node ESM cannot resolve any more
+ * than it can resolve a route file's own sibling imports -- the same
+ * problem loadWebRoute's hook exists for, just hit here before any route
+ * has been loaded and registered it. */
+registerWebRouteResolution();
+const magicLinkLibUrl = new URL("../../apps/web/src/lib/magic-link.ts", import.meta.url).href;
+const { INVITE_CONFIRM_COOKIE_NAME, peekInviteConfirmationDetails } = (await import(magicLinkLibUrl)) as {
+  INVITE_CONFIRM_COOKIE_NAME: string;
+  peekInviteConfirmationDetails(token: string): Promise<
+    { readonly organizationName: string; readonly role: string; readonly replacesRole?: string } | undefined
+  >;
+};
+
 const REQUEST_ROUTE = "../../apps/web/src/app/api/auth/magic-link/request/route.ts";
 const REDEEM_ROUTE = "../../apps/web/src/app/api/auth/magic-link/redeem/route.ts";
 const EMAIL_LINK_ROUTE = "../../apps/web/src/app/auth/redeem/route.ts";
+const CONFIRM_ACCEPT_ROUTE = "../../apps/web/src/app/auth/confirm/accept/route.ts";
 const INVITE_ROUTE = "../../apps/web/src/app/api/invites/route.ts";
 const ORGANIZATIONS_ROUTE = "../../apps/web/src/app/api/me/organizations/route.ts";
 const ROLES_ROUTE = "../../apps/web/src/app/api/roles/route.ts";
@@ -141,6 +160,17 @@ const PUBLIC_APP_ORIGIN = "https://canonical.acme.test";
 
 function sessionCookie(userId: string): string {
   return `${SESSION_COOKIE_NAME}=${encodeURIComponent(createSessionToken(userId, SESSION_SECRET))}`;
+}
+
+/** One `Set-Cookie` response header can carry several cookies joined with
+ * a comma by the underlying Headers implementation; this pulls just the
+ * named one's value out, the same thing a browser's cookie jar does. */
+function cookieValueFrom(setCookieHeader: string | null, name: string): string | undefined {
+  if (setCookieHeader === null) {
+    return undefined;
+  }
+  const match = new RegExp(`(?:^|,\\s*)${name}=([^;,]*)`, "u").exec(setCookieHeader);
+  return match?.[1] === undefined ? undefined : decodeURIComponent(match[1]);
 }
 
 function authenticatedJsonRequest(
@@ -1056,9 +1086,26 @@ test("a prefetch of the emailed invite link leaves the token and membership unch
     // no session minted.
     assert.ok(prefetch.status >= 300 && prefetch.status < 400, `expected a redirect, got ${prefetch.status}`);
     const location = prefetch.headers.get("location");
-    assert.ok(location !== null && location.includes("/auth/confirm"), `expected /auth/confirm, got ${location}`);
-    assert.ok(location.includes(`token=${token}`), "the confirmation step needs the token to act on");
-    assert.equal(prefetch.headers.get("set-cookie"), null, "a prefetch must not establish a session");
+    assert.equal(location, `${PUBLIC_APP_ORIGIN}/auth/confirm`, "no query string -- see REV-002");
+    // Review #88 round 5, REV-002: the token travels in an HttpOnly cookie
+    // scoped to /auth/confirm, not the query string of a page the browser
+    // actually renders (address bar, history, Referer). A prefetch still
+    // gets that cookie set -- that alone is not a session -- but never a
+    // SESSION_COOKIE_NAME cookie, which is the thing that would actually
+    // authenticate the scanner as the invitee.
+    const prefetchSetCookie = prefetch.headers.get("set-cookie");
+    assert.ok(prefetchSetCookie !== null, "the confirmation cookie must be set");
+    assert.doesNotMatch(
+      prefetchSetCookie ?? "",
+      new RegExp(`${SESSION_COOKIE_NAME}=`, "u"),
+      "a prefetch must not establish a session"
+    );
+    assert.equal(
+      cookieValueFrom(prefetchSetCookie, INVITE_CONFIRM_COOKIE_NAME),
+      token,
+      "the confirmation step reads the token from this cookie, not from a URL"
+    );
+    assert.match(prefetchSetCookie ?? "", /HttpOnly/iu);
 
     // No membership exists yet: provisioning was deferred, not performed.
     // There is no userId to query directly (no user row exists until
@@ -1083,13 +1130,18 @@ test("a prefetch of the emailed invite link leaves the token and membership unch
     );
 
     // The token the scanner fetched is still live: the confirm step's own
-    // POST (what clicking "Accept invite" actually does) redeems it.
-    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
-    const confirmed = await redeemRoute.POST(
-      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+    // POST (what clicking "Accept invite" actually does) redeems it --
+    // reading the token from the same HttpOnly cookie the prefetch above
+    // received, never from a request body a client script would have had
+    // to be given the raw token to construct (review #88 round 5, REV-002).
+    const confirmAcceptRoute = await loadWebRoute<PostRouteModule>(import.meta.url, CONFIRM_ACCEPT_ROUTE);
+    const confirmed = await confirmAcceptRoute.POST(
+      new NextRequest("http://localhost:3000/auth/confirm/accept", {
         method: "POST",
-        headers: { "content-type": "application/json", "Idempotency-Key": "prefetch-confirm" },
-        body: JSON.stringify({ token })
+        headers: {
+          "Idempotency-Key": "prefetch-confirm",
+          cookie: `${INVITE_CONFIRM_COOKIE_NAME}=${token}`
+        }
       })
     );
     assert.equal(confirmed.status, 200, await confirmed.clone().text());
@@ -1097,6 +1149,11 @@ test("a prefetch of the emailed invite link leaves the token and membership unch
     assert.deepEqual(
       (await listOrganizationsForUser(databaseUrl, schema, confirmedBody.userId)).map((o) => o.role),
       ["recruiter"]
+    );
+    assert.match(
+      confirmed.headers.get("set-cookie") ?? "",
+      new RegExp(`${SESSION_COOKIE_NAME}=`, "u"),
+      "accepting must establish a session"
     );
 
     // And having been redeemed, the same token cannot be spent a second
@@ -1361,6 +1418,313 @@ test("reusing an Idempotency-Key with a different replaceExistingRole intent is 
       assert.equal(body.error.code, "idempotency_key_conflict");
     });
     assert.equal(/[?&]token=/u.test(second), false);
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88 round 5, REV-001 (hemnaath04, blocking). The membership_invite
+// row's own actor and request id are attributable and correct -- they are
+// read at invite creation, when the admin issuing it is definitely still a
+// member. What was wrong was the *role-change* row: it recorded
+// `${membershipId}:${from}->${to}` from previewInviteEffect's creation-time
+// read, committed and released long before redemption, with nothing holding
+// a lock on that membership in between. This proves the fix directly: an
+// invite opts in to replacing whatever role it finds (replaceExistingRole:
+// true), a second, independent grant changes the role to something REV-010's
+// preview never saw, and the first invite's own redemption still applies
+// (its opt-in covers "some other role", not one specific one) -- so the
+// audit row must show the role redemption actually found, not the one
+// creation did.
+test("the role-change audit row records the role redemption actually found, not the one creation previewed", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `stale-from-owner-${Date.now()}@acme.test`;
+  const memberEmail = `stale-from-member-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Stale From Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+    const member = await seedMemberThroughInvite(
+      databaseUrl,
+      schema,
+      owner,
+      memberEmail,
+      "recruiter",
+      "stale-from-seed"
+    );
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const redeemRoute = await loadWebRoute<PostRouteModule>(import.meta.url, REDEEM_ROUTE);
+
+    // Issued while the member is "recruiter" -- previewInviteEffect sees
+    // (and, before this fix, would have recorded) recruiter as the "from".
+    const staleEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "auditor",
+            replaceExistingRole: true
+          },
+          "stale-from-invite",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const staleToken = extractToken(staleEmitted);
+
+    // An independent second grant lands before the first invite is
+    // redeemed, changing the role to a THIRD value the first invite's own
+    // creation-time preview never saw. Its own replaceExistingRole opt-in
+    // (this is itself a role replacement, recruiter -> admin) is unrelated
+    // to the first invite's -- each is checked against the membership
+    // state its own creation actually saw.
+    const interleaveEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "admin",
+            replaceExistingRole: true
+          },
+          "stale-from-interleave",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const interleaveRedeemed = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "stale-from-interleave-redeem" },
+        body: JSON.stringify({ token: extractToken(interleaveEmitted) })
+      })
+    );
+    assert.equal(interleaveRedeemed.status, 200, await interleaveRedeemed.clone().text());
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["admin"]
+    );
+
+    // The first invite's opt-in was to replacing whatever role exists, not
+    // specifically "recruiter" -- REV-010's guard checks only that the
+    // token opted in at all, so this redeems and applies "auditor" over
+    // "admin", not over "recruiter".
+    const redeemed = await redeemRoute.POST(
+      new NextRequest("http://localhost:3000/api/auth/magic-link/redeem", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "stale-from-redeem" },
+        body: JSON.stringify({ token: staleToken })
+      })
+    );
+    assert.equal(redeemed.status, 200, await redeemed.clone().text());
+    assert.deepEqual(
+      (await listOrganizationsForUser(databaseUrl, schema, member.userId)).map((o) => o.role),
+      ["auditor"]
+    );
+
+    // The durable row must say admin->auditor -- the true transition this
+    // redemption applied -- never recruiter->auditor, which is what a
+    // creation-time read would have claimed and which was never true at
+    // any instant anything actually changed.
+    const membershipId = await getMembershipIdForEmail(
+      databaseUrl,
+      schema,
+      owner.organizationId,
+      memberEmail
+    );
+    assert.ok(membershipId !== undefined);
+    const trueTransition = await listAuditEventsForEntity(
+      databaseUrl,
+      schema,
+      "membership_role_change",
+      `${membershipId}:admin->auditor`
+    );
+    assert.equal(trueTransition.length, 1);
+    assert.equal(trueTransition[0]?.actorUserId, owner.userId);
+
+    const staleTransition = await listAuditEventsForEntity(
+      databaseUrl,
+      schema,
+      "membership_role_change",
+      `${membershipId}:recruiter->auditor`
+    );
+    assert.equal(
+      staleTransition.length,
+      0,
+      "no row may claim a transition from a role that was never true at the moment of the write"
+    );
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88 round 5, REV-003 (hemnaath04, non-blocking). Accepting an
+// invite is an explicit action (REV-011); this is what makes it an
+// informed one -- the organization, the role, and whether accepting
+// replaces a role the recipient already holds.
+test("the invite peek reports the organization, role, and any role it would replace", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `peek-owner-${Date.now()}@acme.test`;
+  const newEmail = `peek-new-${Date.now()}@acme.test`;
+  const memberEmail = `peek-member-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Peek Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+    await seedMemberThroughInvite(databaseUrl, schema, owner, memberEmail, "recruiter", "peek-seed");
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+
+    // A brand new membership: nothing is being replaced.
+    const newInviteEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          { email: newEmail, organizationId: owner.organizationId, role: "recruiter" },
+          "peek-new-invite",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const newInvitePeek = await peekInviteConfirmationDetails(extractToken(newInviteEmitted));
+    assert.deepEqual(newInvitePeek, { organizationName: "Peek Co", role: "recruiter" });
+
+    // A role replacement: the recipient's current role must be reported so
+    // accepting is not indistinguishable from joining fresh.
+    const replaceInviteEmitted = await captureStderr(async () => {
+      const response = await inviteRoute.POST(
+        authenticatedJsonRequest(
+          "http://localhost:3000/api/invites",
+          {
+            email: memberEmail,
+            organizationId: owner.organizationId,
+            role: "auditor",
+            replaceExistingRole: true
+          },
+          "peek-replace-invite",
+          owner.userId
+        )
+      );
+      assert.equal(response.status, 202, await response.clone().text());
+    });
+    const replaceInvitePeek = await peekInviteConfirmationDetails(extractToken(replaceInviteEmitted));
+    assert.deepEqual(replaceInvitePeek, {
+      organizationName: "Peek Co",
+      role: "auditor",
+      replacesRole: "recruiter"
+    });
+
+    // Not a currently-live invite token at all: undefined, the same
+    // "advisory, not authoritative" contract isRedeemableInviteToken has.
+    assert.equal(await peekInviteConfirmationDetails("not-a-real-token"), undefined);
+  } finally {
+    await dropProbeSchema(databaseUrl, schema);
+  }
+});
+
+// Review #88 round 5, REV-004 (hemnaath04, non-blocking). A 503 here is the
+// conventional signal to retry, and the token/audit rows are already
+// committed by the time it is returned -- so a retry under the same
+// Idempotency-Key must not be told 202 for a mail that was never sent.
+test("retrying an invite whose delivery failed answers 503 again, not 202", async () => {
+  const databaseUrl = requireDatabase();
+  const schema = await provisionRouteProbeSchema(databaseUrl);
+  const ownerEmail = `undelivered-owner-${Date.now()}@acme.test`;
+  const inviteeEmail = `undelivered-invitee-${Date.now()}@acme.test`;
+  try {
+    applyRouteEnvironment(databaseUrl, schema);
+    const owner = await bootstrapOrganizationOwner(databaseUrl, schema, {
+      organizationName: "Undelivered Co",
+      email: ownerEmail,
+      displayName: "Dana Ops"
+    });
+
+    const inviteRoute = await loadWebRoute<PostRouteModule>(import.meta.url, INVITE_ROUTE);
+    const body = { email: inviteeEmail, organizationId: owner.organizationId, role: "recruiter" };
+    const key = "undelivered-retry";
+
+    // A hosted environment with delivery pointed at a closed port: the HTTP
+    // sender's fetch rejects, a real provider failure needing no network
+    // access (same technique magic-link-route.test.ts uses).
+    Object.assign(process.env, {
+      APP_ENV: "staging",
+      MAGIC_LINK_EMAIL_ENDPOINT: "http://127.0.0.1:1/send",
+      MAGIC_LINK_EMAIL_API_KEY: "test-key",
+      MAGIC_LINK_EMAIL_FROM: "no-reply@acme.test"
+    });
+    try {
+      const first = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, key, owner.userId)
+      );
+      assert.equal(first.status, 503, await first.clone().text());
+
+      // The token and its audit row still committed: a second, differently
+      // keyed invite for the same address must see an existing membership
+      // shape, not a clean slate. Simpler and more direct here: read the
+      // token straight out of magic_link_tokens is not exposed, so this
+      // instead confirms the replay path itself, below, which only exists
+      // for a request that did commit.
+
+      // The retry a client conventionally makes after a 503: same key,
+      // still-broken delivery. Must answer 503 again, never 202 -- nothing
+      // has ever been sent for this invite.
+      const secondStillBroken = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, key, owner.userId)
+      );
+      assert.equal(secondStillBroken.status, 503, await secondStillBroken.clone().text());
+
+      // Restoring delivery does not change the answer for THIS key: a
+      // replay never re-attempts sending, by design (REV-007's own
+      // "nothing is re-sent" contract) -- only a fresh key triggers a real
+      // send, which is exactly what the 503's own message already says to
+      // do ("Issue it again").
+      delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
+      delete process.env.MAGIC_LINK_EMAIL_API_KEY;
+      delete process.env.MAGIC_LINK_EMAIL_FROM;
+      process.env.APP_ENV = "test";
+      const thirdDeliveryRestored = await inviteRoute.POST(
+        authenticatedJsonRequest("http://localhost:3000/api/invites", body, key, owner.userId)
+      );
+      assert.equal(
+        thirdDeliveryRestored.status,
+        503,
+        "a replay must never claim success for a send it never attempted"
+      );
+
+      // A genuinely new key, issued the way the 503 tells the admin to,
+      // succeeds normally.
+      const freshKeyEmitted = await captureStderr(async () => {
+        const response = await inviteRoute.POST(
+          authenticatedJsonRequest(
+            "http://localhost:3000/api/invites",
+            body,
+            "undelivered-retry-fresh-key",
+            owner.userId
+          )
+        );
+        assert.equal(response.status, 202, await response.clone().text());
+      });
+      assert.match(freshKeyEmitted, /open: /u);
+    } finally {
+      delete process.env.MAGIC_LINK_EMAIL_ENDPOINT;
+      delete process.env.MAGIC_LINK_EMAIL_API_KEY;
+      delete process.env.MAGIC_LINK_EMAIL_FROM;
+    }
   } finally {
     await dropProbeSchema(databaseUrl, schema);
   }

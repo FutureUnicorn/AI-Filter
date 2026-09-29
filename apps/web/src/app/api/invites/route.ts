@@ -9,8 +9,8 @@ import {
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
   createInviteMagicLinkToken,
-  getMembershipIdForEmail,
   getMembershipsForUser,
+  markInviteDelivered,
   previewInviteEffect
 } from "@signal-audit/db";
 import {
@@ -79,7 +79,7 @@ async function handlePOST(request: NextRequest): Promise<Response> {
     const error = buildApiError({
       requestId,
       code: "invalid_request",
-      message: "Body must be { email, organizationId, role }."
+      message: "Body must be { email, organizationId, role, replaceExistingRole? }."
     });
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
@@ -162,16 +162,6 @@ async function handlePOST(request: NextRequest): Promise<Response> {
       });
     }
 
-    const roleChange =
-      effect.outcome === "changes_role"
-        ? await getMembershipIdForEmail(
-            config.database.url,
-            config.database.schema,
-            parsed.data.organizationId,
-            parsed.data.email
-          )
-        : undefined;
-
     const generated = generateMagicLinkToken();
     const creation = await createInviteMagicLinkToken(config.database.url, config.database.schema, {
       idempotencyKey,
@@ -184,10 +174,7 @@ async function handlePOST(request: NextRequest): Promise<Response> {
       email: parsed.data.email,
       invite: { organizationId: parsed.data.organizationId, role: parsed.data.role },
       expiresAt: generated.expiresAt,
-      audit: { actorUserId: userId, requestId },
-      ...(effect.outcome === "changes_role" && roleChange !== undefined
-        ? { roleChange: { membershipId: roleChange, from: effect.from, to: effect.to } }
-        : {})
+      audit: { actorUserId: userId, requestId }
     });
 
     if (creation.outcome === "conflict") {
@@ -208,8 +195,26 @@ async function handlePOST(request: NextRequest): Promise<Response> {
     }
 
     if (creation.outcome === "replayed") {
-      // This key already minted an invite. Nothing was written, and nothing
-      // is sent: re-delivering would put a second live link in the
+      if (!creation.delivered) {
+        // Review #88 round 5, REV-004: the first attempt's token and audit
+        // rows committed, but its mail send never confirmed -- answering
+        // 202 here, the ordinary replay response, would tell a client that
+        // retried the 503 below that delivery succeeded when nothing has
+        // ever been sent for this invite. Answering the same 503 again
+        // keeps that promise honest; issuing a new invite under a new key
+        // remains the actual fix, exactly as the message says.
+        const error = buildApiError({
+          requestId,
+          code: "service_unavailable",
+          message: "The invite was created but could not be emailed. Issue it again once delivery is restored."
+        });
+        return Response.json(error.body, {
+          status: error.status,
+          headers: withRequestId(undefined, requestId)
+        });
+      }
+      // This key already minted an invite and confirmed delivery. Nothing
+      // is re-sent: re-delivering would put a second live link in the
       // recipient's mailbox for one act. The 202 is the same as the first
       // call's, which is the point of the header.
       return new Response(null, { status: 202, headers: withRequestId(undefined, requestId) });
@@ -233,6 +238,10 @@ async function handlePOST(request: NextRequest): Promise<Response> {
         link,
         purpose: effect.outcome === "changes_role" ? "role_change" : "invite"
       });
+      // Review #88 round 5, REV-004: recorded only once the send confirms,
+      // so a retry that reaches this key's replay branch can tell a
+      // delivered invite from one whose mail never went out.
+      await markInviteDelivered(config.database.url, config.database.schema, generated.tokenHash);
     } catch (deliveryError) {
       // Reported honestly, unlike the login endpoint's deliberate silence.
       // That endpoint is unauthenticated, so telling the caller anything
