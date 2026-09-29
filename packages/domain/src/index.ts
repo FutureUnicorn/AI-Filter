@@ -1841,146 +1841,6 @@ export function selectAuditSample(
     sampledApplicationIds: ordered.slice(0, Math.max(0, size)).map((candidate) => candidate.applicationId)
   };
 }
-
-// ---- AF-53: keyboard-first review navigation ----
-//
-// "Recruiters reviewing hundreds of applications need keyboard-driven
-// navigation between cards and source context, not mouse-only review."
-//
-// The decision layer lives here, in a pure function, for a reason worth
-// stating: this repository has no DOM test infrastructure -- no jsdom,
-// no testing-library, tests run under node --test. Keyboard handling
-// written directly into a component would therefore be shipped
-// untested, and the parts most likely to be wrong are not the event
-// plumbing but the RULES: which keys are claimed, when they are not
-// claimed, and where the boundaries are. Those are decidable without a
-// browser, so they are decided here and exhaustively tested, and the
-// component is left as thin glue over them.
-
-export type ReviewKeyAction =
-  | "next"
-  | "previous"
-  | "first"
-  | "last"
-  | "open"
-  | "reveal-source"
-  | "help"
-  | "none";
-
-export interface ReviewKeyEvent {
-  readonly key: string;
-  readonly ctrlKey?: boolean;
-  readonly metaKey?: boolean;
-  readonly altKey?: boolean;
-  /**
-   * True when focus is inside a text field or contenteditable region.
-   * The caller determines this from the DOM; this module will not guess.
-   */
-  readonly editingText?: boolean;
-}
-
-/**
- * Two refusals come before any binding is considered, and they matter
- * more than the bindings do.
- *
- * A shortcut that fires while a recruiter is typing a correction
- * rationale eats their input -- and AF-50 requires that rationale, so
- * the damage lands on the one field the system insists on. `editingText`
- * suppresses everything.
- *
- * A shortcut that fires with Ctrl, Meta or Alt held steals a browser or
- * operating-system binding: Cmd+K, Ctrl+F, Alt+Left. An application
- * that takes those is harder to use with a keyboard, not easier, which
- * inverts the ticket. Shift is NOT in that list on purpose -- `?` and
- * `G` require it on most layouts, so refusing Shift would refuse two of
- * the bindings below.
- */
-export function resolveReviewKeyAction(event: ReviewKeyEvent): ReviewKeyAction {
-  if (event.editingText === true) {
-    return "none";
-  }
-  if (event.ctrlKey === true || event.metaKey === true || event.altKey === true) {
-    return "none";
-  }
-  switch (event.key) {
-    case "j":
-    case "ArrowDown":
-      return "next";
-    case "k":
-    case "ArrowUp":
-      return "previous";
-    case "g":
-    case "Home":
-      return "first";
-    case "G":
-    case "End":
-      return "last";
-    case "Enter":
-      return "open";
-    case "s":
-      return "reveal-source";
-    case "?":
-      return "help";
-    default:
-      return "none";
-  }
-}
-
-/**
- * Clamped, never wrapped.
- *
- * A review queue that loops from the last candidate back to the first
- * re-presents people who have already been looked at as though they are
- * new, and gives no signal that the list ended. In a tool whose whole
- * purpose is that a human actually saw each candidate, silently
- * restarting is the wrong failure. Reaching the end and staying there
- * is legible; wrapping is not.
- */
-export function nextReviewIndex(action: ReviewKeyAction, currentIndex: number, itemCount: number): number {
-  if (itemCount <= 0) {
-    return -1;
-  }
-  const clamp = (index: number): number => Math.min(Math.max(index, 0), itemCount - 1);
-  switch (action) {
-    case "next":
-      return clamp(currentIndex + 1);
-    case "previous":
-      return clamp(currentIndex - 1);
-    case "first":
-      return 0;
-    case "last":
-      return itemCount - 1;
-    case "open":
-    case "reveal-source":
-    case "help":
-    case "none":
-      return clamp(currentIndex);
-    default:
-      return clamp(currentIndex);
-  }
-}
-
-export interface ReviewShortcut {
-  readonly keys: readonly string[];
-  readonly description: string;
-}
-
-/**
- * Published so the UI renders the same list the resolver implements,
- * rather than a hand-maintained copy that drifts. A keyboard interface
- * nobody can discover is a mouse-only interface with extra steps, so
- * this is part of the feature rather than documentation of it.
- */
-export const REVIEW_SHORTCUTS: readonly ReviewShortcut[] = [
-  { keys: ["j", "↓"], description: "Next" },
-  { keys: ["k", "↑"], description: "Previous" },
-  { keys: ["g", "Home"], description: "First" },
-  { keys: ["G", "End"], description: "Last" },
-  { keys: ["Enter"], description: "Open the focused item" },
-  { keys: ["s"], description: "Reveal the source citation for the focused card" },
-  { keys: ["?"], description: "Show these shortcuts" }
-];
-
 // ---- AF-54: capture recruiter review timing ----
 //
 // "Time-per-application in the review queue, needed as the baseline for
@@ -2011,12 +1871,28 @@ export interface ReviewTimingSummary {
    * is the specific way this metric could flatter the product.
    */
   readonly medianActiveMs: number | null;
-  /** Applications with at least one usable span. The denominator. */
+  /** Applications whose review time is FULLY observed. The denominator. */
   readonly sampleSize: number;
   /** Applications in scope, whether or not they were ever opened. */
   readonly population: number;
   /** Spans excluded because an idle cutoff ended them. */
   readonly truncatedSpanCount: number;
+  /**
+   * Applications kept out of the denominator because at least one of
+   * their spans hit an idle cutoff, so their total is a lower bound
+   * rather than a measurement.
+   *
+   * Reported at application grain because truncatedSpanCount cannot
+   * answer the question that matters to a reader: how much of the scope
+   * was dropped. sampleSize + partiallyObservedCount accounts for every
+   * application that produced a span. The remainder of population is
+   * mostly applications nobody has opened, but not only those: AF-54's
+   * capture path discards a span with no active time, so a candidate
+   * opened and closed again immediately arrives here indistinguishable
+   * from one never opened. This summary sees spans, not visits, and
+   * must not be read as if it saw visits.
+   */
+  readonly partiallyObservedCount: number;
 }
 
 /**
@@ -2035,16 +1911,50 @@ export interface ReviewTimingSummary {
  * bias the baseline downward -- again in the direction that flatters a
  * later improvement -- and excluding it silently would hide how much
  * data was dropped, which is why the count is reported.
+ *
+ * The whole APPLICATION leaves the denominator, not just the span.
+ * Dropping the span alone keeps an application whose real total is
+ * unknown in the sample carrying only the part we happened to see: one
+ * five-minute visit followed by an idle-truncated one is counted as a
+ * five-minute review. That understates the median, and if every
+ * application has that shape then sampleSize still equals population,
+ * so the result carries no limitation at all and reads as a complete
+ * measurement. Understating the assisted median overstates the
+ * reduction, which is the one direction this metric must never fail in.
+ *
+ * What remains and cannot be fixed here: a long review is likelier to be
+ * interrupted than a short one, so the applications this drops are not a
+ * random subset, and the surviving median still leans short. That is why
+ * the count is published rather than only the exclusion -- a reader who
+ * sees most of the scope dropped should not treat the remainder as the
+ * role's review time.
  */
 export function summarizeReviewTiming(
   spans: readonly ReviewTimingSpan[],
   population: number
 ): ReviewTimingSummary {
   const truncatedSpanCount = spans.filter((span) => span.truncatedByIdle).length;
-  const usable = spans.filter((span) => !span.truncatedByIdle);
+  const partiallyObserved = new Set(
+    spans.filter((span) => span.truncatedByIdle).map((span) => span.applicationId)
+  );
 
   const totalByApplication = new Map<string, number>();
-  for (const span of usable) {
+  for (const span of spans) {
+    if (partiallyObserved.has(span.applicationId)) {
+      continue;
+    }
+    // A zero-duration span is not a measurement. AF-54 now refuses to
+    // accept or store one, at the contract and at the database, but rows
+    // written before those constraints existed are still readable here,
+    // and this summary is what decides whether an application counts.
+    //
+    // Excluding it rather than summing it matters in both directions: a
+    // zero would pull the assisted median down and inflate the reported
+    // review-time reduction, and it would inflate sampleSize, which is the
+    // number AF-60 uses to say whether the figure can be trusted at all.
+    if (span.activeMs <= 0) {
+      continue;
+    }
     totalByApplication.set(span.applicationId, (totalByApplication.get(span.applicationId) ?? 0) + span.activeMs);
   }
 
@@ -2057,7 +1967,8 @@ export function summarizeReviewTiming(
     medianActiveMs: sampleSize === 0 ? null : median(totals),
     sampleSize,
     population,
-    truncatedSpanCount
+    truncatedSpanCount,
+    partiallyObservedCount: partiallyObserved.size
   };
 }
 
@@ -2202,7 +2113,16 @@ export const METRIC_LIMITATION_CODES = [
    * says the two sides were measured differently, this one says some of
    * the reference side was thrown away as unusable.
    */
-  "adjudication_not_independent"
+  "adjudication_not_independent",
+  /**
+   * AF-57. Part of the denominator counts as examined on the strength of
+   * a record about the candidate rather than about the item being
+   * counted. Like the two codes above, this is about the KIND of data
+   * and not the amount: the examination fact is at a coarser grain than
+   * the unit of the metric, so a larger sample does not make it any more
+   * certain that any single item was read.
+   */
+  "examination_inferred"
 ] as const;
 
 export type MetricLimitationCode = (typeof METRIC_LIMITATION_CODES)[number];
@@ -2388,12 +2308,31 @@ export function identifyStuckJobs(
   now: Date,
   thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
 ): readonly StuckJob[] {
+  // REV-004: a timestamp that does not parse must trip this, not skip it.
+  // Date.parse returns NaN for a malformed value, every comparison against
+  // NaN is false, and "not yet past the threshold" is the false branch, so a
+  // bad waitingSince used to push the job as stuck and retryable with
+  // stuckForMs NaN, and one NaN in the comparator scrambled the triage
+  // order. Thrown rather than skipped: waitingSince comes from database
+  // timestamps, so a malformed one is a bug upstream, and quietly leaving
+  // the job out would hide a job that may really be stuck. Same choice as
+  // summarizeFailedDocuments on bad counts.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("identifyStuckJobs requires a valid now, got an invalid Date");
+  }
   const stuck: StuckJob[] = [];
   for (const observation of observations) {
     if (observation.terminal) {
       continue;
     }
-    const waitedMs = now.getTime() - Date.parse(observation.waitingSince);
+    const waitingSinceMs = Date.parse(observation.waitingSince);
+    if (!Number.isFinite(waitingSinceMs)) {
+      throw new Error(
+        `identifyStuckJobs: job ${observation.jobId} has an unparseable waitingSince: ${JSON.stringify(observation.waitingSince)}`
+      );
+    }
+    const waitedMs = nowMs - waitingSinceMs;
     const threshold =
       observation.kind === "import" ? thresholds.importStuckAfterMs : thresholds.extractionStuckAfterMs;
     if (waitedMs < threshold) {
@@ -2426,32 +2365,101 @@ export interface JobAdministrationRequest {
   readonly operatorUserId: string;
 }
 
+/**
+ * REV-005: the key set above is enforced by the compiler, in the gate.
+ *
+ * The earlier "test" read Object.keys of the test's own fixture, so adding a
+ * field here, optional or not, left the fixture and the test unchanged and
+ * green. The claim that adding a field fails a test was false. tests/ are
+ * not type-checked in this repository, but this file is (pnpm typecheck,
+ * part of pnpm check), so the assertion lives here: adding, removing or
+ * renaming any key of JobAdministrationRequest, including an optional one,
+ * is a compile error. If a new key is genuinely needed, the change has to
+ * come here and say why candidate content still has nowhere to go.
+ */
+type ExactlyTheseKeys<T, K extends PropertyKey> = [Exclude<keyof T, K>, Exclude<K, keyof T>] extends [never, never]
+  ? true
+  : false;
+type AssertTrue<T extends true> = T;
+export type JobAdministrationRequestKeysAreFixed = AssertTrue<
+  ExactlyTheseKeys<JobAdministrationRequest, "jobId" | "action" | "reason" | "operatorUserId">
+>;
+
 export type JobAdministrationRefusal =
   | "job_not_stuck"
+  | "job_mismatch"
+  | "dead_letter_unsupported_for_import"
   | "job_already_terminal"
   | "retries_exhausted"
   | "reason_required"
   | "not_authorized";
 
 export type JobAdministrationDecision =
-  | { readonly allowed: true; readonly action: JobAdministrationAction; readonly attempt: number }
-  | { readonly allowed: false; readonly refusal: JobAdministrationRefusal };
+  | {
+      readonly allowed: true;
+      readonly action: JobAdministrationAction;
+      readonly attempt: number;
+      /** The AF-66 grant that permitted this, so the admin_action audit event can name it. */
+      readonly grantId: string;
+    }
+  | {
+      readonly allowed: false;
+      readonly refusal: JobAdministrationRefusal;
+      /** Present when the refusal is not_authorized: why AF-66 said no. */
+      readonly supportAccessDenial?: SupportAccessDenialReason;
+    };
 
 /**
- * `supportAccessAllowed` is passed in rather than computed here, because
- * the authority to touch a tenant's jobs is AF-66's decision and this
- * module has no business re-deriving it. Passing `false` is refused
- * outright: an admin action on a tenant's data is a look at that tenant's
- * data plus a write.
+ * The support access an administration request is made under: the grant
+ * the operator holds, if any, and the instant to judge it at.
+ */
+export interface JobAdministrationAccess {
+  readonly grant: SupportAccessGrant | undefined;
+  readonly now: Date;
+}
+
+/**
+ * REV-001: authority is checked against THIS job, not taken on trust.
+ *
+ * The first version took `supportAccessAllowed: boolean`, which said only
+ * that some AF-66 check had passed somewhere, for some tenant and some
+ * operator. A caller holding support access to tenant A could dead-letter
+ * a job in tenant B, and a dead-letter is append-only, so it could not be
+ * undone: the cross-tenant write AF-66 exists to prevent.
+ *
+ * So this takes the grant and calls authorizeSupportAccess itself, with
+ * the request built from the job's own organization and the request's own
+ * operator. A SupportAccessDecision would not do: its allowed branch
+ * carries only a grantId, so nothing here could check what tenant or
+ * operator it was issued for. It still does not re-derive AF-66's rules;
+ * it asks AF-66 the right question. The job id in the request must also be
+ * the job being decided on, or the caller's intent and the job acted on can
+ * differ.
  */
 export function authorizeJobAdministration(
   job: StuckJob | undefined,
   request: JobAdministrationRequest,
-  supportAccessAllowed: boolean,
+  access: JobAdministrationAccess,
   thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
 ): JobAdministrationDecision {
-  if (!supportAccessAllowed) {
-    return { allowed: false, refusal: "not_authorized" };
+  if (job === undefined) {
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (request.jobId !== job.jobId) {
+    return { allowed: false, refusal: "job_mismatch" };
+  }
+  const support = authorizeSupportAccess(
+    access.grant,
+    {
+      organizationId: job.organizationId,
+      operatorUserId: request.operatorUserId,
+      entityType: "job",
+      entityId: job.jobId
+    },
+    access.now
+  );
+  if (!support.allowed) {
+    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
   }
   if (!/[^\s]/u.test(request.reason)) {
     // Same rule as AF-66's grant reason. An unexplained retry is
@@ -2459,17 +2467,27 @@ export function authorizeJobAdministration(
     // reason discards a candidate silently.
     return { allowed: false, refusal: "reason_required" };
   }
-  if (job === undefined) {
-    return { allowed: false, refusal: "job_not_stuck" };
-  }
   if (job.terminal) {
     return { allowed: false, refusal: "job_already_terminal" };
   }
+  if (request.action === "dead_letter" && job.kind === "import") {
+    // REV-002: refused, because it cannot be done honestly yet. An import
+    // job is stuck because a validated intake has no canonical text, and a
+    // dead-letter here would only write a per-criterion evidence outcome,
+    // which changes nothing about the intake: the next sweep finds it stuck
+    // again, and summarizeFailedDocuments keeps it inFlight rather than
+    // failed. Returning allowed would claim the work was terminated when it
+    // was not. This is not a permanent product decision: import
+    // dead-lettering needs a terminal "abandoned" intake state that AF-57's
+    // failed-document rate counts as failed, which is its own ticket.
+    // Retrying an import is still allowed, bounded as below.
+    return { allowed: false, refusal: "dead_letter_unsupported_for_import" };
+  }
   if (request.action === "dead_letter") {
-    // Always available. Refusing to dead-letter a job that has not yet
-    // exhausted its retries would leave an operator with no way to stop a
-    // document that is provably never going to parse.
-    return { allowed: true, action: "dead_letter", attempt: job.attempts };
+    // Always available for extraction jobs. Refusing to dead-letter one
+    // that has not yet exhausted its retries would leave an operator with
+    // no way to stop a document that is provably never going to parse.
+    return { allowed: true, action: "dead_letter", attempt: job.attempts, grantId: support.grantId };
   }
   if (!job.retryable || job.attempts >= thresholds.maxAttempts) {
     // Bounded, because an unbounded retry on a permanently broken
@@ -2477,8 +2495,25 @@ export function authorizeJobAdministration(
     // never terminates.
     return { allowed: false, refusal: "retries_exhausted" };
   }
-  return { allowed: true, action: "retry", attempt: job.attempts + 1 };
+  return { allowed: true, action: "retry", attempt: job.attempts + 1, grantId: support.grantId };
 }
+
+/**
+ * REV-003: what a hiring reviewer reads on a dead-lettered criterion.
+ *
+ * A fixed system sentence, never the operator's words, redacted or not.
+ * The first version stored the operator's free-text reason as the
+ * outcome's message, and evidence_outcomes is append-only while
+ * buildEvidenceCard renders a failed outcome's message verbatim, so
+ * "Looking at Jane Doe's stuck upload" would have been written permanently
+ * into candidate evidence and shown to everyone reviewing that candidate.
+ *
+ * Redacting the text first would not have fixed it: free text cannot be
+ * sanitised by pattern (redactPii matches email addresses and phone numbers,
+ * so a name passes through untouched). The fix is to remove the path, which
+ * is why buildDeadLetterOutcome takes no reason at all.
+ */
+export const DEAD_LETTER_EXPLANATION = "Processing was stopped by support.";
 
 /**
  * The outcome recorded when a job is dead-lettered.
@@ -2489,23 +2524,29 @@ export function authorizeJobAdministration(
  * candidate's card set -- a dead-lettered candidate is visible as one the
  * system gave up on, not absent.
  *
- * No organizationId/candidateId here, because ExtractionErrorEvidence on
+ * `failed`, not `extraction_error`: FailedEvidence is "retries are
+ * exhausted or not applicable", which is an operator giving up.
+ * ExtractionErrorEvidence is a raw pipeline break. The two are
+ * structurally identical, so only this discriminant tells them apart, and
+ * evidence_outcomes is append-only: a mis-tagged row can never be fixed.
+ *
+ * It takes no reason, deliberately: there is no parameter through which
+ * operator free text could reach this append-only row (REV-003).
+ *
+ * No organizationId/candidateId here, because FailedEvidence on
  * this stack does not carry them: AF-13's review added attribution to
  * every outcome kind on the develop line, which this stack predates. The
  * fields arrive when develop merges down, and this call site will stop
  * compiling until they are supplied -- which is the correct way to find
  * out, rather than a silently unattributed outcome.
  */
-export function buildDeadLetterOutcome(criterionId: string, reason: string): EvidenceOutcome {
-  if (!/[^\s]/u.test(reason)) {
-    throw new Error("a dead-letter outcome requires a non-whitespace reason");
-  }
+export function buildDeadLetterOutcome(criterionId: string): EvidenceOutcome {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
-    kind: "extraction_error",
+    kind: "failed",
     criterionId,
     errorCode: "dead_lettered_by_operator",
-    message: reason,
+    message: DEAD_LETTER_EXPLANATION,
     // Not retryable: that is the whole meaning of dead-lettering, and a
     // retryable dead-letter would be picked up again by the same job
     // sweep that produced it.
@@ -2539,13 +2580,78 @@ export type SupportAccessDenialReason =
   | "grant_expired"
   | "grant_revoked"
   | "grant_for_other_organization"
-  | "grant_for_other_operator";
+  | "grant_for_other_operator"
+  /**
+   * REV-003: a timestamp on the grant, or the clock it is compared
+   * against, is not a date this code can read. Its own reason rather
+   * than being folded into grant_expired, because the two call for
+   * different action: an expired grant is the system working, and a
+   * grant whose expiry cannot be parsed means something upstream wrote
+   * or mapped a row wrong, which is a bug someone has to go and find.
+   */
+  | "grant_malformed";
+
+/**
+ * Why an operator is looking, as a closed set rather than free text.
+ *
+ * REV-002, raised independently by both reviewers. The previous design
+ * stored a free-text reason and redacted it through redactPii on the
+ * way in, and the retention exemption for support_access_grants rested
+ * on that redaction making the column PII-free. It does not: redactPii
+ * masks email-shaped and phone-shaped substrings, and a support note
+ * says "looking at Jane Doe's stuck upload". The name went in
+ * unchanged, into a table that is exempt from retention, rejects DELETE
+ * and rejects any UPDATE to the reason. There was no way to get it back
+ * out.
+ *
+ * Redaction was the wrong tool for the job. A redactor is a filter that
+ * has to recognise every shape of identifier a human might type, and
+ * names, addresses and dates of birth have no shape. So the free text
+ * is gone rather than better filtered: an operator picks a code and
+ * cites a ticket, and the sentence describing the situation lives in the
+ * ticketing system, which has its own retention policy and its own
+ * deletion story.
+ *
+ * This is a real loss of detail at the grant, and it is the right trade.
+ * The support log's job is to answer "who looked at this tenant, when,
+ * under what authority, and where is the paper trail" -- all four of
+ * which survive. It was never the place to keep the narrative.
+ */
+export const SUPPORT_ACCESS_REASON_CODES = [
+  /** A file intake that did not progress through validation or extraction. */
+  "stuck_upload",
+  /** A CSV import that failed or produced wrong rows. */
+  "failed_import",
+  /** Evidence extraction errored or produced an unusable result. */
+  "extraction_failure",
+  /** A defect the customer reported that needs their data to reproduce. */
+  "customer_reported_defect",
+  /** An active incident where this tenant's data is in scope. */
+  "incident_investigation",
+  /** A data subject exercising a right that requires locating their records. */
+  "data_subject_request"
+] as const;
+
+export type SupportAccessReasonCode = (typeof SUPPORT_ACCESS_REASON_CODES)[number];
+
+/**
+ * A ticket key: letters, then a hyphen, then digits. Deliberately narrow.
+ *
+ * The point of citing a ticket is that the detail lives somewhere with
+ * its own retention, so this column must not become a second free-text
+ * field wearing a pattern. Anything a person might type a name into
+ * fails this.
+ */
+export const SUPPORT_ACCESS_TICKET_REFERENCE_PATTERN = /^[A-Z][A-Z0-9]*-[0-9]+$/u;
 
 export interface SupportAccessGrant {
   readonly grantId: string;
   readonly organizationId: string;
   readonly operatorUserId: string;
-  readonly reason: string;
+  /** Why, from a closed set. See SUPPORT_ACCESS_REASON_CODES. */
+  readonly reasonCode: SupportAccessReasonCode;
+  /** Where the detail lives, under that system's own retention. */
+  readonly ticketReference: string;
   readonly grantedByUserId: string;
   readonly grantedAt: string;
   readonly expiresAt: string;
@@ -2595,38 +2701,84 @@ export function authorizeSupportAccess(
   if (grant.operatorUserId !== request.operatorUserId) {
     return { allowed: false, denialReason: "grant_for_other_operator" };
   }
-  if (grant.revokedAt !== undefined && Date.parse(grant.revokedAt) <= now.getTime()) {
-    return { allowed: false, denialReason: "grant_revoked" };
+  // REV-003: parse before comparing, and deny when the parse fails.
+  //
+  // Date.parse returns NaN for a string it cannot read, and every
+  // comparison with NaN is false, so the previous `Date.parse(x) <=
+  // now.getTime()` form skipped its own denial and fell through to
+  // allowed. A grant whose expiry was corrupt or badly mapped became a
+  // grant with no expiry, and a revocation stored as "" was ignored.
+  // These two checks are the only place this function takes loosely
+  // typed input -- strings off a database row -- so they were the only
+  // place it could fail open, and they did.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    // The same hole one level up: an Invalid Date makes every comparison
+    // below false no matter what the grant says. The clock is an
+    // argument here precisely so a caller controls it, which makes it
+    // input like any other.
+    return { allowed: false, denialReason: "grant_malformed" };
+  }
+  if (grant.revokedAt !== undefined) {
+    const revokedAtMs = Date.parse(grant.revokedAt);
+    if (!Number.isFinite(revokedAtMs)) {
+      // A present but unreadable revocation is treated as a reason to
+      // deny, not as an absent one. Someone wrote something into that
+      // column, and the only safe reading of "this grant may have been
+      // revoked" is that it was.
+      return { allowed: false, denialReason: "grant_malformed" };
+    }
+    if (revokedAtMs <= nowMs) {
+      return { allowed: false, denialReason: "grant_revoked" };
+    }
+  }
+  const expiresAtMs = Date.parse(grant.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return { allowed: false, denialReason: "grant_malformed" };
   }
   // <= rather than <: a grant is dead at its expiry instant, not one
   // millisecond after. The boundary is the case someone will test.
-  if (Date.parse(grant.expiresAt) <= now.getTime()) {
+  if (expiresAtMs <= nowMs) {
     return { allowed: false, denialReason: "grant_expired" };
   }
   return { allowed: true, grantId: grant.grantId };
 }
 
+export interface SupportAccessReason {
+  readonly reasonCode: SupportAccessReasonCode;
+  readonly ticketReference: string;
+}
+
 /**
- * A grant's reason is free text an operator typed, and it is retained.
- * "Looking at Jane Doe's stuck upload" is the natural thing to write,
- * which would quietly make the support log a candidate-data store --
- * and one that outlives retention, since it is an audit record.
+ * The write boundary for a grant's stated reason.
  *
- * Redacting at the boundary keeps the support log free of candidate
- * content, which is what lets it be classified as holding none and
- * retained as an audit trail. The redaction runs BEFORE storage rather
- * than at read time, because a value that was never written cannot leak
- * from a backup, a replica or a log shipper.
+ * There is deliberately no redactor parameter and no free text to pass
+ * through one. A redactor has to recognise every shape of identifier a
+ * human might type, and the most common kind in a support note -- a
+ * name -- has no shape. The previous version of this function took
+ * `redactPii` and returned "Looking at Jane Doe's stuck upload"
+ * unchanged, which is what made the retention exemption on
+ * support_access_grants false.
+ *
+ * Mirrors 0022's CHECKs rather than replacing them: the database is
+ * what a direct INSERT has to get past, and this is what a caller gets
+ * a readable error from.
  */
-export function prepareSupportAccessReason(reason: string, redact: (value: string) => string): string {
-  const redacted = redact(reason);
-  if (!/[^\s]/u.test(redacted)) {
-    // Mirrors 0022's CHECK. Rejected rather than defaulted: a support
-    // access whose stated reason is blank is exactly the silent access
-    // this ticket exists to prevent, wearing a row.
-    throw new Error("a support access reason must contain at least one non-whitespace character");
+export function validateSupportAccessReason(reason: SupportAccessReason): void {
+  if (!(SUPPORT_ACCESS_REASON_CODES as readonly string[]).includes(reason.reasonCode)) {
+    throw new Error(
+      `a support access reason code must be one of ${SUPPORT_ACCESS_REASON_CODES.join(", ")}, ` +
+        `got: ${reason.reasonCode}`
+    );
   }
-  return redacted;
+  if (!SUPPORT_ACCESS_TICKET_REFERENCE_PATTERN.test(reason.ticketReference)) {
+    // Narrow on purpose. A looser pattern would let this column become
+    // the free-text field that was just removed, and it would be exempt
+    // from retention and unredactable in exactly the same way.
+    throw new Error(
+      `a support access ticket reference must look like ABC-123, got: ${reason.ticketReference}`
+    );
+  }
 }
 
 // ---- AF-63: deletion reconciliation ----
@@ -2651,6 +2803,26 @@ export function prepareSupportAccessReason(reason: string, redact: (value: strin
 // not classify as its own finding. An unclassified surface is not
 // automatically a leak; it is automatically unreviewed, which is the
 // thing that must not be silent.
+//
+// **The second way this job could lie is by not measuring a surface at
+// all.** An absent count and a measured zero are the same number, so a
+// surface nothing looked at reads exactly like a surface that was looked
+// at and found empty. object_storage_documents is the live case: it is
+// the only surface the plan calls purgeable, it does not live in
+// Postgres, and nothing counts blob objects, so a tenant whose uploaded
+// CVs are still sitting in storage past the window reconciles
+// `clean: true` -- green because the report never looked, which is the
+// failure this ticket exists to prevent. The same hole opens for any
+// Postgres surface whose table is absent from the schema the observer
+// read.
+//
+// So a measurement is something a residue has to claim explicitly, via
+// `observedSurfaces`, and anything a run did not measure becomes a
+// `not_observed` finding that keeps the report off green. That makes the
+// honest answer representable rather than deferring it: `clean` again
+// means "every surface was looked at, and was empty", and it stays
+// reachable, because a caller that really does list blob storage can
+// supply that count and earn it.
 
 export type ReconciliationFindingKind =
   /** A surface the plan says should be emptied still holds rows past the cutoff. */
@@ -2658,18 +2830,36 @@ export type ReconciliationFindingKind =
   /** A surface the plan already admits it cannot purge. Expected, still reported. */
   | "blocked_as_planned"
   /** A table exists in the schema that the retention plan does not classify at all. */
-  | "unclassified_surface";
+  | "unclassified_surface"
+  /** The plan covers this surface, but this run never measured it, so nothing is known about it. */
+  | "not_observed";
 
 export interface ReconciliationFinding {
   readonly kind: ReconciliationFindingKind;
   readonly surface: string;
-  readonly rowsPastCutoff: number;
+  /**
+   * Rows past the cutoff, or `undefined` when this run did not measure
+   * the surface. Never 0 standing in for "not measured": that
+   * substitution is the whole defect this field's shape guards against.
+   */
+  readonly rowsPastCutoff: number | undefined;
   readonly detail: string;
 }
 
 export interface RetentionResidue {
   /** Rows older than the cutoff still present, per surface name. */
   readonly rowsPastCutoffBySurface: Readonly<Record<string, number>>;
+  /**
+   * The plan surfaces this run actually measured, whether or not it
+   * found anything. Stated separately rather than inferred from the keys
+   * of `rowsPastCutoffBySurface`, so an observer that can only reach some
+   * of the surfaces has to say which ones, instead of an omission
+   * quietly reading as a zero.
+   *
+   * A surface may be measured from outside Postgres: an object-storage
+   * listing belongs here exactly as much as a `count(*)` does.
+   */
+  readonly observedSurfaces: readonly string[];
   /** Every table observed in the live schema, however named. */
   readonly observedTables: readonly string[];
 }
@@ -2678,7 +2868,12 @@ export interface ReconciliationReport {
   readonly organizationId: string;
   readonly cutoff: string;
   readonly findings: readonly ReconciliationFinding[];
-  /** True when nothing at all needs a human: no residue and no unclassified table. */
+  /**
+   * True when nothing at all needs a human: every surface the plan covers
+   * was measured, none held anything past the cutoff, and no table is
+   * unclassified. A surface this run could not measure keeps `clean`
+   * false, because "we did not look" is not "it was empty".
+   */
   readonly clean: boolean;
   readonly statement: string;
 }
@@ -2689,6 +2884,26 @@ export interface ReconciliationReport {
  * pattern-matched, so adding a table is a decision someone makes here
  * rather than something a prefix rule silently absorbs.
  */
+/**
+ * Tables the reconciler will not report as unclassified.
+ *
+ * REV-001: this list had four entries that held a candidate's
+ * application identifier, so the reconciliation could report a tenant
+ * clean without ever measuring them. evidence_extraction_runs,
+ * audit_sample_members and review_timing_spans are now classified
+ * surfaces in AF-61's plan and are measured per tenant; they are gone
+ * from here, and assertRetentionExemptionsAreLive fails if a planned
+ * surface is ever listed in both places, because an exemption that
+ * shadows a classification is how a measured surface stops being
+ * measured without anyone editing the measurement.
+ *
+ * audit_samples stays, and it is the one entry that needs its reasoning
+ * written down rather than assumed: the draw itself holds a seed, a
+ * role, counts and a drawing user, and no application identifier. Its
+ * members are what name candidates, and those are now counted. A draw
+ * with no members past the cutoff is genuinely nothing about a
+ * candidate.
+ */
 const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "organizations",
   "users",
@@ -2696,23 +2911,34 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   "roles",
   "rubrics",
   "magic_link_tokens",
-  "evidence_extraction_runs",
   "inference_usage_ledger",
   "inference_kill_switch",
   "import_finalizations",
   "audit_samples",
-  "audit_sample_members",
-  "review_timing_spans",
   "af11_synthetic_environment_fixture",
-  // AF-66. These hold operator activity, not candidate content: the
-  // grant's reason is redacted through redactPii before storage
-  // (prepareSupportAccessReason) precisely so this classification is
-  // true, and entity_id is an identifier rather than candidate text --
-  // the same basis on which audit_events is exempt. If the redaction
-  // were ever removed, this exemption would become false, which is why
-  // the two are documented together.
+  // AF-66. Holds operator activity and no candidate content.
+  //
+  // REV-002 is why this reads differently from how it used to. The
+  // exemption previously rested on the grant's free-text reason being
+  // redacted through redactPii on the way in, and that redaction does
+  // not cover names, so the basis was false. The free text is gone: a
+  // grant now carries a reason code from a closed set and a ticket
+  // reference matched against a narrow pattern, and there is no column
+  // here a candidate identifier can be written into. The exemption is
+  // true because of the shape of the table rather than because of a
+  // filter someone has to keep ahead of.
+  //
+  // support_access_events is NOT here. It carries entity_type and
+  // entity_id, and an operator opening a candidate's application writes
+  // that application's identifier into it, so it is a planned surface
+  // alongside audit_events.
   "support_access_grants",
-  "support_access_events",
+  // AF-66 REV-001. The allowlist of platform staff who may be named on a
+  // support grant. It holds a user_id and when that person was revoked,
+  // nothing else: no tenant, no candidate, no free text. Exempt because it
+  // is access-control configuration, and purging it would make every
+  // historical grant name an operator the schema no longer recognises.
+  "platform_operators",
   // AF-62. The erasure receipt: which application was erased, on whose
   // authority, and what survived. It carries no candidate content -- the
   // surfaces_erased and residue columns hold surface names and counts, not
@@ -2720,18 +2946,57 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // stronger sense too: it is the audit metadata the deletion workflow is
   // specified to preserve, so a retention job that purged it would destroy
   // the only evidence that the deletion it is auditing ever happened.
+  //
+  // This is the one exemption on this list that survives holding an
+  // application identifier, and it is exempt for a reason none of the
+  // others could use: the record exists to evidence the erasure, so
+  // purging it destroys the proof of the deletion it documents. That is a
+  // claim about what the row is for, not a claim that the identifier is
+  // harmless, which is the distinction AF-61 REV-001 turned on.
   "candidate_data_erasures",
   // AF-64. The record of a privacy obligation: who asked, for what, by
-  // when, and what they were told. Exempt for the same reason the erasure
-  // receipt is -- purging it would destroy the only evidence that a
-  // request was answered in time, which is the thing a regulator asks for.
+  // when, and what they were told. Exempt on the same footing as the
+  // erasure receipt above and not on the older one -- purging it would
+  // destroy the only evidence that a request was answered in time, which
+  // is the thing a regulator asks for.
+  //
   // The free-text fields (refusal_reason, extension_reason, and an event's
   // note) are operator-written and must stay operator-facing: this
   // exemption is false the moment someone pastes a candidate's details
-  // into one, the same caveat that applies to support_access_grants.
+  // into one. AF-66 REV-002 is what that failure looks like when it is
+  // load-bearing, and the answer there was to remove the free text rather
+  // than to keep filtering it.
   "privacy_requests",
-  "privacy_request_events"
+  "privacy_request_events",
+  // REV-001. Who extended a request's deadline, why, and from when to when.
+  // Exempt on the same basis as privacy_request_events: it is the evidence
+  // that a response was on time, and reason carries the same caveat as
+  // extension_reason.
+  "privacy_request_extensions"
 ]);
+
+/**
+ * Every exempt table is still unplanned, and every planned surface is
+ * still unexempt.
+ *
+ * Exported so a test can run it, and written as an assertion rather than
+ * a test-local loop because the failure it catches is silent: a table
+ * that appears in both places is classified, described in the privacy
+ * notice, and skipped by the reconciler, with each half looking correct
+ * on its own. That is exactly the state this stack was in for
+ * evidence_extraction_runs.
+ */
+export function assertRetentionExemptionsAreLive(): void {
+  const planned = new Set<string>(RETENTION_SURFACES);
+  const shadowed = [...RETENTION_EXEMPT_TABLES].filter((table) => planned.has(table)).sort();
+  if (shadowed.length > 0) {
+    throw new Error(
+      `RETENTION_EXEMPT_TABLES exempts ${shadowed.join(", ")}, which AF-61 classifies as a retention ` +
+        `surface. An exemption on a planned surface stops it being reconciled while the plan still ` +
+        `claims it is accounted for.`
+    );
+  }
+}
 
 export type RetentionClassification = "planned" | "exempt" | "unclassified";
 
@@ -2758,8 +3023,34 @@ export function reconcileRetention(
 ): ReconciliationReport {
   const findings: ReconciliationFinding[] = [];
   const planned = new Map(plan.surfaces.map((surface) => [String(surface.surface), surface]));
+  const observed = new Set(residue.observedSurfaces);
 
   for (const surface of plan.surfaces) {
+    if (surface.disposition === "no_candidate_data") {
+      // Deliberately exempt from the not_observed check below, not an
+      // oversight. The plan's claim here is not "this is empty past the
+      // cutoff", it is "nothing candidate-derived is ever written here,
+      // by construction". A row count neither confirms nor refutes that,
+      // so counting the surface would not make the report any truer, and
+      // reporting it unmeasured every single run would be noise that
+      // trains a reader to skim past the findings that matter. Changing
+      // a surface to this disposition is an explicit edit to
+      // RETENTION_PLAN, so the silence is still someone's recorded
+      // decision rather than an omission.
+      continue;
+    }
+    if (!observed.has(surface.surface)) {
+      findings.push({
+        kind: "not_observed",
+        surface: surface.surface,
+        rowsPastCutoff: undefined,
+        detail:
+          `This run did not measure ${surface.surface}, so the report cannot say whether it is ` +
+          `empty past the cutoff. It holds ${surface.holds}, and that may still be there. ` +
+          `Supply a count for it before reading this report as a clean bill of health.`
+      });
+      continue;
+    }
     const rows = residue.rowsPastCutoffBySurface[surface.surface] ?? 0;
     if (rows === 0) {
       continue;
@@ -2773,9 +3064,6 @@ export function reconcileRetention(
           `${rows} row(s) older than the cutoff remain in a surface the plan says is purgeable. ` +
           `Either the purge did not run or it did not cover this surface.`
       });
-      continue;
-    }
-    if (surface.disposition === "no_candidate_data") {
       continue;
     }
     findings.push({
@@ -2793,7 +3081,13 @@ export function reconcileRetention(
     findings.push({
       kind: "unclassified_surface",
       surface: table,
-      rowsPastCutoff: residue.rowsPastCutoffBySurface[table] ?? 0,
+      // Undefined rather than 0 when nothing counted it. An unclassified
+      // table has no known tenant column, so the observer cannot scope a
+      // count to one organization, and an unscoped count would be a
+      // cross-tenant read in a report handed to one customer. The finding
+      // stands on the table's existence either way; what must not happen
+      // is a never-measured table reporting "0 rows" as if someone looked.
+      rowsPastCutoff: residue.rowsPastCutoffBySurface[table],
       detail:
         `Table "${table}" exists in the schema but the retention plan does not classify it. ` +
         `It may hold candidate data that nothing is accounting for. Classify it in ` +
@@ -2824,10 +3118,21 @@ function buildReconciliationStatement(
   const parts: string[] = [];
   const unclassified = needsAttention.filter((finding) => finding.kind === "unclassified_surface");
   const residue = needsAttention.filter((finding) => finding.kind === "residue_present");
+  const unmeasured = needsAttention.filter((finding) => finding.kind === "not_observed");
   if (residue.length > 0) {
     parts.push(
       `${residue.length} surface(s) that should have been purged still hold data: ` +
         residue.map((finding) => finding.surface).join(", ")
+    );
+  }
+  // Named before the blocked surfaces, and in the sentence rather than
+  // only in the findings array, because this is the one category a
+  // reader could otherwise mistake for a clean result.
+  if (unmeasured.length > 0) {
+    parts.push(
+      `${unmeasured.length} surface(s) were not measured by this run, so nothing here says whether ` +
+        `they are empty: ` +
+        unmeasured.map((finding) => finding.surface).join(", ")
     );
   }
   if (unclassified.length > 0) {
@@ -2843,7 +3148,10 @@ function buildReconciliationStatement(
     );
   }
   if (parts.length === 0) {
-    return "Every surface the retention plan covers is empty past the cutoff, and no table is unclassified.";
+    return (
+      "Every surface the retention plan covers was measured and is empty past the cutoff, " +
+      "and no table is unclassified."
+    );
   }
   return parts.join(". ") + ".";
 }
@@ -2856,22 +3164,57 @@ function buildReconciliationStatement(
 //
 // "Consistently" is the whole ticket, and the honest finding is that it
 // is not currently achievable. Measured against the real migrations, on
-// a candidate with one document and one evidence outcome, EVERY deletion
-// path fails:
+// a candidate with one document, one evidence outcome and one decision,
+// the deletion paths split in two:
 //
-//   DELETE evidence_outcomes  -> append-only trigger rejects DELETE
-//   UPDATE evidence_outcomes  -> append-only trigger rejects UPDATE too,
-//                                so the quote cannot even be redacted
-//   DELETE applications       -> FK violation from evidence_outcomes
-//   DELETE file_intakes       -> FK violation from applications
+//   DELETE evidence_outcomes   -> append-only trigger rejects DELETE
+//   UPDATE evidence_outcomes   -> append-only trigger rejects UPDATE too,
+//                                 so the quote cannot even be redacted
+//   DELETE candidate_decisions -> append-only, DELETE and UPDATE both
+//   DELETE applications        -> refused by five independent constraints,
+//                                 any one of which is enough: the FKs from
+//                                 evidence_outcomes, candidate_decisions,
+//                                 audit_sample_members and
+//                                 review_timing_spans (23503), and
+//                                 import_rows_check, which the FK's
+//                                 ON DELETE SET NULL trips (23514)
+//   DELETE file_intakes        -> FK violation from applications
+//   DELETE audit_events        -> append-only, DELETE and UPDATE both
+//   DELETE evidence_extraction_runs -> append-only, DELETE and UPDATE both
 //
-// The candidate's name, email, full canonical CV text and quoted CV text
-// all survive. That is not a bug in any one migration: 0016 is
-// append-only because an evidence record that can be edited after the
-// fact cannot serve as an audit trail, and it deliberately has no
-// ON DELETE CASCADE because a cascade issues a DELETE that the very same
-// trigger rejects (the AF-20 defect). Both decisions are right on their
-// own terms and together they make retention unimplementable.
+//   DELETE canonical_text_extractions -> permitted, the row goes
+//   DELETE import_rows                -> permitted, the row goes
+//
+// So the two surfaces the ticket names directly, canonical text and a
+// derived index, can be purged on time today. What cannot is the layer
+// the ticket does not mention: candidate_full_name and candidate_email
+// on applications, declared_filename on file_intakes, the verbatim
+// quote on evidence_outcomes and the rationale on candidate_decisions.
+//
+// And below that, a layer that is not text at all: the application
+// identifier, written into audit_events and evidence_extraction_runs
+// through a polymorphic entity_type/entity_id pair. It reads as
+// metadata and is not -- it is the key that re-links every surviving
+// row above to one person, and both tables are append-only, so it
+// cannot be removed or redacted either.
+//
+// Every line above is asserted against a real Postgres by
+// assertRetentionPurgeBlockers, the permitted ones included. The first
+// revision of this module called canonical_text_extractions and
+// import_rows blocked, reasoning from their cascade through file_intakes
+// and never trying the direct DELETE, and the probe is what disproved
+// it. A plan that overstates what survives is wrong in the same way as
+// one that understates it, which is why both directions are proved.
+//
+// That the blocked half is blocked is not a bug in any one migration:
+// 0016_evidence_outcomes.sql is append-only because an evidence record
+// that can be edited after the fact cannot serve as an audit trail, and
+// it deliberately has no ON DELETE CASCADE because a cascade issues a
+// DELETE that the very same trigger rejects (the AF-20 defect).
+// 0019_candidate_decisions.sql repeats both decisions for the same
+// stated reasons, and so do 0020_audit_samples.sql and
+// 0021_review_timing.sql. Each is right on its own terms and together
+// they make a complete purge unimplementable.
 //
 // So this module does NOT pretend to purge. It produces a plan in which
 // every surface carries an explicit disposition, blocked ones say why,
@@ -2887,6 +3230,27 @@ function buildReconciliationStatement(
 // well beyond this ticket and needs a human decision, so AF-61 stops at
 // telling the truth about the current state.
 
+// REV-001: two surfaces link to a candidate through a polymorphic
+// entity_type/entity_id text pair rather than a foreign key, and both
+// were mishandled because of it.
+//
+// evidence_extraction_runs (0006_evidence_extraction_runs.sql) was
+// absent from this list altogether. The inventory that would have caught
+// the omission reads pg_constraint, and there is no constraint to read:
+// the link to an application is two text columns. A table invisible to
+// the check that finds unaccounted tables is exactly the one that goes
+// unaccounted for.
+//
+// audit_events was listed, and classified no_candidate_data. It holds no
+// candidate TEXT -- AF-21's redaction and the closed context allowlist
+// are real -- but entity_type and entity_id are free text constrained
+// only by length > 0, and two of the four audit actions
+// (evidence_corrected, decision_recorded) are per-application by
+// definition. So the identifier of a candidate's application is written
+// there in the ordinary course of business, and an identifier is not a
+// lesser kind of candidate data for retention purposes: it is the thing
+// that re-links every surviving record to a person. Both tables are
+// append-only, so it can be neither deleted nor redacted.
 export const RETENTION_SURFACES = [
   "object_storage_documents",
   "file_intakes",
@@ -2895,7 +3259,31 @@ export const RETENTION_SURFACES = [
   "applications",
   "evidence_outcomes",
   "candidate_decisions",
-  "audit_events"
+  "audit_events",
+  "evidence_extraction_runs",
+  // The same rule one step further out. These two declare their link to
+  // a candidate properly, with a composite foreign key onto
+  // applications, so the reference inventory could always see them -- and
+  // saw them accounted for, because the applications detail names both
+  // as blockers. Being named as something that pins another surface is
+  // not the same as being classified as a surface, and nothing was
+  // checking for the difference. Both are append-only and both keep an
+  // application identifier past any cutoff.
+  "audit_sample_members",
+  "review_timing_spans",
+  // AF-66 REV-002. Every look an operator takes, named by entity_type
+  // and entity_id. When that look is at a candidate's application, the
+  // identifier written here is the candidate's, which is the same
+  // polymorphic pair that put audit_events and evidence_extraction_runs
+  // on this list. It was previously exempt, on a basis that named
+  // entity_id as "an identifier rather than candidate text" -- true, and
+  // not the question retention asks.
+  //
+  // Its sibling support_access_grants stays exempt and genuinely is:
+  // after REV-002 it holds a reason code from a closed set and a ticket
+  // reference, and there is no column on it a candidate identifier can
+  // reach.
+  "support_access_events"
 ] as const;
 
 export type RetentionSurface = (typeof RETENTION_SURFACES)[number];
@@ -2980,37 +3368,64 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
   },
   file_intakes: {
     disposition: "blocked_by_reference",
-    holds: "declared_filename, which routinely contains the candidate's name",
+    holds:
+      "declared_filename, which routinely contains the candidate's name, and " +
+      "storage_key, which embeds that same filename",
     detail:
       "DELETE fails with a foreign key violation from applications. The filename is easy to " +
       "overlook as PII and is often exactly 'Firstname_Lastname_CV.pdf'."
   },
   canonical_text_extractions: {
-    disposition: "blocked_by_reference",
+    disposition: "purge",
     holds: "the full extracted text of the candidate's document",
     detail:
-      "ON DELETE CASCADE from file_intakes would remove it, but file_intakes itself cannot be " +
-      "deleted while an application references it. The largest single store of raw candidate text."
+      "Deletable directly by intake_id. Nothing references this table and it carries no " +
+      "append-only trigger, so the row goes. It also cascades away with its file_intake, and " +
+      "that route is blocked while an application references the intake, but it is not the " +
+      "only route: reading the cascade alone is what previously made this surface look " +
+      "blocked. The largest single store of raw candidate text, and it can go on time. " +
+      "Purging it does leave the citation quotes in evidence_outcomes with no source text to " +
+      "validate against, which is a consequence to accept deliberately rather than discover."
   },
   import_rows: {
-    disposition: "blocked_by_reference",
+    disposition: "purge",
     holds: "failure_reason, which can quote the offending row",
-    detail: "Cascades from file_intakes, and inherits its blocker."
+    detail:
+      "Deletable directly by intake_id, for the same reason as canonical_text_extractions: " +
+      "nothing references it and no trigger guards it. The cascade from file_intakes is " +
+      "blocked, but it is not the only route. Purging it drops rows from the per-row import " +
+      "ledger, so AF-32's 'every input row is accounted for' stops holding once an intake " +
+      "has expired. Its processed rows are also one of the five things that pin applications, " +
+      "so any purge that reaches applications has to purge import_rows first."
   },
   applications: {
     disposition: "blocked_by_reference",
     holds: "candidate_full_name, candidate_email, external_reference_id",
     detail:
-      "DELETE fails with a foreign key violation from evidence_outcomes, which has no " +
-      "ON DELETE CASCADE -- deliberately, since a cascade issues a DELETE the append-only " +
-      "trigger would reject anyway."
+      "DELETE is refused by five independent constraints, any one of which is enough on its " +
+      "own. Four are uncascaded foreign keys from append-only tables, each refused with a " +
+      "foreign key violation: evidence_outcomes (0016_evidence_outcomes.sql), " +
+      "candidate_decisions (0019_candidate_decisions.sql), audit_sample_members " +
+      "(0020_audit_samples.sql) and review_timing_spans (0021_review_timing.sql). None carries " +
+      "ON DELETE CASCADE, deliberately, since a cascade issues a DELETE the append-only trigger " +
+      "would reject anyway, and the same trigger stops those rows being deleted first. The " +
+      "fifth is import_rows (0015_applications_and_import_finalization.sql): its foreign key " +
+      "is ON DELETE SET NULL, but import_rows_check requires a processed row to keep its " +
+      "application_id, so the SET NULL is refused with a check violation. Every CSV-imported " +
+      "application has a processed import row, so this applies to all of them, and import_rows " +
+      "must be purged before applications. Postgres names only the first refusal it meets, so " +
+      "unblocking any one of these independently leaves this surface blocked by the others."
   },
   evidence_outcomes: {
     disposition: "blocked_append_only",
-    holds: "citation quotes, which are verbatim candidate text",
+    holds:
+      "citation quotes, which are verbatim candidate text, and correction_reason, " +
+      "free text a reviewer wrote about the candidate's evidence",
     detail:
       "Both DELETE and UPDATE are rejected by the append-only trigger, so the quote cannot be " +
-      "removed and cannot be redacted in place either. This is the root blocker."
+      "removed and cannot be redacted in place either. It is one of four append-only tables " +
+      "whose foreign keys pin applications, alongside candidate_decisions, " +
+      "audit_sample_members and review_timing_spans, so unblocking it alone frees nothing."
   },
   candidate_decisions: {
     disposition: "blocked_append_only",
@@ -3020,11 +3435,66 @@ const RETENTION_PLAN: Readonly<Record<RetentionSurface, Omit<RetentionSurfacePla
       "evidence who decided what."
   },
   audit_events: {
-    disposition: "no_candidate_data",
-    holds: "nothing candidate-derived, by construction",
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, which is a candidate's application identifier whenever entity_type is " +
+      "\"application\" -- what evidence_corrected and decision_recorded record by definition",
     detail:
-      "Append-only, and AF-21's redaction plus the closed context allowlist are what keep " +
-      "candidate text out of it. Listed so its exclusion is a stated finding rather than an omission."
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "identifier can be neither removed nor redacted in place. It carries no candidate TEXT -- AF-21's " +
+      "redaction and the closed context allowlist keep that out, and that part of the earlier " +
+      "no_candidate_data classification was right -- but entity_type and entity_id are free text " +
+      "checked only for length, so nothing in the schema stops an application identifier being " +
+      "written here, and two of the four audit actions are per-application by definition. An " +
+      "identifier is what re-links every other surviving record to a person, so a retention statement " +
+      "that counts it as nothing is claiming more deletion than happens."
+  },
+  audit_sample_members: {
+    disposition: "blocked_append_only",
+    holds: "application_id, the identifier of a candidate drawn into an audit sample",
+    detail:
+      "Append-only (0020_audit_samples.sql): DELETE and UPDATE are both rejected. It carries no " +
+      "candidate text, only the identifier and the draw it belongs to, but the row is itself a " +
+      "statement about a named candidate -- that they were selected for audit -- and it is one of " +
+      "the four uncascaded foreign keys that pin applications, so it cannot go first either."
+  },
+  review_timing_spans: {
+    disposition: "blocked_append_only",
+    holds:
+      "application_id, plus reviewer_user_id and the start, end and active duration of every " +
+      "review of that candidate",
+    detail:
+      "Append-only (0021_review_timing.sql): DELETE and UPDATE are both rejected. Beyond the " +
+      "identifier this is behavioural data linking a named reviewer to a named candidate at a " +
+      "specific time, which is more than an aggregate input to AF-55's median. Another of the four " +
+      "uncascaded foreign keys pinning applications."
+  },
+  support_access_events: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, which is a candidate's application identifier whenever a support operator " +
+      "opened that application, alongside the operator and the moment they looked",
+    detail:
+      "Append-only (0022_support_access.sql): DELETE and UPDATE are both rejected, deliberately, " +
+      "because an access log the operator can edit answers nothing -- the one person with a motive " +
+      "to remove a row is the person the row is about. That is the right design and it means the " +
+      "identifier cannot be removed. Its sibling support_access_grants is exempt rather than " +
+      "planned: after REV-002 a grant holds a reason code from a closed set and a ticket reference, " +
+      "and no candidate identifier can reach it."
+  },
+  evidence_extraction_runs: {
+    disposition: "blocked_append_only",
+    holds:
+      "entity_id, an application identifier for every run this product writes " +
+      "(APPLICATION_ENTITY_TYPE), alongside provider, model and version strings that are not " +
+      "candidate-derived",
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql): DELETE and UPDATE are both rejected. Its " +
+      "association with an application is the polymorphic entity_type/entity_id pair and not a " +
+      "foreign key, which is why pg_constraint cannot see it and why this surface was missing from " +
+      "the plan rather than merely misclassified. listEvidenceExtractionRunsForEntities queries it " +
+      "by entity_type = \"application\" and a list of application identifiers, so the association is " +
+      "load-bearing production behaviour rather than a possibility the schema leaves open."
   }
 };
 
@@ -3053,6 +3523,8 @@ export function planRetention(policy: RetentionPolicy, now: Date): RetentionPlan
 export interface SurvivingCandidateData {
   /** True when at least one surface still holds candidate data after expiry. */
   readonly anySurvives: boolean;
+  /** Echoed from the input, so whoever renders the notice can see which case it is. */
+  readonly automatedDeletionActive: boolean;
   readonly surfaces: readonly RetentionSurfacePlan[];
   /**
    * A sentence a privacy notice can be written from without it becoming a
@@ -3061,27 +3533,59 @@ export interface SurvivingCandidateData {
   readonly statement: string;
 }
 
-export function summarizeSurvivingCandidateData(plan: RetentionPlan): SurvivingCandidateData {
+export interface RetentionEnforcement {
+  /**
+   * Whether a purge executor is actually running for this deployment.
+   * Must be read from deployment configuration, never passed as a literal
+   * true: this decides whether a data subject is told their data is
+   * deleted. Required with no default, so the optimistic sentence cannot be
+   * reached by forgetting an argument, only by stating something false.
+   */
+  readonly automatedDeletionActive: boolean;
+}
+
+/**
+ * REV-005: the statement describes what actually happens, not what the
+ * policy would do if something enforced it. Nothing runs planRetention or
+ * deletes anything on a schedule yet, so with no executor the sentence
+ * says so outright, and says the data is kept past the window, rather
+ * than listing survivors in a way that implies everything unlisted is
+ * gone. Understating what we delete is safe; overstating it is a false
+ * statement to the person whose data it is.
+ *
+ * The anySurvives: false branch cannot be reached through planRetention
+ * today, because the plan always carries blocked surfaces, but
+ * RetentionPlan is exported and a hand-built plan reaches it, so it obeys
+ * the same rule and is tested rather than trusted.
+ */
+export function summarizeSurvivingCandidateData(
+  plan: RetentionPlan,
+  enforcement: RetentionEnforcement
+): SurvivingCandidateData {
+  const { automatedDeletionActive } = enforcement;
   const surviving = plan.surfaces.filter(
     (surface) =>
       surface.disposition === "blocked_append_only" || surface.disposition === "blocked_by_reference"
   );
-  if (surviving.length === 0) {
-    return {
-      anySurvives: false,
-      surfaces: [],
-      statement: `Raw candidate data is deleted ${plan.windowDays} days after intake.`
-    };
+  const survivorList = surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ");
+  const notEnforced =
+    `Candidate data is not currently deleted automatically: no deletion process runs yet, so it is ` +
+    `kept after the ${plan.windowDays}-day retention window until one does.`;
+
+  let statement: string;
+  if (!automatedDeletionActive) {
+    statement =
+      surviving.length === 0
+        ? notEnforced
+        : `${notEnforced} Even once it does, the following cannot currently be deleted: ${survivorList}.`;
+  } else {
+    statement =
+      surviving.length === 0
+        ? `Raw candidate data is deleted ${plan.windowDays} days after intake.`
+        : `Raw candidate data is deleted ${plan.windowDays} days after intake, except the following, ` +
+          `which is retained and cannot currently be deleted: ${survivorList}.`;
   }
-  return {
-    anySurvives: true,
-    surfaces: surviving,
-    statement:
-      `After the ${plan.windowDays}-day retention window, the following candidate data is still ` +
-      `retained and cannot currently be deleted: ` +
-      surviving.map((surface) => `${surface.surface} (${surface.holds})`).join("; ") +
-      `.`
-  };
+  return { anySurvives: surviving.length > 0, automatedDeletionActive, surfaces: surviving, statement };
 }
 
 // ---- AF-62: candidate-data deletion workflow ----
@@ -3129,7 +3633,16 @@ export type CandidateDataErasureMethod =
   | "redact_in_place"
   /** An append-only trigger rejects UPDATE as well as DELETE. Needs AF-91. */
   | "blocked_append_only"
-  /** In scope for completeness; holds nothing candidate-derived. */
+  /**
+   * In scope for completeness; holds nothing candidate-derived.
+   *
+   * No surface currently carries this. audit_events did, on the basis
+   * that it held no candidate TEXT, which was true and was not the
+   * question: it holds the application identifier, and an identifier is
+   * what re-links every surviving row to a person (AF-61 REV-001). Kept
+   * in the union because a future surface may genuinely qualify, and a
+   * new one should have to argue for it.
+   */
   | "not_candidate_data";
 
 export interface CandidateDataErasureStep {
@@ -3250,11 +3763,57 @@ const CANDIDATE_DATA_ERASURE_PLAN: readonly CandidateDataErasureStep[] = [
   },
   {
     surface: "audit_events",
-    method: "not_candidate_data",
-    columns: [],
+    // AF-61 REV-001: was not_candidate_data, on the same basis the
+    // retention plan used and for the same reason it was wrong. AF-21's
+    // redaction and the closed context allowlist do keep candidate TEXT
+    // out, and that half was right. entity_type and entity_id are free
+    // text, and an application identifier is written there whenever a
+    // correction or a decision is recorded -- two of the four audit
+    // actions. The identifier is what re-links every other surviving row
+    // to a person, so an erasure that reports this surface as holding
+    // nothing is reporting more deletion than happened.
+    method: "blocked_append_only",
+    columns: ["entity_id"],
     detail:
-      "Preserved deliberately -- this is the audit metadata the ticket says is the only thing kept. " +
-      "AF-21's redaction and the closed context allowlist are what keep candidate text out of it."
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "application identifier can be neither removed nor redacted in place. It is also the audit " +
+      "metadata this ticket says is deliberately kept -- but kept and erasable are different claims, " +
+      "and only the first one is true here. Needs AF-91."
+  },
+  {
+    surface: "evidence_extraction_runs",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql). entity_id is the application identifier for " +
+      "every run this product writes, and the association is a polymorphic text pair rather than a " +
+      "foreign key, which is why no cascade reaches it. Needs AF-91."
+  },
+  {
+    surface: "audit_sample_members",
+    method: "blocked_append_only",
+    columns: ["application_id"],
+    detail:
+      "Append-only (0020_audit_samples.sql). One row per candidate drawn into an audit sample: it " +
+      "holds no candidate text, and the row is itself a statement about a named candidate. Needs AF-91."
+  },
+  {
+    surface: "review_timing_spans",
+    method: "blocked_append_only",
+    columns: ["application_id", "reviewer_user_id"],
+    detail:
+      "Append-only (0021_review_timing.sql). Beyond the identifier this records which reviewer spent " +
+      "how long on which candidate and when, which is behavioural data about a named person on both " +
+      "sides. Needs AF-91."
+  },
+  {
+    surface: "support_access_events",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0022_support_access.sql), deliberately so: an access log the operator can edit " +
+      "answers nothing, because the one person with a motive to remove a row is the person the row is " +
+      "about. entity_id names the application a support operator opened. Needs AF-91."
   }
 ];
 
@@ -3314,33 +3873,116 @@ export interface CandidateDataErasureResidue {
   readonly surfaces: readonly CandidateDataErasureStep[];
   /**
    * The sentence that goes on the receipt and, ultimately, to the
-   * candidate. Written from what the workflow can actually do rather than
-   * from what it was asked to do.
+   * candidate. Written from what actually happened on this run, not from
+   * the static plan alone.
    */
   readonly statement: string;
 }
 
+/**
+ * What this erasure run actually did to intake-scoped and object-storage
+ * surfaces. Required so the receipt cannot claim a shared document was
+ * erased while it is still deferred, or claim an object was deleted when
+ * the delete never ran.
+ */
+export interface CandidateDataErasureRunOutcome {
+  readonly intakeErased: boolean;
+  /** True only when the object-storage delete callback ran successfully. */
+  readonly objectStorageDeleted: boolean;
+  readonly applicationsStillReferencingIntake: number;
+}
+
+const INTAKE_SCOPED_SURFACES: ReadonlySet<string> = new Set([
+  "object_storage_documents",
+  "canonical_text_extractions",
+  "import_rows",
+  "file_intakes"
+]);
+
+/**
+ * REV-008: `outcome` is REQUIRED, with no default. It used to default to
+ * "everything erased", so a caller that left it out got the full-erasure
+ * sentence whatever had actually happened: the optimistic statement reached
+ * by forgetting an argument. That is the defect #70 REV-005 removed from the
+ * retention statement, and the same rule applies to every statement made to
+ * a data subject: a false claim must need someone to pass a false value.
+ * tests/architecture/data-subject-statements-require-their-facts.test.ts
+ * holds it, because tsc is the only other thing that would.
+ */
 export function summarizeCandidateDataErasureResidue(
-  plan: CandidateDataErasurePlan
+  plan: CandidateDataErasurePlan,
+  outcome: CandidateDataErasureRunOutcome
 ): CandidateDataErasureResidue {
   const blocked = plan.steps.filter((step) => step.method === "blocked_append_only");
-  if (blocked.length === 0) {
+  const deferredIntake = plan.steps.filter(
+    (step) => INTAKE_SCOPED_SURFACES.has(step.surface) && !outcome.intakeErased
+  );
+  // REV-006: when the object was not deleted, file_intakes is residue too,
+  // because its storage_key still embeds the declared filename and is left
+  // intact on purpose, so the key keeps naming the object.
+  const objectSkippedWhileIntakeErased =
+    outcome.intakeErased && !outcome.objectStorageDeleted
+      ? plan.steps.filter(
+          (step) => step.surface === "object_storage_documents" || step.surface === "file_intakes"
+        )
+      : [];
+
+  const surviving = [...blocked, ...deferredIntake, ...objectSkippedWhileIntakeErased];
+  // Dedupe by surface name while preserving plan order.
+  const seen = new Set<string>();
+  const surfaces: CandidateDataErasureStep[] = [];
+  for (const step of surviving) {
+    if (seen.has(step.surface)) {
+      continue;
+    }
+    seen.add(step.surface);
+    surfaces.push(step);
+  }
+
+  if (surfaces.length === 0) {
     return {
       anyResidue: false,
       surfaces: [],
       statement: "Every surface holding candidate-derived content was erased."
     };
   }
+
+  const parts: string[] = [];
+  if (outcome.intakeErased && outcome.objectStorageDeleted) {
+    parts.push("Original documents, canonical text and candidate identity were erased.");
+  } else if (outcome.intakeErased && !outcome.objectStorageDeleted) {
+    parts.push(
+      "Candidate identity and extracted text were erased in place, but the stored object was not " +
+        "deleted, so its storage_key was left intact: object_storage_documents and file_intakes remain " +
+        "residue until a later erasure deletes the object."
+    );
+  } else {
+    const others = outcome.applicationsStillReferencingIntake;
+    parts.push(
+      "Candidate identity on this application was erased. The shared source document and its " +
+        "extracted text are retained until the " +
+        String(others) +
+        " other candidate" +
+        (others === 1 ? "" : "s") +
+        " in the same file " +
+        (others === 1 ? "is" : "are") +
+        " erased."
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      "The following candidate-derived content survives because the append-only ledger rejects " +
+        "both DELETE and UPDATE on it, and erasing it requires the per-candidate encryption key " +
+        "design tracked as AF-91: " +
+        blocked.map((step) => step.surface).join("; ") +
+        "."
+    );
+  }
+
   return {
     anyResidue: true,
-    surfaces: blocked,
-    statement:
-      "Original documents, canonical text and candidate identity were erased. The following " +
-      "candidate-derived content survives because the append-only ledger rejects both DELETE and " +
-      "UPDATE on it, and erasing it requires the per-candidate encryption key design tracked as " +
-      "AF-91: " +
-      blocked.map((step) => step.surface).join("; ") +
-      "."
+    surfaces,
+    statement: parts.join(" ")
   };
 }
 
@@ -3446,6 +4088,31 @@ export function canExtendPrivacyRequest(receivedAt: Date, now: Date): boolean {
   return now.getTime() <= addCalendarMonths(receivedAt, PRIVACY_REQUEST_RESPONSE_MONTHS).getTime();
 }
 
+/** The least an extension can be. Zero further months is not an extension. */
+export const PRIVACY_REQUEST_MIN_EXTENSION_MONTHS = 1;
+
+/**
+ * REV-001: the months an extension grants, which must be 1 or 2.
+ *
+ * computePrivacyRequestDueDate accepts 0, because an unextended request is
+ * due after 0 extra months. An extension of 0 is different: it would record
+ * that a deadline was extended without moving it. The same range is a CHECK
+ * on privacy_request_extensions in 0024_privacy_requests.sql, so neither
+ * layer is the only thing refusing it.
+ */
+export function validatePrivacyRequestExtensionMonths(extensionMonths: number): void {
+  if (
+    !Number.isInteger(extensionMonths) ||
+    extensionMonths < PRIVACY_REQUEST_MIN_EXTENSION_MONTHS ||
+    extensionMonths > PRIVACY_REQUEST_MAX_EXTENSION_MONTHS
+  ) {
+    throw new Error(
+      `a privacy request extension must be a whole number of months from ` +
+        `${PRIVACY_REQUEST_MIN_EXTENSION_MONTHS} to ${PRIVACY_REQUEST_MAX_EXTENSION_MONTHS}, got: ${extensionMonths}`
+    );
+  }
+}
+
 /**
  * The legal transitions. Written as a map rather than checked inline so
  * that adding a status forces a decision about what may reach it.
@@ -3461,6 +4128,11 @@ const PRIVACY_REQUEST_TRANSITIONS: Readonly<Record<PrivacyRequestStatus, readonl
     completed: [],
     refused: []
   };
+
+/** Whether a status has no onward transition: once there, the request is answered. */
+export function isPrivacyRequestTerminal(status: PrivacyRequestStatus): boolean {
+  return PRIVACY_REQUEST_TRANSITIONS[status].length === 0;
+}
 
 export function validatePrivacyRequestTransition(
   from: PrivacyRequestStatus,
@@ -3484,6 +4156,18 @@ export interface PrivacyRequestClock {
   readonly status: PrivacyRequestStatus;
   readonly receivedAt: string;
   readonly dueAt: string;
+  /**
+   * When the request reached a terminal status, for both of them.
+   *
+   * REV-002: the column behind this was `completed_at`, so a completed
+   * request carried its own timestamp and a refused one carried none.
+   * Establishing when a refusal happened meant joining
+   * privacy_request_events for the transition's occurred_at -- two
+   * terminal states, two different queries, and only one of them
+   * obvious. resolved_by_user_id was already symmetric across both,
+   * which is what made the timestamp an oversight rather than a design.
+   */
+  readonly resolvedAt?: string | undefined;
 }
 
 /**
@@ -3498,6 +4182,56 @@ export function isPrivacyRequestOverdue(request: PrivacyRequestClock, now: Date)
     return false;
   }
   return now.getTime() > new Date(request.dueAt).getTime();
+}
+
+/**
+ * Whether a request that has been resolved was resolved in time.
+ *
+ * REV-002: the other half of the question a due date exists to answer.
+ * isPrivacyRequestOverdue answers "is this still open and past due",
+ * which is the operational half -- it correctly goes false the moment a
+ * request reaches a terminal status, whether or not that resolution was
+ * itself late. The retrospective half is what a regulator or an internal
+ * audit actually asks: was this request answered on time. Nothing
+ * answered it, and the raw data only supported half of it.
+ *
+ * Three outcomes, not a boolean. "Not resolved yet" is a real state and
+ * is not the same answer as "resolved late" -- collapsing them would let
+ * an open request past its deadline be counted as a breach twice, once
+ * here and once by isPrivacyRequestOverdue, or worse, as compliant.
+ */
+export type PrivacyRequestTimeliness = "unresolved" | "on_time" | "late";
+
+export function describePrivacyRequestTimeliness(request: PrivacyRequestClock): PrivacyRequestTimeliness {
+  if (!isPrivacyRequestTerminal(request.status)) {
+    return "unresolved";
+  }
+  const resolvedAt = request.resolvedAt;
+  if (resolvedAt === undefined) {
+    // The schema forbids this: privacy_requests_resolution_is_recorded is
+    // an equivalence between a terminal status and a resolved_at, so a row
+    // cannot be one without the other. Reaching it means the value was
+    // assembled somewhere other than that table, and answering "on_time"
+    // would be an unearned pass for a request nobody can date.
+    throw new Error(
+      `a ${request.status} privacy request must carry resolvedAt; without it there is no way to say ` +
+        "whether it was answered in time"
+    );
+  }
+  const resolvedMs = Date.parse(resolvedAt);
+  const dueMs = Date.parse(request.dueAt);
+  if (!Number.isFinite(resolvedMs) || !Number.isFinite(dueMs)) {
+    // NaN compares false against everything, so an unparseable timestamp
+    // would silently take the on_time branch below. The same fail-open
+    // shape AF-66 REV-003 removed from authorizeSupportAccess.
+    throw new Error(
+      `privacy request timeliness needs two readable timestamps, got resolvedAt=${resolvedAt} ` +
+        `dueAt=${request.dueAt}`
+    );
+  }
+  // <= : answering exactly on the deadline is answering in time. The
+  // boundary is the case someone will argue about, so it is stated.
+  return resolvedMs <= dueMs ? "on_time" : "late";
 }
 
 export interface PrivacyRequestOutcome {
@@ -3592,6 +4326,76 @@ export const ROLE_AUDIT_METRICS = [
 export type RoleAuditMetric = (typeof ROLE_AUDIT_METRICS)[number];
 
 /**
+ * Metric identities a section may be filled by besides the one it is
+ * named for, each with the words that carry the difference into the
+ * heading the reader sees.
+ *
+ * AF-57 changes the precision metric's identity when its denominator
+ * rests on candidate-level decisions instead of item-level proof: the
+ * sample comes back named
+ * `evidence_precision_live_pilot_examination_inferred` precisely so that
+ * it cannot be read against the 98% target. That rename is right, and it
+ * meets a report whose sections are fixed keys.
+ *
+ * Refusing the qualified name here looks like the strict choice and is
+ * the dangerous one. A live pilot only produces the unqualified name
+ * when every examined item carried a correction, which is a precision of
+ * 0 by construction, so in practice the section would be permanently
+ * absent -- and an absent section renders as "not measured", which reads
+ * as "no problems here". That is the exact failure the required-keys
+ * design exists to prevent, arrived at by being strict about a name.
+ *
+ * So a section accepts its own metric or a declared qualification of it,
+ * and the qualification travels into the heading rather than only into a
+ * note underneath it. A caveat printed below the number does not stop
+ * the number being quoted; the name above it does. Anything not declared
+ * here is still refused: a preservation figure under the precision key
+ * remains an error.
+ *
+ * The heading text lives in this same table on purpose. A qualification
+ * that could be declared without saying how it reads would be a
+ * qualification the renderer had to invent words for, and those words
+ * are the whole point of it.
+ */
+const ROLE_AUDIT_METRIC_QUALIFICATIONS: Readonly<
+  Record<RoleAuditMetric, Readonly<Record<string, string>>>
+> = {
+  review_time_reduction: {},
+  qualified_candidate_preservation: {},
+  evidence_precision_live_pilot: {
+    examination_inferred: "examination inferred, not measured item by item"
+  },
+  failed_document_rate: {}
+};
+
+/**
+ * The heading words for the qualification a sample carries under this
+ * section, or null when the sample is the metric itself.
+ *
+ * Throws when it is neither, which is the mislabelling check: this is
+ * the one fact summarizeMetric cannot know, since it is told the name
+ * and has no idea which section it will be filed under.
+ */
+function resolveRoleAuditQualification(
+  context: string,
+  metric: RoleAuditMetric,
+  sampleMetric: string
+): string | null {
+  if (sampleMetric === metric) {
+    return null;
+  }
+  for (const [qualifier, heading] of Object.entries(ROLE_AUDIT_METRIC_QUALIFICATIONS[metric])) {
+    if (sampleMetric === `${metric}_${qualifier}`) {
+      return heading;
+    }
+  }
+  // A sample filed under the wrong key would be rendered with the wrong
+  // heading -- a preservation figure labelled as precision is worse than
+  // a missing one, because it is believable.
+  throw new Error(`${context}: metrics.${metric} carries a sample for "${sampleMetric}"`);
+}
+
+/**
  * AF-52's selection with the sampled application ids removed.
  *
  * The employer needs to see that the sample was drawn honestly -- the
@@ -3607,16 +4411,42 @@ export interface AuditSampleProvenance {
 }
 
 export function describeAuditSampleProvenance(selection: AuditSampleSelection): AuditSampleProvenance {
+  const distinct = new Set(selection.sampledApplicationIds);
+  if (distinct.size !== selection.sampledApplicationIds.length) {
+    // This is the last place the ids exist. sampledCount is published
+    // beside a claim that re-running the draw reproduces the sample, and
+    // a repeated id counts one candidate twice -- so the published count
+    // no longer matches anything a reproducer can arrive at, and every
+    // stage after this one has lost the evidence needed to notice. The
+    // store rejects it too: audit_sample_members is UNIQUE on
+    // (audit_sample_id, application_id).
+    throw new Error(
+      "describeAuditSampleProvenance: the selection repeats an application id, so sampledCount would overstate the draw"
+    );
+  }
   return {
     seed: selection.seed,
     eligibleCount: selection.eligibleCount,
-    sampledCount: selection.sampledApplicationIds.length
+    sampledCount: distinct.size
   };
 }
 
-/** The correction figures AF-57 produces, without the precision rate. */
+/**
+ * The correction figures AF-57 produces, without the precision rate.
+ *
+ * `examinedItems`, not `reviewedItems`. It is the same denominator the
+ * precision metric is computed over, and AF-57 stopped calling that
+ * "reviewed" because nothing in this system records that a human read a
+ * given item: an item counts as examined by naming the record that
+ * establishes it, which for a live pilot is usually a decision taken on
+ * the whole candidate. Printing "reviewed evidence items" to an employer
+ * re-asserts in prose the exact fact the metric's name was changed to
+ * stop asserting, two lines below the heading that now says examination
+ * was inferred. The section immediately above carries what the word
+ * rests on, so this one only has to stop overclaiming.
+ */
 export interface CorrectionSummary {
-  readonly reviewedItems: number;
+  readonly examinedItems: number;
   readonly correctedItems: number;
   readonly correctionEvents: number;
 }
@@ -3640,23 +4470,102 @@ export interface BuildRoleAuditReportInput {
   readonly auditSample: AuditSampleProvenance | null;
 }
 
+/**
+ * Every figure this report prints has to survive a reader with no one
+ * present to explain it, so each one is checked here before it can be
+ * published.
+ *
+ * The metrics do not need it: summarizeMetric is a real constructor and
+ * refuses a non-integer count, a sampleSize above its population and a
+ * non-finite value, so the only thing left for this boundary to check is
+ * the one fact the constructor cannot know, which key the sample was
+ * filed under. CorrectionSummary and AuditSampleProvenance had no such
+ * constructor -- they are bare interfaces assembled at the call site --
+ * and so reached the renderer with nothing checked at all.
+ */
+function assertPublishableCounts(context: string, counts: Readonly<Record<string, number>>): void {
+  for (const [name, value] of Object.entries(counts)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${context} requires a non-negative integer ${name}, got: ${value}`);
+    }
+  }
+}
+
 export function buildRoleAuditReport(input: BuildRoleAuditReportInput): RoleAuditReport {
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = input.metrics[metric];
-    if (sample !== null && sample.metric !== metric) {
-      // A sample filed under the wrong key would be rendered with the
-      // wrong heading -- a preservation figure labelled as precision is
-      // worse than a missing one, because it is believable.
+    if (sample !== null) {
+      // Throws unless the sample is this metric or a declared
+      // qualification of it.
+      resolveRoleAuditQualification("buildRoleAuditReport", metric, sample.metric);
+    }
+  }
+
+  const corrections = input.corrections;
+  if (corrections !== null) {
+    assertPublishableCounts("buildRoleAuditReport: corrections", {
+      examinedItems: corrections.examinedItems,
+      correctedItems: corrections.correctedItems,
+      correctionEvents: corrections.correctionEvents
+    });
+    if (corrections.correctedItems > corrections.examinedItems) {
       throw new Error(
-        `buildRoleAuditReport: metrics.${metric} carries a sample for "${sample.metric}"`
+        "buildRoleAuditReport: correctedItems cannot exceed examinedItems"
+      );
+    }
+    if (corrections.correctionEvents < corrections.correctedItems) {
+      // Correcting an item is what produces a correction event, so events
+      // below corrected items is not a small discrepancy: one of the two
+      // numbers is measuring something other than what the report says it
+      // is, and the reader has no way to tell which.
+      throw new Error(
+        `buildRoleAuditReport: ${corrections.correctionEvents} correction event(s) cannot account for ` +
+          `${corrections.correctedItems} corrected item(s); correcting an item takes at least one event`
+      );
+    }
+    const precision = input.metrics.evidence_precision_live_pilot;
+    if (precision !== null && precision.sampleSize !== corrections.examinedItems) {
+      // Both figures are AF-57's, over one set of examined items, and the
+      // report prints both: "(from N of M)" under Evidence precision and
+      // "x of N examined evidence items" under Corrections. Two different
+      // N's is a document that contradicts itself, and a reader who
+      // divides the corrections line gets a precision that is not the one
+      // printed above it.
+      throw new Error(
+        `buildRoleAuditReport: corrections cover ${corrections.examinedItems} examined item(s) but ` +
+          `evidence_precision_live_pilot was computed over ${precision.sampleSize}; the report would print ` +
+          "two different denominators for the same set"
       );
     }
   }
-  if (input.corrections !== null && input.corrections.correctedItems > input.corrections.reviewedItems) {
-    throw new Error(
-      "buildRoleAuditReport: correctedItems cannot exceed reviewedItems"
-    );
+
+  const auditSample = input.auditSample;
+  if (auditSample !== null) {
+    assertPublishableCounts("buildRoleAuditReport: auditSample", {
+      eligibleCount: auditSample.eligibleCount,
+      sampledCount: auditSample.sampledCount
+    });
+    if (auditSample.seed.trim().length === 0) {
+      // The report prints the seed as the thing that makes the draw
+      // checkable. A blank one is printed just the same and explains
+      // nothing, which is why audit_samples CHECKs it in the store.
+      throw new Error(
+        "buildRoleAuditReport: the audit sample seed cannot be blank; it is what makes the draw reproducible"
+      );
+    }
+    if (auditSample.sampledCount > auditSample.eligibleCount) {
+      // The report tells the reader that re-running the selection with
+      // this seed reproduces this sample. A draw larger than the set it
+      // came from cannot be reproduced by anyone, so the report would be
+      // inviting a check that is guaranteed to fail and calling that
+      // provenance.
+      throw new Error(
+        `buildRoleAuditReport: the audit sample claims ${auditSample.sampledCount} of ` +
+          `${auditSample.eligibleCount} eligible candidates; a draw cannot exceed what it was drawn from`
+      );
+    }
   }
+
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     organizationId: input.organizationId,
@@ -3701,12 +4610,22 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 
   for (const metric of ROLE_AUDIT_METRICS) {
     const sample = report.metrics[metric];
-    lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
     if (sample === null) {
+      lines.push(`${ROLE_AUDIT_METRIC_HEADINGS[metric]}`);
       lines.push(`  Not measured for this role.`);
       lines.push(``);
       continue;
     }
+    // Re-resolved here rather than trusted from buildRoleAuditReport.
+    // RoleAuditReport is an interface, so a caller can assemble one
+    // directly, and this is the boundary where a wrong name becomes a
+    // wrong heading in front of an employer.
+    const qualification = resolveRoleAuditQualification("renderRoleAuditReport", metric, sample.metric);
+    lines.push(
+      qualification === null
+        ? `${ROLE_AUDIT_METRIC_HEADINGS[metric]}`
+        : `${ROLE_AUDIT_METRIC_HEADINGS[metric]} (${qualification})`
+    );
     lines.push(
       sample.value === null
         ? `  Not enough data to report.`
@@ -3723,7 +4642,7 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
     lines.push(`  Not measured for this role.`);
   } else {
     lines.push(
-      `  ${report.corrections.correctedItems} of ${report.corrections.reviewedItems} reviewed evidence items ` +
+      `  ${report.corrections.correctedItems} of ${report.corrections.examinedItems} examined evidence items ` +
         `were corrected, across ${report.corrections.correctionEvents} correction(s).`
     );
   }
@@ -3776,36 +4695,130 @@ export function renderRoleAuditReport(report: RoleAuditReport): string {
 // are two populations. Pooling them lets a large, clean offline eval
 // mask live-pilot errors -- and the offline set is exactly the one that
 // can be grown cheaply. There is deliberately no function here that
-// accepts both at once; the dataset is a required argument, and it
-// selects the metric name.
+// accepts both at once.
+//
+// Which dataset an item came from is a property of the item, not an
+// argument supplied at the end. The first version of this took the
+// dataset only where the metric name was chosen, and checked it against
+// the examination source: `candidate_decision` belongs to a live pilot,
+// `offline_annotation` to the locked eval. That catches nothing for the
+// source that matters, because `item_correction` is the one examination
+// record both worlds produce -- a recruiter correcting a card and an
+// annotator marking an item wrong leave the same shape of revision
+// chain. So a batch of live-pilot corrections could be reported under
+// the offline name, and the inverse too: precisely the pooling the two
+// targets exist to prevent, with the number carrying no trace of it.
+// Every history now names its dataset, every item in a batch has to
+// agree with it, and the sample takes its name from that rather than
+// from a second argument nothing cross-checks.
+//
+// **An item enters the denominator only by naming what proves a human
+// examined it.** The first version of this took a bare
+// `reviewed: boolean`, which asks the caller to assert the single fact
+// the metric cannot check and this stack does not record. Nothing
+// records it: evidence_outcomes (0016_evidence_outcomes.sql) stores what
+// was produced and what was corrected, candidate_decisions
+// (0019_candidate_decisions.sql), audit_sample_members
+// (0020_audit_samples.sql) and review_timing_spans
+// (0021_review_timing.sql) are all per application, and AF-53's focused
+// card index never leaves the browser. A bare boolean lets a caller
+// count items nobody opened and inflate precision, with the emitted
+// sample saying nothing about it.
+//
+// Narrowing the denominator to item-level proof is not the way out: a
+// correction is the only item-level record there is, so a denominator
+// made only of proven examinations is a denominator of corrected items,
+// and the metric would report 0 for ever. So the flag is replaced by the
+// fact behind it, and the weakest fact in the denominator is carried out
+// with the number. A correction proves the item it lands on was
+// examined. A locked-eval annotation proves it too, because every case
+// in evals/datasets/gold-set-v1.json carries an expected kind per
+// criterion, so each item was adjudicated one at a time. A decision
+// recorded on the candidate proves only that the candidate was handled:
+// it covers every item on that candidate at once, and it is all that is
+// available for the common case of an item a reviewer read and left
+// alone. Those still count -- excluding them is the always-0 metric
+// above -- but they attach `examination_inferred`, so what the
+// denominator rests on is machine-readable rather than a doc comment
+// nobody reads. Expect that code on every live-pilot sample until
+// something records per-item examination. That is the honest state of
+// the data, not noise.
 
 export type EvidencePrecisionDataset = "live_pilot" | "locked_offline_eval";
+
+export const EVIDENCE_EXAMINATION_SOURCES = [
+  /** Nobody is known to have looked at this item. It stays out of the denominator. */
+  "not_examined",
+  /**
+   * The item's own revision chain carries a human correction
+   * (0017_evidence_corrections.sql). Item-level proof, and the only kind
+   * a live pilot produces today. It says nothing about which dataset the
+   * item came from: both worlds correct items, and the chains are
+   * indistinguishable. That is why the dataset is carried separately.
+   */
+  "item_correction",
+  /**
+   * A locked-eval annotator labelled this item. Item-level proof, since
+   * an expected kind is recorded per criterion rather than per case, and
+   * it exists only for the offline dataset.
+   */
+  "offline_annotation",
+  /**
+   * A decision was recorded on the candidate (0019_candidate_decisions.sql).
+   * That the candidate was handled, not that this item was read: one
+   * decision covers every item on the candidate at once. An inference,
+   * counted but declared.
+   */
+  "candidate_decision"
+] as const;
+
+export type EvidenceExaminationSource = (typeof EVIDENCE_EXAMINATION_SOURCES)[number];
 
 export interface EvidenceItemHistory {
   /** Stable identity across corrections: the root of the revision chain. */
   readonly itemId: string;
+  /**
+   * Which population this item belongs to. Caller-asserted like
+   * `examinedVia`, and for the same reason: nothing in a revision chain
+   * distinguishes a pilot correction from an eval one. Stating it per
+   * item is what makes a mixed batch detectable at all, since a single
+   * dataset argument agrees with itself no matter what it is handed.
+   */
+  readonly dataset: EvidencePrecisionDataset;
   /** Every revision of this one item, in any order. */
   readonly revisions: readonly EvidenceRevision[];
   /**
-   * Whether a human examined this item -- a decision was recorded on the
-   * candidate, or the item itself was corrected. Not derivable from the
-   * revisions alone, because the common case is an item a reviewer read
-   * and left alone, which leaves no trace on the item.
+   * What establishes that a human examined this item. Deliberately not a
+   * boolean: examination is asserted by the caller and cannot be checked
+   * here, so the assertion has to name the record it rests on and carry
+   * that record's weakness into the reported sample.
    */
-  readonly reviewed: boolean;
+  readonly examinedVia: EvidenceExaminationSource;
 }
 
 export interface EvidencePrecision {
-  /** 1 - (corrected / reviewed). null when nothing has been reviewed. */
+  /**
+   * The one population these items came from. Carried through rather
+   * than restated at reporting time, so the metric name cannot disagree
+   * with the data it was computed over.
+   */
+  readonly dataset: EvidencePrecisionDataset;
+  /** 1 - (corrected / examined). null when nothing has been examined. */
   readonly precision: number | null;
   /** Items a human examined: the denominator. */
-  readonly reviewedItems: number;
-  /** Reviewed items that needed at least one correction. */
+  readonly examinedItems: number;
+  /** Examined items that needed at least one correction. */
   readonly correctedItems: number;
-  /** Items produced, reviewed or not: the population. */
+  /** Items produced, examined or not: the population. */
   readonly producedItems: number;
   /**
-   * Corrections applied across reviewed items, counting repeats. Reported
+   * Denominator items counted as examined because a decision was
+   * recorded on the candidate, with nothing recorded against the item.
+   * Drives `examination_inferred`.
+   */
+  readonly inferredExaminations: number;
+  /**
+   * Corrections applied across examined items, counting repeats. Reported
    * beside correctedItems rather than folded into it: an item corrected
    * three times is one imprecise item for this metric, but three
    * corrections is a different and worse story than one, and only the
@@ -3820,16 +4833,53 @@ export interface EvidencePrecision {
  * Counting correction events instead would let a single stubborn item
  * push the rate below any target on its own, and the number would stop
  * meaning "share of items" while still being named that.
+ *
+ * `examinedVia` has to agree with the revisions in both directions. A
+ * correction is a human act, so an item carrying one was examined by
+ * definition and cannot be attributed to anything weaker; and an item
+ * with no correction cannot claim `item_correction`, which is the only
+ * way a caller could otherwise assert item-level proof for an item no
+ * record covers. Both are contradictory input rather than edge cases:
+ * each hides a bug in whatever built the histories, and that bug moves
+ * the denominator.
+ *
+ * `dataset` is required and every item must match it. Pooling is caught
+ * here, where the items are, rather than at reporting time, where all
+ * that is left of them is a count: by then a live-pilot correction and
+ * an offline one are the same integer.
  */
 export function summarizeEvidencePrecision(
-  items: readonly EvidenceItemHistory[]
+  items: readonly EvidenceItemHistory[],
+  dataset: EvidencePrecisionDataset
 ): EvidencePrecision {
   const seen = new Set<string>();
-  let reviewedItems = 0;
+  let examinedItems = 0;
   let correctedItems = 0;
   let correctionEvents = 0;
+  let inferredExaminations = 0;
 
   for (const item of items) {
+    if (item.dataset !== dataset) {
+      // The live pilot and the locked eval answer to different targets,
+      // so an item counted into the wrong one is not a mislabelled row:
+      // it is the pooling this metric is split in two to prevent.
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} belongs to ${item.dataset} ` +
+          `and cannot be counted into a ${dataset} sample`
+      );
+    }
+    if (item.examinedVia === "offline_annotation" && dataset !== "locked_offline_eval") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia offline_annotation ` +
+          `in a ${dataset} sample; only the locked eval has annotators`
+      );
+    }
+    if (item.examinedVia === "candidate_decision" && dataset !== "live_pilot") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia candidate_decision ` +
+          `in a ${dataset} sample; only a live pilot has recruiters deciding on candidates`
+      );
+    }
     if (seen.has(item.itemId)) {
       // Two histories for one item would double-count it in both
       // numerator and denominator -- not cancelling out, because only one
@@ -3842,33 +4892,41 @@ export function summarizeEvidencePrecision(
       (revision) => revision.supersedesEvidenceOutcomeId !== undefined
     ).length;
 
-    if (corrections > 0 && !item.reviewed) {
-      // Contradictory input rather than an edge case: a correction is a
-      // human act, so the item was examined by definition. Silently
-      // flipping the flag would hide a bug in whatever computed it, and
-      // that bug moves the denominator.
+    if (corrections > 0 && item.examinedVia !== "item_correction") {
       throw new Error(
-        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s) but is marked unreviewed`
+        `summarizeEvidencePrecision: item ${item.itemId} has ${corrections} correction(s), ` +
+          `which is item-level proof of examination, but claims examinedVia ${item.examinedVia}`
       );
     }
-    if (!item.reviewed) {
+    if (corrections === 0 && item.examinedVia === "item_correction") {
+      throw new Error(
+        `summarizeEvidencePrecision: item ${item.itemId} claims examinedVia item_correction ` +
+          "but none of its revisions supersedes another"
+      );
+    }
+    if (item.examinedVia === "not_examined") {
       continue;
     }
-    reviewedItems += 1;
+    examinedItems += 1;
     correctionEvents += corrections;
     if (corrections > 0) {
       correctedItems += 1;
     }
+    if (item.examinedVia === "candidate_decision") {
+      inferredExaminations += 1;
+    }
   }
 
   return {
+    dataset,
     // null, never 1. Perfect precision over an empty denominator is what
     // a pilot that has not started yet would report, and it is the single
     // most quotable wrong number this metric could produce.
-    precision: reviewedItems === 0 ? null : (reviewedItems - correctedItems) / reviewedItems,
-    reviewedItems,
+    precision: examinedItems === 0 ? null : (examinedItems - correctedItems) / examinedItems,
+    examinedItems,
     correctedItems,
     producedItems: items.length,
+    inferredExaminations,
     correctionEvents
   };
 }
@@ -3877,21 +4935,78 @@ export function summarizeEvidencePrecision(
  * Precision as a reportable metric, for one dataset at a time.
  *
  * `population` is every item produced and `sampleSize` is only those
- * reviewed, so an unread backlog surfaces as population_incomplete
+ * examined, so an unread backlog surfaces as population_incomplete
  * without anyone having to remember to mention it.
+ *
+ * A denominator resting on candidate-level decisions is reported, with
+ * `examination_inferred` attached. Suppressing the number instead would
+ * suppress every live-pilot figure this product can currently produce,
+ * and a metric nobody can compute is not a safer metric: it is the same
+ * claim made in a slide deck with nothing attached to it at all.
+ *
+ * There is deliberately no dataset argument. The dataset arrived with
+ * the items and was checked against every one of them; taking it again
+ * here would create a second place to state it and therefore a way for
+ * the two to disagree, which is the same reasoning that keeps a
+ * candidate's workflow status out of a column on applications
+ * (0019_candidate_decisions.sql). A sample reported under the wrong name
+ * is not rejected here because it cannot be constructed.
  */
 export function describeEvidencePrecision(
   precision: EvidencePrecision,
-  dataset: EvidencePrecisionDataset,
   minimumSampleSize: number
 ): MetricSample {
-  return summarizeMetric({
-    metric: `evidence_precision_${dataset}`,
+  // REV-001: the metric's NAME is what makes it comparable to AF-57's 98%
+  // target. A denominator built partly from candidate-level decisions is
+  // not measured item examination, and attaching a limitation to a figure
+  // still called evidence_precision_live_pilot does not stop anyone
+  // reading it as one: a caveat travels in prose and the number travels in
+  // a slide.
+  //
+  // So the identity changes with the denominator. When any item counts as
+  // examined only because a decision was recorded on the candidate, this
+  // reports as evidence_precision_<dataset>_examination_inferred, which
+  // has no target to be measured against and cannot be mistaken for the
+  // one that does.
+  //
+  // Suppressing the value outright was the alternative and is worse: it
+  // would suppress every live-pilot figure this product can currently
+  // produce, and a metric nobody can compute is not a safer metric, it is
+  // the same claim made with nothing attached to it at all. Renaming keeps
+  // the signal and removes the false equivalence, which is the actual
+  // defect.
+  const inferred = precision.inferredExaminations > 0;
+  const sample = summarizeMetric({
+    metric: inferred
+      ? `evidence_precision_${precision.dataset}_examination_inferred`
+      : `evidence_precision_${precision.dataset}`,
     value: precision.precision,
-    sampleSize: precision.reviewedItems,
+    sampleSize: precision.examinedItems,
     population: precision.producedItems,
     minimumSampleSize
   });
+
+  if (!inferred) {
+    return sample;
+  }
+  // Attached even when the value is suppressed, for the reason AF-55
+  // gives: this describes how the denominator was built, not how large
+  // it is, and a caveat that appeared and vanished with sample size
+  // would read as being about sample size.
+  return {
+    ...sample,
+    limitations: [
+      ...sample.limitations,
+      {
+        code: "examination_inferred",
+        detail:
+          `${precision.inferredExaminations} of ${precision.examinedItems} item(s) in the denominator ` +
+          "count as examined because a decision was recorded on the candidate, not because anything " +
+          "records that this item was read; nothing in this system captures per-item examination, so an " +
+          "item a reviewer scrolled past is indistinguishable here from one they checked and accepted"
+      }
+    ]
+  };
 }
 
 // ---- AF-56: qualified-candidate preservation ----
@@ -3936,6 +5051,11 @@ export interface CandidateAdjudication {
   readonly blindToWorkflowOutput: boolean;
 }
 
+/**
+ * One row per application, describing what the reviewer actually got.
+ * A second row for the same `applicationId` is rejected rather than
+ * merged: see `summarizeQualifiedPreservation`.
+ */
 export interface SurfacedCandidate {
   readonly applicationId: string;
   /**
@@ -3991,6 +5111,25 @@ export function summarizeQualifiedPreservation(
 
   const evidenceByApplication = new Map<string, EvidenceStrengthSummary | null>();
   for (const candidate of surfaced) {
+    if (evidenceByApplication.has(candidate.applicationId)) {
+      // Rejected for the same reason as a duplicate adjudication, and at
+      // the same point: before anything has been counted. Letting the
+      // last row win made the North Star safety metric depend on input
+      // order, so a `cited` row followed by a `none` row for one
+      // candidate reported a miss while the same two rows the other way
+      // round reported a save.
+      //
+      // No merge rule is defined instead, because a second row for one
+      // application does not mean the candidate was surfaced twice; it
+      // means the caller's queue-to-evidence join fanned out, and
+      // neither row is known to be what the reviewer saw. Picking the
+      // strongest would let a broken join turn misses into saves, and
+      // picking the weakest would invent losses. Both answer a question
+      // the input cannot support.
+      throw new Error(
+        `summarizeQualifiedPreservation received two surfaced rows for ${candidate.applicationId}`
+      );
+    }
     evidenceByApplication.set(candidate.applicationId, candidate.evidence);
   }
 
@@ -4099,6 +5238,14 @@ export const REVIEW_TIME_BASELINE_SOURCES = [
   /**
    * Timing spans this system recorded before assisted review was turned
    * on for the role. Measured the same way as the assisted side.
+   *
+   * No route may accept this from a caller, and none does: a source a
+   * request can name is a caveat a request can delete. It is reachable
+   * only from a server-owned measurement, which needs spans recorded
+   * while assistance was off plus a persisted per-role record of when it
+   * was enabled, to tell those spans from the assisted ones. Neither
+   * exists yet, so today this value has no honest producer.
+   * tests/architecture/metric-exposure.test.ts holds that line.
    */
   "measured_preassist"
 ] as const;
@@ -4112,6 +5259,23 @@ export interface ReviewTimeBaseline {
 }
 
 /**
+ * The sample this metric refuses to report below, fixed here rather than
+ * taken from the caller.
+ *
+ * describeReviewTimeReduction still takes a minimum as an argument so
+ * tests can drive the suppression boundary directly, but the reporting
+ * path must not: a threshold a request can choose is not a threshold. An
+ * endpoint that accepted `minimumSampleSize=1` would hand anyone who
+ * wanted a number the means to get one out of a single review.
+ *
+ * Ten, because this is a median. Below roughly that, one interrupted
+ * review moves the middle value by minutes, and docs/VALIDATION_STATUS.md
+ * sizes the POC at about a hundred applications per role, so ten is the
+ * order of a tenth of a role rather than a number chosen to be reachable.
+ */
+export const REVIEW_TIME_REDUCTION_MINIMUM_SAMPLE_SIZE = 10;
+
+/**
  * Assisted review time against a baseline, as a reportable metric.
  *
  * The value is the fraction of baseline time removed: 0.5 means half the
@@ -4122,11 +5286,12 @@ export interface ReviewTimeBaseline {
  * ever say, and a floor at zero would render it as "no improvement" and
  * lose it.
  *
- * The denominator handed to summarizeMetric is applications with usable
- * timing, not spans. AF-54 drops idle-truncated spans, so an application
- * whose only visit was truncated never reaches the sample -- which shows
- * up as `population_incomplete` rather than quietly shrinking the base
- * the median was drawn from.
+ * The denominator handed to summarizeMetric is applications whose review
+ * time is fully observed, not spans and not applications. AF-54 drops
+ * any application with an idle-truncated span, so a partially observed
+ * review shows up as `population_incomplete` rather than as a short
+ * complete one -- see summarizeReviewTiming for why the alternative
+ * silently overstates this metric.
  */
 export function describeReviewTimeReduction(
   assisted: ReviewTimingSummary,
@@ -4175,5 +5340,169 @@ export function describeReviewTimeReduction(
           "figure excludes, which biases the comparison in favour of a larger reduction"
       }
     ]
+  };
+}
+
+// ---- AF-54: the capture half ----
+//
+// summarizeReviewTiming above consumes spans. Nothing produced one until
+// this existed: the table, the recorder and the summary were all in
+// place and no recruiter action created a row, so the baseline the
+// ticket asks for was always going to be empty.
+//
+// The split is the one AF-53 drew, for the same reason. This repository
+// has no jsdom, so anything decided inside a React effect cannot be
+// tested. Every rule about what counts as review time lives in these
+// functions, which are pure and clock-free -- the caller passes the time
+// in -- and apps/web/src/lib/review-timing.ts does only the parts that
+// genuinely need a browser: subscribing to events, reading the clock,
+// and sending the result.
+
+/**
+ * Two minutes without an interaction and the reviewer is no longer
+ * reviewing, whatever the tab still says.
+ *
+ * The exact number is a judgement, so what matters is which way it errs.
+ * Too long and a coffee break lands in the baseline, inflating the
+ * "before" and flattering any later improvement; too short and a
+ * reviewer who reads carefully before touching anything gets chopped
+ * into truncated fragments. Truncated spans are excluded from the median
+ * and counted in the open, so erring short costs sample size visibly
+ * while erring long corrupts the number silently. Two minutes is the
+ * short side of that trade on purpose.
+ */
+export const REVIEW_IDLE_CUTOFF_MS = 120_000;
+
+/**
+ * One visit in progress.
+ *
+ * `countedUntilMs` is the last instant that counts as review, and it is
+ * the only place duration is held. There is no separate accumulator,
+ * because a span never pauses: it starts when the page becomes visible
+ * and ends when it stops being visible, so active time within one span
+ * is exactly `countedUntilMs - startedAtMs` and a second field holding
+ * the same fact could only ever disagree with it.
+ *
+ * `lastActivityAtMs` is the last instant the reviewer proved they were
+ * there, which is a different thing and is why both are kept.
+ */
+export interface ReviewTimingState {
+  readonly startedAtMs: number;
+  readonly countedUntilMs: number;
+  readonly lastActivityAtMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** Exactly the fields the recorder needs, and no reviewer among them. */
+export interface ReviewTimingSpanDraft {
+  readonly startedAtMs: number;
+  readonly endedAtMs: number;
+  readonly activeMs: number;
+  readonly truncatedByIdle: boolean;
+}
+
+/** A settled state and, when one just ended, the span it produced. */
+export interface ReviewTimingTransition {
+  readonly state: ReviewTimingState;
+  readonly completed: ReviewTimingSpanDraft | undefined;
+}
+
+export function beginReviewTiming(atMs: number): ReviewTimingState {
+  return { startedAtMs: atMs, countedUntilMs: atMs, lastActivityAtMs: atMs, truncatedByIdle: false };
+}
+
+/**
+ * Advance the span to `atMs`, or conclude the reviewer had already left.
+ *
+ * The idle cutoff is applied here rather than by a timer, so the answer
+ * does not depend on whether a tick happened to fire. A reviewer who
+ * walked away an hour ago and whose tab is only now closing gets the
+ * same span either way.
+ *
+ * When the cutoff has passed, time is counted only up to the last
+ * interaction -- the grace window itself is not counted. That is the
+ * difference between a truncated span being a lower bound on the review,
+ * which is what it is described as and what makes it safe to exclude,
+ * and it being the review plus up to two minutes of absence.
+ *
+ * What the flag cannot tell you, for whoever tries to refine this. A
+ * truncated span covers two situations this producer cannot separate:
+ * the reviewer broke off mid-candidate and came back, and the reviewer
+ * finished, sat a while, and closed the tab. The obvious discriminator
+ * is that a truncated span which is the LAST one for its application,
+ * with a decision recorded afterwards, is the second case. That is a
+ * real improvement to the exclusion rule and it is worth having, but it
+ * is worth being clear about what it does not do: it does not make the
+ * underlying signal less ambiguous. A reviewer reading a long CV without
+ * scrolling or clicking is indistinguishable from an empty chair, and
+ * that is equally true BELOW the cutoff, where the silent stretch is
+ * counted as review and no flag is raised at all. No threshold and no
+ * discriminator fixes that, which is why the count of excluded
+ * applications is published rather than the exclusion being presented as
+ * clean. Agreed with AF-55, which consumes these spans.
+ */
+export function settleReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingState {
+  if (state.truncatedByIdle) {
+    return state;
+  }
+  if (atMs <= state.lastActivityAtMs + REVIEW_IDLE_CUTOFF_MS) {
+    // Math.max, not assignment: a clock that jumps backwards must not
+    // un-count time already counted.
+    return { ...state, countedUntilMs: Math.max(state.countedUntilMs, atMs) };
+  }
+  return { ...state, countedUntilMs: state.lastActivityAtMs, truncatedByIdle: true };
+}
+
+/**
+ * The reviewer did something at `atMs`.
+ *
+ * If the cutoff had already passed, that span is finished and this
+ * interaction opens a new one. Handing the finished span back rather
+ * than resuming it is what stops a reviewer returning from lunch from
+ * having the lunch counted, and stops the opposite failure: a span that
+ * truncated once and then silently measures nothing for the rest of the
+ * visit.
+ */
+export function recordReviewActivity(state: ReviewTimingState, atMs: number): ReviewTimingTransition {
+  const settled = settleReviewTiming(state, atMs);
+  if (!settled.truncatedByIdle) {
+    return {
+      state: { ...settled, lastActivityAtMs: Math.max(settled.lastActivityAtMs, atMs) },
+      completed: undefined
+    };
+  }
+  return { state: beginReviewTiming(atMs), completed: toSpanDraft(settled) };
+}
+
+/**
+ * Close the span at `atMs`, or report that there is nothing to send.
+ *
+ * `undefined` for a span that measured no time, and that is not merely
+ * an optimization. An application whose only spans were empty would
+ * still enter summarizeReviewTiming's denominator carrying a total of
+ * zero, pulling the median toward "reviews take no time" -- the exact
+ * number that function refuses to report. Dropping them at the source is
+ * what keeps the sample made of measurements.
+ */
+export function sealReviewTiming(state: ReviewTimingState, atMs: number): ReviewTimingSpanDraft | undefined {
+  const draft = toSpanDraft(settleReviewTiming(state, atMs));
+  return draft.activeMs > 0 ? draft : undefined;
+}
+
+/**
+ * `endedAtMs` is the counted frontier, never the caller's clock, and
+ * `activeMs` is measured against the same instant.
+ *
+ * That is what makes `activeMs <= endedAtMs - startedAtMs` true by
+ * construction rather than by hope. Migration 0021 asserts the same
+ * bound as a CHECK, and a producer that can only emit conforming spans
+ * is worth more than one that is merely rejected when it does not.
+ */
+function toSpanDraft(state: ReviewTimingState): ReviewTimingSpanDraft {
+  return {
+    startedAtMs: state.startedAtMs,
+    endedAtMs: state.countedUntilMs,
+    activeMs: state.countedUntilMs - state.startedAtMs,
+    truncatedByIdle: state.truncatedByIdle
   };
 }

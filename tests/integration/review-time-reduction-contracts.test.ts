@@ -37,7 +37,7 @@ test("an unknown property on a baseline is rejected", () => {
 
 test("what describeReviewTimeReduction returns validates as a MetricSample", () => {
   const sample = describeReviewTimeReduction(
-    { medianActiveMs: 300_000, sampleSize: 20, population: 20, truncatedSpanCount: 0 },
+    { medianActiveMs: 300_000, sampleSize: 20, population: 20, truncatedSpanCount: 0, partiallyObservedCount: 0 },
     reviewTimeBaselineSchema.parse(VALID),
     10
   );
@@ -51,7 +51,7 @@ test("the AF-55 limitation code crosses the contract boundary", () => {
   // carrying the caveat would be rejected in transit and the caveat is
   // exactly what must not get dropped.
   const sample = describeReviewTimeReduction(
-    { medianActiveMs: 300_000, sampleSize: 20, population: 20, truncatedSpanCount: 0 },
+    { medianActiveMs: 300_000, sampleSize: 20, population: 20, truncatedSpanCount: 0, partiallyObservedCount: 0 },
     reviewTimeBaselineSchema.parse(VALID),
     10
   );
@@ -68,7 +68,7 @@ test("a suppressed review-time reduction cannot smuggle a value past the contrac
   // the headline metric, and it is the one someone would be tempted to
   // hand-build for a demo.
   const suppressed = describeReviewTimeReduction(
-    { medianActiveMs: 300_000, sampleSize: 2, population: 20, truncatedSpanCount: 0 },
+    { medianActiveMs: 300_000, sampleSize: 2, population: 20, truncatedSpanCount: 0, partiallyObservedCount: 0 },
     reviewTimeBaselineSchema.parse(VALID),
     10
   );
