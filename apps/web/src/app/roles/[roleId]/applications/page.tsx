@@ -85,7 +85,7 @@ export default function ApplicationReviewQueuePage() {
   const entries = state.kind === "ready" ? state.queue.entries : [];
   // AF-53: keyboard navigation over the rows actually shown, so the
   // count follows AF-47's filters rather than the whole role.
-  const { focusedIndex, helpVisible } = useReviewKeyboard({
+  const { focusedIndex, helpVisible, shortcuts, registerItem, setFocusedIndex } = useReviewKeyboard({
     itemCount: entries.length,
     onOpen: (index) => {
       const target = entries[index];
@@ -150,7 +150,7 @@ export default function ApplicationReviewQueuePage() {
       <p>
         <small>Keyboard: j/k to move, Enter to open, ? for all shortcuts.</small>
       </p>
-      <ShortcutHelp visible={helpVisible} />
+      <ShortcutHelp visible={helpVisible} shortcuts={shortcuts} />
 
       {state.kind === "loading" && <p>Loading applications…</p>}
       {state.kind === "error" && <p role="alert">Could not load the review queue: {state.message}</p>}
@@ -210,10 +210,25 @@ export default function ApplicationReviewQueuePage() {
                 {state.queue.entries.map((entry, index) => (
                   <tr
                     key={entry.application.applicationId}
-                    aria-selected={index === focusedIndex}
-                    // A focus ring the mouse user never sees is the point:
-                    // keyboard review is unusable if you cannot tell which
-                    // row you are on.
+                    // REV-001: the row itself takes DOM focus, so the
+                    // browser scrolls to it and a screen reader reads the
+                    // candidate out. An outline alone is invisible once the
+                    // selection passes the fold, which is the point at
+                    // which a queue of hundreds starts to matter.
+                    ref={registerItem(index)}
+                    // Roving tabindex: exactly one row is in the tab order,
+                    // so Tab reaches the queue in one press and j/k moves
+                    // within it, instead of Tab walking every row.
+                    tabIndex={index === focusedIndex ? 0 : -1}
+                    // aria-current rather than aria-selected: selection is
+                    // not supported on a row outside a grid or treegrid, so
+                    // the old attribute announced nothing and additionally
+                    // marked every other row as explicitly not selected.
+                    aria-current={index === focusedIndex ? "true" : undefined}
+                    // Clicking a row focuses it; without this the outline
+                    // would stay on a different row and the next j would
+                    // jump back there.
+                    onFocus={() => setFocusedIndex(index)}
                     style={index === focusedIndex ? { outline: "2px solid" } : undefined}
                   >
                     <td>{entry.application.sourceRowNumber}</td>
