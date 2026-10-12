@@ -4761,7 +4761,19 @@ export const SHARE_LINK_DEFAULT_DAYS = 30;
 /** Enforced here and again by a CHECK constraint, so neither can drift alone. */
 export const SHARE_LINK_MAX_DAYS = 180;
 
-export function computeShareLinkExpiry(createdAt: Date, days: number = SHARE_LINK_DEFAULT_DAYS): string {
+/**
+ * The lifetime rules, on their own, so a caller that needs the number of
+ * days rather than a timestamp does not have to restate them.
+ *
+ * #79 REV-010: `createAuditReportShareLink` used to read the clock in its
+ * own round trip and compute the expiry here, in JS, while `created_at`
+ * was pinned by a separate `clock_timestamp()` inside the INSERT. Two
+ * reads of "now", and the ceiling CHECK compares them. It now derives the
+ * expiry server-side from the same statement, which means it needs the
+ * validated day count and not a finished timestamp. Splitting the rules
+ * out keeps one place that decides what a legal lifetime is.
+ */
+export function validateShareLinkDays(days: number = SHARE_LINK_DEFAULT_DAYS): number {
   if (!Number.isInteger(days) || days < 1) {
     throw new Error(`a share link must last a whole number of days, at least one, got: ${days}`);
   }
@@ -4771,7 +4783,11 @@ export function computeShareLinkExpiry(createdAt: Date, days: number = SHARE_LIN
         "the pilot it was made for is the failure this ceiling exists to prevent"
     );
   }
-  return new Date(createdAt.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+  return days;
+}
+
+export function computeShareLinkExpiry(createdAt: Date, days: number = SHARE_LINK_DEFAULT_DAYS): string {
+  return new Date(createdAt.getTime() + validateShareLinkDays(days) * 24 * 60 * 60 * 1000).toISOString();
 }
 
 /**

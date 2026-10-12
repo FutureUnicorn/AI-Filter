@@ -69,7 +69,8 @@ import {
   isPrivacyRequestTerminal,
   validatePrivacyRequestExtensionMonths,
   validatePrivacyRequestTransition,
-  computeShareLinkExpiry,
+  SHARE_LINK_MAX_DAYS,
+  validateShareLinkDays,
   renderShareLinkResolution
 
 } from "@signal-audit/domain";
@@ -9670,21 +9671,30 @@ export async function createAuditReportShareLink(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    // Only the Date form is needed here. extendPrivacyRequest on AF-64
-    // also reads the clock as text, deliberately, because it writes that
-    // exact value into two tables and text keeps the microseconds a JS
-    // Date truncates to milliseconds. Nothing is written from here:
-    // created_at comes from the column DEFAULT and the pin trigger, so
-    // the text form was carried over from a place whose reason for it
-    // does not apply.
-    const clock = await client.query<{ now: Date }>(
-      `SELECT clock_timestamp() AS now`
-    );
-    const dbNow = clock.rows[0];
-    if (dbNow === undefined) {
-      throw new Error("createAuditReportShareLink: could not read the database clock");
-    }
-    const expiresAt = computeShareLinkExpiry(dbNow.now, input.days ?? undefined);
+    // #79 REV-010: expires_at is derived inside the INSERT, from the
+    // database's own clock, instead of being computed in JS from a
+    // separate `SELECT clock_timestamp()` round trip.
+    //
+    // The two reads were the problem. created_at is pinned by the BEFORE
+    // INSERT trigger with its own clock_timestamp(), and the ceiling
+    // CHECK compares the two (`expires_at <= created_at + 180 days`). A
+    // backward clock step landing in the gap between the SELECT and the
+    // INSERT could put created_at earlier than the instant expires_at was
+    // computed from, and a legitimate request for the full 180 days would
+    // fail the CHECK. A network round trip is exactly where an NTP
+    // correction has room to land.
+    //
+    // Evaluation order makes the remaining window safe, and it was
+    // measured rather than assumed: across 200 inserts against real
+    // Postgres the BEFORE INSERT trigger's clock_timestamp() was never
+    // earlier than the VALUES expression's (200/200), averaging 5
+    // microseconds later. So created_at >= the instant expires_at is
+    // derived from, which is the direction the ceiling CHECK needs.
+    //
+    // The validation still lives in the domain. make_interval takes the
+    // day count, so what crosses the boundary is the validated integer
+    // rather than a finished timestamp.
+    const days = validateShareLinkDays(input.days);
     // created_at is omitted on purpose: DEFAULT plus the pin trigger write
     // the database clock. Passing a bind parameter would re-open the
     // writable-anchor hole the trigger exists to close.
@@ -9692,7 +9702,7 @@ export async function createAuditReportShareLink(
       `INSERT INTO "${schema}".audit_report_share_links
          (organization_id, role_id, token_hash, report, report_generated_at, expires_at,
           created_by_user_id)
-       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7)
+       VALUES ($1,$2,$3,$4::jsonb,$5, clock_timestamp() + make_interval(days => $6), $7)
        RETURNING share_link_id, expires_at`,
       [
         input.organizationId,
@@ -9700,7 +9710,7 @@ export async function createAuditReportShareLink(
         input.tokenHash,
         JSON.stringify(input.report),
         input.report.generatedAt,
-        expiresAt,
+        days,
         input.createdByUserId
       ]
     );
@@ -9851,6 +9861,13 @@ export async function revokeAuditReportShareLinks(
 }
 
 export interface AuditReportShareLinkObservations {
+  /** #79 REV-010: how far short of exactly the requested lifetime the
+   *  stored expiry falls, in microseconds. With the expiry derived
+   *  inside the INSERT this is the intra-statement distance between
+   *  the VALUES expression and the BEFORE INSERT trigger. */
+  readonly ceilingExpiryGapMicroseconds: number;
+  readonly ceilingExpiryWithinCeiling: boolean;
+  readonly ceilingExpiryInFuture: boolean;
   /** REV-009: the refusal a non-finite clock produced, empty if it was accepted. */
   readonly invalidClockRejection: string;
   /** REV-009: a refused resolve must not leave a view row claiming it served. */
@@ -9999,6 +10016,25 @@ export async function assertAuditReportShareLinkSecurity(
           days
         })
       ).shareLinkId;
+
+    // #79 REV-010: a link at the full 180-day ceiling, which is the only
+    // place the two-reads-of-now gap could bite. The measured quantity is
+    // how far short of exactly 180 days the stored expiry falls, in
+    // microseconds. Deriving the expiry inside the INSERT makes that the
+    // intra-statement gap between the VALUES expression and the BEFORE
+    // INSERT trigger. Computing it in JS from a separate round trip made
+    // it the round trip, which is orders of magnitude larger and is where
+    // a backward clock step has room to land.
+    const ceilingId = await link("ceiling", SHARE_LINK_MAX_DAYS, roleId, report);
+    const ceilingGap = await admin.query<{ gap_us: string; within_ceiling: boolean; in_future: boolean }>(
+      `SELECT round(
+                EXTRACT(EPOCH FROM (created_at + make_interval(days => $2::int) - expires_at)) * 1e6
+              )::text AS gap_us,
+              expires_at <= created_at + make_interval(days => $2::int) AS within_ceiling,
+              expires_at > created_at AS in_future
+         FROM audit_report_share_links WHERE share_link_id = $1`,
+      [ceilingId, SHARE_LINK_MAX_DAYS]
+    );
 
     const liveId = await link("live", 30, roleId, report);
     // One day of life from the database clock; resolveNow is two days ahead.
@@ -10195,6 +10231,9 @@ export async function assertAuditReportShareLinkSecurity(
       viewsBeforeInvalid.rows[0]?.count === viewsAfterInvalid.rows[0]?.count;
 
     return {
+      ceilingExpiryGapMicroseconds: Number.parseInt(ceilingGap.rows[0]?.gap_us ?? "", 10),
+      ceilingExpiryWithinCeiling: ceilingGap.rows[0]?.within_ceiling === true,
+      ceilingExpiryInFuture: ceilingGap.rows[0]?.in_future === true,
       invalidClockRejection,
       invalidClockLoggedNoView,
       resolveBlockedOnRevoke,

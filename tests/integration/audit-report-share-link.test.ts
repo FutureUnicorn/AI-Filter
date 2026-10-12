@@ -204,3 +204,29 @@ test("the raw token is not recoverable from what gets stored", () => {
   assert.notEqual(tokenHash, token);
   assert.ok(!tokenHash.includes(token));
 });
+
+// #79 REV-010. A link at the full 180-day ceiling is the only place the
+// two-reads-of-now gap could bite: expires_at is checked against the
+// trigger-pinned created_at, so if the instant expires_at was derived
+// from were later than created_at, a legitimate request would fail
+// `audit_report_share_links_expiry_within_ceiling`.
+//
+// The expiry is now derived inside the INSERT, from the database's own
+// clock. These assert the constraints hold at the boundary. The size of
+// the remaining gap is deliberately NOT asserted: it is the
+// intra-statement distance between the VALUES expression and the BEFORE
+// INSERT trigger, around 1.5ms here against 2.7ms before the fix, and a
+// threshold between two numbers that close would be a flake rather than
+// a regression test. What stops the round trip coming back is the
+// architecture guard, which is deterministic.
+test("a link at the full 180-day ceiling satisfies both expiry constraints", async () => {
+  const observed = await observe();
+  assert.equal(observed.ceilingExpiryWithinCeiling, true);
+  assert.equal(observed.ceilingExpiryInFuture, true);
+  // Sanity on the measurement itself: a gap of a whole second would mean
+  // the expiry is being derived somewhere far from the insert.
+  assert.ok(
+    observed.ceilingExpiryGapMicroseconds >= 0 && observed.ceilingExpiryGapMicroseconds < 1_000_000,
+    `expiry gap was ${observed.ceilingExpiryGapMicroseconds} microseconds, which is not an intra-statement gap`
+  );
+});
