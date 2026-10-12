@@ -2237,6 +2237,371 @@ export function describeFailedDocumentRate(
   });
 }
 
+// ---- AF-65: retry / dead-letter administration ----
+//
+// "Admin view to retry or dead-letter stuck import/extraction jobs
+// without manually editing underlying candidate data."
+//
+// The clause after "without" is the requirement, not a caveat. An admin
+// tool that can reach candidate rows is the most dangerous surface in
+// the product: it is used rarely, by whoever is on call, under time
+// pressure, on the one tenant already having a bad day. So
+// JobAdministrationRequest carries a job id, an action and a reason and
+// has NO field into which candidate content could be placed. That is
+// what makes "without editing candidate data" a property of the type
+// rather than a rule someone has to keep.
+//
+// There is deliberately no new queue table. Stuckness is derived from
+// state that already exists -- a validated intake with no canonical
+// text, or an application whose current outcome is still processing or
+// retrying -- and dead-lettering records a terminal `failed` outcome
+// through the existing append-only evidence store. Inventing a job table
+// would create a second copy of "what happened to this document" that
+// could disagree with the first.
+//
+// **The property that matters most: dead-lettering must not improve any
+// metric.** The tempting implementation excludes dead-lettered
+// candidates from AF-56's denominator -- "we could not process them, so
+// they do not count" -- which would let the North Star safety number be
+// raised by dead-lettering everything difficult. A dead-lettered
+// candidate is precisely a candidate the workflow failed to surface, and
+// must keep counting as one.
+
+export type StuckJobKind = "import" | "extraction";
+export type JobAdministrationAction = "retry" | "dead_letter";
+
+export interface JobObservation {
+  readonly jobId: string;
+  readonly kind: StuckJobKind;
+  readonly organizationId: string;
+  /** Terminal jobs are never stuck, whatever their age. */
+  readonly terminal: boolean;
+  readonly attempts: number;
+  /** When the job entered its current non-terminal state. */
+  readonly waitingSince: string;
+}
+
+export interface StuckJobThresholds {
+  readonly importStuckAfterMs: number;
+  readonly extractionStuckAfterMs: number;
+  /** Attempts after which retrying is refused and dead-lettering is the only move. */
+  readonly maxAttempts: number;
+}
+
+export const DEFAULT_STUCK_JOB_THRESHOLDS: StuckJobThresholds = {
+  // Generous on purpose. A job flagged stuck while it is merely slow
+  // invites a retry that duplicates work still in flight, and the
+  // operator has no way to tell the two apart from the outside.
+  importStuckAfterMs: 30 * 60 * 1000,
+  extractionStuckAfterMs: 60 * 60 * 1000,
+  maxAttempts: 3
+};
+
+export interface StuckJob extends JobObservation {
+  readonly stuckForMs: number;
+  /** False once attempts have been exhausted: dead-letter is then the only action. */
+  readonly retryable: boolean;
+}
+
+export function identifyStuckJobs(
+  observations: readonly JobObservation[],
+  now: Date,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): readonly StuckJob[] {
+  // REV-004: a timestamp that does not parse must trip this, not skip it.
+  // Date.parse returns NaN for a malformed value, every comparison against
+  // NaN is false, and "not yet past the threshold" is the false branch, so a
+  // bad waitingSince used to push the job as stuck and retryable with
+  // stuckForMs NaN, and one NaN in the comparator scrambled the triage
+  // order. Thrown rather than skipped: waitingSince comes from database
+  // timestamps, so a malformed one is a bug upstream, and quietly leaving
+  // the job out would hide a job that may really be stuck. Same choice as
+  // summarizeFailedDocuments on bad counts.
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("identifyStuckJobs requires a valid now, got an invalid Date");
+  }
+  const stuck: StuckJob[] = [];
+  for (const observation of observations) {
+    if (observation.terminal) {
+      continue;
+    }
+    const waitingSinceMs = Date.parse(observation.waitingSince);
+    if (!Number.isFinite(waitingSinceMs)) {
+      throw new Error(
+        `identifyStuckJobs: job ${observation.jobId} has an unparseable waitingSince: ${JSON.stringify(observation.waitingSince)}`
+      );
+    }
+    const waitedMs = nowMs - waitingSinceMs;
+    const threshold =
+      observation.kind === "import" ? thresholds.importStuckAfterMs : thresholds.extractionStuckAfterMs;
+    if (waitedMs < threshold) {
+      continue;
+    }
+    stuck.push({
+      ...observation,
+      stuckForMs: waitedMs,
+      retryable: observation.attempts < thresholds.maxAttempts
+    });
+  }
+  // Longest-waiting first: the operator working down this list is
+  // triaging, and the oldest job is the one a customer has been staring
+  // at.
+  return stuck.sort((left, right) => right.stuckForMs - left.stuckForMs);
+}
+
+/**
+ * Everything an operator may say about a stuck job.
+ *
+ * Note what is absent: there is no field for a candidate name, a quote,
+ * a corrected value or arbitrary SQL. The admin path cannot edit
+ * candidate data because there is nowhere to put it, not because a
+ * reviewer remembered to check.
+ */
+export interface JobAdministrationRequest {
+  /**
+   * The tenant the operator claims to be acting in.
+   *
+   * REV-008: this exists so authorization can run before the job is
+   * looked at. It used to be read off the job, which meant the job had to
+   * be resolved first and its existence therefore leaked to a caller
+   * holding no grant at all. A claim needs nothing resolved, and it is
+   * checked against both the grant and the job below, so it cannot be
+   * used to reach another tenant's work.
+   */
+  readonly organizationId: string;
+  readonly jobId: string;
+  readonly action: JobAdministrationAction;
+  readonly reason: string;
+  readonly operatorUserId: string;
+}
+
+/**
+ * REV-005: the key set above is enforced by the compiler, in the gate.
+ *
+ * The earlier "test" read Object.keys of the test's own fixture, so adding a
+ * field here, optional or not, left the fixture and the test unchanged and
+ * green. The claim that adding a field fails a test was false. tests/ are
+ * not type-checked in this repository, but this file is (pnpm typecheck,
+ * part of pnpm check), so the assertion lives here: adding, removing or
+ * renaming any key of JobAdministrationRequest, including an optional one,
+ * is a compile error. If a new key is genuinely needed, the change has to
+ * come here and say why candidate content still has nowhere to go.
+ */
+type ExactlyTheseKeys<T, K extends PropertyKey> = [Exclude<keyof T, K>, Exclude<K, keyof T>] extends [never, never]
+  ? true
+  : false;
+type AssertTrue<T extends true> = T;
+export type JobAdministrationRequestKeysAreFixed = AssertTrue<
+  // organizationId added by REV-008, and this is the "say why" the comment
+  // above asks for. It is the tenant the operator CLAIMS to be acting in,
+  // so that authorization can run before the job is resolved -- reading it
+  // off the job is what leaked the job's existence to a caller holding no
+  // grant. It is an identifier the caller already supplied by choosing a
+  // tenant to act in, checked against the grant and against the job, and
+  // it carries no candidate content: candidate text still has nowhere to
+  // go in this type.
+  ExactlyTheseKeys<JobAdministrationRequest, "organizationId" | "jobId" | "action" | "reason" | "operatorUserId">
+>;
+
+export type JobAdministrationRefusal =
+  | "job_not_stuck"
+  | "job_mismatch"
+  | "dead_letter_unsupported_for_import"
+  | "job_already_terminal"
+  | "retries_exhausted"
+  | "reason_required"
+  | "not_authorized";
+
+export type JobAdministrationDecision =
+  | {
+      readonly allowed: true;
+      readonly action: JobAdministrationAction;
+      readonly attempt: number;
+      /** The AF-66 grant that permitted this, so the admin_action audit event can name it. */
+      readonly grantId: string;
+    }
+  | {
+      readonly allowed: false;
+      readonly refusal: JobAdministrationRefusal;
+      /** Present when the refusal is not_authorized: why AF-66 said no. */
+      readonly supportAccessDenial?: SupportAccessDenialReason;
+    };
+
+/**
+ * The support access an administration request is made under: the grant
+ * the operator holds, if any, and the instant to judge it at.
+ */
+export interface JobAdministrationAccess {
+  readonly grant: SupportAccessGrant | undefined;
+  readonly now: Date;
+}
+
+/**
+ * REV-001: authority is checked against THIS job, not taken on trust.
+ *
+ * The first version took `supportAccessAllowed: boolean`, which said only
+ * that some AF-66 check had passed somewhere, for some tenant and some
+ * operator. A caller holding support access to tenant A could dead-letter
+ * a job in tenant B, and a dead-letter is append-only, so it could not be
+ * undone: the cross-tenant write AF-66 exists to prevent.
+ *
+ * So this takes the grant and calls authorizeSupportAccess itself, with
+ * the request built from the job's own organization and the request's own
+ * operator. A SupportAccessDecision would not do: its allowed branch
+ * carries only a grantId, so nothing here could check what tenant or
+ * operator it was issued for. It still does not re-derive AF-66's rules;
+ * it asks AF-66 the right question. The job id in the request must also be
+ * the job being decided on, or the caller's intent and the job acted on can
+ * differ.
+ */
+export function authorizeJobAdministration(
+  job: StuckJob | undefined,
+  request: JobAdministrationRequest,
+  access: JobAdministrationAccess,
+  thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
+): JobAdministrationDecision {
+  // REV-008 (Pradeep): authorization first, before anything is read off
+  // the job.
+  //
+  // The REV-001 fix put the job checks first, because the tenant to
+  // authorize against was taken from job.organizationId and the job had
+  // to exist to supply it. That was correct about tenancy and wrong about
+  // ordering: a caller holding no grant for anything got job_not_stuck,
+  // job_mismatch or not_authorized depending on whether the id they named
+  // was a currently-stuck job, before their authorization was ever
+  // considered. That is a state-existence oracle across the authorization
+  // boundary, and it would have told an unauthorized caller something
+  // about another tenant's pipeline health.
+  //
+  // The tenant is now a claim on the request, which needs nothing
+  // resolved. It is checked twice: here against the grant, and below
+  // against the job, so a valid grant for one tenant plus another
+  // tenant's job id still refuses.
+  const support = authorizeSupportAccess(
+    access.grant,
+    {
+      organizationId: request.organizationId,
+      operatorUserId: request.operatorUserId,
+      entityType: "job",
+      entityId: request.jobId
+    },
+    access.now
+  );
+  if (!support.allowed) {
+    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
+  }
+  if (job === undefined) {
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (request.jobId !== job.jobId) {
+    return { allowed: false, refusal: "job_mismatch" };
+  }
+  if (job.organizationId !== request.organizationId) {
+    // The other half of moving the tenant onto the request. Without this
+    // an operator with a live grant for their own tenant could hand in a
+    // job belonging to someone else and pass every check, which is the
+    // cross-tenant hole REV-001 closed, reopened from the other side.
+    //
+    // Reported as job_not_stuck rather than as its own refusal, because
+    // to a caller authorized for this tenant that is exactly what is
+    // true: this tenant has no such stuck job. A distinct code would
+    // rebuild the oracle one layer in.
+    return { allowed: false, refusal: "job_not_stuck" };
+  }
+  if (!/[^\s]/u.test(request.reason)) {
+    // Same rule as AF-66's grant reason. An unexplained retry is
+    // indistinguishable from an accident, and dead-lettering without a
+    // reason discards a candidate silently.
+    return { allowed: false, refusal: "reason_required" };
+  }
+  if (job.terminal) {
+    return { allowed: false, refusal: "job_already_terminal" };
+  }
+  if (request.action === "dead_letter" && job.kind === "import") {
+    // REV-002: refused, because it cannot be done honestly yet. An import
+    // job is stuck because a validated intake has no canonical text, and a
+    // dead-letter here would only write a per-criterion evidence outcome,
+    // which changes nothing about the intake: the next sweep finds it stuck
+    // again, and summarizeFailedDocuments keeps it inFlight rather than
+    // failed. Returning allowed would claim the work was terminated when it
+    // was not. This is not a permanent product decision: import
+    // dead-lettering needs a terminal "abandoned" intake state that AF-57's
+    // failed-document rate counts as failed, which is its own ticket.
+    // Retrying an import is still allowed, bounded as below.
+    return { allowed: false, refusal: "dead_letter_unsupported_for_import" };
+  }
+  if (request.action === "dead_letter") {
+    // Always available for extraction jobs. Refusing to dead-letter one
+    // that has not yet exhausted its retries would leave an operator with
+    // no way to stop a document that is provably never going to parse.
+    return { allowed: true, action: "dead_letter", attempt: job.attempts, grantId: support.grantId };
+  }
+  if (!job.retryable || job.attempts >= thresholds.maxAttempts) {
+    // Bounded, because an unbounded retry on a permanently broken
+    // document burns the inference budget AF-41 exists to protect and
+    // never terminates.
+    return { allowed: false, refusal: "retries_exhausted" };
+  }
+  return { allowed: true, action: "retry", attempt: job.attempts + 1, grantId: support.grantId };
+}
+
+/**
+ * REV-003: what a hiring reviewer reads on a dead-lettered criterion.
+ *
+ * A fixed system sentence, never the operator's words, redacted or not.
+ * The first version stored the operator's free-text reason as the
+ * outcome's message, and evidence_outcomes is append-only while
+ * buildEvidenceCard renders a failed outcome's message verbatim, so
+ * "Looking at Jane Doe's stuck upload" would have been written permanently
+ * into candidate evidence and shown to everyone reviewing that candidate.
+ *
+ * Redacting the text first would not have fixed it: free text cannot be
+ * sanitised by pattern (redactPii matches email addresses and phone numbers,
+ * so a name passes through untouched). The fix is to remove the path, which
+ * is why buildDeadLetterOutcome takes no reason at all.
+ */
+export const DEAD_LETTER_EXPLANATION = "Processing was stopped by support.";
+
+/**
+ * The outcome recorded when a job is dead-lettered.
+ *
+ * `retryable: false` is the honest signal to every downstream reader
+ * that this will not resolve itself. It is still an EvidenceOutcome, so
+ * it still lands in the append-only store and still appears in the
+ * candidate's card set -- a dead-lettered candidate is visible as one the
+ * system gave up on, not absent.
+ *
+ * `failed`, not `extraction_error`: FailedEvidence is "retries are
+ * exhausted or not applicable", which is an operator giving up.
+ * ExtractionErrorEvidence is a raw pipeline break. The two are
+ * structurally identical, so only this discriminant tells them apart, and
+ * evidence_outcomes is append-only: a mis-tagged row can never be fixed.
+ *
+ * It takes no reason, deliberately: there is no parameter through which
+ * operator free text could reach this append-only row (REV-003).
+ *
+ * No organizationId/candidateId here, because FailedEvidence on
+ * this stack does not carry them: AF-13's review added attribution to
+ * every outcome kind on the develop line, which this stack predates. The
+ * fields arrive when develop merges down, and this call site will stop
+ * compiling until they are supplied -- which is the correct way to find
+ * out, rather than a silently unattributed outcome.
+ */
+export function buildDeadLetterOutcome(criterionId: string): EvidenceOutcome {
+  return {
+    schemaVersion: CONTRACT_SCHEMA_VERSION,
+    kind: "failed",
+    criterionId,
+    errorCode: "dead_lettered_by_operator",
+    message: DEAD_LETTER_EXPLANATION,
+    // Not retryable: that is the whole meaning of dead-lettering, and a
+    // retryable dead-letter would be picked up again by the same job
+    // sweep that produced it.
+    retryable: false
+  };
+}
+
 // ---- AF-66: support-access logging ----
 //
 // "Any time a founder/operator looks at a specific tenant's data for
@@ -2621,7 +2986,22 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // nothing else: no tenant, no candidate, no free text. Exempt because it
   // is access-control configuration, and purging it would make every
   // historical grant name an operator the schema no longer recognises.
-  "platform_operators"
+  "platform_operators",
+  // AF-62. The erasure receipt: which application was erased, on whose
+  // authority, and what survived. It carries no candidate content -- the
+  // surfaces_erased and residue columns hold surface names and counts, not
+  // anything copied out of the rows being erased. It is exempt in the
+  // stronger sense too: it is the audit metadata the deletion workflow is
+  // specified to preserve, so a retention job that purged it would destroy
+  // the only evidence that the deletion it is auditing ever happened.
+  //
+  // This is the one exemption on this list that survives holding an
+  // application identifier, and it is exempt for a reason none of the
+  // others could use: the record exists to evidence the erasure, so
+  // purging it destroys the proof of the deletion it documents. That is a
+  // claim about what the row is for, not a claim that the identifier is
+  // harmless, which is the distinction AF-61 REV-001 turned on.
+  "candidate_data_erasures"
 ]);
 
 /**
@@ -3236,6 +3616,405 @@ export function summarizeSurvivingCandidateData(
   }
   return { anySurvives: surviving.length > 0, automatedDeletionActive, surfaces: surviving, statement };
 }
+
+// ---- AF-62: candidate-data deletion workflow ----
+//
+// "On request or retention expiry, delete original documents, canonical
+// text, model outputs, and indexes -- audit metadata is the only thing
+// preserved."
+//
+// AF-61 answered the question "can retention delete this?" surface by
+// surface and found that it cannot: everything is either append-only or
+// pinned behind a foreign key to something append-only. Taken at face
+// value that makes this ticket unimplementable.
+//
+// It is not, because "delete the row" and "erase the content" are
+// different operations and only the first is blocked. The four pinned
+// surfaces carry no append-only trigger; a foreign key is all that stops
+// their DELETE, and a foreign key says nothing about UPDATE. Overwriting
+// the candidate-derived columns in place keeps the row for the references
+// that need it and destroys the text, which is what the candidate was
+// actually promised. That reaches the biggest store of raw candidate data
+// in the system -- the full extracted document text -- which row deletion
+// could not have touched at all.
+//
+// Two surfaces stay genuinely out of reach: the verbatim quote in
+// evidence_outcomes and the human rationale in candidate_decisions are
+// append-only against UPDATE too, so they can be neither removed nor
+// redacted. Erasing them needs the per-candidate encryption key design
+// AF-61 named and left for a human decision, tracked as AF-91. Every plan
+// this module produces reports that residue rather than rounding it off.
+
+/** Why an erasure is happening. The two triggers the ticket names. */
+export type CandidateDataErasureTrigger = "retention_expiry" | "candidate_request";
+
+/**
+ * What can be done to a surface, given the schema as it stands.
+ *
+ * The distinction between `redact_in_place` and `blocked_append_only` is
+ * the whole finding of this ticket, and it is a property of the trigger
+ * on the table rather than of how sensitive the column is.
+ */
+export type CandidateDataErasureMethod =
+  /** The bytes themselves are removed from object storage. */
+  | "delete_object"
+  /** The row stays; its candidate-derived columns are overwritten. */
+  | "redact_in_place"
+  /** An append-only trigger rejects UPDATE as well as DELETE. Needs AF-91. */
+  | "blocked_append_only"
+  /**
+   * In scope for completeness; holds nothing candidate-derived.
+   *
+   * No surface currently carries this. audit_events did, on the basis
+   * that it held no candidate TEXT, which was true and was not the
+   * question: it holds the application identifier, and an identifier is
+   * what re-links every surviving row to a person (AF-61 REV-001). Kept
+   * in the union because a future surface may genuinely qualify, and a
+   * new one should have to argue for it.
+   */
+  | "not_candidate_data";
+
+export interface CandidateDataErasureStep {
+  readonly surface: RetentionSurface;
+  readonly method: CandidateDataErasureMethod;
+  /** The columns this step overwrites. Empty unless the method redacts. */
+  readonly columns: readonly string[];
+  /** Why this method and not another. Never empty for a blocked surface. */
+  readonly detail: string;
+}
+
+/**
+ * What a redacted text column is set to.
+ *
+ * Not NULL and not the empty string, because the columns that most need
+ * erasing are the ones the schema protects: file_intakes.declared_filename
+ * and applications.candidate_full_name/candidate_email are all NOT NULL
+ * with a non-empty CHECK, so an erasure that tried to null them would be
+ * rejected by the constraint rather than quietly doing nothing.
+ */
+export const CANDIDATE_DATA_ERASURE_PLACEHOLDER = "[erased]";
+
+/**
+ * The replacement for file_intakes.storage_key.
+ *
+ * storage_key is candidate data, which is easy to miss: the web layer
+ * builds it as `quarantine/{org}/{role}/pending/{uuid}-{declaredFilename}`,
+ * so it embeds the same filename the row's declared_filename column holds
+ * and is just as likely to read "Jane_Doe_CV.pdf". Redacting the filename
+ * while leaving the key behind would leave the candidate's name in the
+ * database and make the receipt wrong.
+ *
+ * It cannot take the flat placeholder, though, because the column is
+ * NOT NULL UNIQUE -- the second erasure in any organization would collide
+ * on it. Deriving the replacement from the intake's own primary key keeps
+ * it unique without carrying anything about the candidate.
+ */
+export function erasedStorageKey(intakeId: string): string {
+  const trimmed = intakeId.trim();
+  if (trimmed.length === 0) {
+    throw new Error("erasedStorageKey requires a non-empty intakeId");
+  }
+  return `erased:${trimmed}`;
+}
+
+/**
+ * The order steps must run in, and the reason the order is not arbitrary.
+ *
+ * object_storage_documents is first because storage_key is the only handle
+ * to the stored object, and file_intakes -- the row holding that key -- is
+ * redacted at the end. Reversing the two would overwrite the key while the
+ * object it points at is still sitting in the bucket, leaving bytes that
+ * nothing in the system can name any more, let alone delete. That failure
+ * is silent and permanent, so the ordering is encoded here rather than
+ * left to whoever calls this next.
+ */
+const CANDIDATE_DATA_ERASURE_PLAN: readonly CandidateDataErasureStep[] = [
+  {
+    surface: "object_storage_documents",
+    method: "delete_object",
+    columns: [],
+    detail:
+      "Deleted by storage key before file_intakes is redacted, because that redaction destroys the " +
+      "only reference to the object."
+  },
+  {
+    surface: "canonical_text_extractions",
+    method: "redact_in_place",
+    columns: ["pages"],
+    detail:
+      "pages holds the full text of the candidate's document and is the largest single store of raw " +
+      "candidate data. Overwritten with an empty array; total_pages and quality are left as they were, " +
+      "since they describe the extraction rather than the candidate, and redacted_at is what tells a " +
+      "reader the emptiness was deliberate."
+  },
+  {
+    surface: "import_rows",
+    method: "redact_in_place",
+    columns: ["failure_reason"],
+    detail:
+      "failure_reason can quote the offending CSV row verbatim. It cannot simply be nulled: the table " +
+      "carries CHECK ((outcome = 'failed') = (failure_reason IS NOT NULL)), so nulling it turns every " +
+      "failed row into a constraint violation. Rows that have a reason get the placeholder; rows that " +
+      "never had one keep their NULL."
+  },
+  {
+    surface: "applications",
+    method: "redact_in_place",
+    columns: ["candidate_full_name", "candidate_email", "external_reference_id"],
+    detail:
+      "The candidate's identity. The first two are NOT NULL with a non-empty CHECK and take the " +
+      "placeholder; external_reference_id is nullable and is set to NULL outright."
+  },
+  {
+    surface: "file_intakes",
+    method: "redact_in_place",
+    columns: ["declared_filename", "storage_key"],
+    detail:
+      "Both columns carry the candidate's name -- storage_key embeds the declared filename by " +
+      "construction. Redacted last so the object it names can be deleted first."
+  },
+  {
+    surface: "evidence_outcomes",
+    method: "blocked_append_only",
+    columns: [],
+    detail:
+      "The citation quote is verbatim candidate text, and the append-only trigger rejects UPDATE as " +
+      "well as DELETE, so it can be neither removed nor redacted in place. This is the root blocker " +
+      "and needs AF-91's per-candidate encryption key."
+  },
+  {
+    surface: "candidate_decisions",
+    method: "blocked_append_only",
+    columns: [],
+    detail:
+      "rationale is free text a human wrote about the candidate, append-only for the same reason: a " +
+      "decision record that can be edited afterwards cannot evidence who decided what. Also AF-91."
+  },
+  {
+    surface: "audit_events",
+    // AF-61 REV-001: was not_candidate_data, on the same basis the
+    // retention plan used and for the same reason it was wrong. AF-21's
+    // redaction and the closed context allowlist do keep candidate TEXT
+    // out, and that half was right. entity_type and entity_id are free
+    // text, and an application identifier is written there whenever a
+    // correction or a decision is recorded -- two of the four audit
+    // actions. The identifier is what re-links every other surviving row
+    // to a person, so an erasure that reports this surface as holding
+    // nothing is reporting more deletion than happened.
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "application identifier can be neither removed nor redacted in place. It is also the audit " +
+      "metadata this ticket says is deliberately kept -- but kept and erasable are different claims, " +
+      "and only the first one is true here. Needs AF-91."
+  },
+  {
+    surface: "evidence_extraction_runs",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql). entity_id is the application identifier for " +
+      "every run this product writes, and the association is a polymorphic text pair rather than a " +
+      "foreign key, which is why no cascade reaches it. Needs AF-91."
+  },
+  {
+    surface: "audit_sample_members",
+    method: "blocked_append_only",
+    columns: ["application_id"],
+    detail:
+      "Append-only (0020_audit_samples.sql). One row per candidate drawn into an audit sample: it " +
+      "holds no candidate text, and the row is itself a statement about a named candidate. Needs AF-91."
+  },
+  {
+    surface: "review_timing_spans",
+    method: "blocked_append_only",
+    columns: ["application_id", "reviewer_user_id"],
+    detail:
+      "Append-only (0021_review_timing.sql). Beyond the identifier this records which reviewer spent " +
+      "how long on which candidate and when, which is behavioural data about a named person on both " +
+      "sides. Needs AF-91."
+  },
+  {
+    surface: "support_access_events",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0022_support_access.sql), deliberately so: an access log the operator can edit " +
+      "answers nothing, because the one person with a motive to remove a row is the person the row is " +
+      "about. entity_id names the application a support operator opened. Needs AF-91."
+  }
+];
+
+export interface CandidateDataErasurePlan {
+  readonly trigger: CandidateDataErasureTrigger;
+  /** Present only for a candidate_request; an expiry run has no requester. */
+  readonly requestedByUserId?: string | undefined;
+  readonly steps: readonly CandidateDataErasureStep[];
+}
+
+/**
+ * Rejects an erasure that cannot be attributed.
+ *
+ * A candidate_request is a named person acting on someone's instruction,
+ * and a request with nobody attached cannot be evidenced later. A
+ * retention_expiry is the system acting on a policy and has no requester
+ * to name, so supplying one would put a person's name against a decision
+ * they did not make. Both directions are wrong, so both are refused.
+ */
+export function validateCandidateDataErasureRequest(
+  trigger: CandidateDataErasureTrigger,
+  requestedByUserId?: string | undefined
+): void {
+  const requester = requestedByUserId?.trim() ?? "";
+  if (trigger === "candidate_request" && requester.length === 0) {
+    throw new Error("a candidate_request erasure requires the user id of whoever requested it");
+  }
+  if (trigger === "retention_expiry" && requester.length > 0) {
+    throw new Error(
+      "a retention_expiry erasure has no requester; it is the policy acting, not a person"
+    );
+  }
+}
+
+export function planCandidateDataErasure(
+  trigger: CandidateDataErasureTrigger,
+  requestedByUserId?: string | undefined
+): CandidateDataErasurePlan {
+  validateCandidateDataErasureRequest(trigger, requestedByUserId);
+  return {
+    trigger,
+    requestedByUserId: trigger === "candidate_request" ? requestedByUserId : undefined,
+    steps: CANDIDATE_DATA_ERASURE_PLAN
+  };
+}
+
+/** Surfaces this workflow actually reaches, in the order it must touch them. */
+export function erasableSurfaces(plan: CandidateDataErasurePlan): readonly CandidateDataErasureStep[] {
+  return plan.steps.filter(
+    (step) => step.method === "delete_object" || step.method === "redact_in_place"
+  );
+}
+
+export interface CandidateDataErasureResidue {
+  /** True while any candidate-derived content survives a completed erasure. */
+  readonly anyResidue: boolean;
+  readonly surfaces: readonly CandidateDataErasureStep[];
+  /**
+   * The sentence that goes on the receipt and, ultimately, to the
+   * candidate. Written from what actually happened on this run, not from
+   * the static plan alone.
+   */
+  readonly statement: string;
+}
+
+/**
+ * What this erasure run actually did to intake-scoped and object-storage
+ * surfaces. Required so the receipt cannot claim a shared document was
+ * erased while it is still deferred, or claim an object was deleted when
+ * the delete never ran.
+ */
+export interface CandidateDataErasureRunOutcome {
+  readonly intakeErased: boolean;
+  /** True only when the object-storage delete callback ran successfully. */
+  readonly objectStorageDeleted: boolean;
+  readonly applicationsStillReferencingIntake: number;
+}
+
+const INTAKE_SCOPED_SURFACES: ReadonlySet<string> = new Set([
+  "object_storage_documents",
+  "canonical_text_extractions",
+  "import_rows",
+  "file_intakes"
+]);
+
+/**
+ * REV-008: `outcome` is REQUIRED, with no default. It used to default to
+ * "everything erased", so a caller that left it out got the full-erasure
+ * sentence whatever had actually happened: the optimistic statement reached
+ * by forgetting an argument. That is the defect #70 REV-005 removed from the
+ * retention statement, and the same rule applies to every statement made to
+ * a data subject: a false claim must need someone to pass a false value.
+ * tests/architecture/data-subject-statements-require-their-facts.test.ts
+ * holds it, because tsc is the only other thing that would.
+ */
+export function summarizeCandidateDataErasureResidue(
+  plan: CandidateDataErasurePlan,
+  outcome: CandidateDataErasureRunOutcome
+): CandidateDataErasureResidue {
+  const blocked = plan.steps.filter((step) => step.method === "blocked_append_only");
+  const deferredIntake = plan.steps.filter(
+    (step) => INTAKE_SCOPED_SURFACES.has(step.surface) && !outcome.intakeErased
+  );
+  // REV-006: when the object was not deleted, file_intakes is residue too,
+  // because its storage_key still embeds the declared filename and is left
+  // intact on purpose, so the key keeps naming the object.
+  const objectSkippedWhileIntakeErased =
+    outcome.intakeErased && !outcome.objectStorageDeleted
+      ? plan.steps.filter(
+          (step) => step.surface === "object_storage_documents" || step.surface === "file_intakes"
+        )
+      : [];
+
+  const surviving = [...blocked, ...deferredIntake, ...objectSkippedWhileIntakeErased];
+  // Dedupe by surface name while preserving plan order.
+  const seen = new Set<string>();
+  const surfaces: CandidateDataErasureStep[] = [];
+  for (const step of surviving) {
+    if (seen.has(step.surface)) {
+      continue;
+    }
+    seen.add(step.surface);
+    surfaces.push(step);
+  }
+
+  if (surfaces.length === 0) {
+    return {
+      anyResidue: false,
+      surfaces: [],
+      statement: "Every surface holding candidate-derived content was erased."
+    };
+  }
+
+  const parts: string[] = [];
+  if (outcome.intakeErased && outcome.objectStorageDeleted) {
+    parts.push("Original documents, canonical text and candidate identity were erased.");
+  } else if (outcome.intakeErased && !outcome.objectStorageDeleted) {
+    parts.push(
+      "Candidate identity and extracted text were erased in place, but the stored object was not " +
+        "deleted, so its storage_key was left intact: object_storage_documents and file_intakes remain " +
+        "residue until a later erasure deletes the object."
+    );
+  } else {
+    const others = outcome.applicationsStillReferencingIntake;
+    parts.push(
+      "Candidate identity on this application was erased. The shared source document and its " +
+        "extracted text are retained until the " +
+        String(others) +
+        " other candidate" +
+        (others === 1 ? "" : "s") +
+        " in the same file " +
+        (others === 1 ? "is" : "are") +
+        " erased."
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      "The following candidate-derived content survives because the append-only ledger rejects " +
+        "both DELETE and UPDATE on it, and erasing it requires the per-candidate encryption key " +
+        "design tracked as AF-91: " +
+        blocked.map((step) => step.surface).join("; ") +
+        "."
+    );
+  }
+
+  return {
+    anyResidue: true,
+    surfaces,
+    statement: parts.join(" ")
+  };
+}
+
 
 // ---- AF-59: role-level audit report ----
 //

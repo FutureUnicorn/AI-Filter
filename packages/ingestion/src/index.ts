@@ -137,6 +137,36 @@ export async function fetchObjectBytes(options: StorageConnectionOptions, key: s
   }
 }
 
+// ---- AF-62: candidate-data deletion workflow ----
+
+/**
+ * Deletes a stored document. The one retention surface that a plain
+ * delete actually reaches.
+ *
+ * S3 DeleteObject is idempotent and answers 204 for a key that was never
+ * there, so a success here means "the object is not in the bucket", not
+ * "the object was in the bucket and now is not". That is the right
+ * guarantee for an erasure -- re-running a partially completed erasure
+ * must not fail on the objects it already removed -- but it does mean this
+ * cannot be used to prove the document ever existed. The file_intakes row
+ * is what evidences that, which is a further reason its redaction has to
+ * happen after this call rather than before.
+ */
+export async function deleteStoredObject(
+  options: StorageConnectionOptions,
+  key: string
+): Promise<void> {
+  if (key.trim().length === 0) {
+    throw new Error("deleteStoredObject requires a non-empty key");
+  }
+  const client = storageClient(options);
+  try {
+    await client.send(new DeleteObjectCommand({ Bucket: options.bucket, Key: key }));
+  } finally {
+    client.destroy();
+  }
+}
+
 const ZIP_EOCD_SIGNATURE = 0x06054b50;
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
 const ZIP_EOCD_MIN_SIZE = 22;
