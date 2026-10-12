@@ -166,7 +166,15 @@ test("a stuck import stays inFlight whether or not a dead-letter was attempted",
   );
   const decision = authorizeJobAdministration(
     job,
-    { jobId: "intake-1", action: "dead_letter", reason: "file is corrupt and will never parse", operatorUserId: "op-1" },
+    {
+      // REV-008: the tenant is a claim on the request now, so that
+      // authorization runs before the job is read.
+      organizationId,
+      jobId: "intake-1",
+      action: "dead_letter",
+      reason: "file is corrupt and will never parse",
+      operatorUserId: "op-1"
+    },
     {
       grant: {
         grantId: "grant-1",
