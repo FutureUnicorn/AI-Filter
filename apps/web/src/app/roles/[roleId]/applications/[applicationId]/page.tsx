@@ -1,7 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
+
+import { revealedCriterionId } from "../../../../../lib/review-keys";
+
+import { ShortcutHelp } from "../../../../../lib/ShortcutHelp";
+import { buildSourceContextAnnouncement } from "../../../../../lib/review-focus";
+import { useReviewKeyboard } from "../../../../../lib/review-keyboard";
 
 interface SourceCitation {
   readonly document: string;
@@ -88,6 +94,47 @@ export default function EvidenceCardPage() {
   const { roleId, applicationId } = params;
   const [state, setState] = useState<CardState>({ kind: "loading" });
   const [workflow, setWorkflow] = useState<WorkflowStatus | undefined>(undefined);
+  // REV-002: a criterion id, not an index. The reveal is scoped to the
+  // focused card, and an id cannot be compared against a citation's
+  // position by accident: TypeScript rejects string === number, so the
+  // bug this replaced is now a build failure rather than a convention.
+  const [revealedCriterion, setRevealedCriterion] = useState<string | undefined>(undefined);
+  const [announcement, setAnnouncement] = useState("");
+  const revealTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    return () => {
+      if (revealTimeoutRef.current !== undefined) {
+        clearTimeout(revealTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const cards = state.kind === "ready" ? state.cards.cards : [];
+  // AF-53: "navigation between cards and source context" -- j/k moves
+  // between criterion cards, s reveals the sources for the focused one.
+  const { focusedIndex, helpVisible, shortcuts, registerItem, setFocusedIndex } = useReviewKeyboard({
+    itemCount: cards.length,
+    onRevealSource: (index) => {
+      const criterionId = revealedCriterionId(cards.map((card) => card.criterionId), index);
+      setRevealedCriterion(criterionId);
+      const targetCard = cards.find((card) => card.criterionId === criterionId);
+      const nextAnnouncement = buildSourceContextAnnouncement(
+        targetCard?.criterionId,
+        targetCard?.citations
+      );
+      // REV-009: clear first, then refill on next tick (50ms) so DOM mutation
+      // triggers assistive technology announcement even when repeating on the
+      // same card or returning to it.
+      setAnnouncement("");
+      if (revealTimeoutRef.current !== undefined) {
+        clearTimeout(revealTimeoutRef.current);
+      }
+      revealTimeoutRef.current = setTimeout(() => {
+        setAnnouncement(nextAnnouncement);
+      }, 50);
+    }
+  });
 
   useEffect(() => {
     if (roleId === undefined || applicationId === undefined) {
@@ -144,6 +191,31 @@ export default function EvidenceCardPage() {
     <main>
       <p className="eyebrow">Evidence</p>
       <h1>Evidence for this application</h1>
+      <p>
+        <small>Keyboard: j/k to move between criteria, s to reveal the source, ? for all shortcuts.</small>
+      </p>
+      <ShortcutHelp visible={helpVisible} shortcuts={shortcuts} />
+
+      {/* REV-006: persistent live region for screen-reader source announcements.
+          Must be in the DOM before any reveal occurs, so mutations inside it
+          are reliably announced by screen readers. Exactly one per page. */}
+      <p
+        aria-live="polite"
+        aria-atomic="true"
+        style={{
+          position: "absolute",
+          width: "1px",
+          height: "1px",
+          padding: 0,
+          margin: "-1px",
+          overflow: "hidden",
+          clip: "rect(0, 0, 0, 0)",
+          whiteSpace: "nowrap",
+          border: 0
+        }}
+      >
+        {announcement}
+      </p>
 
       {workflow !== undefined && (
         <p>
@@ -186,8 +258,20 @@ export default function EvidenceCardPage() {
             </small>
           </p>
 
-          {state.cards.cards.map((card) => (
-            <article key={card.criterionId} aria-label={`Evidence for ${card.criterionId}`}>
+          {state.cards.cards.map((card, cardIndex) => (
+            <article
+              key={card.criterionId}
+              // REV-001: same as the queue. A card list is taller than the
+              // viewport as soon as a criterion has more than one quote, so
+              // `j` walks the selection off-screen and `s` then reveals a
+              // citation nobody can see.
+              ref={registerItem(cardIndex)}
+              tabIndex={cardIndex === focusedIndex ? 0 : -1}
+              aria-label={`Evidence for ${card.criterionId}`}
+              aria-current={cardIndex === focusedIndex ? "true" : undefined}
+              onFocus={() => setFocusedIndex(cardIndex)}
+              style={cardIndex === focusedIndex ? { outline: "2px solid" } : undefined}
+            >
               <h2>{card.criterionId}</h2>
               <p>
                 <strong>State:</strong> {card.kind}
@@ -207,8 +291,8 @@ export default function EvidenceCardPage() {
                       <p>
                         <small>What the original AI output quoted — kept, never overwritten:</small>
                       </p>
-                      {card.correction.previousCitations.map((entry, index) => (
-                        <figure key={`${card.criterionId}-before-${index}`}>
+                      {card.correction.previousCitations.map((entry, citationIndex) => (
+                        <figure key={`${card.criterionId}-before-${citationIndex}`}>
                           <blockquote cite={entry.citation.document}>{entry.citation.quote}</blockquote>
                           <p>
                             <small>
@@ -228,8 +312,8 @@ export default function EvidenceCardPage() {
                   <em>Nothing to verify for this criterion.</em>
                 </p>
               ) : (
-                card.citations.map((entry, index) => (
-                  <figure key={`${card.criterionId}-${entry.role}-${index}`}>
+                card.citations.map((entry, citationIndex) => (
+                  <figure key={`${card.criterionId}-${entry.role}-${citationIndex}`}>
                     <figcaption>{CITATION_ROLE_LABELS[entry.role]}</figcaption>
                     <blockquote cite={entry.citation.document}>{entry.citation.quote}</blockquote>
                     <p>
@@ -238,6 +322,15 @@ export default function EvidenceCardPage() {
                         {entry.citation.offset}
                       </small>
                     </p>
+                    {revealedCriterion === card.criterionId && (
+                      <p>
+                        <small>
+                          Source context: {entry.citation.document}, {entry.citation.pageOrSection}, starting at
+                          character {entry.citation.offset}. The document itself is not rendered here - nothing links
+                          an application to its source file yet.
+                        </small>
+                      </p>
+                    )}
                   </figure>
                 ))
               )}
