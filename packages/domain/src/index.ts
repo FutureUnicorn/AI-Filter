@@ -2359,6 +2359,17 @@ export function identifyStuckJobs(
  * reviewer remembered to check.
  */
 export interface JobAdministrationRequest {
+  /**
+   * The tenant the operator claims to be acting in.
+   *
+   * REV-008: this exists so authorization can run before the job is
+   * looked at. It used to be read off the job, which meant the job had to
+   * be resolved first and its existence therefore leaked to a caller
+   * holding no grant at all. A claim needs nothing resolved, and it is
+   * checked against both the grant and the job below, so it cannot be
+   * used to reach another tenant's work.
+   */
+  readonly organizationId: string;
   readonly jobId: string;
   readonly action: JobAdministrationAction;
   readonly reason: string;
@@ -2382,7 +2393,15 @@ type ExactlyTheseKeys<T, K extends PropertyKey> = [Exclude<keyof T, K>, Exclude<
   : false;
 type AssertTrue<T extends true> = T;
 export type JobAdministrationRequestKeysAreFixed = AssertTrue<
-  ExactlyTheseKeys<JobAdministrationRequest, "jobId" | "action" | "reason" | "operatorUserId">
+  // organizationId added by REV-008, and this is the "say why" the comment
+  // above asks for. It is the tenant the operator CLAIMS to be acting in,
+  // so that authorization can run before the job is resolved -- reading it
+  // off the job is what leaked the job's existence to a caller holding no
+  // grant. It is an identifier the caller already supplied by choosing a
+  // tenant to act in, checked against the grant and against the job, and
+  // it carries no candidate content: candidate text still has nowhere to
+  // go in this type.
+  ExactlyTheseKeys<JobAdministrationRequest, "organizationId" | "jobId" | "action" | "reason" | "operatorUserId">
 >;
 
 export type JobAdministrationRefusal =
@@ -2442,24 +2461,53 @@ export function authorizeJobAdministration(
   access: JobAdministrationAccess,
   thresholds: StuckJobThresholds = DEFAULT_STUCK_JOB_THRESHOLDS
 ): JobAdministrationDecision {
+  // REV-008 (Pradeep): authorization first, before anything is read off
+  // the job.
+  //
+  // The REV-001 fix put the job checks first, because the tenant to
+  // authorize against was taken from job.organizationId and the job had
+  // to exist to supply it. That was correct about tenancy and wrong about
+  // ordering: a caller holding no grant for anything got job_not_stuck,
+  // job_mismatch or not_authorized depending on whether the id they named
+  // was a currently-stuck job, before their authorization was ever
+  // considered. That is a state-existence oracle across the authorization
+  // boundary, and it would have told an unauthorized caller something
+  // about another tenant's pipeline health.
+  //
+  // The tenant is now a claim on the request, which needs nothing
+  // resolved. It is checked twice: here against the grant, and below
+  // against the job, so a valid grant for one tenant plus another
+  // tenant's job id still refuses.
+  const support = authorizeSupportAccess(
+    access.grant,
+    {
+      organizationId: request.organizationId,
+      operatorUserId: request.operatorUserId,
+      entityType: "job",
+      entityId: request.jobId
+    },
+    access.now
+  );
+  if (!support.allowed) {
+    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
+  }
   if (job === undefined) {
     return { allowed: false, refusal: "job_not_stuck" };
   }
   if (request.jobId !== job.jobId) {
     return { allowed: false, refusal: "job_mismatch" };
   }
-  const support = authorizeSupportAccess(
-    access.grant,
-    {
-      organizationId: job.organizationId,
-      operatorUserId: request.operatorUserId,
-      entityType: "job",
-      entityId: job.jobId
-    },
-    access.now
-  );
-  if (!support.allowed) {
-    return { allowed: false, refusal: "not_authorized", supportAccessDenial: support.denialReason };
+  if (job.organizationId !== request.organizationId) {
+    // The other half of moving the tenant onto the request. Without this
+    // an operator with a live grant for their own tenant could hand in a
+    // job belonging to someone else and pass every check, which is the
+    // cross-tenant hole REV-001 closed, reopened from the other side.
+    //
+    // Reported as job_not_stuck rather than as its own refusal, because
+    // to a caller authorized for this tenant that is exactly what is
+    // true: this tenant has no such stuck job. A distinct code would
+    // rebuild the oracle one layer in.
+    return { allowed: false, refusal: "job_not_stuck" };
   }
   if (!/[^\s]/u.test(request.reason)) {
     // Same rule as AF-66's grant reason. An unexplained retry is
