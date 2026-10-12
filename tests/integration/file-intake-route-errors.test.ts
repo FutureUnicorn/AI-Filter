@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import moduleHooks from "node:module";
 import test from "node:test";
 
 import { dropProbeSchema, getFileIntakeById, provisionFileIntakeRouteSchema } from "../../packages/db/src/index.ts";
 import { ALLOWED_SNIFFED_MIME_TYPES } from "../../packages/domain/src/index.ts";
 import { SESSION_COOKIE_NAME, createSessionToken } from "../../packages/security/src/index.ts";
 import { storageControl } from "../support/ingestion-storage-stub.ts";
+import { loadWebRoute } from "../support/web-route-loader.ts";
 
 /**
  * PR #83 review round 2. Sai's note was "cover the endpoint behavior, not just
@@ -41,58 +41,22 @@ function requireDatabase(): string {
   return databaseUrl;
 }
 
-let hooksRegistered = false;
-
-/**
- * Two jobs in one hook, both needed before a route file can be imported here.
- *
- * The extension retry is the same one magic-link-route.test.ts installs:
- * apps/web uses extensionless relative imports and bundler-resolved package
- * subpaths, neither of which Node resolves on its own.
- *
- * The redirect points `@signal-audit/ingestion` at the stub. It is scoped to
- * that one specifier, so every other import in the route, including the
- * database and the domain rules, stays real.
- */
-function registerRouteResolution(): void {
-  const stubUrl = new URL("../support/ingestion-storage-stub.ts", import.meta.url).href;
-  moduleHooks.registerHooks({
-    resolve(specifier, context, nextResolve) {
-      if (specifier === "@signal-audit/ingestion") {
-        return { url: stubUrl, shortCircuit: true };
-      }
-      try {
-        return nextResolve(specifier, context);
-      } catch (error) {
-        if (/\.[cm]?[jt]sx?$/u.test(specifier)) {
-          throw error;
-        }
-        for (const extension of [".ts", ".js"]) {
-          try {
-            return nextResolve(`${specifier}${extension}`, context);
-          } catch {
-            continue;
-          }
-        }
-        throw error;
-      }
-    }
-  });
-}
-
 interface PostRouteModule {
   POST(request: unknown, context: { params: Promise<Record<string, string>> }): Promise<Response>;
 }
 
-/** Imported through a runtime-built specifier for the reason spelled out in
- * magic-link-route.test.ts: a static import would pull apps/web into
- * tests/tsconfig.json, which reads its ESM route files as CommonJS. */
+/**
+ * The resolution hook and the runtime-built specifier live in
+ * tests/support/web-route-loader.ts. The one thing specific to this file is
+ * the redirect: `@signal-audit/ingestion` points at the stub, because CI
+ * provides Postgres and no object store. It is scoped to that one specifier,
+ * so every other import in the route -- the database, the domain rules, the
+ * authorization check -- stays real.
+ */
 async function loadRoute(relativePath: string): Promise<PostRouteModule> {
-  if (!hooksRegistered) {
-    registerRouteResolution();
-    hooksRegistered = true;
-  }
-  return (await import(new URL(relativePath, import.meta.url).href)) as PostRouteModule;
+  return loadWebRoute<PostRouteModule>(import.meta.url, relativePath, {
+    "@signal-audit/ingestion": new URL("../support/ingestion-storage-stub.ts", import.meta.url).href
+  });
 }
 
 function applyRouteEnvironment(databaseUrl: string, schema: string): void {

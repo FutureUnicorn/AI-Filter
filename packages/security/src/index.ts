@@ -8,6 +8,7 @@ import type {
   DomainPort,
   MagicLinkEmailSender,
   MagicLinkInvite,
+  MagicLinkPurpose,
   MagicLinkRedemptionAttempt,
   MagicLinkVerification,
   Membership,
@@ -155,6 +156,58 @@ export function isHostedEnvironment(appEnv: string): boolean {
   return !LOCAL_CONSOLE_ENVIRONMENTS.has(appEnv);
 }
 
+/**
+ * The subject and body per purpose (review #88, REV-002).
+ *
+ * The role-change wording is the one that matters. Redemption commits the
+ * change, so the recipient's click is the act; a mail that says only "sign
+ * in" makes them the instrument of a change to their own access without
+ * telling them. The other two are unchanged in substance.
+ *
+ * A Map for the same reason auth-codes.ts is one: `purpose` is a closed
+ * union here, but the lookup is the kind that acquires a caller-supplied
+ * key later.
+ */
+const MAGIC_LINK_COPY: ReadonlyMap<MagicLinkPurpose, { readonly subject: string; readonly body: string }> =
+  new Map([
+    [
+      "sign_in",
+      {
+        subject: "Your sign-in link",
+        body: "Open this link to sign in. It expires shortly and can be used once."
+      }
+    ],
+    [
+      "invite",
+      {
+        subject: "You have been invited",
+        body:
+          "Open this link to accept your invitation and sign in. It creates your account and your " +
+          "membership. The link expires shortly and can be used once."
+      }
+    ],
+    [
+      "role_change",
+      {
+        subject: "Your role is being changed",
+        body:
+          "An administrator has changed your role in this organization. Opening this link signs you in " +
+          "and applies the change to your access. If you were not expecting this, do not open it and " +
+          "contact your administrator. The link expires shortly and can be used once."
+      }
+    ]
+  ]);
+
+function magicLinkCopy(purpose: MagicLinkPurpose | undefined): {
+  readonly subject: string;
+  readonly body: string;
+} {
+  const copy = MAGIC_LINK_COPY.get(purpose ?? "sign_in");
+  // Unreachable for a well-typed caller; falling back to the least
+  // presumptuous wording rather than throwing inside a delivery path.
+  return copy ?? { subject: "Your sign-in link", body: "Open this link to sign in." };
+}
+
 export function createConsoleMagicLinkEmailSender(appEnv: string): MagicLinkEmailSender {
   if (isHostedEnvironment(appEnv)) {
     throw new Error(
@@ -162,7 +215,11 @@ export function createConsoleMagicLinkEmailSender(appEnv: string): MagicLinkEmai
     );
   }
   return {
-    async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
+    async sendMagicLink(input: {
+      readonly email: string;
+      readonly link: string;
+      readonly purpose?: MagicLinkPurpose;
+    }): Promise<void> {
       // The structured log records that delivery happened and carries no
       // PII or credential. That property is unchanged and load-bearing:
       // logStructured output is retained, shipped and searchable, so a
@@ -188,7 +245,8 @@ export function createConsoleMagicLinkEmailSender(appEnv: string): MagicLinkEmai
       // createMagicLinkEmailSender enforces the same thing from the
       // other side.
       process.stderr.write(
-        `\n[dev magic link] to: ${input.email}\n[dev magic link] open: ${input.link}\n\n`
+        `\n[dev magic link] to: ${input.email}\n[dev magic link] purpose: ${input.purpose ?? "sign_in"}\n` +
+          `[dev magic link] open: ${input.link}\n\n`
       );
     }
   };
@@ -205,7 +263,12 @@ export function createHttpMagicLinkEmailSender(
   delivery: MagicLinkEmailDelivery
 ): MagicLinkEmailSender {
   return {
-    async sendMagicLink(input: { readonly email: string; readonly link: string }): Promise<void> {
+    async sendMagicLink(input: {
+      readonly email: string;
+      readonly link: string;
+      readonly purpose?: MagicLinkPurpose;
+    }): Promise<void> {
+      const copy = magicLinkCopy(input.purpose);
       const response = await fetch(delivery.endpoint, {
         method: "POST",
         headers: {
@@ -215,8 +278,8 @@ export function createHttpMagicLinkEmailSender(
         body: JSON.stringify({
           from: delivery.from,
           to: input.email,
-          subject: "Your sign-in link",
-          text: `Open this link to sign in. It expires shortly and can be used once.\n\n${input.link}\n`
+          subject: copy.subject,
+          text: `${copy.body}\n\n${input.link}\n`
         })
       });
       if (!response.ok) {

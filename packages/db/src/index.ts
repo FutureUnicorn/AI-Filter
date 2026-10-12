@@ -9,6 +9,7 @@ import type {
   CandidateDecision,
   CandidateDecisionKind,
   CanonicalTextExtraction,
+  CallerOrganization,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
@@ -303,6 +304,11 @@ interface MagicLinkTokenRow {
   readonly role: MembershipRole | null;
   readonly expires_at: Date;
   readonly consumed_at: Date | null;
+  /** Review #88, REV-010: read back at redemption so provisionInvitedMembership
+   * enforces the caller's actual opt-in rather than trusting the state
+   * previewInviteEffect saw at invite creation. Absent (null) for a plain
+   * login token, same as organization_id and role. */
+  readonly replace_existing_role: boolean | null;
 }
 
 function mapMagicLinkTokenRow(row: MagicLinkTokenRow): MagicLinkTokenRecord {
@@ -323,6 +329,16 @@ export interface CreateMagicLinkTokenInput {
   readonly email: string;
   readonly invite?: MagicLinkInvite;
   readonly expiresAt: Date;
+  /**
+   * Only meaningful alongside `invite`; ignored for a plain login token.
+   * Nothing shipped calls this function with `invite` set -- that path is
+   * `createInviteMagicLinkToken`, which requires the field and gates it on
+   * `previewInviteEffect` -- so this is the raw persistence-layer knob,
+   * used directly only by RLS/replay probes constructing a token without
+   * going through the route. Review #88, REV-010: defaults to false, the
+   * safer reading of a caller that did not say.
+   */
+  readonly replaceExistingRole?: boolean;
 }
 
 /**
@@ -414,7 +430,9 @@ async function provisionInvitedMembership(
   schema: string,
   email: string,
   organizationId: string,
-  role: MembershipRole
+  role: MembershipRole,
+  replaceExistingRole: boolean,
+  tokenHash: string
 ): Promise<void> {
   const displayName = email.split("@")[0] || email;
   const userResult = await client.query<{ user_id: string }>(
@@ -436,6 +454,44 @@ async function provisionInvitedMembership(
   // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
   // sharing the connection.
   await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+
+  // Review #88, REV-012: serializes every redemption for this organization
+  // before either row lock below is taken. Without it, two concurrent
+  // redemptions demoting two different owners could each hold the row this
+  // check locks next while waiting on the other's -- the membership row
+  // REV-010 locks first, then the owner-set query below locks every owner
+  // row, so two transactions taking those two locks in the opposite order
+  // (each already holding its own target row, each then blocking on the
+  // other's) deadlock. An advisory lock keyed on the organization, taken
+  // before any row lock, makes the order moot: only one redemption for
+  // this organization is ever inside the critical section below at a time.
+  // Same pattern bootstrapOrganizationOwner already uses for the same
+  // reason, on organization name rather than id.
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationId]);
+
+  // Review #88, REV-010: replaceExistingRole was only ever checked against
+  // the membership state previewInviteEffect saw at invite CREATION. An
+  // invite issued while this address had no membership carries
+  // replaceExistingRole=false and needed no opt-in at creation -- but if
+  // another admin, a second invite, or bootstrap granted a membership
+  // before this token was redeemed, the unconditional DO UPDATE below
+  // would apply the originally requested role over it, replacing a
+  // membership the caller never agreed to replace. FOR UPDATE locks this
+  // row for the rest of the transaction, so a concurrent grant cannot land
+  // between this check and the upsert.
+  const currentMembership = await client.query<{ membership_id: string; role: MembershipRole }>(
+    `SELECT membership_id, role FROM "${schema}".memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+    [organizationId, userId]
+  );
+  const currentRole = currentMembership.rows[0]?.role;
+  const membershipId = currentMembership.rows[0]?.membership_id;
+  if (currentRole !== undefined && currentRole !== role && !replaceExistingRole) {
+    throw new Error(
+      `invite would change ${email}'s role in organization ${organizationId} from ${currentRole} to ${role} ` +
+        `without replaceExistingRole; a membership was created or changed after this invite was issued`
+    );
+  }
+
   // Applying the invited role (below) makes one destructive direction
   // reachable that DO NOTHING made impossible: a re-invite naming a
   // non-owner role for the organization's only owner would leave it with
@@ -473,6 +529,192 @@ async function provisionInvitedMembership(
      ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
+
+  // Review #88 round 5, REV-001: written here, not at invite creation,
+  // because this is the only point where `currentRole` is a value the
+  // transaction actually holds a lock on and is about to act on -- the
+  // `from` in this row is true at the instant it is written, which a
+  // creation-time read committed and released long before redemption
+  // cannot promise. `membershipId` is already in hand from the same
+  // locked SELECT above, so there is no second read to go stale between.
+  //
+  // No audit row at all when currentRole is undefined (a brand new
+  // membership) or already equals role (previewInviteEffect's "unchanged"
+  // case redeemed with nothing to say): neither is a role change.
+  if (currentRole !== undefined && currentRole !== role && membershipId !== undefined) {
+    // The actor and request id for this row are recovered from the
+    // `membership_invite` row this same token's creation already wrote,
+    // rather than threaded through as a fresh parameter, for the same
+    // reason that row is written at creation and not here: the admin who
+    // authorized this is only known to have been a member at the moment
+    // they acted, and audit_events' own membership trigger (below) checks
+    // that against the *current* member set, not a historical one. Using
+    // the recorded authorizer keeps this row honestly attributed to who
+    // actually decided, rather than to the invitee whose click merely
+    // triggered this transaction -- consistent with why redemption itself
+    // has never been the place authorship is recorded in this system.
+    // to_regclass never throws for a name that does not resolve, unlike
+    // selecting from the table itself would -- which matters inside this
+    // transaction, since a failed statement here would abort the
+    // membership upsert already committed to it, not just this lookup.
+    // audit_events does not exist at all in some deliberately reduced
+    // probe schemas (assertMagicLinkRlsSafety applies only prefixes
+    // `0002`-`0004` and `0027`, to isolate RLS mechanics from the audit
+    // trail this table belongs to); checked rather than assumed present.
+    const auditEventsExists = await client.query<{ exists: boolean }>(
+      `SELECT to_regclass('"${schema}".audit_events') IS NOT NULL AS exists`
+    );
+    let actor: { actor_user_id: string; request_id: string } | undefined;
+    if (auditEventsExists.rows[0]?.exists === true) {
+      const authorization = await client.query<{ actor_user_id: string; request_id: string }>(
+        `SELECT actor_user_id, request_id FROM "${schema}".audit_events
+          WHERE organization_id = $1 AND entity_type = 'membership_invite' AND entity_id = $2
+          LIMIT 1`,
+        [organizationId, tokenHash]
+      );
+      actor = authorization.rows[0];
+    }
+    if (actor === undefined) {
+      // No membership_invite row to attribute this to: either audit_events
+      // does not exist in this schema (above), or this token was
+      // constructed directly via createMagicLinkToken rather than through
+      // createInviteMagicLinkToken, which is the only thing that ever
+      // writes one. That second case is exactly as unaudited today as
+      // createMagicLinkToken itself always was -- it writes no
+      // membership_invite row either, so there was never an authorization
+      // record to lose. Every invite POST /api/invites actually mints
+      // goes through createInviteMagicLinkToken, which always writes this
+      // row in the same transaction as the token, so this branch is
+      // reachable only from direct package-level use (tests, tooling),
+      // never from that route. Skipped, not thrown: refusing the role
+      // change here would make a legitimate, merely-unattributed change
+      // impossible instead.
+    } else {
+      // The roles travel in entity_id because audit_events has no column
+      // for them, and adding one to an append-only table is not a change
+      // to make in passing. Semantic content in entity_id has precedent
+      // here: the kill-switch path writes "engaged"/"disengaged" rather
+      // than an id. The membership id leads the value so the row still
+      // joins.
+      //
+      // audit_events' own trigger requires actor_user_id to currently be a
+      // member of organizationId (0006_audit_events_delete_and_membership_fixes.sql).
+      // If the admin who authorized this has since left the organization,
+      // this INSERT -- and so this whole redemption -- fails loudly rather
+      // than silently applying a role change with no valid attribution
+      // left to record. That is a real, accepted narrowing versus
+      // redeeming unconditionally: an authorization this system can no
+      // longer stand behind does not get to take effect merely because
+      // nobody updated the link.
+      await client.query(
+        `INSERT INTO "${schema}".audit_events
+           (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+         VALUES ($1, $2, 'admin_action', 'membership_role_change', $3, $4)`,
+        [organizationId, actor.actor_user_id, `${membershipId}:${currentRole}->${role}`, actor.request_id]
+      );
+    }
+  }
+}
+
+/**
+ * Review #88, REV-012. Deterministically forces the lock order that made a
+ * concurrent demotion race able to deadlock: two connections each already
+ * hold the OTHER's target row (REV-010's lock, above) before either asks
+ * for the full owner set (the pre-existing last-owner guard's lock, also
+ * above). Two genuinely concurrent redemptions do not reliably land in
+ * that exact window on a fast local connection -- one commonly finishes
+ * before the other starts, which is why the integration-level regression
+ * test for this same scenario passed even before this fix existed -- so
+ * this constructs the interleaving by hand rather than hoping for it,
+ * proving the hazard is real rather than theoretical.
+ *
+ * The fix itself (the pg_advisory_xact_lock now taken before either row
+ * lock, above) is not raced here because it does not need to be: an
+ * advisory lock fully serializes every caller holding the same key, so
+ * only one transaction is ever inside the section this probe exercises at
+ * a time, which makes the cross-wait this forces structurally impossible
+ * rather than merely unlikely. The real call path's safety under genuine
+ * concurrency is exercised end to end by
+ * "concurrent redemptions demoting two different owners do not deadlock"
+ * in deployment-entry-point.test.ts instead.
+ */
+export async function assertUnserializedOwnerDemotionsCanDeadlock(
+  databaseUrl: string,
+  schema: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const organizationId = randomUUID();
+  const ownerAId = randomUUID();
+  const ownerBId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  await admin.connect();
+  try {
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Lock Order Probe')`, [
+      organizationId
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'A'), ($3, $4, 'B')`,
+      [ownerAId, `lockorder-a-${organizationId}@acme.test`, ownerBId, `lockorder-b-${organizationId}@acme.test`]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'owner')`,
+      [organizationId, ownerAId, ownerBId]
+    );
+
+    const clientA = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    const clientB = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    await clientA.connect();
+    await clientB.connect();
+    try {
+      await clientA.query(`SET search_path TO "${schema}"`);
+      await clientB.query(`SET search_path TO "${schema}"`);
+      await clientA.query("BEGIN");
+      await clientB.query("BEGIN");
+
+      // Each locks its own target row first -- exactly REV-010's lock,
+      // taken without REV-012's advisory lock ahead of it -- so both
+      // already hold one of the two rows the very next query needs before
+      // either issues it. Sequential awaits here are the point: this is
+      // what pins the order, rather than leaving it to scheduling chance.
+      await clientA.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerAId]
+      );
+      await clientB.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerBId]
+      );
+
+      const results = await Promise.allSettled([
+        clientA.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        ),
+        clientB.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        )
+      ]);
+      await clientA.query("ROLLBACK").catch(() => undefined);
+      await clientB.query("ROLLBACK").catch(() => undefined);
+      return results.some(
+        (result) =>
+          result.status === "rejected" &&
+          (result.reason as { code?: string } | undefined)?.code === "40P01"
+      );
+    } finally {
+      await clientA.end().catch(() => undefined);
+      await clientB.end().catch(() => undefined);
+    }
+  } finally {
+    await admin
+      .query(`DELETE FROM memberships WHERE organization_id = $1`, [organizationId])
+      .catch(() => undefined);
+    await admin.query(`DELETE FROM users WHERE user_id = ANY($1)`, [[ownerAId, ownerBId]]).catch(() => undefined);
+    await admin.query(`DELETE FROM organizations WHERE organization_id = $1`, [organizationId]).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export async function createMagicLinkToken(
@@ -492,16 +734,475 @@ export async function createMagicLinkToken(
       throw new Error("login magic link requires an existing user with a membership");
     }
     await client.query(
-      `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO "${schema}".magic_link_tokens
+         (token_hash, email, organization_id, role, expires_at, replace_existing_role)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         input.tokenHash,
         email,
         input.invite?.organizationId ?? null,
         input.invite?.role ?? null,
-        input.expiresAt
+        input.expiresAt,
+        input.invite === undefined ? null : (input.replaceExistingRole ?? false)
       ]
     );
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * What redeeming an invite would actually do to the target's membership.
+ *
+ * Review #88, REV-002 and REV-003: `POST /api/invites` is not only an
+ * "add somebody" endpoint. `provisionInvitedMembership` ends in
+ * `ON CONFLICT ... DO UPDATE SET role`, which nothing could reach before
+ * this ticket exposed invite creation over HTTP. So an invite naming an
+ * existing member silently replaces their role when they click what their
+ * mail client shows as a routine sign-in link; and an invite that would
+ * demote an organization's sole owner is accepted, audited and delivered,
+ * then fails at redemption forever, bouncing the invitee to `/?auth=error`
+ * with nothing telling the admin who issued it.
+ *
+ * This lets the route answer for both before minting anything.
+ */
+export type InviteEffect =
+  /** No membership exists yet: the ordinary invite. */
+  | { readonly outcome: "creates_membership" }
+  /** Already a member in exactly this role; redemption changes nothing. */
+  | { readonly outcome: "unchanged"; readonly role: MembershipRole }
+  /** Replaces an existing member's role. */
+  | { readonly outcome: "changes_role"; readonly from: MembershipRole; readonly to: MembershipRole }
+  /** Would leave the organization with no owner; redemption refuses this. */
+  | { readonly outcome: "strands_organization"; readonly from: MembershipRole; readonly to: MembershipRole };
+
+/**
+ * Advisory, not the enforcement.
+ *
+ * This is a read, so between it and redemption the membership can change.
+ * `provisionInvitedMembership`'s own last-owner guard, inside the
+ * redemption transaction and holding `FOR UPDATE` on the owner rows, stays
+ * the actual invariant. What this buys is that the common case fails at the
+ * admin who can act on it rather than at an invitee holding a link that can
+ * never work.
+ */
+export async function previewInviteEffect(
+  databaseUrl: string,
+  schema: string,
+  input: { readonly organizationId: string; readonly email: string; readonly role: MembershipRole }
+): Promise<InviteEffect> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // AF-18's memberships policy needs this for the reads below under any
+      // role RLS applies to; is_local ties it to this transaction.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [input.organizationId]);
+      const existing = await client.query<{ user_id: string; role: MembershipRole }>(
+        `SELECT m.user_id, m.role
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email, input.organizationId]
+      );
+      const current = existing.rows[0];
+      if (current === undefined) {
+        await client.query("COMMIT");
+        return { outcome: "creates_membership" };
+      }
+      if (current.role === input.role) {
+        await client.query("COMMIT");
+        return { outcome: "unchanged", role: current.role };
+      }
+      if (input.role !== "owner") {
+        const owners = await client.query<{ user_id: string }>(
+          `SELECT user_id FROM "${schema}".memberships
+            WHERE organization_id = $1 AND role = 'owner'`,
+          [input.organizationId]
+        );
+        const ownerIds = owners.rows.map((owner) => owner.user_id);
+        if (ownerIds.length === 1 && ownerIds[0] === current.user_id) {
+          await client.query("COMMIT");
+          return { outcome: "strands_organization", from: current.role, to: input.role };
+        }
+      }
+      await client.query("COMMIT");
+      return { outcome: "changes_role", from: current.role, to: input.role };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** The membership an invite would change, for the audit row that records it. */
+export async function getMembershipIdForEmail(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  email: string
+): Promise<string | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const result = await client.query<{ membership_id: string }>(
+        `SELECT m.membership_id
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email.toLowerCase(), organizationId]
+      );
+      await client.query("COMMIT");
+      return result.rows[0]?.membership_id;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export interface CreateInviteMagicLinkTokenInput {
+  readonly tokenHash: string;
+  readonly email: string;
+  readonly invite: MagicLinkInvite;
+  readonly expiresAt: Date;
+  /**
+   * Not optional, and not a second call the caller could forget to make.
+   * An invite grants a named role in an organization to whoever redeems
+   * it, which is exactly the consequential `admin_action` AF-20 requires
+   * to be attributable -- and redemption itself records nothing, because
+   * the person redeeming is not the person who decided to grant it.
+   * Making this a field means an invite that is not attributable cannot
+   * be expressed, rather than merely discouraged.
+   */
+  readonly audit: {
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
+  /**
+   * The caller's Idempotency-Key, honoured rather than merely validated
+   * (review #88, REV-007). A retry after a timeout must not mint a second
+   * live credential, a second audit trail and a second email for one
+   * administrative act.
+   *
+   * Bound to the request it was issued for, not accepted bare (review #88,
+   * REV-009): a key reused against a different email, role or
+   * `replaceExistingRole` -- a client bug, a copy-pasted header, a key
+   * minted once per admin session instead of once per submission -- hit
+   * the same unique-index conflict as a genuine retry and answered the
+   * same silent-success 202, for an invite that was never created. See
+   * `replaceExistingRole` below and `createInviteMagicLinkToken`'s
+   * fingerprint comparison.
+   */
+  readonly idempotencyKey: string;
+  /**
+   * The caller's stated intent, folded into the idempotency fingerprint
+   * alongside email and role. Required, not defaulted to `false` inside
+   * this function: the fingerprint must reflect what the caller actually
+   * sent, and a default here would make two different requests -- one that
+   * omitted the field and one that sent `false` -- fingerprint identically,
+   * which happens to be harmless today only because they mean the same
+   * thing; a silent default is still the wrong place to encode that.
+   */
+  readonly replaceExistingRole: boolean;
+}
+
+export type CreateInviteOutcome =
+  | { readonly outcome: "created" }
+  /**
+   * This exact request, replayed under the same key: nothing was written,
+   * and nothing should be sent again for a delivery that already
+   * succeeded.
+   *
+   * `delivered` is false when the first attempt's token and audit rows
+   * committed but its mail send never confirmed (review #88 round 5,
+   * REV-004) -- a client retrying the 503 that response produces must not
+   * be told 202, since nothing has ever gone out for this invite and the
+   * conventional response to a 503 is exactly the retry that would land
+   * here.
+   */
+  | { readonly outcome: "replayed"; readonly delivered: boolean }
+  /** The key was reused for a different request. Refused, not replayed:
+   * silently discarding the second request would tell its caller it
+   * succeeded when nothing was created for it. */
+  | { readonly outcome: "conflict" };
+
+/**
+ * Mints an invite token and its audit row in one transaction.
+ *
+ * Separate from createMagicLinkToken rather than an optional argument on
+ * it: a login link re-sends access somebody already has, an invite
+ * creates it, and only the second is an administrative act with an
+ * actor to record.
+ *
+ * The audit row's entity_id is the token hash, not the invited email.
+ * audit_events is append-only by trigger and has no delete path, so an
+ * address written there could never be removed; the token hash points at
+ * the magic_link_tokens row, which holds the email, organization and
+ * role together and can be deleted. The audit trail keeps the fact and
+ * its actor, and the joinable row keeps the detail.
+ */
+export async function createInviteMagicLinkToken(
+  databaseUrl: string,
+  schema: string,
+  input: CreateInviteMagicLinkTokenInput
+): Promise<CreateInviteOutcome> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  // Review #88, REV-009: what makes a replay "the same request" as the one
+  // that first claimed this key. Same shape as claimIdempotentRequest's own
+  // request_fingerprint -- a canonical hash of the fields that determine the
+  // invite's effect -- kept as its own column rather than reusing that
+  // generic mechanism, because invites already have their own idempotency
+  // column (REV-007) and this repo's convention is a bespoke column per
+  // consequential write (candidate decisions, import finalization,
+  // evidence corrections), not a shared table every route funnels through.
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ email, organizationId: input.invite.organizationId, role: input.invite.role, replaceExistingRole: input.replaceExistingRole }))
+    .digest("hex");
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // The INSERT is the deduplication, not a check before it: the partial
+      // unique index means exactly one concurrent caller can claim a key, so
+      // two simultaneous retries cannot both proceed. On conflict nothing is
+      // written and the audit rows below are skipped with it, inside this
+      // same transaction.
+      const inserted = await client.query(
+        `INSERT INTO "${schema}".magic_link_tokens
+           (token_hash, email, organization_id, role, expires_at, idempotency_key, idempotency_fingerprint,
+            replace_existing_role)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+         DO NOTHING`,
+        [
+          input.tokenHash,
+          email,
+          input.invite.organizationId,
+          input.invite.role,
+          input.expiresAt,
+          input.idempotencyKey,
+          fingerprint,
+          // Review #88, REV-010: stored so redemption can enforce the
+          // opt-in against the membership state it actually finds, not the
+          // one previewInviteEffect saw when this invite was created.
+          input.replaceExistingRole
+        ]
+      );
+      if (inserted.rowCount === 0) {
+        // Same key, but is it the same request? The unique index alone
+        // cannot tell: it only knows the (organization, key) pair
+        // conflicted, not whether this call's fingerprint matches the one
+        // that won the race. Read back what actually claimed the key and
+        // compare, the same distinction claimIdempotentRequest draws
+        // between `replay` and `fingerprint_mismatch`.
+        const existing = await client.query<{
+          idempotency_fingerprint: string | null;
+          delivered_at: Date | null;
+        }>(
+          `SELECT idempotency_fingerprint, delivered_at FROM "${schema}".magic_link_tokens
+            WHERE organization_id = $1 AND idempotency_key = $2`,
+          [input.invite.organizationId, input.idempotencyKey]
+        );
+        const existingRow = existing.rows[0];
+        if (existingRow?.idempotency_fingerprint === undefined) {
+          // Only reachable if the row was deleted between the two
+          // statements, which nothing here does. Reported rather than
+          // silently treated as either outcome.
+          throw new Error("invite idempotency record vanished between claim and read");
+        }
+        if (existingRow.idempotency_fingerprint !== fingerprint) {
+          // A different request reused this key. Refused, not replayed:
+          // treating it as a replay would answer 202 for an invite that
+          // was never created, which is the exact failure mode reported
+          // in review #88 (REV-009).
+          await client.query("ROLLBACK");
+          return { outcome: "conflict" };
+        }
+        await client.query("COMMIT");
+        return { outcome: "replayed", delivered: existingRow.delivered_at !== null };
+      }
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.invite.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "membership_invite",
+          entityId: input.tokenHash,
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      // Review #88 round 5, REV-001: no `membership_role_change` row is
+      // written here. The role this invite names is only a request until
+      // redemption actually applies it -- redemption can be hours later,
+      // can be refused by `provisionInvitedMembership`'s own guards, or can
+      // never happen at all if the link expires unclicked -- so a row
+      // written here from `previewInviteEffect`'s creation-time read would
+      // assert a transition that has not occurred, from a `from` value
+      // nothing holds a lock on past the moment it was read. Two admins
+      // racing a preview and a redemption could make it record a transition
+      // whose stated starting point was never true at the instant anything
+      // changed. `provisionInvitedMembership` writes the real row, from the
+      // value it locks and actually applies, in the same transaction as the
+      // update it describes -- see the call there for how it recovers the
+      // authorizing actor and request id from this `membership_invite` row.
+      await client.query("COMMIT");
+      return { outcome: "created" };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Records that an invite's mail actually went out.
+ *
+ * Review #88 round 5, REV-004: `POST /api/invites` commits the token and
+ * its audit rows before attempting delivery, then answers 503 if the send
+ * fails. Nothing previously distinguished that state from a normal
+ * created-and-sent invite, so a client retrying the 503 -- the
+ * conventional response to one -- replayed into a 202 that claimed
+ * delivery which never happened. Called once, after `sendMagicLink`
+ * confirms; a replay of an invite this was never called for reports
+ * `delivered: false` and the route can answer 503 again instead.
+ *
+ * `IS NULL` in the WHERE clause rather than an unconditional SET: this
+ * marks the first confirmed send, not the most recent call, though nothing
+ * in this route currently calls it more than once per token.
+ */
+export async function markInviteDelivered(databaseUrl: string, schema: string, tokenHash: string): Promise<void> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `UPDATE "${schema}".magic_link_tokens
+          SET delivered_at = clock_timestamp()
+        WHERE token_hash = $1 AND delivered_at IS NULL`,
+      [tokenHash]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Whether a token is an invite, without consuming it.
+ *
+ * Review #88, REV-011: `GET /auth/redeem` used to call the atomic,
+ * consuming redemption directly, so a corporate mail gateway's prefetch of
+ * the emailed link -- an ordinary GET, indistinguishable from the
+ * recipient's own click -- provisioned or changed a membership and burned
+ * the single-use token before the invitee ever acted. A plain login token
+ * has no comparable effect (redemption only mints a session, the accepted
+ * tradeoff already documented on that route), so this only needs to steer
+ * invite tokens to a non-mutating confirmation step; everything else keeps
+ * going straight to the real, consuming redemption, which re-validates
+ * expiry and single-use atomically regardless of what this said.
+ *
+ * Deliberately not authoritative: an invalid, expired or already-consumed
+ * token reports "not_invite" here and falls through to that same real
+ * redemption, which already produces the right invalid/expired/consumed
+ * outcome. This function only has one job, telling a still-live invite
+ * apart from everything else, so the caller knows to defer.
+ */
+export async function peekMagicLinkTokenIsInvite(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ organization_id: string | null }>(
+      `SELECT organization_id
+         FROM "${schema}".magic_link_tokens
+        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    return result.rows[0]?.organization_id !== null && result.rows[0]?.organization_id !== undefined;
+  } finally {
+    client.release();
+  }
+}
+
+export interface InvitePeek {
+  readonly organizationName: string;
+  readonly role: MembershipRole;
+  /** The invitee's current role, present only when accepting would replace
+   * it with `role` -- undefined for a brand new membership or a role that
+   * already matches, exactly the distinction `previewInviteEffect` draws
+   * at creation. */
+  readonly replacesRole?: MembershipRole;
+}
+
+/**
+ * The detail `/auth/confirm` renders so accepting an invite is an informed
+ * action, not just an explicit one (review #88 round 5, REV-003).
+ *
+ * REV-011's confirmation step establishes that consuming an invite takes a
+ * deliberate click. It does not by itself make that click informed: a
+ * member being replaced into a different role saw the same generic
+ * sentence as someone joining a new organization, and could not tell an
+ * invitation from a change to access they already hold. This is the same
+ * non-mutating peek `peekMagicLinkTokenIsInvite` performs -- a plain read,
+ * advisory only, superseded by whatever `redeemMagicLinkForSession` finds
+ * when the accept action actually runs.
+ *
+ * Returns undefined for anything that is not a currently-live invite
+ * token, the same cases `peekMagicLinkTokenIsInvite` reports `false` for:
+ * the caller falls through to the real redemption either way, which
+ * produces the right invalid/expired/consumed/no_account outcome.
+ */
+export async function peekInviteDetails(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<InvitePeek | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_name: string;
+      role: MembershipRole;
+      current_role: MembershipRole | null;
+    }>(
+      `SELECT o.name AS organization_name, t.role AS role, m.role AS current_role
+         FROM "${schema}".magic_link_tokens t
+         INNER JOIN "${schema}".organizations o ON o.organization_id = t.organization_id
+         LEFT JOIN "${schema}".users u ON u.email = t.email
+         LEFT JOIN "${schema}".memberships m ON m.user_id = u.user_id AND m.organization_id = t.organization_id
+        WHERE t.token_hash = $1
+          AND t.organization_id IS NOT NULL
+          AND t.role IS NOT NULL
+          AND t.consumed_at IS NULL
+          AND t.expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      organizationName: row.organization_name,
+      role: row.role,
+      ...(row.current_role !== null && row.current_role !== row.role ? { replacesRole: row.current_role } : {})
+    };
   } finally {
     client.release();
   }
@@ -532,7 +1233,7 @@ export async function redeemMagicLinkToken(
         `UPDATE "${schema}".magic_link_tokens
             SET consumed_at = clock_timestamp()
           WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
-          RETURNING email, organization_id, role, expires_at, consumed_at`,
+          RETURNING email, organization_id, role, expires_at, consumed_at, replace_existing_role`,
         [tokenHash]
       );
       const redeemedRow = redeemed.rows[0];
@@ -544,7 +1245,9 @@ export async function redeemMagicLinkToken(
             schema,
             record.email.toLowerCase(),
             record.invite.organizationId,
-            record.invite.role
+            record.invite.role,
+            redeemedRow.replace_existing_role === true,
+            tokenHash
           );
         }
         await client.query("COMMIT");
@@ -552,7 +1255,7 @@ export async function redeemMagicLinkToken(
       }
 
       const existing = await client.query<MagicLinkTokenRow>(
-        `SELECT email, organization_id, role, expires_at, consumed_at
+        `SELECT email, organization_id, role, expires_at, consumed_at, replace_existing_role
            FROM "${schema}".magic_link_tokens WHERE token_hash = $1`,
         [tokenHash]
       );
@@ -621,6 +1324,66 @@ export async function appendAuditEvent(
   const client = await acquireConnection(databaseUrl);
   try {
     await insert(client);
+  } finally {
+    client.release();
+  }
+}
+
+export interface RecordedAuditEvent {
+  readonly organizationId: string;
+  readonly actorUserId: string;
+  readonly action: AuditAction;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly requestId: string;
+}
+
+/**
+ * Reads back the audit rows for one entity.
+ *
+ * Exported for the same reason the assert* probes below are: `pg` lives
+ * in this package, so a test that needs to see real rows either goes
+ * through here or reaches for a driver it cannot resolve.
+ *
+ * It exists because of review #88, which caught a test asserting the
+ * wrong thing. `POST /api/invites` answering 202 was taken as proof that
+ * the `admin_action` row had been written; it is not. Deleting the
+ * `appendAuditEvent` call entirely would still insert the token, send
+ * the mail and answer 202, and the only assertion covering AF-20's
+ * "every consequential action is attributable" invariant would have gone
+ * on passing. The row has to be read to be checked.
+ */
+export async function listAuditEventsForEntity(
+  databaseUrl: string,
+  schema: string,
+  entityType: string,
+  entityId: string
+): Promise<readonly RecordedAuditEvent[]> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_id: string;
+      actor_user_id: string;
+      action: AuditAction;
+      entity_type: string;
+      entity_id: string;
+      request_id: string;
+    }>(
+      `SELECT organization_id, actor_user_id, action, entity_type, entity_id, request_id
+         FROM "${schema}".audit_events
+        WHERE entity_type = $1 AND entity_id = $2
+        ORDER BY occurred_at ASC`,
+      [entityType, entityId]
+    );
+    return result.rows.map((row) => ({
+      organizationId: row.organization_id,
+      actorUserId: row.actor_user_id,
+      action: row.action,
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      requestId: row.request_id
+    }));
   } finally {
     client.release();
   }
@@ -1020,6 +1783,260 @@ export async function getMembershipsForUser(
   }
 }
 
+// ---- AF-97: entering a deployment ----
+
+interface CallerOrganizationRow {
+  readonly organization_id: string;
+  readonly name: string;
+  readonly role: MembershipRole;
+}
+
+/**
+ * The organizations a signed-in caller may act in, with the role they
+ * hold in each.
+ *
+ * Every other route takes an organizationId it does not produce, so
+ * before this existed a user had exactly one way to learn their own:
+ * be told it out of band and paste it into a query string. This is the
+ * one query that turns a session into a set of places to act in, which
+ * is what an organization switcher renders.
+ *
+ * The organization name is only reachable through the caller's own
+ * membership rows -- the join, not a filter applied afterwards -- so an
+ * organizationId the caller has no membership for cannot be resolved to
+ * a name here, and the list cannot become an organization directory.
+ */
+export async function listOrganizationsForUser(
+  databaseUrl: string,
+  schema: string,
+  userId: string
+): Promise<readonly CallerOrganization[]> {
+  assertSafeSchema(schema);
+  // Same cross-organization lookup as getMembershipsForUser, and the same
+  // reason it must fail loudly: under a role RLS applies to, this returns
+  // zero rows for every caller, and an organization switcher that renders
+  // "you belong to no organizations" is indistinguishable from the truth.
+  await requireMembershipLookupVisibleOnce(databaseUrl, schema, "listing a user's organizations");
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<CallerOrganizationRow>(
+      `SELECT o.organization_id, o.name, m.role
+         FROM "${schema}".memberships m
+         INNER JOIN "${schema}".organizations o ON o.organization_id = m.organization_id
+        WHERE m.user_id = $1
+        ORDER BY o.name ASC, o.organization_id ASC`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      organizationId: row.organization_id,
+      name: row.name,
+      role: row.role
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+export interface BootstrapOrganizationOwnerInput {
+  readonly organizationName: string;
+  readonly email: string;
+  readonly displayName: string;
+}
+
+export interface BootstrapOrganizationOwnerResult {
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly organizationCreated: boolean;
+  readonly userCreated: boolean;
+  /** `promoted` means the user already belonged to this organization in a
+   * non-owner role and now owns it -- reported rather than silent, because
+   * it is the one privilege change this command can make to existing data. */
+  readonly membership: "created" | "promoted" | "unchanged";
+}
+
+/**
+ * Creates the first organization, user and owner membership of a
+ * deployment, atomically.
+ *
+ * A fresh deployment has none of the three, and no code path creates
+ * any: `POST /api/auth/magic-link/request` only mails a link to an email
+ * that already holds a membership, and an invite can only be issued by
+ * somebody who already owns an organization. That is a deliberate
+ * invite-only design (AF-16) with one missing step -- the first invite
+ * has nobody to come from -- so every route in the app was unreachable
+ * without hand-editing the database.
+ *
+ * This is the missing step, and it is deliberately NOT an HTTP route.
+ * Whatever creates the first owner cannot itself be behind
+ * authentication, so as a route it would be an unauthenticated
+ * privilege-granting endpoint that must be disabled after first use,
+ * and "we remembered to disable it" is not a security control. Requiring
+ * the operator to already hold database credentials moves the
+ * authorization to something the deployment already has to protect.
+ *
+ * Idempotent, so an interrupted or repeated run converges instead of
+ * creating a second organization with the same name: an existing
+ * organization of that name is reused, the user is matched by email, and
+ * the owner membership is upserted. See BootstrapOrganizationOwnerResult
+ * for what a repeat run reports.
+ */
+export async function bootstrapOrganizationOwner(
+  databaseUrl: string,
+  schema: string,
+  input: BootstrapOrganizationOwnerInput
+): Promise<BootstrapOrganizationOwnerResult> {
+  assertSafeSchema(schema);
+  const organizationName = input.organizationName.trim();
+  const displayName = input.displayName.trim();
+  const email = input.email.trim().toLowerCase();
+  // Checked here rather than left to the table's CHECK constraints: an
+  // operator running this by hand should get the reason, not a raw
+  // constraint-violation stack.
+  if (organizationName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty organization name");
+  }
+  if (displayName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty display name");
+  }
+  // Structural only, and deliberately not an attempt to restate the
+  // grammar (review #88). The authoritative check is contracts'
+  // `storedEmailSchema` -- the very object `POST /api/auth/magic-link/request`
+  // parses with -- applied by scripts/environment/bootstrap.mjs before it
+  // gets here, because this package may not depend on contracts and a
+  // second hand-written email regex would drift from the one that decides
+  // whether the owner can actually sign in.
+  //
+  // This still refuses what the table's own CHECK is too weak to catch:
+  // `position('@' in email) > 1` accepts `owner@`, `foo@@bar` and `a@b`,
+  // every one of which `z.email()` rejects. Left unchecked, the one
+  // command whose purpose is to create somebody who can sign in could
+  // create somebody who provably cannot.
+  const [localPart, domain, ...extraParts] = email.split("@");
+  if (
+    localPart === undefined ||
+    localPart.length === 0 ||
+    domain === undefined ||
+    extraParts.length > 0 ||
+    !/^[^\s@]+\.[^\s@]+$/u.test(domain)
+  ) {
+    throw new Error(
+      `bootstrapOrganizationOwner requires an email address of the form name@example.com; ` +
+        `an address the sign-in endpoint rejects would create an owner who can never request a link`
+    );
+  }
+
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // One transaction for all three rows: a crash between them would
+      // otherwise leave an organization nobody owns or a user with no
+      // membership, and the second is exactly the "half-onboarded account"
+      // the login path reports as no_account.
+      //
+      // organizations.name carries no unique constraint -- two real
+      // employers may share a name -- so "insert unless one exists" is a
+      // check-then-write that two concurrent runs could both pass,
+      // producing the duplicate organization the idempotency below exists
+      // to prevent. A transaction-scoped advisory lock on the name makes
+      // the pair atomic without constraining the table, and is released by
+      // COMMIT or ROLLBACK either way.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationName]);
+      const insertedOrganization = await client.query<{ organization_id: string }>(
+        `INSERT INTO "${schema}".organizations (name)
+         SELECT $1
+          WHERE NOT EXISTS (SELECT 1 FROM "${schema}".organizations WHERE name = $1)
+         RETURNING organization_id`,
+        [organizationName]
+      );
+      const organizationCreated = insertedOrganization.rows[0] !== undefined;
+      const organizationId =
+        insertedOrganization.rows[0]?.organization_id ??
+        (
+          await client.query<{ organization_id: string }>(
+            `SELECT organization_id FROM "${schema}".organizations
+              WHERE name = $1
+              ORDER BY created_at ASC, organization_id ASC
+              LIMIT 1`,
+            [organizationName]
+          )
+        ).rows[0]?.organization_id;
+      if (organizationId === undefined) {
+        throw new Error("bootstrap did not resolve an organization");
+      }
+
+      // Whether this row is new is read from the insert itself rather than
+      // from a prior SELECT, because `xmax = 0` is true only for a tuple this
+      // statement inserted.
+      //
+      // `DO UPDATE SET email = EXCLUDED.email` rather than `DO NOTHING`
+      // (review #88, REV-008), matching provisionInvitedMembership above.
+      // DO NOTHING returns no row on conflict and does not block on a
+      // concurrent uncommitted insert of the same email; the fallback SELECT
+      // could not see that uncommitted row under READ COMMITTED either, so
+      // two operators bootstrapping the same person into differently named
+      // organizations at the same moment would leave one of them throwing
+      // "did not resolve a user". The advisory lock above only serialises
+      // runs naming the same organization, so it does not cover this. The
+      // no-op update takes the row lock, waits for the other transaction,
+      // and then returns the row.
+      //
+      // Setting `email` to itself is what makes it a no-op: the display name
+      // is deliberately not overwritten, because this command exists to grant
+      // access, and silently renaming a person whose name an operator typed
+      // differently is not that.
+      const insertedUser = await client.query<{ user_id: string; inserted: boolean }>(
+        `INSERT INTO "${schema}".users (email, display_name)
+         VALUES ($1, $2)
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+         RETURNING user_id, (xmax = 0) AS inserted`,
+        [email, displayName]
+      );
+      const userRow = insertedUser.rows[0];
+      if (userRow === undefined) {
+        throw new Error("bootstrap did not resolve a user");
+      }
+      const userCreated = userRow.inserted;
+      const userId = userRow.user_id;
+
+      // AF-18's memberships policy requires this for both the SELECT and
+      // the INSERT below under any role RLS applies to; is_local = true
+      // ties it to this transaction, so it cannot leak onto a later query
+      // sharing the pooled connection. Same reasoning as
+      // provisionInvitedMembership.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const existing = await client.query<{ role: MembershipRole }>(
+        `SELECT role FROM "${schema}".memberships
+          WHERE organization_id = $1 AND user_id = $2
+          FOR UPDATE`,
+        [organizationId, userId]
+      );
+      const existingRole = existing.rows[0]?.role;
+      await client.query(
+        `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
+         VALUES ($1, $2, 'owner')
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'owner'`,
+        [organizationId, userId]
+      );
+      await client.query("COMMIT");
+      return {
+        organizationId,
+        userId,
+        organizationCreated,
+        userCreated,
+        membership:
+          existingRole === undefined ? "created" : existingRole === "owner" ? "unchanged" : "promoted"
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Seeds one organization + user + membership and returns the user id.
  *
@@ -1036,8 +2053,8 @@ export async function getMembershipsForUser(
  * invoke it.
  */
 /**
- * Provision a throwaway schema with only the migrations the magic-link
- * routes touch, and return its name.
+ * Provision a throwaway schema with the migrations the authentication and
+ * entry-point routes touch, and return its name.
  *
  * Lives here rather than in the test because `pg` is a packages/db
  * dependency and tests do not import it directly (the same reason
@@ -1047,6 +2064,13 @@ export async function getMembershipsForUser(
  * workstation after `pnpm dev:infra`, false in the Integration CI job, which
  * starts a bare postgres service with no migrations applied. All three route
  * tests passed locally and failed in CI.
+ *
+ * AF-97 widened it from the two magic-link migrations to the five the way
+ * INTO a deployment now spans: audit_events, because an invite writes its
+ * `admin_action` row in the same transaction as the token, and roles,
+ * because "a recruiter can reach a role" is the thing entering a deployment
+ * is for. One fixture rather than a near-identical second one, so the two
+ * cannot drift about what a route-level probe contains.
  */
 export async function provisionRouteProbeSchema(databaseUrl: string): Promise<string> {
   const schema = `route_probe_${randomBytes(4).toString("hex")}`;
@@ -1054,7 +2078,31 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
-    for (const file of ["0002_organizations_users_memberships.sql", "0003_magic_link_tokens.sql"]) {
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0003_magic_link_tokens.sql",
+      "0005_immutable_audit_events.sql",
+      // 0005_immutable_audit_events.sql leaves audit_events with an
+      // ON DELETE CASCADE that fights its own append-only trigger, and the
+      // file below is the fix; applying the first without the second would
+      // give the probe a shape no real database has ever had.
+      "0006_audit_events_delete_and_membership_fixes.sql",
+      "0009_roles.sql",
+      // The invite route deduplicates on this column (review #88, REV-007),
+      // so a probe without it would not exercise the route as it ships.
+      "0023_invite_idempotency.sql",
+      // The fingerprint that binds a key to the request it was issued for
+      // (review #88, REV-009) -- same reasoning as the migration above.
+      "0024_invite_idempotency_fingerprint.sql",
+      // The persisted replaceExistingRole intent redemption enforces
+      // (review #88, REV-010) -- same reasoning as the two migrations above.
+      "0027_invite_role_replacement_intent.sql",
+      // Tracks whether an invite's mail actually sent, so a replay of one
+      // that never delivered can be told apart from a real repeat send
+      // (review #88 round 5, REV-004) -- same reasoning as the migrations
+      // above.
+      "0028_invite_delivery_tracking.sql"
+    ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
@@ -2730,6 +3778,12 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0003_magic_link_tokens.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    // redeemMagicLinkToken now reads replace_existing_role back on every
+    // redemption (review #88, REV-010), so a probe schema without it would
+    // fail on the SELECT rather than exercising RLS.
+    await admin.query(
+      readFileSync(join(MIGRATIONS_DIRECTORY, "0027_invite_role_replacement_intent.sql"), "utf8")
+    );
     await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
     await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
@@ -2799,11 +3853,15 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     }
 
     // A promotion re-invite: DO NOTHING would report success here while
-    // silently leaving the old role in place.
+    // silently leaving the old role in place. replaceExistingRole: true
+    // because this deliberately targets an email that already holds a
+    // membership (review #88, REV-010) -- without it, redemption now
+    // refuses the change before DO NOTHING/DO UPDATE is ever reached.
     await createMagicLinkToken(probeDatabaseUrl, schema, {
       tokenHash: `rls-reinvite-${suffix}`,
       email: invitedEmail,
       invite: { organizationId, role: "admin" },
+      replaceExistingRole: true,
       expiresAt
     });
     await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);
