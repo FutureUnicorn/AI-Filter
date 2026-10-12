@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import type {
   Application,
   AuditAction,
-  CandidateDataErasureTrigger,
   CandidateDecision,
+  CandidateDataErasureTrigger,
   CandidateDecisionKind,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -27,43 +27,51 @@ import type {
   MagicLinkTokenRecord,
   Membership,
   MembershipRole,
-  PrivacyRequestKind,
-  PrivacyRequestStatus,
-  PrivacyRequestSubjectKind,
   RetentionResidue,
   ReviewTimingSpan,
+  SupportAccessDenialReason,
+  SupportAccessGrant,
+  SupportAccessReason,
+  SupportAccessRequest,
   Role,
-  RoleAuditReport,
   RoleStatus,
   Rubric,
   RubricCriterion,
   RubricStatus,
-  ShareLinkResolution,
-  User
+  User,
+  PrivacyRequestKind,
+  PrivacyRequestStatus,
+  PrivacyRequestSubjectKind,
+  RoleAuditReport,
+  ShareLinkResolution
+
 } from "@signal-audit/domain";
 import {
-  beginReviewTiming,
   CANDIDATE_DATA_ERASURE_PLACEHOLDER,
-  canExtendPrivacyRequest,
-  canonicalizeCsvColumnMapping,
-  classifyCsvImportRow,
-  compareApplicationsBySourceOrder,
-  computePrivacyRequestDueDate,
-  computeShareLinkExpiry,
   CONTRACT_SCHEMA_VERSION,
+  beginReviewTiming,
+  canonicalizeCsvColumnMapping,
+  compareApplicationsBySourceOrder,
+  classifyCsvImportRow,
   erasedStorageKey,
-  isPrivacyRequestOverdue,
-  isPrivacyRequestTerminal,
   mapCsvRowToApplication,
   planCandidateDataErasure,
   recordReviewActivity,
-  renderShareLinkResolution,
   sealReviewTiming,
   summarizeCandidateDataErasureResidue,
   summarizeFailedDocuments,
   summarizeImportRows,
+  authorizeSupportAccess,
+  validateSupportAccessReason,
+  canExtendPrivacyRequest,
+  computePrivacyRequestDueDate,
+  isPrivacyRequestOverdue,
+  isPrivacyRequestTerminal,
   validatePrivacyRequestExtensionMonths,
-  validatePrivacyRequestTransition
+  validatePrivacyRequestTransition,
+  computeShareLinkExpiry,
+  renderShareLinkResolution
+
 } from "@signal-audit/domain";
 import { Client } from "pg";
 import type { QueryResult, QueryResultRow } from "pg";
@@ -3943,6 +3951,50 @@ export async function recordAuditSample(
       if (auditSampleId === undefined) {
         throw new Error("recording an audit sample did not produce a draw row");
       }
+      // REV-009 (Pradeep): AF-62 classifies audit_sample_members as
+      // candidate-identifying residue that erasure cannot remove, so a
+      // member row must not be able to appear after the receipt was
+      // written. The foreign key does not stop it: erasure redacts the
+      // application in place rather than deleting it, so the key still
+      // resolves and the insert succeeds against an erased candidate.
+      //
+      // One query for the whole draw rather than one per id, and the row
+      // count is what decides.
+      //
+      // An earlier version of this comment said a per-id loop could
+      // deadlock two concurrent draws over overlapping samples. That was
+      // wrong, and Pradeep caught it: FOR SHARE does not conflict with
+      // FOR SHARE, so two draws take these locks in any order without
+      // blocking each other. Verified rather than reasoned about -- two
+      // sessions taking FOR SHARE on the same two rows in opposite order
+      // both proceed.
+      //
+      // The single statement is still the right shape, for duller
+      // reasons: one round trip instead of one per sampled id, and the
+      // count against the distinct id count is the direct way to say
+      // "every one of these must still be live", which a loop would have
+      // to reconstruct.
+      //
+      // FOR SHARE, matching the evidence and decision writers: it conflicts
+      // with the erasure's FOR UPDATE, so either this commits first and the
+      // members exist before the erasure and are reported as residue, or it
+      // waits, re-reads under READ COMMITTED, finds redacted_at set, and
+      // refuses.
+      if (input.sampledApplicationIds.length > 0 && (await applicationsHaveRedactedAt(client, schema))) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE organization_id = $1 AND application_id = ANY($2::uuid[]) AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.organizationId, [...new Set(input.sampledApplicationIds)]]
+        );
+        const distinct = new Set(input.sampledApplicationIds).size;
+        if ((live.rowCount ?? 0) !== distinct) {
+          throw new Error(
+            `recordAuditSample: ${distinct - (live.rowCount ?? 0)} of ${distinct} sampled application(s) in ` +
+              `organization ${input.organizationId} are erased or missing; a draw cannot name an erased candidate`
+          );
+        }
+      }
       for (const applicationId of input.sampledApplicationIds) {
         await client.query(
           `INSERT INTO "${schema}".audit_sample_members (audit_sample_id, organization_id, application_id)
@@ -4221,20 +4273,57 @@ export async function recordReviewTimingSpan(
   const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
   try {
     await client.connect();
-    await client.query(
-      `INSERT INTO "${schema}".review_timing_spans
-         (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        input.organizationId,
-        input.applicationId,
-        input.reviewerUserId,
-        input.startedAt,
-        input.endedAt,
-        input.activeMs,
-        input.truncatedByIdle
-      ]
-    );
+    // REV-009 (Pradeep): a transaction, where there was a bare INSERT.
+    //
+    // The timing route already calls getApplicationById first, and that now
+    // hides erased rows, which covers the non-racing case. It is a snapshot
+    // read on a different connection though, so an erasure committing
+    // between the two let the insert through -- and the foreign key does not
+    // catch it, because erasure redacts the application in place rather than
+    // deleting it. The row that lands ties an erased candidate's
+    // application_id to a named reviewer and a duration, in an append-only
+    // table, after their receipt said what survived.
+    //
+    // A lock only holds for the life of a transaction, so the guard is
+    // worthless without one: BEGIN, take FOR SHARE on the application, then
+    // insert. FOR SHARE conflicts with the erasure's FOR UPDATE, so either
+    // this commits first and the span is reported as residue, or it waits,
+    // re-reads under READ COMMITTED, finds redacted_at set, and refuses.
+    await client.query("BEGIN");
+    try {
+      if (await applicationsHaveRedactedAt(client, schema)) {
+        const live = await client.query(
+          `SELECT 1 FROM "${schema}".applications
+            WHERE application_id = $1 AND organization_id = $2 AND redacted_at IS NULL
+            FOR SHARE`,
+          [input.applicationId, input.organizationId]
+        );
+        if ((live.rowCount ?? 0) === 0) {
+          throw new Error(
+            `recordReviewTimingSpan: application ${input.applicationId} in organization ` +
+              `${input.organizationId} is erased or missing`
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO "${schema}".review_timing_spans
+           (organization_id, application_id, reviewer_user_id, started_at, ended_at, active_ms, truncated_by_idle)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          input.organizationId,
+          input.applicationId,
+          input.reviewerUserId,
+          input.startedAt,
+          input.endedAt,
+          input.activeMs,
+          input.truncatedByIdle
+        ]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -7776,6 +7865,16 @@ export interface EvidenceWriteRacingErasureObservations {
   readonly evidenceRecordedDuringErasure: boolean;
   /** Lock waiters seen before the erasure was released, so the race was really exercised. */
   readonly writersBlockedBeforeRelease: number;
+  /**
+   * REV-009 (Pradeep): what recordReviewTimingSpan threw, or null. A span
+   * ties an erased candidate's application_id to a named reviewer and a
+   * duration, in an append-only table.
+   */
+  readonly timingError: string | null;
+  readonly timingRowsAfterErasure: number;
+  /** REV-009: what recordAuditSample threw, or null. */
+  readonly auditSampleError: string | null;
+  readonly auditSampleMemberRowsAfterErasure: number;
 }
 
 /**
@@ -7826,20 +7925,12 @@ export async function assertEvidenceWriteRacingErasure(
     await gate.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await admin.query(`SET search_path TO "${schema}"`);
-    for (const file of [
-      "0002_organizations_users_memberships.sql",
-      "0006_evidence_extraction_runs.sql",
-      "0009_roles.sql",
-      "0012_file_intakes.sql",
-      "0013_file_intake_validation.sql",
-      "0014_canonical_text_extractions.sql",
-      "0015_applications_and_import_finalization.sql",
-      "0016_evidence_outcomes.sql",
-      "0017_evidence_corrections.sql",
-      "0018_correction_attribution.sql",
-      "0019_candidate_decisions.sql",
-      "0023_candidate_data_erasure.sql"
-    ]) {
+    // Every migration in the runner's order, not a hand-picked list. The
+    // list ended at 0023 and included no review_timing_spans or
+    // audit_sample_members, so REV-009's two writers could not have been
+    // raced here at all -- the same shape corrected in the other probes in
+    // this file.
+    for (const file of listMigrationsInRunnerOrder()) {
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
     await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'A')`, [org]);
@@ -7957,7 +8048,34 @@ export async function assertEvidenceWriteRacingErasure(
       })
     );
 
-    // All three writers are waiting on a row lock held by the parked erasure, so
+    // REV-009: the two writers AF-62's own plan now classifies as
+    // unerasable identifier residue. Raced on the same barrier as the other
+    // three, because "the route checks first" is a snapshot read on another
+    // connection and this is the window it does not cover.
+    const timing = settle(
+      recordReviewTimingSpan(databaseUrl, schema, {
+        organizationId: org,
+        applicationId,
+        reviewerUserId: userId,
+        startedAt: new Date("2026-08-29T12:00:00.000Z"),
+        endedAt: new Date("2026-08-29T12:01:00.000Z"),
+        activeMs: 60_000,
+        truncatedByIdle: false
+      })
+    );
+    const auditSample = settle(
+      recordAuditSample(databaseUrl, schema, {
+        organizationId: org,
+        roleId,
+        seed: "race-probe",
+        requestedSize: 1,
+        eligibleCount: 1,
+        drawnByUserId: userId,
+        sampledApplicationIds: [applicationId]
+      })
+    );
+
+    // All five writers are waiting on a row lock held by the parked erasure, so
     // whatever check they made before the wait was made against a snapshot
     // in which redacted_at was still NULL.
     const writersBlockedBeforeRelease = await poll(
@@ -7966,16 +8084,12 @@ export async function assertEvidenceWriteRacingErasure(
         WHERE NOT l.granted AND l.locktype IN ('transactionid', 'tuple')
           AND a.query LIKE '%' || $1 || '%'`,
       [`"${schema}".`],
-      3
+      5
     );
 
     await gate.query(`SELECT pg_advisory_unlock($1, $2)`, [barrierClass, barrierObj]);
-    const [erasureError, evidenceError, decisionError, correctionError] = await Promise.all([
-      erasure,
-      evidence,
-      decision,
-      correction
-    ]);
+    const [erasureError, evidenceError, decisionError, correctionError, timingError, auditSampleError] =
+      await Promise.all([erasure, evidence, decision, correction, timing, auditSample]);
     if (erasureError !== null) {
       throw new Error(`assertEvidenceWriteRacingErasure: the erasure itself failed: ${erasureError}`);
     }
@@ -7987,6 +8101,14 @@ export async function assertEvidenceWriteRacingErasure(
     );
     const decisionRows = await admin.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM candidate_decisions WHERE application_id = $1`,
+      [applicationId]
+    );
+    const timingRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM review_timing_spans WHERE application_id = $1`,
+      [applicationId]
+    );
+    const auditSampleRows = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_sample_members WHERE application_id = $1`,
       [applicationId]
     );
     const receipt = await admin.query<{ executed_at: Date }>(
@@ -8005,7 +8127,11 @@ export async function assertEvidenceWriteRacingErasure(
       decisionRowsAfterErasure: Number.parseInt(decisionRows.rows[0]?.count ?? "", 10),
       evidenceRecordedDuringErasure:
         lastEvidence !== null && executedAt !== null && lastEvidence.getTime() >= executedAt.getTime(),
-      writersBlockedBeforeRelease
+      writersBlockedBeforeRelease,
+      timingError,
+      timingRowsAfterErasure: Number.parseInt(timingRows.rows[0]?.count ?? "", 10),
+      auditSampleError,
+      auditSampleMemberRowsAfterErasure: Number.parseInt(auditSampleRows.rows[0]?.count ?? "", 10)
     };
   } finally {
     try {
@@ -8023,6 +8149,587 @@ export async function assertEvidenceWriteRacingErasure(
   }
 }
 
+// ---- AF-66 REV-001: the production support-access boundary ----
+
+/**
+ * Sai's REV-001 on #72 was right, and it is this repository's oldest
+ * failure mode wearing a new hat: `authorizeSupportAccess` was a correct
+ * decision function with nothing in production calling it, and
+ * `support_access_events` was a correct table with nothing in production
+ * writing to it. Both ends were tested. Nothing carried the value
+ * across, so the AF-66 guarantee ("any time an operator reads tenant
+ * data, it is logged") rested on every future caller remembering to do
+ * four things in the right order.
+ *
+ * This is that boundary. A support-facing read does not get to assemble
+ * the sequence itself; it hands over what it wants to read and receives
+ * either the data or a denial.
+ *
+ * Four properties, each one a thing that could otherwise fail open:
+ *
+ * 1. **One transaction.** The event row and the data read commit
+ *    together or not at all. There is no window in which an operator
+ *    saw something that the log does not record, and none in which the
+ *    log claims a look that never happened.
+ *
+ * 2. **The grant is locked, not merely read.** `FOR SHARE` on the grant
+ *    row means a concurrent revocation blocks until this read commits.
+ *    Without it, a revoke could land between the authorization and the
+ *    read, and the operator would be served data under an authority
+ *    that no longer existed by the time the bytes moved.
+ *
+ * 3. **The clock comes from the database.** `clock_timestamp()` is read
+ *    inside the same transaction and is what expiry is judged against,
+ *    rather than the Node process's own `new Date()`. "Time the system
+ *    trusts from outside itself" has produced a defect in this
+ *    repository four times now. Here it would have been worse than
+ *    usual: a support operator's workstation clock deciding whether
+ *    that operator's own grant had expired.
+ *
+ * 4. **The read cannot write.** After the event is inserted, the
+ *    transaction is flipped with `SET LOCAL transaction_read_only = on`,
+ *    so Postgres itself refuses any write the caller's read attempts
+ *    ("cannot execute INSERT in a read-only transaction"). Verified
+ *    against a real database rather than assumed: the toggle is legal
+ *    mid-transaction, after the event write, and rows already written
+ *    stay visible to the rest of the transaction. This is the database
+ *    refusing, not a pattern matching SQL text, which is the standard
+ *    #90 REV-001 settled on for `readProbeRows`.
+ *
+ * Order matters and is the whole point: authorize, then log, then read.
+ * A denial never reaches step two, so a refused operator leaves no
+ * event and reads nothing. A failure to persist the event never reaches
+ * step three, so an unloggable access is a denied access.
+ */
+
+/** What a caller may do with the tenant's data once the boundary opens. */
+export interface SupportAccessReadHandle {
+  /**
+   * The schema the grant covers, so a caller does not have to thread it
+   * separately and cannot accidentally read a different one.
+   */
+  readonly schema: string;
+  rows<T extends Record<string, unknown>>(sql: string, params?: readonly unknown[]): Promise<readonly T[]>;
+}
+
+export type SupportAccessRead<T> = (handle: SupportAccessReadHandle) => Promise<T>;
+
+export type SupportAccessReadOutcome<T> =
+  | { readonly allowed: true; readonly grantId: string; readonly data: T }
+  | { readonly allowed: false; readonly denialReason: SupportAccessDenialReason };
+
+interface SupportAccessGrantRow extends Record<string, unknown> {
+  readonly grant_id: string;
+  readonly organization_id: string;
+  readonly operator_user_id: string;
+  readonly reason_code: string;
+  readonly ticket_reference: string;
+  readonly granted_by_user_id: string;
+  readonly granted_at: string;
+  readonly expires_at: string;
+  readonly revoked_at: string | null;
+  readonly db_now: string;
+}
+
+export interface CreateSupportAccessGrantInput {
+  readonly organizationId: string;
+  readonly operatorUserId: string;
+  readonly grantedByUserId: string;
+  readonly reason: SupportAccessReason;
+  /** ISO 8601. The schema caps the window at 24 hours from the grant. */
+  readonly expiresAt: string;
+}
+
+/**
+ * Issuing a grant. `validateSupportAccessReason` runs here rather than
+ * only in the CHECK constraints, so a bad reason code or ticket
+ * reference is a typed domain error naming the field, not a Postgres
+ * constraint-violation string the caller has to parse.
+ *
+ * The self-grant refusal is enforced in the schema
+ * (`support_access_grants_not_self_granted`) and repeated here for the
+ * same reason: an operator who can authorise their own access has not
+ * been controlled, and that deserves to fail before it reaches SQL.
+ */
+export async function createSupportAccessGrant(
+  databaseUrl: string,
+  schema: string,
+  input: CreateSupportAccessGrantInput
+): Promise<{ readonly grantId: string }> {
+  assertSafeSchema(schema);
+  validateSupportAccessReason(input.reason);
+  if (input.operatorUserId === input.grantedByUserId) {
+    throw new Error("support access cannot be self-granted: operator and authoriser must differ");
+  }
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query<{ grant_id: string }>(
+      `INSERT INTO "${schema}".support_access_grants
+         (organization_id, operator_user_id, reason_code, ticket_reference, granted_by_user_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING grant_id`,
+      [
+        input.organizationId,
+        input.operatorUserId,
+        input.reason.reasonCode,
+        input.reason.ticketReference,
+        input.grantedByUserId,
+        input.expiresAt
+      ]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("support access grant insert returned no row");
+    }
+    return { grantId: row.grant_id };
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Revocation is the only UPDATE the grants trigger permits, and only
+ * once. The organization is part of the predicate so a revocation
+ * cannot be aimed at another tenant's grant by id alone.
+ */
+export async function revokeSupportAccessGrant(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  grantId: string
+): Promise<void> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await client.connect();
+    const result = await client.query(
+      `UPDATE "${schema}".support_access_grants
+          SET revoked_at = clock_timestamp()
+        WHERE grant_id = $1 AND organization_id = $2 AND revoked_at IS NULL`,
+      [grantId, organizationId]
+    );
+    if (result.rowCount !== 1) {
+      throw new Error("support access grant not found, already revoked, or belongs to another organization");
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * The boundary itself. See the section comment above for why each step
+ * is where it is.
+ */
+export async function readTenantDataUnderSupportAccess<T>(
+  databaseUrl: string,
+  schema: string,
+  request: SupportAccessRequest,
+  read: SupportAccessRead<T>
+): Promise<SupportAccessReadOutcome<T>> {
+  assertSafeSchema(schema);
+  const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  let handleOpen = false;
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+
+    // The grant this operator holds over this tenant, locked so a
+    // concurrent revoke waits for this transaction rather than racing
+    // it. clock_timestamp() rides along on the same row so the instant
+    // authorization is judged against is the database's, read inside
+    // the same transaction that writes the event.
+    //
+    // `(revoked_at IS NULL) DESC` before `expires_at DESC`, and the
+    // order is load-bearing. An operator can hold more than one grant
+    // over the same tenant, because renewal is a new row rather than an
+    // extension. Ordering on expiry alone picked whichever row happened
+    // to run longest, so a revoked grant that was issued for a longer
+    // window outranked a live one and the boundary denied an access it
+    // should have served. Caught by the expiry case in
+    // assertSupportAccessBoundary, which is what it is for. Unusable
+    // grants still sort last rather than being filtered out, so when
+    // every grant is revoked the denial says `grant_revoked` instead of
+    // the less useful `no_grant`.
+    const grantResult = await client.query<SupportAccessGrantRow>(
+      `SELECT grant_id, organization_id, operator_user_id, reason_code, ticket_reference,
+              granted_by_user_id, granted_at, expires_at, revoked_at,
+              clock_timestamp() AS db_now
+         FROM "${schema}".support_access_grants
+        WHERE organization_id = $1 AND operator_user_id = $2
+        ORDER BY (revoked_at IS NULL) DESC, expires_at DESC
+        LIMIT 1
+          FOR SHARE`,
+      [request.organizationId, request.operatorUserId]
+    );
+    const row = grantResult.rows[0];
+
+    // No row means no grant, and it also means no database clock to
+    // judge against. `new Date()` here would be the process clock
+    // deciding a question it is not entitled to decide, so the denial
+    // is produced directly instead.
+    if (row === undefined) {
+      await client.query("ROLLBACK");
+      return { allowed: false, denialReason: "no_grant" };
+    }
+
+    const grant: SupportAccessGrant = {
+      grantId: row.grant_id,
+      organizationId: row.organization_id,
+      operatorUserId: row.operator_user_id,
+      reasonCode: row.reason_code as SupportAccessGrant["reasonCode"],
+      ticketReference: row.ticket_reference,
+      grantedByUserId: row.granted_by_user_id,
+      grantedAt: new Date(row.granted_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+      revokedAt: row.revoked_at === null ? undefined : new Date(row.revoked_at).toISOString()
+    };
+
+    const decision = authorizeSupportAccess(grant, request, new Date(row.db_now));
+    if (!decision.allowed) {
+      // Nothing is read and nothing is logged. A refused operator
+      // leaves no event, because no access happened.
+      await client.query("ROLLBACK");
+      return { allowed: false, denialReason: decision.denialReason };
+    }
+
+    // Before the data moves, not after. If this throws, the catch below
+    // rolls back and rethrows, so an access that cannot be logged is an
+    // access that does not happen.
+    await client.query(
+      `INSERT INTO "${schema}".support_access_events
+         (grant_id, organization_id, operator_user_id, entity_type, entity_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [decision.grantId, request.organizationId, request.operatorUserId, request.entityType, request.entityId]
+    );
+
+    // From here the database refuses writes, so the caller's read
+    // cannot quietly become a caller's write.
+    await client.query("SET LOCAL transaction_read_only = on");
+
+    handleOpen = true;
+    const handle: SupportAccessReadHandle = {
+      schema,
+      rows: async <R extends Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = []
+      ): Promise<readonly R[]> => {
+        if (!handleOpen) {
+          // A handle kept past the boundary would be a connection with
+          // no event behind it, which is the whole thing this function
+          // exists to prevent.
+          throw new Error("support access read handle used after the boundary closed");
+        }
+        const result = await client.query<R>(sql, [...params]);
+        return result.rows;
+      }
+    };
+
+    const data = await read(handle);
+    handleOpen = false;
+    await client.query("COMMIT");
+    return { allowed: true, grantId: decision.grantId, data };
+  } catch (error) {
+    handleOpen = false;
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    handleOpen = false;
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Proof that the boundary above is load-bearing, against a real
+ * database. Every case here fails if a single step is removed, and the
+ * commit message records which revert kills which case.
+ *
+ * The clock case swaps `globalThis.Date` for the duration of one call.
+ * That is invasive and it is the only decisive test available: the
+ * boundary takes no clock argument precisely so a caller cannot supply
+ * one, so the only way to show it ignores the process clock is to make
+ * the process clock wrong and watch the answer not change.
+ */
+export async function assertSupportAccessBoundary(databaseUrl: string): Promise<Record<string, string>> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `support_boundary_${suffix}`;
+  const orgA = "11111111-1111-4111-8111-111111111111";
+  const orgB = "22222222-2222-4222-8222-222222222222";
+  const operator = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherOperator = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const authoriser = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  const observed: Record<string, string> = {};
+
+  const scopedUrl = `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}options=-c%20search_path%3D${schema}`;
+  const countEvents = async (): Promise<number> => {
+    const result = await admin.query<{ n: string }>(`SELECT count(*) AS n FROM "${schema}".support_access_events`);
+    return Number(result.rows[0]?.n ?? "0");
+  };
+  const readOrganizationName: SupportAccessRead<string | undefined> = async (handle) => {
+    const rows = await handle.rows<{ name: string }>(
+      `SELECT name FROM "${handle.schema}".organizations WHERE organization_id = $1`,
+      [orgA]
+    );
+    return rows[0]?.name;
+  };
+
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    // Every migration in runner order, not a hand-picked list. That
+    // shape has produced a silently wrong result four times here.
+    for (const file of listMigrationsInRunnerOrder()) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1,'Acme'), ($2,'Other')`, [
+      orgA,
+      orgB
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name)
+       VALUES ($1,$2,'Op'), ($3,$4,'Op2'), ($5,$6,'Auth')`,
+      [
+        operator,
+        `op_${suffix}@acme.test`,
+        otherOperator,
+        `op2_${suffix}@acme.test`,
+        authoriser,
+        `auth_${suffix}@acme.test`
+      ]
+    );
+    await admin.query(`INSERT INTO platform_operators (user_id) VALUES ($1), ($2), ($3)`, [
+      operator,
+      otherOperator,
+      authoriser
+    ]);
+
+    const request: SupportAccessRequest = {
+      organizationId: orgA,
+      operatorUserId: operator,
+      entityType: "organization",
+      entityId: orgA
+    };
+
+    // ---- 1. No grant at all ----
+    const noGrant = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, readOrganizationName);
+    observed.no_grant = noGrant.allowed ? "ALLOWED" : noGrant.denialReason;
+    observed.no_grant_events = String(await countEvents());
+
+    // ---- 2. A live grant: data returned, exactly one event ----
+    const live = await createSupportAccessGrant(scopedUrl, schema, {
+      organizationId: orgA,
+      operatorUserId: operator,
+      grantedByUserId: authoriser,
+      reason: { reasonCode: "stuck_upload", ticketReference: "AF-66" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    });
+    const allowed = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, readOrganizationName);
+    observed.allowed = allowed.allowed ? `ALLOWED:${allowed.data ?? "none"}` : allowed.denialReason;
+    observed.allowed_events = String(await countEvents());
+    const eventRow = await admin.query<{ grant_id: string; entity_type: string; entity_id: string }>(
+      `SELECT grant_id, entity_type, entity_id FROM "${schema}".support_access_events`
+    );
+    observed.allowed_event_matches_grant = String(eventRow.rows[0]?.grant_id === live.grantId);
+    observed.allowed_event_entity = `${eventRow.rows[0]?.entity_type}:${eventRow.rows[0]?.entity_id === orgA}`;
+
+    // ---- 3. The read cannot write ----
+    const eventsBeforeWrite = await countEvents();
+    let writeRefusal = "NOT REFUSED";
+    try {
+      await readTenantDataUnderSupportAccess(scopedUrl, schema, request, async (handle) => {
+        await handle.rows(`INSERT INTO "${handle.schema}".organizations (organization_id, name) VALUES
+          ('33333333-3333-4333-8333-333333333333','Smuggled')`);
+        return "wrote";
+      });
+    } catch (error) {
+      writeRefusal = error instanceof Error ? error.message : String(error);
+    }
+    observed.read_cannot_write = writeRefusal;
+    // The refusal must also undo the event: an access that failed
+    // released nothing, so it must not be logged as though it did.
+    observed.read_cannot_write_events_unchanged = String((await countEvents()) === eventsBeforeWrite);
+
+    // ---- 4. An access that cannot be logged is an access that does not happen ----
+    const eventsBeforeUnloggable = await countEvents();
+    let readLeaked = "NOTHING READ";
+    let unloggable = "NOT REFUSED";
+    try {
+      await readTenantDataUnderSupportAccess(
+        scopedUrl,
+        schema,
+        // entity_type is whitespace, which the CHECK rejects, so the
+        // event INSERT throws before the data read is ever reached.
+        { ...request, entityType: "   " },
+        async (handle) => {
+          readLeaked = "READ RAN";
+          return readOrganizationName(handle);
+        }
+      );
+    } catch (error) {
+      unloggable = error instanceof Error ? error.message.split("\n")[0] ?? "" : String(error);
+    }
+    observed.unloggable_refused = unloggable === "NOT REFUSED" ? "NOT REFUSED" : "REFUSED";
+    observed.unloggable_read_never_ran = String(readLeaked === "NOTHING READ");
+    observed.unloggable_events_unchanged = String((await countEvents()) === eventsBeforeUnloggable);
+
+    // ---- 5. Revocation ----
+    await revokeSupportAccessGrant(scopedUrl, schema, orgA, live.grantId);
+    const revoked = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, readOrganizationName);
+    observed.revoked = revoked.allowed ? "ALLOWED" : revoked.denialReason;
+
+    // ---- 6. Wrong tenant and wrong operator ----
+    //
+    // The grant lookup is scoped to the organization AND the operator in
+    // SQL, so neither of these can select a grant and then be talked out
+    // of it: there is nothing to select. That is deliberate. A lookup
+    // broad enough to return another tenant's grant could pick it in
+    // preference to a valid one when an operator holds several at once,
+    // and deny an access that should have succeeded. So the boundary's
+    // answer here is `no_grant`, and `authorizeSupportAccess`'s own
+    // `grant_for_other_organization` and `grant_for_other_operator`
+    // stay as defence in depth for any other caller that hands it a
+    // grant it did not fetch itself.
+    const forOrgA = await createSupportAccessGrant(scopedUrl, schema, {
+      organizationId: orgA,
+      operatorUserId: operator,
+      grantedByUserId: authoriser,
+      reason: { reasonCode: "failed_import", ticketReference: "AF-67" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    });
+    const wrongTenant = await readTenantDataUnderSupportAccess(
+      scopedUrl,
+      schema,
+      { ...request, organizationId: orgB, entityId: orgB },
+      readOrganizationName
+    );
+    observed.wrong_tenant = wrongTenant.allowed ? "ALLOWED" : wrongTenant.denialReason;
+    const wrongOperator = await readTenantDataUnderSupportAccess(
+      scopedUrl,
+      schema,
+      { ...request, operatorUserId: otherOperator },
+      readOrganizationName
+    );
+    observed.wrong_operator = wrongOperator.allowed ? "ALLOWED" : wrongOperator.denialReason;
+
+    // ---- 6b. A concurrent revoke cannot slip between authorize and read ----
+    //
+    // The claim FOR SHARE makes is that a revocation arriving mid-read
+    // waits for this transaction rather than landing inside it. Proven
+    // rather than asserted in a comment: the revoke is started while the
+    // boundary is parked inside its own read callback, and has to still
+    // be unfinished at that moment.
+    const racingGrant = await createSupportAccessGrant(scopedUrl, schema, {
+      organizationId: orgA,
+      operatorUserId: operator,
+      grantedByUserId: authoriser,
+      reason: { reasonCode: "customer_reported_defect", ticketReference: "AF-69" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    });
+    // The revoking connection is opened and warmed BEFORE the race, so
+    // what is being measured is the lock and not connection setup. An
+    // earlier version created the client inside the callback and went
+    // flaky under a loaded suite: a connection that failed fast looked
+    // exactly like a revoke that was blocked, because both are "not
+    // finished yet". The outcome is now recorded as a state rather than
+    // a boolean, so a rejection says so instead of passing for a block.
+    const revoker = new Client({ connectionString: scopedUrl, connectionTimeoutMillis: 5_000 });
+    await revoker.connect();
+    let revokeOutcome = "pending";
+    let revoking: Promise<void> | undefined;
+    const racing = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, async (handle) => {
+      revoking = revoker
+        .query(
+          `UPDATE "${schema}".support_access_grants
+              SET revoked_at = clock_timestamp()
+            WHERE grant_id = $1 AND organization_id = $2 AND revoked_at IS NULL`,
+          [racingGrant.grantId, orgA]
+        )
+        .then(
+          () => {
+            revokeOutcome = "fulfilled";
+          },
+          (error: unknown) => {
+            revokeOutcome = `rejected: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        );
+      // Long enough that an unblocked UPDATE on an already-open
+      // connection would certainly have finished.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      observed.revoke_blocked_during_read = revokeOutcome;
+      return readOrganizationName(handle);
+    });
+    // Awaited out here, after the boundary committed and released the
+    // row. Checking the grant without this was reading the table while
+    // the unblocked UPDATE was still in flight, which passed alone and
+    // failed under a loaded suite.
+    await revoking;
+    observed.racing_read_served = racing.allowed ? "ALLOWED" : racing.denialReason;
+    // And once the boundary commits, the revoke it was blocking goes
+    // through, so this is a wait and not a deadlock.
+    const revokedAfter = await admin.query<{ revoked_at: string | null }>(
+      `SELECT revoked_at FROM "${schema}".support_access_grants WHERE grant_id = $1`,
+      [racingGrant.grantId]
+    );
+    observed.revoke_completed_after_commit = String(revokedAfter.rows[0]?.revoked_at !== null);
+    observed.revoke_outcome_after_commit = revokeOutcome;
+    await revoker.end().catch(() => undefined);
+
+    // ---- 7. Expiry, judged by the database's clock and not this process's ----
+    await revokeSupportAccessGrant(scopedUrl, schema, orgA, forOrgA.grantId);
+    const expiredGrantId = "44444444-4444-4444-8444-444444444444";
+    await admin.query(
+      `INSERT INTO "${schema}".support_access_grants
+         (grant_id, organization_id, operator_user_id, reason_code, ticket_reference,
+          granted_by_user_id, granted_at, expires_at)
+       VALUES ($1, $2, $3, 'incident_investigation', 'AF-68', $4,
+               clock_timestamp() - interval '2 hours', clock_timestamp() - interval '1 hour')`,
+      [expiredGrantId, orgA, operator, authoriser]
+    );
+    const expired = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, readOrganizationName);
+    observed.expired = expired.allowed ? "ALLOWED" : expired.denialReason;
+
+    // The same expired grant, with this process convinced it is three
+    // hours ago, when that grant was still live. A boundary reading
+    // `new Date()` would allow it. Reading clock_timestamp() inside the
+    // transaction, it still denies.
+    const RealDate = globalThis.Date;
+    const skewMs = 3 * 60 * 60 * 1000;
+    // A Proxy rather than a subclass: `new Date()` with no arguments
+    // and `Date.now()` are the only two ways this process can learn the
+    // time, and both have to move for the test to mean anything. Every
+    // other member passes straight through, so parsing and formatting
+    // behave normally while the boundary runs.
+    const SkewedDate = new Proxy(RealDate, {
+      construct(target, args: readonly unknown[]) {
+        if (args.length === 0) {
+          return new target(RealDate.now() - skewMs);
+        }
+        return Reflect.construct(target, args);
+      },
+      get(target, property, receiver: unknown) {
+        if (property === "now") {
+          return (): number => RealDate.now() - skewMs;
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    let skewed: SupportAccessReadOutcome<string | undefined>;
+    try {
+      (globalThis as { Date: DateConstructor }).Date = SkewedDate as unknown as DateConstructor;
+      skewed = await readTenantDataUnderSupportAccess(scopedUrl, schema, request, readOrganizationName);
+    } finally {
+      (globalThis as { Date: DateConstructor }).Date = RealDate;
+    }
+    observed.expired_under_skewed_process_clock = skewed.allowed ? "ALLOWED" : skewed.denialReason;
+
+    return observed;
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
 
 // ---- AF-64: privacy export/delete requests ----
 
@@ -8920,7 +9627,6 @@ export async function assertPrivacyRequestExtension(
     await admin.end().catch(() => undefined);
   }
 }
-
 
 // ---- AF-90: unauthenticated share link for the role-level audit report ----
 
