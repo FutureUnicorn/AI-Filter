@@ -60,6 +60,42 @@ test("an application whose only spans were truncated does not reach the denomina
   assert.equal(summary.truncatedSpanCount, 2);
 });
 
+test("an application with one usable span and one truncated span leaves the denominator entirely", () => {
+  // The whole application goes, not just the truncated span. Keeping it
+  // records a candidate who was reviewed for AT LEAST eleven minutes as
+  // an eleven-minute review, and every such application drags the median
+  // down. Downward here means the reduction computed against it comes
+  // out larger than the evidence supports.
+  const summary = summarizeReviewTiming(
+    [span("a", 660_000), span("a", 400_000, true), span("b", 900_000), span("c", 1_200_000)],
+    3
+  );
+  assert.equal(summary.sampleSize, 2, "only b and c are fully observed");
+  assert.equal(summary.medianActiveMs, 1_050_000, "a must not pull the median down to 900,000");
+  assert.equal(summary.partiallyObservedCount, 1, "and the reader is told an application was dropped, not just a span");
+  assert.equal(summary.truncatedSpanCount, 1);
+});
+
+test("when every application is partially observed the sample is empty, not complete", () => {
+  // The failure this pins: dropping the span alone left sampleSize equal
+  // to population, so the result carried no limitation at all and read
+  // as a complete measurement of a role nobody has fully reviewed.
+  const summary = summarizeReviewTiming(
+    [
+      span("a", 300_000),
+      span("a", 400_000, true),
+      span("b", 300_000),
+      span("b", 400_000, true),
+      span("c", 300_000),
+      span("c", 400_000, true)
+    ],
+    3
+  );
+  assert.equal(summary.sampleSize, 0);
+  assert.equal(summary.medianActiveMs, null);
+  assert.equal(summary.partiallyObservedCount, 3);
+});
+
 test("no measurements reports null, never zero", () => {
   // Zero would read as "reviews take no time", and a zero is exactly the
   // kind of number that gets quoted without its context.
@@ -84,7 +120,7 @@ test("the summary carries no per-reviewer field at all", () => {
   const summary = summarizeReviewTiming([span("a", 1_000)], 1);
   assert.deepEqual(
     Object.keys(summary).sort(),
-    ["medianActiveMs", "population", "sampleSize", "truncatedSpanCount"]
+    ["medianActiveMs", "partiallyObservedCount", "population", "sampleSize", "truncatedSpanCount"]
   );
 });
 
@@ -97,4 +133,40 @@ test("span order does not change the answer", () => {
 
 test("a single measured application is its own median", () => {
   assert.equal(summarizeReviewTiming([span("a", 7_500)], 4).medianActiveMs, 7_500);
+});
+
+// AF-55 REV-001. AF-54 now refuses a zero-duration span at the contract and
+// at the database, but rows written before those constraints existed remain
+// readable, and this summary is what decides whether an application counts
+// as measured. A zero here does two things at once: it drags the assisted
+// median down, inflating the reported review-time reduction, and it inflates
+// sampleSize, which is the number AF-60 uses to say whether the figure can
+// be trusted at all. So the exclusion lives here too, not only upstream.
+
+test("a zero-duration span cannot make an application count as measured", () => {
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    reviewerUserId: "22222222-2222-4222-8222-222222222222",
+    truncatedByIdle: false
+  };
+  const summary = summarizeReviewTiming([
+    { ...base, applicationId: "a", activeMs: 60_000 },
+    { ...base, applicationId: "b", activeMs: 0 }
+  ]);
+  assert.equal(summary.sampleSize, 1, "the zero-time application must not be counted");
+  assert.equal(summary.medianActiveMs, 60_000, "and must not move the median");
+});
+
+test("an application with only zero-duration spans contributes nothing at all", () => {
+  const base = {
+    organizationId: "11111111-1111-4111-8111-111111111111",
+    reviewerUserId: "22222222-2222-4222-8222-222222222222",
+    truncatedByIdle: false
+  };
+  const summary = summarizeReviewTiming([
+    { ...base, applicationId: "only-zero", activeMs: 0 },
+    { ...base, applicationId: "only-zero", activeMs: 0 }
+  ]);
+  assert.equal(summary.sampleSize, 0, "no measured time means no sample");
+  assert.equal(summary.medianActiveMs, null, "and no median to report");
 });
