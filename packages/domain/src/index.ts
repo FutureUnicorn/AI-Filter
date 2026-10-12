@@ -2986,7 +2986,22 @@ const RETENTION_EXEMPT_TABLES: ReadonlySet<string> = new Set([
   // nothing else: no tenant, no candidate, no free text. Exempt because it
   // is access-control configuration, and purging it would make every
   // historical grant name an operator the schema no longer recognises.
-  "platform_operators"
+  "platform_operators",
+  // AF-62. The erasure receipt: which application was erased, on whose
+  // authority, and what survived. It carries no candidate content -- the
+  // surfaces_erased and residue columns hold surface names and counts, not
+  // anything copied out of the rows being erased. It is exempt in the
+  // stronger sense too: it is the audit metadata the deletion workflow is
+  // specified to preserve, so a retention job that purged it would destroy
+  // the only evidence that the deletion it is auditing ever happened.
+  //
+  // This is the one exemption on this list that survives holding an
+  // application identifier, and it is exempt for a reason none of the
+  // others could use: the record exists to evidence the erasure, so
+  // purging it destroys the proof of the deletion it documents. That is a
+  // claim about what the row is for, not a claim that the identifier is
+  // harmless, which is the distinction AF-61 REV-001 turned on.
+  "candidate_data_erasures"
 ]);
 
 /**
@@ -3601,6 +3616,405 @@ export function summarizeSurvivingCandidateData(
   }
   return { anySurvives: surviving.length > 0, automatedDeletionActive, surfaces: surviving, statement };
 }
+
+// ---- AF-62: candidate-data deletion workflow ----
+//
+// "On request or retention expiry, delete original documents, canonical
+// text, model outputs, and indexes -- audit metadata is the only thing
+// preserved."
+//
+// AF-61 answered the question "can retention delete this?" surface by
+// surface and found that it cannot: everything is either append-only or
+// pinned behind a foreign key to something append-only. Taken at face
+// value that makes this ticket unimplementable.
+//
+// It is not, because "delete the row" and "erase the content" are
+// different operations and only the first is blocked. The four pinned
+// surfaces carry no append-only trigger; a foreign key is all that stops
+// their DELETE, and a foreign key says nothing about UPDATE. Overwriting
+// the candidate-derived columns in place keeps the row for the references
+// that need it and destroys the text, which is what the candidate was
+// actually promised. That reaches the biggest store of raw candidate data
+// in the system -- the full extracted document text -- which row deletion
+// could not have touched at all.
+//
+// Two surfaces stay genuinely out of reach: the verbatim quote in
+// evidence_outcomes and the human rationale in candidate_decisions are
+// append-only against UPDATE too, so they can be neither removed nor
+// redacted. Erasing them needs the per-candidate encryption key design
+// AF-61 named and left for a human decision, tracked as AF-91. Every plan
+// this module produces reports that residue rather than rounding it off.
+
+/** Why an erasure is happening. The two triggers the ticket names. */
+export type CandidateDataErasureTrigger = "retention_expiry" | "candidate_request";
+
+/**
+ * What can be done to a surface, given the schema as it stands.
+ *
+ * The distinction between `redact_in_place` and `blocked_append_only` is
+ * the whole finding of this ticket, and it is a property of the trigger
+ * on the table rather than of how sensitive the column is.
+ */
+export type CandidateDataErasureMethod =
+  /** The bytes themselves are removed from object storage. */
+  | "delete_object"
+  /** The row stays; its candidate-derived columns are overwritten. */
+  | "redact_in_place"
+  /** An append-only trigger rejects UPDATE as well as DELETE. Needs AF-91. */
+  | "blocked_append_only"
+  /**
+   * In scope for completeness; holds nothing candidate-derived.
+   *
+   * No surface currently carries this. audit_events did, on the basis
+   * that it held no candidate TEXT, which was true and was not the
+   * question: it holds the application identifier, and an identifier is
+   * what re-links every surviving row to a person (AF-61 REV-001). Kept
+   * in the union because a future surface may genuinely qualify, and a
+   * new one should have to argue for it.
+   */
+  | "not_candidate_data";
+
+export interface CandidateDataErasureStep {
+  readonly surface: RetentionSurface;
+  readonly method: CandidateDataErasureMethod;
+  /** The columns this step overwrites. Empty unless the method redacts. */
+  readonly columns: readonly string[];
+  /** Why this method and not another. Never empty for a blocked surface. */
+  readonly detail: string;
+}
+
+/**
+ * What a redacted text column is set to.
+ *
+ * Not NULL and not the empty string, because the columns that most need
+ * erasing are the ones the schema protects: file_intakes.declared_filename
+ * and applications.candidate_full_name/candidate_email are all NOT NULL
+ * with a non-empty CHECK, so an erasure that tried to null them would be
+ * rejected by the constraint rather than quietly doing nothing.
+ */
+export const CANDIDATE_DATA_ERASURE_PLACEHOLDER = "[erased]";
+
+/**
+ * The replacement for file_intakes.storage_key.
+ *
+ * storage_key is candidate data, which is easy to miss: the web layer
+ * builds it as `quarantine/{org}/{role}/pending/{uuid}-{declaredFilename}`,
+ * so it embeds the same filename the row's declared_filename column holds
+ * and is just as likely to read "Jane_Doe_CV.pdf". Redacting the filename
+ * while leaving the key behind would leave the candidate's name in the
+ * database and make the receipt wrong.
+ *
+ * It cannot take the flat placeholder, though, because the column is
+ * NOT NULL UNIQUE -- the second erasure in any organization would collide
+ * on it. Deriving the replacement from the intake's own primary key keeps
+ * it unique without carrying anything about the candidate.
+ */
+export function erasedStorageKey(intakeId: string): string {
+  const trimmed = intakeId.trim();
+  if (trimmed.length === 0) {
+    throw new Error("erasedStorageKey requires a non-empty intakeId");
+  }
+  return `erased:${trimmed}`;
+}
+
+/**
+ * The order steps must run in, and the reason the order is not arbitrary.
+ *
+ * object_storage_documents is first because storage_key is the only handle
+ * to the stored object, and file_intakes -- the row holding that key -- is
+ * redacted at the end. Reversing the two would overwrite the key while the
+ * object it points at is still sitting in the bucket, leaving bytes that
+ * nothing in the system can name any more, let alone delete. That failure
+ * is silent and permanent, so the ordering is encoded here rather than
+ * left to whoever calls this next.
+ */
+const CANDIDATE_DATA_ERASURE_PLAN: readonly CandidateDataErasureStep[] = [
+  {
+    surface: "object_storage_documents",
+    method: "delete_object",
+    columns: [],
+    detail:
+      "Deleted by storage key before file_intakes is redacted, because that redaction destroys the " +
+      "only reference to the object."
+  },
+  {
+    surface: "canonical_text_extractions",
+    method: "redact_in_place",
+    columns: ["pages"],
+    detail:
+      "pages holds the full text of the candidate's document and is the largest single store of raw " +
+      "candidate data. Overwritten with an empty array; total_pages and quality are left as they were, " +
+      "since they describe the extraction rather than the candidate, and redacted_at is what tells a " +
+      "reader the emptiness was deliberate."
+  },
+  {
+    surface: "import_rows",
+    method: "redact_in_place",
+    columns: ["failure_reason"],
+    detail:
+      "failure_reason can quote the offending CSV row verbatim. It cannot simply be nulled: the table " +
+      "carries CHECK ((outcome = 'failed') = (failure_reason IS NOT NULL)), so nulling it turns every " +
+      "failed row into a constraint violation. Rows that have a reason get the placeholder; rows that " +
+      "never had one keep their NULL."
+  },
+  {
+    surface: "applications",
+    method: "redact_in_place",
+    columns: ["candidate_full_name", "candidate_email", "external_reference_id"],
+    detail:
+      "The candidate's identity. The first two are NOT NULL with a non-empty CHECK and take the " +
+      "placeholder; external_reference_id is nullable and is set to NULL outright."
+  },
+  {
+    surface: "file_intakes",
+    method: "redact_in_place",
+    columns: ["declared_filename", "storage_key"],
+    detail:
+      "Both columns carry the candidate's name -- storage_key embeds the declared filename by " +
+      "construction. Redacted last so the object it names can be deleted first."
+  },
+  {
+    surface: "evidence_outcomes",
+    method: "blocked_append_only",
+    columns: [],
+    detail:
+      "The citation quote is verbatim candidate text, and the append-only trigger rejects UPDATE as " +
+      "well as DELETE, so it can be neither removed nor redacted in place. This is the root blocker " +
+      "and needs AF-91's per-candidate encryption key."
+  },
+  {
+    surface: "candidate_decisions",
+    method: "blocked_append_only",
+    columns: [],
+    detail:
+      "rationale is free text a human wrote about the candidate, append-only for the same reason: a " +
+      "decision record that can be edited afterwards cannot evidence who decided what. Also AF-91."
+  },
+  {
+    surface: "audit_events",
+    // AF-61 REV-001: was not_candidate_data, on the same basis the
+    // retention plan used and for the same reason it was wrong. AF-21's
+    // redaction and the closed context allowlist do keep candidate TEXT
+    // out, and that half was right. entity_type and entity_id are free
+    // text, and an application identifier is written there whenever a
+    // correction or a decision is recorded -- two of the four audit
+    // actions. The identifier is what re-links every other surviving row
+    // to a person, so an erasure that reports this surface as holding
+    // nothing is reporting more deletion than happened.
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0005_immutable_audit_events.sql): DELETE and UPDATE are both rejected, so the " +
+      "application identifier can be neither removed nor redacted in place. It is also the audit " +
+      "metadata this ticket says is deliberately kept -- but kept and erasable are different claims, " +
+      "and only the first one is true here. Needs AF-91."
+  },
+  {
+    surface: "evidence_extraction_runs",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0006_evidence_extraction_runs.sql). entity_id is the application identifier for " +
+      "every run this product writes, and the association is a polymorphic text pair rather than a " +
+      "foreign key, which is why no cascade reaches it. Needs AF-91."
+  },
+  {
+    surface: "audit_sample_members",
+    method: "blocked_append_only",
+    columns: ["application_id"],
+    detail:
+      "Append-only (0020_audit_samples.sql). One row per candidate drawn into an audit sample: it " +
+      "holds no candidate text, and the row is itself a statement about a named candidate. Needs AF-91."
+  },
+  {
+    surface: "review_timing_spans",
+    method: "blocked_append_only",
+    columns: ["application_id", "reviewer_user_id"],
+    detail:
+      "Append-only (0021_review_timing.sql). Beyond the identifier this records which reviewer spent " +
+      "how long on which candidate and when, which is behavioural data about a named person on both " +
+      "sides. Needs AF-91."
+  },
+  {
+    surface: "support_access_events",
+    method: "blocked_append_only",
+    columns: ["entity_id"],
+    detail:
+      "Append-only (0022_support_access.sql), deliberately so: an access log the operator can edit " +
+      "answers nothing, because the one person with a motive to remove a row is the person the row is " +
+      "about. entity_id names the application a support operator opened. Needs AF-91."
+  }
+];
+
+export interface CandidateDataErasurePlan {
+  readonly trigger: CandidateDataErasureTrigger;
+  /** Present only for a candidate_request; an expiry run has no requester. */
+  readonly requestedByUserId?: string | undefined;
+  readonly steps: readonly CandidateDataErasureStep[];
+}
+
+/**
+ * Rejects an erasure that cannot be attributed.
+ *
+ * A candidate_request is a named person acting on someone's instruction,
+ * and a request with nobody attached cannot be evidenced later. A
+ * retention_expiry is the system acting on a policy and has no requester
+ * to name, so supplying one would put a person's name against a decision
+ * they did not make. Both directions are wrong, so both are refused.
+ */
+export function validateCandidateDataErasureRequest(
+  trigger: CandidateDataErasureTrigger,
+  requestedByUserId?: string | undefined
+): void {
+  const requester = requestedByUserId?.trim() ?? "";
+  if (trigger === "candidate_request" && requester.length === 0) {
+    throw new Error("a candidate_request erasure requires the user id of whoever requested it");
+  }
+  if (trigger === "retention_expiry" && requester.length > 0) {
+    throw new Error(
+      "a retention_expiry erasure has no requester; it is the policy acting, not a person"
+    );
+  }
+}
+
+export function planCandidateDataErasure(
+  trigger: CandidateDataErasureTrigger,
+  requestedByUserId?: string | undefined
+): CandidateDataErasurePlan {
+  validateCandidateDataErasureRequest(trigger, requestedByUserId);
+  return {
+    trigger,
+    requestedByUserId: trigger === "candidate_request" ? requestedByUserId : undefined,
+    steps: CANDIDATE_DATA_ERASURE_PLAN
+  };
+}
+
+/** Surfaces this workflow actually reaches, in the order it must touch them. */
+export function erasableSurfaces(plan: CandidateDataErasurePlan): readonly CandidateDataErasureStep[] {
+  return plan.steps.filter(
+    (step) => step.method === "delete_object" || step.method === "redact_in_place"
+  );
+}
+
+export interface CandidateDataErasureResidue {
+  /** True while any candidate-derived content survives a completed erasure. */
+  readonly anyResidue: boolean;
+  readonly surfaces: readonly CandidateDataErasureStep[];
+  /**
+   * The sentence that goes on the receipt and, ultimately, to the
+   * candidate. Written from what actually happened on this run, not from
+   * the static plan alone.
+   */
+  readonly statement: string;
+}
+
+/**
+ * What this erasure run actually did to intake-scoped and object-storage
+ * surfaces. Required so the receipt cannot claim a shared document was
+ * erased while it is still deferred, or claim an object was deleted when
+ * the delete never ran.
+ */
+export interface CandidateDataErasureRunOutcome {
+  readonly intakeErased: boolean;
+  /** True only when the object-storage delete callback ran successfully. */
+  readonly objectStorageDeleted: boolean;
+  readonly applicationsStillReferencingIntake: number;
+}
+
+const INTAKE_SCOPED_SURFACES: ReadonlySet<string> = new Set([
+  "object_storage_documents",
+  "canonical_text_extractions",
+  "import_rows",
+  "file_intakes"
+]);
+
+/**
+ * REV-008: `outcome` is REQUIRED, with no default. It used to default to
+ * "everything erased", so a caller that left it out got the full-erasure
+ * sentence whatever had actually happened: the optimistic statement reached
+ * by forgetting an argument. That is the defect #70 REV-005 removed from the
+ * retention statement, and the same rule applies to every statement made to
+ * a data subject: a false claim must need someone to pass a false value.
+ * tests/architecture/data-subject-statements-require-their-facts.test.ts
+ * holds it, because tsc is the only other thing that would.
+ */
+export function summarizeCandidateDataErasureResidue(
+  plan: CandidateDataErasurePlan,
+  outcome: CandidateDataErasureRunOutcome
+): CandidateDataErasureResidue {
+  const blocked = plan.steps.filter((step) => step.method === "blocked_append_only");
+  const deferredIntake = plan.steps.filter(
+    (step) => INTAKE_SCOPED_SURFACES.has(step.surface) && !outcome.intakeErased
+  );
+  // REV-006: when the object was not deleted, file_intakes is residue too,
+  // because its storage_key still embeds the declared filename and is left
+  // intact on purpose, so the key keeps naming the object.
+  const objectSkippedWhileIntakeErased =
+    outcome.intakeErased && !outcome.objectStorageDeleted
+      ? plan.steps.filter(
+          (step) => step.surface === "object_storage_documents" || step.surface === "file_intakes"
+        )
+      : [];
+
+  const surviving = [...blocked, ...deferredIntake, ...objectSkippedWhileIntakeErased];
+  // Dedupe by surface name while preserving plan order.
+  const seen = new Set<string>();
+  const surfaces: CandidateDataErasureStep[] = [];
+  for (const step of surviving) {
+    if (seen.has(step.surface)) {
+      continue;
+    }
+    seen.add(step.surface);
+    surfaces.push(step);
+  }
+
+  if (surfaces.length === 0) {
+    return {
+      anyResidue: false,
+      surfaces: [],
+      statement: "Every surface holding candidate-derived content was erased."
+    };
+  }
+
+  const parts: string[] = [];
+  if (outcome.intakeErased && outcome.objectStorageDeleted) {
+    parts.push("Original documents, canonical text and candidate identity were erased.");
+  } else if (outcome.intakeErased && !outcome.objectStorageDeleted) {
+    parts.push(
+      "Candidate identity and extracted text were erased in place, but the stored object was not " +
+        "deleted, so its storage_key was left intact: object_storage_documents and file_intakes remain " +
+        "residue until a later erasure deletes the object."
+    );
+  } else {
+    const others = outcome.applicationsStillReferencingIntake;
+    parts.push(
+      "Candidate identity on this application was erased. The shared source document and its " +
+        "extracted text are retained until the " +
+        String(others) +
+        " other candidate" +
+        (others === 1 ? "" : "s") +
+        " in the same file " +
+        (others === 1 ? "is" : "are") +
+        " erased."
+    );
+  }
+  if (blocked.length > 0) {
+    parts.push(
+      "The following candidate-derived content survives because the append-only ledger rejects " +
+        "both DELETE and UPDATE on it, and erasing it requires the per-candidate encryption key " +
+        "design tracked as AF-91: " +
+        blocked.map((step) => step.surface).join("; ") +
+        "."
+    );
+  }
+
+  return {
+    anyResidue: true,
+    surfaces,
+    statement: parts.join(" ")
+  };
+}
+
 
 // ---- AF-59: role-level audit report ----
 //
