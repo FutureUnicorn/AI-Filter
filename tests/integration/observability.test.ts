@@ -10,6 +10,7 @@ import {
   buildInferenceBudgetTelemetry,
   recordInferenceBudgetTelemetry,
   sanitizeWorkerEvent,
+  sanitizeWorkerSpan,
   setWorkerTelemetryAdapterForTesting
 } from "../../apps/worker/src/observability.ts";
 import {
@@ -427,4 +428,138 @@ test("every handled web 500 uses the safe capture abstraction and all required o
   for (const operation of MONITORED_OPERATIONS) {
     assert.match(source, new RegExp(`withServerOperation\\("${operation.replaceAll(".", "\\.")}"`, "u"));
   }
+});
+
+// ---- AF-104 queue telemetry through the sanitizer ----
+//
+// PR #94 review, REV-002 (Saikrishnaa-vr). `sanitizeWorkerSpan` is installed
+// as `beforeSendSpan`, so it is the last code to touch a span before Sentry
+// receives it. It recognised only `inference.token_budget`, and rewrote
+// everything else to the generic `worker.job` shape, dropping its data. That
+// silently included AF-104's queue span: the heartbeat published it, the
+// publisher had tests, and the detector query still could not match a single
+// delivered span, because by the time one arrived it was no longer a queue
+// span at all.
+//
+// This asserts the delivered output, not the published input. The publisher
+// was never the broken end.
+
+const QUEUE_CONFIG = loadMonitoringConfig(
+  {
+    APP_ENV: "staging",
+    DEPLOYMENT_COMMIT_SHA: "a".repeat(40),
+    SENTRY_DSN: "https://publickey@o0.ingest.sentry.io/1",
+    SENTRY_TRACES_SAMPLE_RATE: "0.1"
+  },
+  "worker"
+);
+
+function queueSpan(data: Record<string, unknown>): Parameters<typeof sanitizeWorkerSpan>[0] {
+  return {
+    trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+    span_id: "00f067aa0ba902b7",
+    start_timestamp: 1_700_000_000,
+    timestamp: 1_700_000_001,
+    description: "evidence_extraction.queue",
+    op: "monitor.queue",
+    data: { "service.name": "worker", "monitor.operation": "evidence_extraction.queue", ...data }
+  } as unknown as Parameters<typeof sanitizeWorkerSpan>[0];
+}
+
+test("a populated queue span survives sanitization with its operation and numeric fields", () => {
+  const sanitized = sanitizeWorkerSpan(
+    queueSpan({
+      "monitor.queue.oldest_ready_age_ms": 94_000,
+      "monitor.queue.ready": 7,
+      "monitor.queue.running": 2,
+      "monitor.queue.failed": 1,
+      "monitor.queue.completed": 412,
+      "monitor.queue.attempts": 430,
+      "monitor.worker.heartbeat_age_ms": 1_500
+    }),
+    QUEUE_CONFIG
+  );
+
+  // The operation the detector query matches on. Before the fix this was
+  // "worker.job" and the alert could never fire.
+  assert.equal(sanitized.data["monitor.operation"], "evidence_extraction.queue");
+  assert.equal(sanitized.description, "evidence_extraction.queue");
+  assert.equal(sanitized.op, "monitor.queue");
+
+  assert.deepEqual(sanitized.data, {
+    "service.name": "worker",
+    "monitor.operation": "evidence_extraction.queue",
+    "monitor.queue.oldest_ready_age_ms": 94_000,
+    "monitor.queue.ready": 7,
+    "monitor.queue.running": 2,
+    "monitor.queue.failed": 1,
+    "monitor.queue.completed": 412,
+    "monitor.queue.attempts": 430,
+    "monitor.worker.heartbeat_age_ms": 1_500
+  });
+});
+
+test("an empty queue keeps its -1 and 0 sentinels, which a truthiness filter would drop", () => {
+  // The two values that make an idle worker distinguishable from a dead one.
+  // -1 is "nothing ready" and "no worker has ever reported"; 0 is a real
+  // count. Both are falsy, so a `value ? ... : {}` filter would silently
+  // delete exactly the readings the no-data rule depends on.
+  const sanitized = sanitizeWorkerSpan(
+    queueSpan({
+      "monitor.queue.oldest_ready_age_ms": -1,
+      "monitor.queue.ready": 0,
+      "monitor.queue.running": 0,
+      "monitor.queue.failed": 0,
+      "monitor.queue.completed": 0,
+      "monitor.queue.attempts": 0,
+      "monitor.worker.heartbeat_age_ms": -1
+    }),
+    QUEUE_CONFIG
+  );
+
+  assert.equal(sanitized.data["monitor.queue.oldest_ready_age_ms"], -1);
+  assert.equal(sanitized.data["monitor.worker.heartbeat_age_ms"], -1);
+  for (const key of [
+    "monitor.queue.ready",
+    "monitor.queue.running",
+    "monitor.queue.failed",
+    "monitor.queue.completed",
+    "monitor.queue.attempts"
+  ]) {
+    assert.equal(sanitized.data[key], 0, `${key} must survive as 0, not be dropped as falsy`);
+  }
+});
+
+test("the queue span carries nothing but service name, operation and numbers", () => {
+  // The allowlist is the privacy boundary as much as the correctness one: a
+  // future attribute naming an organization, application or job must not
+  // reach Sentry by being adjacent to approved ones.
+  const sanitized = sanitizeWorkerSpan(
+    queueSpan({
+      "monitor.queue.ready": 3,
+      "monitor.queue.organization_id": "11111111-1111-4111-8111-111111111111",
+      "monitor.queue.oldest_job_id": "job_abc",
+      "monitor.queue.candidate_email": "candidate@example.test"
+    }),
+    QUEUE_CONFIG
+  );
+
+  assert.deepEqual(Object.keys(sanitized.data).sort(), [
+    "monitor.operation",
+    "monitor.queue.ready",
+    "service.name"
+  ]);
+  assert.doesNotMatch(JSON.stringify(sanitized), /candidate@example\.test|job_abc|11111111/u);
+});
+
+test("an unrecognised worker span is still reduced to the generic shape", () => {
+  // The default has to stay closed. Recognising a second operation must not
+  // turn the sanitizer into a pass-through for a third.
+  const sanitized = sanitizeWorkerSpan(
+    queueSpan({ "monitor.operation": "evidence_extraction.something_new", "monitor.queue.ready": 3 }),
+    QUEUE_CONFIG
+  );
+  assert.equal(sanitized.data["monitor.operation"], "worker.job");
+  assert.equal(sanitized.op, "worker");
+  assert.equal(sanitized.data["monitor.queue.ready"], undefined);
 });

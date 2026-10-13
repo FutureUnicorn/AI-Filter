@@ -157,3 +157,89 @@ test("the queue telemetry carries no identifier", () => {
     "the queue signal must stay counts and durations"
   );
 });
+
+// PR #94 review, REV-002 (Saikrishnaa-vr). The guards above follow the chain
+// from the worker entry point to the emitter, and stop there. They proved a
+// deployed path reaches the publisher and that the publisher names the
+// operation the detector queries. Neither says anything about the hop after
+// it.
+//
+// That hop is where AF-104 actually broke. `sanitizeWorkerSpan` runs as
+// `beforeSendSpan`, recognised only `inference.token_budget`, and rewrote
+// every other span's operation to `worker.job` while dropping its data. So
+// the emitter published `evidence_extraction.queue`, this file confirmed it
+// published `evidence_extraction.queue`, and Sentry received `worker.job`.
+// Every assertion above passed the entire time.
+//
+// The chain is only as good as its last link, so these extend it to the
+// boundary the span actually leaves through.
+
+function recognizedOperations(observability: string): readonly string[] {
+  const table = observability.slice(
+    observability.indexOf("const RECOGNIZED_WORKER_OPERATIONS"),
+    observability.indexOf("export function sanitizeWorkerSpan")
+  );
+  assert.notEqual(table, "", "the sanitizer must keep a named table of the operations it recognizes");
+  return [...table.matchAll(/\["([a-z_]+\.[a-z_]+)",/gu)].map((match) => match[1] as string);
+}
+
+test("every operation the worker emits is one the sanitizer recognizes", () => {
+  const observability = source("apps/worker/src/observability.ts");
+  const recognized = recognizedOperations(observability);
+
+  // Every operation literal published as a span attribute, taken from the
+  // source rather than from a list someone has to remember to update.
+  const emitted = [
+    ...observability.matchAll(/"monitor\.operation": "([a-z_]+\.[a-z_]+)"/gu)
+  ].map((match) => match[1] as string);
+
+  assert.ok(emitted.length > 0, "expected the worker to emit at least one named operation");
+  for (const operation of new Set(emitted)) {
+    assert.ok(
+      recognized.includes(operation),
+      `the worker emits "${operation}" but sanitizeWorkerSpan does not recognize it, so every such ` +
+        `span reaches Sentry rewritten to "worker.job" with its data stripped. Add it to ` +
+        `RECOGNIZED_WORKER_OPERATIONS and preserve the fields its detector queries.`
+    );
+  }
+});
+
+test("every operation the detectors query survives the sanitizer", () => {
+  const recognized = recognizedOperations(source("apps/worker/src/observability.ts"));
+  const alerts = source("scripts/observability/sentry-alerts.mjs");
+
+  // A detector naming an operation the sanitizer discards is a monitor that
+  // can never fire, which reads as a healthy system rather than as a broken
+  // one. Web operations are sanitized by apps/web's own allowlist, so only
+  // the worker's two are in scope here.
+  const workerQueried = [...alerts.matchAll(/monitor\.operation:([a-z_]+\.[a-z_]+)/gu)]
+    .map((match) => match[1] as string)
+    .filter((operation) => operation === "inference.token_budget" || operation === "evidence_extraction.queue");
+
+  assert.ok(workerQueried.length > 0, "expected at least one worker detector");
+  for (const operation of new Set(workerQueried)) {
+    assert.ok(
+      recognized.includes(operation),
+      `a detector queries "${operation}" but the sanitizer does not preserve it; the monitor cannot fire`
+    );
+  }
+});
+
+test("the queue attributes the detectors read are the ones the sanitizer keeps", () => {
+  const observability = source("apps/worker/src/observability.ts");
+  const allowlist = observability.slice(
+    observability.indexOf("const QUEUE_NUMERIC_ATTRIBUTES"),
+    observability.indexOf("const RECOGNIZED_WORKER_OPERATIONS")
+  );
+  assert.notEqual(allowlist, "", "the queue attribute allowlist must stay a named, reviewable list");
+
+  // The two sentinel-bearing fields the alerting rules depend on. Losing
+  // either leaves a no-data rule unable to tell an idle worker from a dead
+  // one, which is the distinction AF-104 exists to make.
+  for (const attribute of ["monitor.queue.oldest_ready_age_ms", "monitor.worker.heartbeat_age_ms"]) {
+    assert.ok(
+      allowlist.includes(`"${attribute}"`),
+      `${attribute} must survive sanitization; it carries the -1 sentinel the detector reads`
+    );
+  }
+});

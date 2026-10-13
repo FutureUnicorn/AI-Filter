@@ -114,13 +114,74 @@ export function sanitizeWorkerEvent<T extends Event>(event: T, config: Monitorin
   } as unknown as T;
 }
 
+/**
+ * The numeric queue attributes `recordEvidenceExtractionQueueTelemetry`
+ * emits, and the only ones that survive sanitization.
+ *
+ * PR #94 review, REV-002. This sanitizer is installed as `beforeSendSpan`,
+ * so it is the last thing to touch a span before Sentry receives it. It
+ * recognised exactly one operation, `inference.token_budget`, because that
+ * was the only one that existed when it was written. AF-104 then added
+ * `evidence_extraction.queue` and nothing here was extended, so every queue
+ * span was rewritten to the generic `worker.job` shape and all seven
+ * attributes below were dropped on the way out. The heartbeat published the
+ * telemetry, the publisher had tests, and the detector query could never
+ * match a single delivered span.
+ *
+ * Listed explicitly rather than matched by a `monitor.queue.` prefix: an
+ * allowlist is what keeps a future attribute carrying an organization or a
+ * job id from reaching Sentry by merely being named well.
+ */
+const QUEUE_NUMERIC_ATTRIBUTES = [
+  "monitor.queue.oldest_ready_age_ms",
+  "monitor.queue.ready",
+  "monitor.queue.running",
+  "monitor.queue.failed",
+  "monitor.queue.completed",
+  "monitor.queue.attempts",
+  "monitor.worker.heartbeat_age_ms"
+] as const;
+
+/**
+ * Every `monitor.operation` the worker emits, each with the normalized
+ * description and op it keeps. A span whose operation is not here is
+ * reduced to the generic worker shape, which is the correct default for an
+ * unrecognised span and the wrong one for a span we meant to deliver.
+ *
+ * tests/architecture/token-budget-monitors-have-an-emitter.test.ts asserts
+ * every operation literal emitted anywhere under apps/worker appears here,
+ * so adding a third publisher without teaching the sanitizer about it fails
+ * the build rather than going silent in production.
+ */
+const RECOGNIZED_WORKER_OPERATIONS = new Map<string, { readonly description: string; readonly op: string }>([
+  ["inference.token_budget", { description: "inference.token_budget", op: "monitor.budget" }],
+  ["evidence_extraction.queue", { description: "evidence_extraction.queue", op: "monitor.queue" }]
+]);
+
 export function sanitizeWorkerSpan(span: SentrySpanJson, config: MonitoringConfig): SentrySpanJson {
   const operation = span.data["monitor.operation"];
+  const recognized =
+    typeof operation === "string" ? RECOGNIZED_WORKER_OPERATIONS.get(operation) : undefined;
   const isBudget = operation === "inference.token_budget";
+  const isQueue = operation === "evidence_extraction.queue";
   const status = span.data["monitor.budget.status"];
   const utilization = span.data["monitor.budget.utilization"];
   const tokensUsed = span.data["monitor.tokens.used"];
   const tokenCap = span.data["monitor.tokens.cap"];
+  const queueAttributes: Record<string, number> = {};
+  if (isQueue) {
+    for (const key of QUEUE_NUMERIC_ATTRIBUTES) {
+      const value = span.data[key];
+      // `typeof === "number"`, not a truthiness test. Both sentinels this
+      // telemetry depends on would fail a truthy check: -1 means "nothing
+      // ready" / "no worker has ever reported", and 0 is a genuinely empty
+      // queue. Dropping either leaves a no-data rule unable to tell an idle
+      // worker from a dead one, which is the distinction AF-104 exists for.
+      if (typeof value === "number" && Number.isFinite(value)) {
+        queueAttributes[key] = value;
+      }
+    }
+  }
   return {
     trace_id: span.trace_id,
     span_id: span.span_id,
@@ -128,17 +189,20 @@ export function sanitizeWorkerSpan(span: SentrySpanJson, config: MonitoringConfi
     ...(span.timestamp === undefined ? {} : { timestamp: span.timestamp }),
     ...(span.parent_span_id === undefined ? {} : { parent_span_id: span.parent_span_id }),
     ...(span.status === undefined ? {} : { status: span.status }),
-    description: isBudget ? "inference.token_budget" : "worker.operation",
-    op: isBudget ? "monitor.budget" : "worker",
+    description: recognized?.description ?? "worker.operation",
+    op: recognized?.op ?? "worker",
     data: {
       "service.name": config.service,
-      "monitor.operation": isBudget ? "inference.token_budget" : "worker.job",
-      ...(status === "ok" || status === "warning" || status === "capped"
+      "monitor.operation": recognized === undefined ? "worker.job" : (operation as string),
+      ...(isBudget && (status === "ok" || status === "warning" || status === "capped")
         ? { "monitor.budget.status": status }
         : {}),
-      ...(typeof utilization === "number" ? { "monitor.budget.utilization": utilization } : {}),
-      ...(typeof tokensUsed === "number" ? { "monitor.tokens.used": tokensUsed } : {}),
-      ...(typeof tokenCap === "number" ? { "monitor.tokens.cap": tokenCap } : {})
+      ...(isBudget && typeof utilization === "number"
+        ? { "monitor.budget.utilization": utilization }
+        : {}),
+      ...(isBudget && typeof tokensUsed === "number" ? { "monitor.tokens.used": tokensUsed } : {}),
+      ...(isBudget && typeof tokenCap === "number" ? { "monitor.tokens.cap": tokenCap } : {}),
+      ...queueAttributes
     }
   };
 }
