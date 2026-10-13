@@ -1,19 +1,30 @@
 /**
- * AF-100: the repository's one way to drive an API route over HTTP.
+ * AF-100: the repository's one way to drive an API route over HTTP end to
+ * end -- a real request, through a real handler, checked against the rows it
+ * left behind, not just the module-loading mechanism underneath one.
  *
- * Before this file there were two of them. tests/integration/magic-link-route.test.ts
- * worked out the hard parts -- extensionless TypeScript resolution, loading a
- * route through a runtime-built specifier, using the genuine `NextRequest` so
+ * Before this file there were two routes doing that work by hand.
+ * tests/integration/magic-link-route.test.ts worked out the hard parts --
+ * extensionless TypeScript resolution, loading a route through a
+ * runtime-built specifier, using the genuine `NextRequest` so
  * `request.cookies` behaves -- and tests/integration/file-intake-route-errors.test.ts
  * copied them. Every other route ticket that wanted request-level coverage
  * either copied them a third time or, far more often, asserted the wiring
  * structurally by matching source text instead.
  *
- * Those structural guards are why this exists. Several of them passed against
- * the very defect they were written for: one matched a bare function name that
- * a schema constant contained as a prefix, one was satisfied by an unused
- * import, one by the function's own doc comment. A test that issues a real
- * request and reads the resulting rows cannot be satisfied by any of those.
+ * Those structural guards are why the rest of this file exists. Several of
+ * them passed against the very defect they were written for: one matched a
+ * bare function name that a schema constant contained as a prefix, one was
+ * satisfied by an unused import, one by the function's own doc comment. A
+ * test that issues a real request and reads the resulting rows cannot be
+ * satisfied by any of those.
+ *
+ * The module-loading mechanism itself is a narrower problem than that, and
+ * PR #88 (AF-97) extracted it independently into tests/support/web-route-loader.ts
+ * while this PR was open against the same two files. Two shared extractions
+ * of one mechanism is the exact duplication this file's thesis argues
+ * against, so this harness delegates to that one (see `currentRedirects`
+ * below) rather than keeping a second module-hook registration in the tree.
  *
  * Two layers, because route tests need different amounts of this:
  *
@@ -44,7 +55,6 @@
  * against a role built for the question.
  */
 import assert from "node:assert/strict";
-import moduleHooks from "node:module";
 
 import {
   dropProbeSchema,
@@ -54,6 +64,7 @@ import {
 } from "../../packages/db/src/index.ts";
 import type { MembershipRole } from "../../packages/domain/src/index.ts";
 import { SESSION_COOKIE_NAME, createSessionToken } from "../../packages/security/src/index.ts";
+import { loadWebRoute, type WebRouteModule } from "./web-route-loader.ts";
 
 export const ROUTE_SESSION_SECRET = "route-harness-session-secret-at-least-32-chars";
 
@@ -129,8 +140,21 @@ export function applyRouteEnvironment(databaseUrl: string, schema: string): void
   });
 }
 
-const redirects = new Map<string, string>();
-let hooksRegistered = false;
+/**
+ * The module-resolution hook and the runtime-built specifier -- the two
+ * problems common to every route-level test -- now live in
+ * tests/support/web-route-loader.ts, which PR #88 (AF-97) extracted from the
+ * same two files this harness's own header already named as having carried
+ * them. Two extractions of the identical mechanism landing in the same
+ * review round is the duplication this PR's own thesis argues against, so
+ * this harness delegates to that one rather than keeping a second copy:
+ * `currentRedirects` is the single map both `registerModuleRedirect` and
+ * every loader call below pass to `loadWebRoute`, which is what
+ * `web-route-loader.ts` requires -- the same map on every call in a process,
+ * because Node's module hooks are global and cannot be re-registered.
+ */
+const currentRedirects: Record<string, string> = {};
+let routeLoaded = false;
 
 /**
  * Point one bare specifier at a stand-in before any route is loaded.
@@ -138,84 +162,44 @@ let hooksRegistered = false;
  * Scoped to the single specifier named, so everything else in the route --
  * the database, the domain rules, the authorization check -- stays real. Must
  * be called at module scope in the test, because Node caches a module the
- * first time a route imports it.
+ * first time a route imports it; the assertion below catches a call that
+ * arrives too late to take effect, which `web-route-loader.ts`'s own guard
+ * (consistent redirects across calls) does not check for on its own.
  */
 export function registerModuleRedirect(specifier: string, moduleUrl: string): void {
   assert.equal(
-    hooksRegistered,
+    routeLoaded,
     false,
     `registerModuleRedirect("${specifier}") ran after a route was already loaded; the redirect would not apply`
   );
-  redirects.set(specifier, moduleUrl);
-}
-
-/**
- * apps/web imports sibling modules extensionless (`from "../../lib/session"`)
- * and package subpaths through Next's bundler (`next/server`). Plain Node ESM
- * resolves neither. The retry adds an extension only after the bare specifier
- * has already failed, so it never shadows something Node could resolve itself;
- * rewriting production import specifiers to suit a test would change how Next
- * builds the app.
- */
-function registerRouteResolution(): void {
-  moduleHooks.registerHooks({
-    resolve(specifier, context, nextResolve) {
-      const redirected = redirects.get(specifier);
-      if (redirected !== undefined) {
-        return { url: redirected, shortCircuit: true };
-      }
-      try {
-        return nextResolve(specifier, context);
-      } catch (error) {
-        if (/\.[cm]?[jt]sx?$/u.test(specifier)) {
-          throw error;
-        }
-        for (const extension of [".ts", ".js"]) {
-          try {
-            return nextResolve(`${specifier}${extension}`, context);
-          } catch {
-            continue;
-          }
-        }
-        throw error;
-      }
-    }
-  });
+  currentRedirects[specifier] = moduleUrl;
 }
 
 export type RouteHandler = (request: unknown, context: { params: Promise<Record<string, string>> }) => Promise<Response>;
 
 /**
- * Imported through a runtime-built specifier rather than a static import.
- *
- * A static `import ".../route.ts"` would pull apps/web into
- * tests/tsconfig.json, which typechecks with module NodeNext; apps/web has no
- * `"type": "module"`, so every route file is then read as CommonJS and its ESM
- * syntax fails with TS1295. Node still executes the genuine handler, so this
- * remains a route-level test.
- *
  * Returns undefined when the route exports no such verb, which is itself
  * assertable: "there is no PATCH on this endpoint" needs no source-text match.
  */
 export async function loadRouteHandler(route: string, method: string): Promise<RouteHandler | undefined> {
-  if (!hooksRegistered) {
-    registerRouteResolution();
-    hooksRegistered = true;
-  }
-  const specifier = new URL(`../../apps/web/src/app/api/${route}/route.ts`, import.meta.url).href;
-  const module = (await import(specifier)) as Record<string, unknown>;
+  routeLoaded = true;
+  const module = await loadWebRoute<WebRouteModule & Record<string, unknown>>(
+    import.meta.url,
+    `../../apps/web/src/app/api/${route}/route.ts`,
+    currentRedirects
+  );
   const handler = module[method];
   return typeof handler === "function" ? (handler as RouteHandler) : undefined;
 }
 
 /** The exported HTTP verbs of a route, for asserting that a verb is absent. */
 export async function loadRouteMethods(route: string): Promise<readonly string[]> {
-  if (!hooksRegistered) {
-    registerRouteResolution();
-    hooksRegistered = true;
-  }
-  const specifier = new URL(`../../apps/web/src/app/api/${route}/route.ts`, import.meta.url).href;
-  const module = (await import(specifier)) as Record<string, unknown>;
+  routeLoaded = true;
+  const module = await loadWebRoute<WebRouteModule & Record<string, unknown>>(
+    import.meta.url,
+    `../../apps/web/src/app/api/${route}/route.ts`,
+    currentRedirects
+  );
   return Object.keys(module)
     .filter((key) => /^[A-Z]+$/u.test(key) && typeof module[key] === "function")
     .sort();

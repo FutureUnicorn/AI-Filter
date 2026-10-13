@@ -39,6 +39,60 @@ test("runtime infrastructure is isolated, private, bounded, and pinned", () => {
   assert.match(compose, /test "\$\$APP_ENV" != production/u);
 });
 
+/**
+ * AF-97 review #88, REV-001 (blocking).
+ *
+ * `pnpm bootstrap:owner` is the only way to create a deployment's first
+ * owner, and it could not be run against the deployment this repo ships.
+ * runtime.Dockerfile copied `apps` and `packages` and not `scripts`, so the
+ * script was absent from both runtime stages; and `postgres` sits only on
+ * the `private` network, which is `internal: true` with no published port,
+ * so there was no path to the database from outside the project either.
+ * Every documented way in was closed, for the one ticket whose whole purpose
+ * is that a deployment can be entered.
+ *
+ * Asserted here rather than left to a README instruction, because a README
+ * cannot fail.
+ */
+test("the first owner can actually be created inside the shipped deployment", () => {
+  const dockerfile = read("infra/docker/runtime.Dockerfile");
+  assert.match(
+    dockerfile,
+    /^COPY scripts scripts$/mu,
+    "the runtime image must carry scripts/, or bootstrap:owner cannot run in it"
+  );
+
+  const compose = read("infra/compose/runtime.yml");
+  const bootstrapService = /^ {2}bootstrap:[\s\S]*?(?=\n {2}\S)/mu.exec(compose)?.[0];
+  assert.ok(bootstrapService, "expected a bootstrap service so the first owner can be created in-cluster");
+
+  assert.match(
+    bootstrapService!,
+    /entrypoint: \["node", "scripts\/environment\/bootstrap\.mjs"\]/u,
+    "the bootstrap service must run the bootstrap script"
+  );
+  assert.match(
+    bootstrapService!,
+    /networks: \[private\]/u,
+    "bootstrap must reach postgres on the internal network, which is the whole reason it runs in-cluster"
+  );
+  assert.match(bootstrapService!, /profiles: \[tools\]/u, "bootstrap must not start with the stack");
+  assert.match(
+    bootstrapService!,
+    /<<: \*runtime-environment/u,
+    "bootstrap must use the deployment's own configuration, not a hand-assembled one"
+  );
+
+  // Unlike `seed`, deliberately NOT refused in production: a production
+  // deployment is precisely where somebody has to be the first owner. If this
+  // ever gains the guard, the hosted entry point closes again.
+  assert.doesNotMatch(
+    bootstrapService!,
+    /APP_ENV" != production/u,
+    "bootstrap must not refuse production, which is where a first owner is most needed"
+  );
+});
+
 test("fixtures are unmistakably synthetic", () => {
   const fixture = read("tests/fixtures/environment/synthetic.sql");
   assert.match(fixture, /candidate-001@example\.test/u);

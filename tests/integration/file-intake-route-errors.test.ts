@@ -38,9 +38,11 @@ const REAL_HASH = "a".repeat(64);
  * AF-100: the mechanism this file used to carry -- the resolution hook, the
  * runtime-built specifier, the genuine NextRequest, the environment -- now
  * lives in tests/support/route-harness.ts, which is the repository's one way
- * to drive a route. Only the part that is specific to these tests is left
- * here: the stub standing in for object storage, and this file's own probe,
- * which seeds an intake rather than the harness's application chain.
+ * to drive a route (itself now delegating the resolution hook and specifier
+ * to tests/support/web-route-loader.ts, merged in from PR #88 -- see
+ * route-harness.ts's header). Only the part that is specific to these tests
+ * is left here: the stub standing in for object storage, and this file's own
+ * probe, which seeds an intake rather than the harness's application chain.
  *
  * Registered at module scope, before any route is imported: Node caches a
  * module the first time a route asks for it, so a redirect installed later
@@ -63,7 +65,6 @@ async function postAsMember(
   const request = routeRequest({ route, method: "POST", params, as: "recruiter", body }, probe.userId);
   return handler(request, { params: Promise.resolve(params) });
 }
-
 // ---- Finding 1: the unwired archiveUninspectable flag ----
 
 test("a DOCX whose central directory cannot be read is quarantined by the validate route", async () => {
