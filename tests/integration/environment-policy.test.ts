@@ -6,6 +6,11 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import {
+  deployEnvironment,
+  hostedEnvironment,
+  localEnvironment
+} from "../../scripts/environment/cli.mjs";
 import { resolvePreviewStateDirectory } from "../../scripts/environment/model.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -970,3 +975,86 @@ test(
     assert.equal(selectRecoverySlot("", true).status, 1);
   }
 );
+
+/**
+ * PR #86 review, REV-008. `runtime.yml` requires a pre-built, percent-encoded
+ * `DATABASE_URL`, and the only things that satisfy that demand are
+ * `cli.mjs`'s `buildDatabaseUrl` call sites. Both ends of that boundary were
+ * already covered and the middle was not: the helper has unit tests, and the
+ * assertions above read `cli.mjs` as *text*, so they cannot observe what it
+ * emits. A reconciliation that dropped a call site -- which is exactly what
+ * hand-resolving this file's conflicts risks -- would leave the helper's
+ * tests passing, the substring searches passing, and `runtime.yml` still
+ * carrying a comment promising the URL is encoded, while the deployed
+ * environment got no `DATABASE_URL` at all or an unencoded one.
+ *
+ * So this executes the builders and inspects the environment they hand
+ * Compose, including what survives the trip through `deployEnvironment`.
+ */
+test("cli.mjs emits a percent-encoded DATABASE_URL into the environment it hands Compose", () => {
+  // Every URI delimiter that silently reparses an unencoded authority.
+  const password = "p@ss/w?rd#x%y-longer-than-twenty";
+  const hostedControls: Record<string, string> = {
+    AF11_ENABLE_HOSTED_ENVIRONMENTS: "true",
+    COST_CONTROL_REFERENCE: "budget://signal-audit-staging",
+    COST_CONTROL_OWNER: "engineering-owner",
+    ADMIN_AUDIT_REFERENCE: "audit://provider/staging",
+    ADMIN_ROLE_ALLOWLIST: "staging-admin-role",
+    POSTGRES_USER: "svc_user",
+    POSTGRES_PASSWORD: password,
+    STORAGE_ACCESS_KEY_ID: "staging-storage-role",
+    STORAGE_SECRET_ACCESS_KEY: "a-storage-secret-longer-than-twenty",
+    DEPLOYMENT_COMMIT_SHA: "a".repeat(40)
+  };
+
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(hostedControls)) {
+    saved.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+
+  try {
+    const hosted = hostedEnvironment("staging");
+    const hostedUrl = hosted.variables.DATABASE_URL;
+    assert.ok(hostedUrl, "the hosted environment must carry a DATABASE_URL; runtime.yml requires one");
+
+    // The encoded form specifically. A round-trip assertion alone would also
+    // pass against an unencoded value for the `@` case, because URL parsing
+    // splits userinfo at the last `@`.
+    assert.equal(
+      hostedUrl,
+      `postgresql://svc_user:${encodeURIComponent(password)}@postgres:5432/signal_audit_staging`
+    );
+    assert.ok(
+      !hostedUrl.includes(password),
+      "the raw password must not appear unencoded anywhere in the connection URL"
+    );
+    assert.equal(decodeURIComponent(new URL(hostedUrl).password), password);
+
+    // The local path has to carry it too, now that runtime.yml demands it of
+    // every caller rather than deriving it by interpolation.
+    const localUrl = localEnvironment().variables.DATABASE_URL;
+    assert.ok(localUrl, "the local environment must carry a DATABASE_URL as well");
+    assert.equal(new URL(localUrl).protocol, "postgresql:");
+
+    // And it has to survive the trip to Compose: deployEnvironment is what
+    // actually hands these variables over.
+    const handedOver: Record<string, string>[] = [];
+    deployEnvironment(hosted, false, (_project, variables) => {
+      handedOver.push(variables as Record<string, string>);
+    });
+    assert.ok(handedOver.length > 0, "expected deployEnvironment to invoke the docker runner");
+    for (const variables of handedOver) {
+      assert.equal(
+        variables.DATABASE_URL,
+        hostedUrl,
+        "every Compose invocation must receive the encoded DATABASE_URL"
+      );
+    }
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
