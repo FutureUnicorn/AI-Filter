@@ -8,6 +8,19 @@ type SentrySpanJson = ReturnType<typeof Sentry.spanToJSON>;
 
 export type WorkerOperation = "worker.startup" | "worker.job" | "inference.token_budget";
 
+export const WORKER_JOB_FAILURE_CODES = [
+  "invalid_job_context",
+  "model_output_invalid",
+  "provider_usage_missing",
+  "provider_transient",
+  "provider_permanent",
+  "lease_expired_exhausted",
+  "unexpected_error"
+] as const;
+export type WorkerJobFailureCode = (typeof WORKER_JOB_FAILURE_CODES)[number];
+
+const WORKER_JOB_FAILURE_CODE_SET: ReadonlySet<string> = new Set(WORKER_JOB_FAILURE_CODES);
+
 interface SpanHandle {
   setStatus(status: { readonly code: 2; readonly message?: string }): unknown;
   setAttributes(attributes: Record<string, string | number>): unknown;
@@ -58,6 +71,11 @@ export function sanitizeWorkerEvent<T extends Event>(event: T, config: Monitorin
   const diagnostic = hasDiagnostic
     ? describeError({ name: event.tags?.error_name, code: event.tags?.error_code })
     : undefined;
+  const failureCode = event.tags?.failure_code;
+  const safeFailureCode =
+    typeof failureCode === "string" && WORKER_JOB_FAILURE_CODE_SET.has(failureCode)
+      ? (failureCode as WorkerJobFailureCode)
+      : undefined;
   const exceptionValues = event.exception?.values?.map(() => ({
     type: diagnostic?.errorName ?? "WorkerOperationError",
     value: "Unexpected worker failure"
@@ -75,11 +93,19 @@ export function sanitizeWorkerEvent<T extends Event>(event: T, config: Monitorin
       operation: safeOperation,
       ...(diagnostic === undefined
         ? {}
-        : { error_name: diagnostic.errorName, error_code: diagnostic.errorCode })
+        : { error_name: diagnostic.errorName, error_code: diagnostic.errorCode }),
+      ...(safeFailureCode === undefined ? {} : { failure_code: safeFailureCode })
     },
     ...(diagnostic === undefined
       ? {}
-      : { fingerprint: [safeOperation, diagnostic.errorName, diagnostic.errorCode] }),
+      : {
+          fingerprint: [
+            safeOperation,
+            ...(safeFailureCode === undefined ? [] : [safeFailureCode]),
+            diagnostic.errorName,
+            diagnostic.errorCode
+          ]
+        }),
     ...(exceptionValues === undefined ? {} : { exception: { values: exceptionValues } })
   } as unknown as T;
 }
@@ -171,6 +197,34 @@ export function captureWorkerError(error: unknown, operation: "worker.startup" |
     });
   } catch {
     // A broken telemetry/log sink must not replace worker failure semantics.
+  }
+}
+
+/** Reports only a durably terminal queue outcome, never a retryable attempt. */
+export function captureWorkerJobFailure(error: unknown, failureCode: WorkerJobFailureCode): void {
+  const diagnostic = describeError(error);
+  try {
+    telemetryAdapter.captureException(safeWorkerError(diagnostic), {
+      tags: {
+        service: "worker",
+        operation: "worker.job",
+        failure_code: failureCode,
+        error_name: diagnostic.errorName,
+        error_code: diagnostic.errorCode
+      }
+    });
+  } catch {
+    // Monitoring must never change durable job failure behavior.
+  }
+  try {
+    logStructured("error", "worker.job_failed", {
+      action: failureCode,
+      statusCode: 500,
+      errorName: diagnostic.errorName,
+      errorCode: diagnostic.errorCode
+    });
+  } catch {
+    // A broken telemetry/log sink must not replace the durable terminal state.
   }
 }
 

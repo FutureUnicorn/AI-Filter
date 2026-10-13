@@ -5,7 +5,6 @@ on:
     workflows: ["CI"]
     types: [completed]
   pull_request_target:
-    branches: [develop]
     types: [closed]
   schedule:
     - cron: "17 3 * * *"
@@ -21,6 +20,28 @@ defaults:
   run:
     shell: bash
 
+env:
+  # AF-93 PR #85 review (Copilot): a fixed, runner-persistent location
+  # outside every job's checkout, so preview credentials are never part of
+  # what an untrusted PR checkout contains (see scripts/environment/cli.mjs).
+  # Shared across deploy, cleanup, and sweep so all three agree on where
+  # state lives.
+  #
+  # AF-93 PR #85 review (hemnaath04, REV-011): the default below is scoped to
+  # ONE runner process's own _work directory (github.workspace), while the
+  # Docker daemon whose containers this state describes is shared by the
+  # whole host. A second runner process on this host would get an
+  # independent, empty state directory: cleanup dispatched to it finds
+  # nothing, prints "Preview N already absent", exits 0, and the stack it
+  # can't see keeps running. Not a new problem -- the pre-AF-93 in-workspace
+  # `.runtime/` had the same property -- but this is the change that picks
+  # the path, so it is the right moment to make the fix available: set
+  # repository variable PREVIEW_STATE_DIRECTORY to a host-level absolute path
+  # (for example /var/lib/signal-audit/preview-state) if this runner label
+  # ever backs more than one runner process on the same host. Documented
+  # alongside the signal-audit-preview runner prerequisites.
+  PREVIEW_STATE_DIRECTORY: ${{ vars.PREVIEW_STATE_DIRECTORY || format('{0}/../preview-state', github.workspace) }}
+
 jobs:
   deploy:
     name: Preview / Deploy
@@ -30,26 +51,172 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.pull_requests[0] != null &&
+      (
+        github.event.workflow_run.pull_requests[0].base.ref == 'develop' ||
+        github.event.workflow_run.pull_requests[0].base.ref == 'main'
+      ) &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: [self-hosted, linux, x64, signal-audit-preview]
     timeout-minutes: 30
+    permissions:
+      contents: read
+      # AF-93 PR #85 review (Copilot): job-level permissions replace, not
+      # merge with, the workflow-level block above, so contents: read is
+      # restated here. pull-requests: read authenticates the live PR-state
+      # check below; without it the unauthenticated call works only for a
+      # public repository and is subject to the unauthenticated rate limit.
+      pull-requests: read
     environment:
       name: preview/pr-${{ github.event.workflow_run.pull_requests[0].number }}
       url: https://pr-${{ github.event.workflow_run.pull_requests[0].number }}.${{ vars.PREVIEW_BASE_DOMAIN }}
     steps:
-      - name: Check out the exact revision that passed CI
+      # AF-93 PR #85 review (Copilot): the deploy `if:` above only sees
+      # workflow_run's pull_requests[0].base.ref, a snapshot from when CI was
+      # TRIGGERED. If the PR is retargeted away from develop/main while that
+      # CI run is still in flight, the snapshot still says develop/main and
+      # the job still starts -- the live open/closed check above catches a
+      # closed PR but says nothing about its current base. Read base.ref from
+      # this same live API response too, so retargeting during the run is
+      # caught the same way closing during the run already is.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-008): parsed with `node`, not
+      # `jq`. Every other step in this repository's workflows runs on
+      # ubuntu-latest, where jq is preinstalled; this step runs on the
+      # self-hosted signal-audit-preview label, where jq is whatever the host
+      # happens to have. node is already a hard requirement several steps
+      # below (it runs cli.mjs), so it cannot be the thing that's missing.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-009): this is now the FIRST step,
+      # ahead of both checkouts. It needs neither (a plain API call), and a
+      # PR that is closed or retargeted before this runs should not pay for
+      # checking out either revision, let alone place the untrusted tree on
+      # the runner, only to decline afterward. The job's `environment:` block
+      # above still registers a GitHub deployment the moment the job starts,
+      # before this step can run -- that part is a GitHub Actions constraint
+      # this step ordering cannot reach; closing it fully would need splitting
+      # this into a separate, environment-free "check" job upstream of a
+      # "deploy" job, which is a larger change than this fix's scope.
+      - name: Check whether the source pull request is still open and in scope
+        id: pr-state
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          response=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUMBER")
+          node -e '
+            const pr = JSON.parse(process.argv[1]);
+            console.log(`state=${pr.state}`);
+            console.log(`base_ref=${pr.base.ref}`);
+          ' "$response" >> "$GITHUB_OUTPUT"
+      - name: Report a declined deploy
+        if: >-
+          steps.pr-state.outputs.state != 'open' ||
+          (steps.pr-state.outputs.base_ref != 'develop' && steps.pr-state.outputs.base_ref != 'main')
+        run: |
+          {
+            echo "### Preview deploy declined"
+            echo "PR #${{ github.event.workflow_run.pull_requests[0].number }} is no longer open and in scope " \
+              "(current state: \`${{ steps.pr-state.outputs.state }}\`, current base: " \
+              "\`${{ steps.pr-state.outputs.base_ref }}\`). No preview was built or deployed."
+          } >> "$GITHUB_STEP_SUMMARY"
+      # AF-93 PR #85 review (Copilot), high severity: cli.mjs previously ran
+      # from the same, untrusted checkout it was building -- so a PR could
+      # modify cli.mjs itself to read PREVIEW_STATE_DIRECTORY and exfiltrate
+      # every OTHER preview's credentials, or run arbitrary commands as the
+      # runner user. Orchestration now runs from THIS checkout (trusted,
+      # default-branch code); the untrusted PR's own revision is checked out
+      # below into pr-source and used ONLY as the Docker build context, never
+      # executed directly.
+      #
+      # AF-93 PR #85 review (hemnaath04, REV-009): both checkouts below are
+      # now gated on the same live check pr-state performed above, so a
+      # declined PR does not have its tree checked out at all.
+      - name: Check out trusted orchestration code
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          clean: false
+      - name: Check out the exact revision that passed CI (build context only)
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          path: pr-source
           persist-credentials: false
+      # AF-93 PR #85 review (hemnaath04, REV-005). The trust split means what
+      # actually gets built is decided by DEPLOY_SOURCE_DIRECTORY plus
+      # whether infra/compose/runtime.yml (now always the DEFAULT BRANCH's
+      # copy, since cli.mjs resolves it relative to its own trusted checkout)
+      # honours that variable for both services. A partial revert -- one
+      # service's build.context reverted to ../.. -- passes the test suite
+      # unless the test checks both services independently (see REV-003 in
+      # tests/integration/environment-policy.test.ts), and would otherwise
+      # only be discovered by an operator noticing the wrong image running in
+      # production. This is the same check made real, at deploy time, against
+      # the actual resolved config rather than the compose file's source
+      # text. The env values below are placeholders satisfying compose's
+      # required-variable guards for static config resolution only -- this
+      # step never starts a container or connects to anything.
+      - name: Verify the build context resolves to the untrusted checkout
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
+        env:
+          APP_ENV: preview
+          DEPLOYMENT_COMMIT_SHA: 0000000
+          POSTGRES_USER: verify
+          POSTGRES_PASSWORD: verify-only-placeholder-value
+          POSTGRES_DB: verify
+          DATABASE_SCHEMA: verify
+          STORAGE_BUCKET: verify
+          STORAGE_ACCESS_KEY_ID: verify
+          STORAGE_SECRET_ACCESS_KEY: verify-only-placeholder-value
+          SESSION_SECRET: verify-only-placeholder-value
+          DEPLOY_SOURCE_DIRECTORY: ${{ github.workspace }}/pr-source
+        run: |
+          resolved=$(docker compose -f infra/compose/runtime.yml config --format json)
+          node -e '
+            const config = JSON.parse(process.argv[1]);
+            const expected = process.argv[2];
+            for (const service of ["web", "worker"]) {
+              const context = config.services[service]?.build?.context;
+              if (context !== expected) {
+                console.error(`${service} build context resolved to "${context}", expected the untrusted checkout "${expected}"`);
+                process.exit(1);
+              }
+            }
+          ' "$resolved" "$DEPLOY_SOURCE_DIRECTORY"
       - name: Verify and deploy isolated preview
+        if: >-
+          steps.pr-state.outputs.state == 'open' &&
+          (steps.pr-state.outputs.base_ref == 'develop' || steps.pr-state.outputs.base_ref == 'main')
         env:
           PREVIEW_BASE_DOMAIN: ${{ vars.PREVIEW_BASE_DOMAIN }}
           TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          # Read by infra/compose/runtime.yml (web/worker build.context, and
+          # the migrate/seed bind mounts, which must still run the PR's own
+          # migrations for correctness) -- never by cli.mjs's own logic.
+          DEPLOY_SOURCE_DIRECTORY: ${{ github.workspace }}/pr-source
         run: |
-          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          test "$(git -C pr-source rev-parse HEAD)" = "$TESTED_SHA"
           node scripts/environment/cli.mjs preview up --pr "$PR_NUMBER" --sha "$TESTED_SHA"
+      # AF-93 PR #85 review (hemnaath04, REV-007): pr-source holds the PR's
+      # untrusted source tree and is never executed, but nothing else removed
+      # it either -- it would otherwise persist in the trusted workspace
+      # until the next deploy run happens to reuse this exact path. Removed
+      # unconditionally so untrusted code does not have an unbounded lifetime
+      # on a shared host.
+      - name: Remove the untrusted build-context checkout
+        if: always()
+        run: rm -rf pr-source
 
   cleanup:
     name: Preview / Cleanup
@@ -65,6 +232,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+          clean: false
       - name: Remove the closed PR environment
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -83,6 +251,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+          clean: false
       - name: Remove orphaned preview environments
         env:
           PREVIEW_TTL_HOURS: ${{ vars.PREVIEW_TTL_HOURS || '72' }}

@@ -11,6 +11,7 @@ const MONITORED_OPERATIONS = [
   "csv.finalize",
   "application.review_queue",
   "application.evidence",
+  "application.evidence_extraction.enqueue",
   "application.evidence.correct",
   "application.decision"
 ];

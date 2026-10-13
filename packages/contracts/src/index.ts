@@ -23,6 +23,7 @@ import type {
   Application,
   ApplicationQueueEntry,
   AuditEvent,
+  CallerOrganization,
   CandidateDecision,
   CanonicalTextExtraction,
   CanonicalTextPage,
@@ -56,6 +57,12 @@ import type {
   UnsupportedFileEvidence,
   User
 } from "@signal-audit/domain";
+
+/**
+ * Bump whenever the hosted extraction prompt/schema orchestration changes in
+ * a way that should create new logical work for an application.
+ */
+export const EVIDENCE_EXTRACTION_WORKFLOW_VERSION = "1.0.0";
 
 /** Placeholder boundary shape; a later ticket beyond AF-13 owns wiring this
  * into a real adapter boundary. The versioned runtime contracts themselves
@@ -611,11 +618,44 @@ export const requestMagicLinkInputSchema = z.strictObject({
   email: storedEmailSchema
 });
 
+/**
+ * `replaceExistingRole` added by review #88 (REV-002).
+ *
+ * Redemption ends in `ON CONFLICT ... DO UPDATE SET role`, so an invite
+ * naming somebody who is already a member replaces their role -- committed
+ * by the target's own click on what their mail client presents as a routine
+ * sign-in link. Nothing in the invite form's wording, the email's wording,
+ * or this schema said so.
+ *
+ * Defaulting to false means the destructive reading of an ambiguous request
+ * is the one that cannot happen by accident: an invite that would change an
+ * existing member's role is refused unless the caller says that is what they
+ * meant. It stays optional so the ordinary case -- inviting somebody who is
+ * not a member -- is unaffected.
+ */
 export const createInviteInputSchema = z.strictObject({
   email: storedEmailSchema,
   organizationId: z.uuid(),
-  role: z.enum(MEMBERSHIP_ROLES)
+  role: z.enum(MEMBERSHIP_ROLES),
+  replaceExistingRole: z.boolean().optional()
 });
+
+export type CreateInviteInput = z.infer<typeof createInviteInputSchema>;
+
+// ---- AF-97: the organizations the caller can act in ----
+//
+// The response shape behind the organization switcher. It is a contract
+// because a signed-in user's first request is now this one: everything
+// else in the app needs an organizationId, and until AF-97 the only way
+// to obtain one was to be told it out of band and paste it into a query
+// string.
+
+export const callerOrganizationSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  organizationId: z.uuid(),
+  name: z.string().min(1),
+  role: z.enum(MEMBERSHIP_ROLES)
+}) satisfies z.ZodType<CallerOrganization>;
 
 // ---- AF-20: immutable audit events ----
 
@@ -1033,3 +1073,11 @@ export const recordCandidateDecisionInputSchema = z.strictObject({
   decision: z.enum(CANDIDATE_DECISION_KINDS),
   rationale: correctionReasonSchema
 });
+
+// ---- AF-102: hosted evidence-extraction enqueue contract ----
+
+export const enqueueEvidenceExtractionInputSchema = z.strictObject({
+  sourceIntakeId: z.uuid()
+});
+
+export type EnqueueEvidenceExtractionInput = z.infer<typeof enqueueEvidenceExtractionInputSchema>;

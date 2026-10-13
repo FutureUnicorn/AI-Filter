@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { InferenceKillSwitchEngagedError, alwaysDisengagedKillSwitch, createOpenAiAdapter } from "../../packages/ai/src/index.ts";
+import {
+  AiCallNotStartedError,
+  InferenceKillSwitchEngagedError,
+  alwaysDisengagedKillSwitch,
+  createOpenAiAdapter
+} from "../../packages/ai/src/index.ts";
 import type { AiCallMetadata } from "../../packages/domain/src/index.ts";
 import type { OpenAiAdapterConfig, OpenAiResponsesClient } from "../../packages/ai/src/index.ts";
 
@@ -99,10 +104,11 @@ test("runStructuredCall rejects JSON Schemas unsupported by OpenAI", async () =>
     { apiKey: "sk-test", model: "gpt-5.6", checkKillSwitch: alwaysDisengagedKillSwitch },
     fakeClient("{}", capture)
   );
-  await assert.rejects(() => adapter.runStructuredCall({ ...baseInput, jsonSchema: true }), {
-    name: "TypeError",
-    message: "OpenAI structured output requires an object JSON Schema."
-  });
+  await assert.rejects(
+    () => adapter.runStructuredCall({ ...baseInput, jsonSchema: true }),
+    (error: unknown) =>
+      error instanceof AiCallNotStartedError && error.stage === "input_validation"
+  );
   assert.equal(capture.params, undefined);
 });
 
@@ -136,6 +142,35 @@ test("runStructuredCall never calls the provider when the kill switch is engaged
     countingClient
   );
   await assert.rejects(() => adapter.runStructuredCall(baseInput), InferenceKillSwitchEngagedError);
+  assert.equal(callCount, 0);
+});
+
+test("a failed kill-switch lookup is typed as pre-provider and never calls the provider", async () => {
+  let callCount = 0;
+  const client = fakeClient("{}");
+  const countingClient: OpenAiResponsesClient = {
+    responses: {
+      async create(params) {
+        callCount += 1;
+        return client.responses.create(params);
+      }
+    }
+  };
+  const adapter = createOpenAiAdapter(
+    {
+      apiKey: "sk-test",
+      model: "gpt-5.6",
+      checkKillSwitch: async () => {
+        throw new Error("synthetic database failure");
+      }
+    },
+    countingClient
+  );
+  await assert.rejects(
+    () => adapter.runStructuredCall(baseInput),
+    (error: unknown) =>
+      error instanceof AiCallNotStartedError && error.stage === "kill_switch_check"
+  );
   assert.equal(callCount, 0);
 });
 

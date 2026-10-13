@@ -9,11 +9,14 @@ import type {
   CandidateDecision,
   CandidateDecisionKind,
   CanonicalTextExtraction,
+  CallerOrganization,
   CanonicalTextPage,
   CanonicalTextQuality,
   CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRunRef,
+  EvidenceExtractionJob,
+  EvidenceExtractionQueueMonitoringSnapshot,
   EvidenceOutcome,
   FailedDocumentRate,
   FileIntake,
@@ -35,6 +38,7 @@ import type {
 } from "@signal-audit/domain";
 import {
   CONTRACT_SCHEMA_VERSION,
+  buildEvidenceExtractionFailureOutcomes,
   canonicalizeCsvColumnMapping,
   classifyCsvImportRow,
   normalizeAppliedAt,
@@ -300,6 +304,11 @@ interface MagicLinkTokenRow {
   readonly role: MembershipRole | null;
   readonly expires_at: Date;
   readonly consumed_at: Date | null;
+  /** Review #88, REV-010: read back at redemption so provisionInvitedMembership
+   * enforces the caller's actual opt-in rather than trusting the state
+   * previewInviteEffect saw at invite creation. Absent (null) for a plain
+   * login token, same as organization_id and role. */
+  readonly replace_existing_role: boolean | null;
 }
 
 function mapMagicLinkTokenRow(row: MagicLinkTokenRow): MagicLinkTokenRecord {
@@ -320,6 +329,16 @@ export interface CreateMagicLinkTokenInput {
   readonly email: string;
   readonly invite?: MagicLinkInvite;
   readonly expiresAt: Date;
+  /**
+   * Only meaningful alongside `invite`; ignored for a plain login token.
+   * Nothing shipped calls this function with `invite` set -- that path is
+   * `createInviteMagicLinkToken`, which requires the field and gates it on
+   * `previewInviteEffect` -- so this is the raw persistence-layer knob,
+   * used directly only by RLS/replay probes constructing a token without
+   * going through the route. Review #88, REV-010: defaults to false, the
+   * safer reading of a caller that did not say.
+   */
+  readonly replaceExistingRole?: boolean;
 }
 
 /**
@@ -411,7 +430,9 @@ async function provisionInvitedMembership(
   schema: string,
   email: string,
   organizationId: string,
-  role: MembershipRole
+  role: MembershipRole,
+  replaceExistingRole: boolean,
+  tokenHash: string
 ): Promise<void> {
   const displayName = email.split("@")[0] || email;
   const userResult = await client.query<{ user_id: string }>(
@@ -433,6 +454,44 @@ async function provisionInvitedMembership(
   // reverts on COMMIT or ROLLBACK and cannot leak onto a later query
   // sharing the connection.
   await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+
+  // Review #88, REV-012: serializes every redemption for this organization
+  // before either row lock below is taken. Without it, two concurrent
+  // redemptions demoting two different owners could each hold the row this
+  // check locks next while waiting on the other's -- the membership row
+  // REV-010 locks first, then the owner-set query below locks every owner
+  // row, so two transactions taking those two locks in the opposite order
+  // (each already holding its own target row, each then blocking on the
+  // other's) deadlock. An advisory lock keyed on the organization, taken
+  // before any row lock, makes the order moot: only one redemption for
+  // this organization is ever inside the critical section below at a time.
+  // Same pattern bootstrapOrganizationOwner already uses for the same
+  // reason, on organization name rather than id.
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationId]);
+
+  // Review #88, REV-010: replaceExistingRole was only ever checked against
+  // the membership state previewInviteEffect saw at invite CREATION. An
+  // invite issued while this address had no membership carries
+  // replaceExistingRole=false and needed no opt-in at creation -- but if
+  // another admin, a second invite, or bootstrap granted a membership
+  // before this token was redeemed, the unconditional DO UPDATE below
+  // would apply the originally requested role over it, replacing a
+  // membership the caller never agreed to replace. FOR UPDATE locks this
+  // row for the rest of the transaction, so a concurrent grant cannot land
+  // between this check and the upsert.
+  const currentMembership = await client.query<{ membership_id: string; role: MembershipRole }>(
+    `SELECT membership_id, role FROM "${schema}".memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+    [organizationId, userId]
+  );
+  const currentRole = currentMembership.rows[0]?.role;
+  const membershipId = currentMembership.rows[0]?.membership_id;
+  if (currentRole !== undefined && currentRole !== role && !replaceExistingRole) {
+    throw new Error(
+      `invite would change ${email}'s role in organization ${organizationId} from ${currentRole} to ${role} ` +
+        `without replaceExistingRole; a membership was created or changed after this invite was issued`
+    );
+  }
+
   // Applying the invited role (below) makes one destructive direction
   // reachable that DO NOTHING made impossible: a re-invite naming a
   // non-owner role for the organization's only owner would leave it with
@@ -470,6 +529,192 @@ async function provisionInvitedMembership(
      ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
     [organizationId, userId, role]
   );
+
+  // Review #88 round 5, REV-001: written here, not at invite creation,
+  // because this is the only point where `currentRole` is a value the
+  // transaction actually holds a lock on and is about to act on -- the
+  // `from` in this row is true at the instant it is written, which a
+  // creation-time read committed and released long before redemption
+  // cannot promise. `membershipId` is already in hand from the same
+  // locked SELECT above, so there is no second read to go stale between.
+  //
+  // No audit row at all when currentRole is undefined (a brand new
+  // membership) or already equals role (previewInviteEffect's "unchanged"
+  // case redeemed with nothing to say): neither is a role change.
+  if (currentRole !== undefined && currentRole !== role && membershipId !== undefined) {
+    // The actor and request id for this row are recovered from the
+    // `membership_invite` row this same token's creation already wrote,
+    // rather than threaded through as a fresh parameter, for the same
+    // reason that row is written at creation and not here: the admin who
+    // authorized this is only known to have been a member at the moment
+    // they acted, and audit_events' own membership trigger (below) checks
+    // that against the *current* member set, not a historical one. Using
+    // the recorded authorizer keeps this row honestly attributed to who
+    // actually decided, rather than to the invitee whose click merely
+    // triggered this transaction -- consistent with why redemption itself
+    // has never been the place authorship is recorded in this system.
+    // to_regclass never throws for a name that does not resolve, unlike
+    // selecting from the table itself would -- which matters inside this
+    // transaction, since a failed statement here would abort the
+    // membership upsert already committed to it, not just this lookup.
+    // audit_events does not exist at all in some deliberately reduced
+    // probe schemas (assertMagicLinkRlsSafety applies only prefixes
+    // `0002`-`0004` and `0027`, to isolate RLS mechanics from the audit
+    // trail this table belongs to); checked rather than assumed present.
+    const auditEventsExists = await client.query<{ exists: boolean }>(
+      `SELECT to_regclass('"${schema}".audit_events') IS NOT NULL AS exists`
+    );
+    let actor: { actor_user_id: string; request_id: string } | undefined;
+    if (auditEventsExists.rows[0]?.exists === true) {
+      const authorization = await client.query<{ actor_user_id: string; request_id: string }>(
+        `SELECT actor_user_id, request_id FROM "${schema}".audit_events
+          WHERE organization_id = $1 AND entity_type = 'membership_invite' AND entity_id = $2
+          LIMIT 1`,
+        [organizationId, tokenHash]
+      );
+      actor = authorization.rows[0];
+    }
+    if (actor === undefined) {
+      // No membership_invite row to attribute this to: either audit_events
+      // does not exist in this schema (above), or this token was
+      // constructed directly via createMagicLinkToken rather than through
+      // createInviteMagicLinkToken, which is the only thing that ever
+      // writes one. That second case is exactly as unaudited today as
+      // createMagicLinkToken itself always was -- it writes no
+      // membership_invite row either, so there was never an authorization
+      // record to lose. Every invite POST /api/invites actually mints
+      // goes through createInviteMagicLinkToken, which always writes this
+      // row in the same transaction as the token, so this branch is
+      // reachable only from direct package-level use (tests, tooling),
+      // never from that route. Skipped, not thrown: refusing the role
+      // change here would make a legitimate, merely-unattributed change
+      // impossible instead.
+    } else {
+      // The roles travel in entity_id because audit_events has no column
+      // for them, and adding one to an append-only table is not a change
+      // to make in passing. Semantic content in entity_id has precedent
+      // here: the kill-switch path writes "engaged"/"disengaged" rather
+      // than an id. The membership id leads the value so the row still
+      // joins.
+      //
+      // audit_events' own trigger requires actor_user_id to currently be a
+      // member of organizationId (0006_audit_events_delete_and_membership_fixes.sql).
+      // If the admin who authorized this has since left the organization,
+      // this INSERT -- and so this whole redemption -- fails loudly rather
+      // than silently applying a role change with no valid attribution
+      // left to record. That is a real, accepted narrowing versus
+      // redeeming unconditionally: an authorization this system can no
+      // longer stand behind does not get to take effect merely because
+      // nobody updated the link.
+      await client.query(
+        `INSERT INTO "${schema}".audit_events
+           (organization_id, actor_user_id, action, entity_type, entity_id, request_id)
+         VALUES ($1, $2, 'admin_action', 'membership_role_change', $3, $4)`,
+        [organizationId, actor.actor_user_id, `${membershipId}:${currentRole}->${role}`, actor.request_id]
+      );
+    }
+  }
+}
+
+/**
+ * Review #88, REV-012. Deterministically forces the lock order that made a
+ * concurrent demotion race able to deadlock: two connections each already
+ * hold the OTHER's target row (REV-010's lock, above) before either asks
+ * for the full owner set (the pre-existing last-owner guard's lock, also
+ * above). Two genuinely concurrent redemptions do not reliably land in
+ * that exact window on a fast local connection -- one commonly finishes
+ * before the other starts, which is why the integration-level regression
+ * test for this same scenario passed even before this fix existed -- so
+ * this constructs the interleaving by hand rather than hoping for it,
+ * proving the hazard is real rather than theoretical.
+ *
+ * The fix itself (the pg_advisory_xact_lock now taken before either row
+ * lock, above) is not raced here because it does not need to be: an
+ * advisory lock fully serializes every caller holding the same key, so
+ * only one transaction is ever inside the section this probe exercises at
+ * a time, which makes the cross-wait this forces structurally impossible
+ * rather than merely unlikely. The real call path's safety under genuine
+ * concurrency is exercised end to end by
+ * "concurrent redemptions demoting two different owners do not deadlock"
+ * in deployment-entry-point.test.ts instead.
+ */
+export async function assertUnserializedOwnerDemotionsCanDeadlock(
+  databaseUrl: string,
+  schema: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const organizationId = randomUUID();
+  const ownerAId = randomUUID();
+  const ownerBId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  await admin.connect();
+  try {
+    await admin.query(`SET search_path TO "${schema}"`);
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'Lock Order Probe')`, [
+      organizationId
+    ]);
+    await admin.query(
+      `INSERT INTO users (user_id, email, display_name) VALUES ($1, $2, 'A'), ($3, $4, 'B')`,
+      [ownerAId, `lockorder-a-${organizationId}@acme.test`, ownerBId, `lockorder-b-${organizationId}@acme.test`]
+    );
+    await admin.query(
+      `INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'owner')`,
+      [organizationId, ownerAId, ownerBId]
+    );
+
+    const clientA = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    const clientB = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+    await clientA.connect();
+    await clientB.connect();
+    try {
+      await clientA.query(`SET search_path TO "${schema}"`);
+      await clientB.query(`SET search_path TO "${schema}"`);
+      await clientA.query("BEGIN");
+      await clientB.query("BEGIN");
+
+      // Each locks its own target row first -- exactly REV-010's lock,
+      // taken without REV-012's advisory lock ahead of it -- so both
+      // already hold one of the two rows the very next query needs before
+      // either issues it. Sequential awaits here are the point: this is
+      // what pins the order, rather than leaving it to scheduling chance.
+      await clientA.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerAId]
+      );
+      await clientB.query(
+        `SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE`,
+        [organizationId, ownerBId]
+      );
+
+      const results = await Promise.allSettled([
+        clientA.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        ),
+        clientB.query(
+          `SELECT user_id FROM memberships WHERE organization_id = $1 AND role = 'owner' FOR UPDATE`,
+          [organizationId]
+        )
+      ]);
+      await clientA.query("ROLLBACK").catch(() => undefined);
+      await clientB.query("ROLLBACK").catch(() => undefined);
+      return results.some(
+        (result) =>
+          result.status === "rejected" &&
+          (result.reason as { code?: string } | undefined)?.code === "40P01"
+      );
+    } finally {
+      await clientA.end().catch(() => undefined);
+      await clientB.end().catch(() => undefined);
+    }
+  } finally {
+    await admin
+      .query(`DELETE FROM memberships WHERE organization_id = $1`, [organizationId])
+      .catch(() => undefined);
+    await admin.query(`DELETE FROM users WHERE user_id = ANY($1)`, [[ownerAId, ownerBId]]).catch(() => undefined);
+    await admin.query(`DELETE FROM organizations WHERE organization_id = $1`, [organizationId]).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
 }
 
 export async function createMagicLinkToken(
@@ -489,16 +734,475 @@ export async function createMagicLinkToken(
       throw new Error("login magic link requires an existing user with a membership");
     }
     await client.query(
-      `INSERT INTO "${schema}".magic_link_tokens (token_hash, email, organization_id, role, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO "${schema}".magic_link_tokens
+         (token_hash, email, organization_id, role, expires_at, replace_existing_role)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         input.tokenHash,
         email,
         input.invite?.organizationId ?? null,
         input.invite?.role ?? null,
-        input.expiresAt
+        input.expiresAt,
+        input.invite === undefined ? null : (input.replaceExistingRole ?? false)
       ]
     );
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * What redeeming an invite would actually do to the target's membership.
+ *
+ * Review #88, REV-002 and REV-003: `POST /api/invites` is not only an
+ * "add somebody" endpoint. `provisionInvitedMembership` ends in
+ * `ON CONFLICT ... DO UPDATE SET role`, which nothing could reach before
+ * this ticket exposed invite creation over HTTP. So an invite naming an
+ * existing member silently replaces their role when they click what their
+ * mail client shows as a routine sign-in link; and an invite that would
+ * demote an organization's sole owner is accepted, audited and delivered,
+ * then fails at redemption forever, bouncing the invitee to `/?auth=error`
+ * with nothing telling the admin who issued it.
+ *
+ * This lets the route answer for both before minting anything.
+ */
+export type InviteEffect =
+  /** No membership exists yet: the ordinary invite. */
+  | { readonly outcome: "creates_membership" }
+  /** Already a member in exactly this role; redemption changes nothing. */
+  | { readonly outcome: "unchanged"; readonly role: MembershipRole }
+  /** Replaces an existing member's role. */
+  | { readonly outcome: "changes_role"; readonly from: MembershipRole; readonly to: MembershipRole }
+  /** Would leave the organization with no owner; redemption refuses this. */
+  | { readonly outcome: "strands_organization"; readonly from: MembershipRole; readonly to: MembershipRole };
+
+/**
+ * Advisory, not the enforcement.
+ *
+ * This is a read, so between it and redemption the membership can change.
+ * `provisionInvitedMembership`'s own last-owner guard, inside the
+ * redemption transaction and holding `FOR UPDATE` on the owner rows, stays
+ * the actual invariant. What this buys is that the common case fails at the
+ * admin who can act on it rather than at an invitee holding a link that can
+ * never work.
+ */
+export async function previewInviteEffect(
+  databaseUrl: string,
+  schema: string,
+  input: { readonly organizationId: string; readonly email: string; readonly role: MembershipRole }
+): Promise<InviteEffect> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // AF-18's memberships policy needs this for the reads below under any
+      // role RLS applies to; is_local ties it to this transaction.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [input.organizationId]);
+      const existing = await client.query<{ user_id: string; role: MembershipRole }>(
+        `SELECT m.user_id, m.role
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email, input.organizationId]
+      );
+      const current = existing.rows[0];
+      if (current === undefined) {
+        await client.query("COMMIT");
+        return { outcome: "creates_membership" };
+      }
+      if (current.role === input.role) {
+        await client.query("COMMIT");
+        return { outcome: "unchanged", role: current.role };
+      }
+      if (input.role !== "owner") {
+        const owners = await client.query<{ user_id: string }>(
+          `SELECT user_id FROM "${schema}".memberships
+            WHERE organization_id = $1 AND role = 'owner'`,
+          [input.organizationId]
+        );
+        const ownerIds = owners.rows.map((owner) => owner.user_id);
+        if (ownerIds.length === 1 && ownerIds[0] === current.user_id) {
+          await client.query("COMMIT");
+          return { outcome: "strands_organization", from: current.role, to: input.role };
+        }
+      }
+      await client.query("COMMIT");
+      return { outcome: "changes_role", from: current.role, to: input.role };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** The membership an invite would change, for the audit row that records it. */
+export async function getMembershipIdForEmail(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  email: string
+): Promise<string | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const result = await client.query<{ membership_id: string }>(
+        `SELECT m.membership_id
+           FROM "${schema}".users u
+           INNER JOIN "${schema}".memberships m ON m.user_id = u.user_id
+          WHERE u.email = $1 AND m.organization_id = $2`,
+        [email.toLowerCase(), organizationId]
+      );
+      await client.query("COMMIT");
+      return result.rows[0]?.membership_id;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export interface CreateInviteMagicLinkTokenInput {
+  readonly tokenHash: string;
+  readonly email: string;
+  readonly invite: MagicLinkInvite;
+  readonly expiresAt: Date;
+  /**
+   * Not optional, and not a second call the caller could forget to make.
+   * An invite grants a named role in an organization to whoever redeems
+   * it, which is exactly the consequential `admin_action` AF-20 requires
+   * to be attributable -- and redemption itself records nothing, because
+   * the person redeeming is not the person who decided to grant it.
+   * Making this a field means an invite that is not attributable cannot
+   * be expressed, rather than merely discouraged.
+   */
+  readonly audit: {
+    readonly actorUserId: string;
+    readonly requestId: string;
+  };
+  /**
+   * The caller's Idempotency-Key, honoured rather than merely validated
+   * (review #88, REV-007). A retry after a timeout must not mint a second
+   * live credential, a second audit trail and a second email for one
+   * administrative act.
+   *
+   * Bound to the request it was issued for, not accepted bare (review #88,
+   * REV-009): a key reused against a different email, role or
+   * `replaceExistingRole` -- a client bug, a copy-pasted header, a key
+   * minted once per admin session instead of once per submission -- hit
+   * the same unique-index conflict as a genuine retry and answered the
+   * same silent-success 202, for an invite that was never created. See
+   * `replaceExistingRole` below and `createInviteMagicLinkToken`'s
+   * fingerprint comparison.
+   */
+  readonly idempotencyKey: string;
+  /**
+   * The caller's stated intent, folded into the idempotency fingerprint
+   * alongside email and role. Required, not defaulted to `false` inside
+   * this function: the fingerprint must reflect what the caller actually
+   * sent, and a default here would make two different requests -- one that
+   * omitted the field and one that sent `false` -- fingerprint identically,
+   * which happens to be harmless today only because they mean the same
+   * thing; a silent default is still the wrong place to encode that.
+   */
+  readonly replaceExistingRole: boolean;
+}
+
+export type CreateInviteOutcome =
+  | { readonly outcome: "created" }
+  /**
+   * This exact request, replayed under the same key: nothing was written,
+   * and nothing should be sent again for a delivery that already
+   * succeeded.
+   *
+   * `delivered` is false when the first attempt's token and audit rows
+   * committed but its mail send never confirmed (review #88 round 5,
+   * REV-004) -- a client retrying the 503 that response produces must not
+   * be told 202, since nothing has ever gone out for this invite and the
+   * conventional response to a 503 is exactly the retry that would land
+   * here.
+   */
+  | { readonly outcome: "replayed"; readonly delivered: boolean }
+  /** The key was reused for a different request. Refused, not replayed:
+   * silently discarding the second request would tell its caller it
+   * succeeded when nothing was created for it. */
+  | { readonly outcome: "conflict" };
+
+/**
+ * Mints an invite token and its audit row in one transaction.
+ *
+ * Separate from createMagicLinkToken rather than an optional argument on
+ * it: a login link re-sends access somebody already has, an invite
+ * creates it, and only the second is an administrative act with an
+ * actor to record.
+ *
+ * The audit row's entity_id is the token hash, not the invited email.
+ * audit_events is append-only by trigger and has no delete path, so an
+ * address written there could never be removed; the token hash points at
+ * the magic_link_tokens row, which holds the email, organization and
+ * role together and can be deleted. The audit trail keeps the fact and
+ * its actor, and the joinable row keeps the detail.
+ */
+export async function createInviteMagicLinkToken(
+  databaseUrl: string,
+  schema: string,
+  input: CreateInviteMagicLinkTokenInput
+): Promise<CreateInviteOutcome> {
+  assertSafeSchema(schema);
+  const email = input.email.toLowerCase();
+  // Review #88, REV-009: what makes a replay "the same request" as the one
+  // that first claimed this key. Same shape as claimIdempotentRequest's own
+  // request_fingerprint -- a canonical hash of the fields that determine the
+  // invite's effect -- kept as its own column rather than reusing that
+  // generic mechanism, because invites already have their own idempotency
+  // column (REV-007) and this repo's convention is a bespoke column per
+  // consequential write (candidate decisions, import finalization,
+  // evidence corrections), not a shared table every route funnels through.
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ email, organizationId: input.invite.organizationId, role: input.invite.role, replaceExistingRole: input.replaceExistingRole }))
+    .digest("hex");
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // The INSERT is the deduplication, not a check before it: the partial
+      // unique index means exactly one concurrent caller can claim a key, so
+      // two simultaneous retries cannot both proceed. On conflict nothing is
+      // written and the audit rows below are skipped with it, inside this
+      // same transaction.
+      const inserted = await client.query(
+        `INSERT INTO "${schema}".magic_link_tokens
+           (token_hash, email, organization_id, role, expires_at, idempotency_key, idempotency_fingerprint,
+            replace_existing_role)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+         DO NOTHING`,
+        [
+          input.tokenHash,
+          email,
+          input.invite.organizationId,
+          input.invite.role,
+          input.expiresAt,
+          input.idempotencyKey,
+          fingerprint,
+          // Review #88, REV-010: stored so redemption can enforce the
+          // opt-in against the membership state it actually finds, not the
+          // one previewInviteEffect saw when this invite was created.
+          input.replaceExistingRole
+        ]
+      );
+      if (inserted.rowCount === 0) {
+        // Same key, but is it the same request? The unique index alone
+        // cannot tell: it only knows the (organization, key) pair
+        // conflicted, not whether this call's fingerprint matches the one
+        // that won the race. Read back what actually claimed the key and
+        // compare, the same distinction claimIdempotentRequest draws
+        // between `replay` and `fingerprint_mismatch`.
+        const existing = await client.query<{
+          idempotency_fingerprint: string | null;
+          delivered_at: Date | null;
+        }>(
+          `SELECT idempotency_fingerprint, delivered_at FROM "${schema}".magic_link_tokens
+            WHERE organization_id = $1 AND idempotency_key = $2`,
+          [input.invite.organizationId, input.idempotencyKey]
+        );
+        const existingRow = existing.rows[0];
+        if (existingRow?.idempotency_fingerprint === undefined) {
+          // Only reachable if the row was deleted between the two
+          // statements, which nothing here does. Reported rather than
+          // silently treated as either outcome.
+          throw new Error("invite idempotency record vanished between claim and read");
+        }
+        if (existingRow.idempotency_fingerprint !== fingerprint) {
+          // A different request reused this key. Refused, not replayed:
+          // treating it as a replay would answer 202 for an invite that
+          // was never created, which is the exact failure mode reported
+          // in review #88 (REV-009).
+          await client.query("ROLLBACK");
+          return { outcome: "conflict" };
+        }
+        await client.query("COMMIT");
+        return { outcome: "replayed", delivered: existingRow.delivered_at !== null };
+      }
+      await appendAuditEvent(
+        databaseUrl,
+        schema,
+        {
+          organizationId: input.invite.organizationId,
+          actorUserId: input.audit.actorUserId,
+          action: "admin_action",
+          entityType: "membership_invite",
+          entityId: input.tokenHash,
+          requestId: input.audit.requestId
+        },
+        client
+      );
+      // Review #88 round 5, REV-001: no `membership_role_change` row is
+      // written here. The role this invite names is only a request until
+      // redemption actually applies it -- redemption can be hours later,
+      // can be refused by `provisionInvitedMembership`'s own guards, or can
+      // never happen at all if the link expires unclicked -- so a row
+      // written here from `previewInviteEffect`'s creation-time read would
+      // assert a transition that has not occurred, from a `from` value
+      // nothing holds a lock on past the moment it was read. Two admins
+      // racing a preview and a redemption could make it record a transition
+      // whose stated starting point was never true at the instant anything
+      // changed. `provisionInvitedMembership` writes the real row, from the
+      // value it locks and actually applies, in the same transaction as the
+      // update it describes -- see the call there for how it recovers the
+      // authorizing actor and request id from this `membership_invite` row.
+      await client.query("COMMIT");
+      return { outcome: "created" };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Records that an invite's mail actually went out.
+ *
+ * Review #88 round 5, REV-004: `POST /api/invites` commits the token and
+ * its audit rows before attempting delivery, then answers 503 if the send
+ * fails. Nothing previously distinguished that state from a normal
+ * created-and-sent invite, so a client retrying the 503 -- the
+ * conventional response to one -- replayed into a 202 that claimed
+ * delivery which never happened. Called once, after `sendMagicLink`
+ * confirms; a replay of an invite this was never called for reports
+ * `delivered: false` and the route can answer 503 again instead.
+ *
+ * `IS NULL` in the WHERE clause rather than an unconditional SET: this
+ * marks the first confirmed send, not the most recent call, though nothing
+ * in this route currently calls it more than once per token.
+ */
+export async function markInviteDelivered(databaseUrl: string, schema: string, tokenHash: string): Promise<void> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `UPDATE "${schema}".magic_link_tokens
+          SET delivered_at = clock_timestamp()
+        WHERE token_hash = $1 AND delivered_at IS NULL`,
+      [tokenHash]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Whether a token is an invite, without consuming it.
+ *
+ * Review #88, REV-011: `GET /auth/redeem` used to call the atomic,
+ * consuming redemption directly, so a corporate mail gateway's prefetch of
+ * the emailed link -- an ordinary GET, indistinguishable from the
+ * recipient's own click -- provisioned or changed a membership and burned
+ * the single-use token before the invitee ever acted. A plain login token
+ * has no comparable effect (redemption only mints a session, the accepted
+ * tradeoff already documented on that route), so this only needs to steer
+ * invite tokens to a non-mutating confirmation step; everything else keeps
+ * going straight to the real, consuming redemption, which re-validates
+ * expiry and single-use atomically regardless of what this said.
+ *
+ * Deliberately not authoritative: an invalid, expired or already-consumed
+ * token reports "not_invite" here and falls through to that same real
+ * redemption, which already produces the right invalid/expired/consumed
+ * outcome. This function only has one job, telling a still-live invite
+ * apart from everything else, so the caller knows to defer.
+ */
+export async function peekMagicLinkTokenIsInvite(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ organization_id: string | null }>(
+      `SELECT organization_id
+         FROM "${schema}".magic_link_tokens
+        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    return result.rows[0]?.organization_id !== null && result.rows[0]?.organization_id !== undefined;
+  } finally {
+    client.release();
+  }
+}
+
+export interface InvitePeek {
+  readonly organizationName: string;
+  readonly role: MembershipRole;
+  /** The invitee's current role, present only when accepting would replace
+   * it with `role` -- undefined for a brand new membership or a role that
+   * already matches, exactly the distinction `previewInviteEffect` draws
+   * at creation. */
+  readonly replacesRole?: MembershipRole;
+}
+
+/**
+ * The detail `/auth/confirm` renders so accepting an invite is an informed
+ * action, not just an explicit one (review #88 round 5, REV-003).
+ *
+ * REV-011's confirmation step establishes that consuming an invite takes a
+ * deliberate click. It does not by itself make that click informed: a
+ * member being replaced into a different role saw the same generic
+ * sentence as someone joining a new organization, and could not tell an
+ * invitation from a change to access they already hold. This is the same
+ * non-mutating peek `peekMagicLinkTokenIsInvite` performs -- a plain read,
+ * advisory only, superseded by whatever `redeemMagicLinkForSession` finds
+ * when the accept action actually runs.
+ *
+ * Returns undefined for anything that is not a currently-live invite
+ * token, the same cases `peekMagicLinkTokenIsInvite` reports `false` for:
+ * the caller falls through to the real redemption either way, which
+ * produces the right invalid/expired/consumed/no_account outcome.
+ */
+export async function peekInviteDetails(
+  databaseUrl: string,
+  schema: string,
+  tokenHash: string
+): Promise<InvitePeek | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_name: string;
+      role: MembershipRole;
+      current_role: MembershipRole | null;
+    }>(
+      `SELECT o.name AS organization_name, t.role AS role, m.role AS current_role
+         FROM "${schema}".magic_link_tokens t
+         INNER JOIN "${schema}".organizations o ON o.organization_id = t.organization_id
+         LEFT JOIN "${schema}".users u ON u.email = t.email
+         LEFT JOIN "${schema}".memberships m ON m.user_id = u.user_id AND m.organization_id = t.organization_id
+        WHERE t.token_hash = $1
+          AND t.organization_id IS NOT NULL
+          AND t.role IS NOT NULL
+          AND t.consumed_at IS NULL
+          AND t.expires_at > clock_timestamp()`,
+      [tokenHash]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      organizationName: row.organization_name,
+      role: row.role,
+      ...(row.current_role !== null && row.current_role !== row.role ? { replacesRole: row.current_role } : {})
+    };
   } finally {
     client.release();
   }
@@ -529,7 +1233,7 @@ export async function redeemMagicLinkToken(
         `UPDATE "${schema}".magic_link_tokens
             SET consumed_at = clock_timestamp()
           WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > clock_timestamp()
-          RETURNING email, organization_id, role, expires_at, consumed_at`,
+          RETURNING email, organization_id, role, expires_at, consumed_at, replace_existing_role`,
         [tokenHash]
       );
       const redeemedRow = redeemed.rows[0];
@@ -541,7 +1245,9 @@ export async function redeemMagicLinkToken(
             schema,
             record.email.toLowerCase(),
             record.invite.organizationId,
-            record.invite.role
+            record.invite.role,
+            redeemedRow.replace_existing_role === true,
+            tokenHash
           );
         }
         await client.query("COMMIT");
@@ -549,7 +1255,7 @@ export async function redeemMagicLinkToken(
       }
 
       const existing = await client.query<MagicLinkTokenRow>(
-        `SELECT email, organization_id, role, expires_at, consumed_at
+        `SELECT email, organization_id, role, expires_at, consumed_at, replace_existing_role
            FROM "${schema}".magic_link_tokens WHERE token_hash = $1`,
         [tokenHash]
       );
@@ -623,6 +1329,66 @@ export async function appendAuditEvent(
   }
 }
 
+export interface RecordedAuditEvent {
+  readonly organizationId: string;
+  readonly actorUserId: string;
+  readonly action: AuditAction;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly requestId: string;
+}
+
+/**
+ * Reads back the audit rows for one entity.
+ *
+ * Exported for the same reason the assert* probes below are: `pg` lives
+ * in this package, so a test that needs to see real rows either goes
+ * through here or reaches for a driver it cannot resolve.
+ *
+ * It exists because of review #88, which caught a test asserting the
+ * wrong thing. `POST /api/invites` answering 202 was taken as proof that
+ * the `admin_action` row had been written; it is not. Deleting the
+ * `appendAuditEvent` call entirely would still insert the token, send
+ * the mail and answer 202, and the only assertion covering AF-20's
+ * "every consequential action is attributable" invariant would have gone
+ * on passing. The row has to be read to be checked.
+ */
+export async function listAuditEventsForEntity(
+  databaseUrl: string,
+  schema: string,
+  entityType: string,
+  entityId: string
+): Promise<readonly RecordedAuditEvent[]> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      organization_id: string;
+      actor_user_id: string;
+      action: AuditAction;
+      entity_type: string;
+      entity_id: string;
+      request_id: string;
+    }>(
+      `SELECT organization_id, actor_user_id, action, entity_type, entity_id, request_id
+         FROM "${schema}".audit_events
+        WHERE entity_type = $1 AND entity_id = $2
+        ORDER BY occurred_at ASC`,
+      [entityType, entityId]
+    );
+    return result.rows.map((row) => ({
+      organizationId: row.organization_id,
+      actorUserId: row.actor_user_id,
+      action: row.action,
+      entityType: row.entity_type,
+      entityId: row.entity_id,
+      requestId: row.request_id
+    }));
+  } finally {
+    client.release();
+  }
+}
+
 // ---- AF-40: persist model/prompt/schema/rubric versions ----
 //
 // Insert only, same as appendAuditEvent: immutability is enforced by
@@ -644,16 +1410,17 @@ export interface RecordEvidenceExtractionRunInput {
 export async function recordEvidenceExtractionRun(
   databaseUrl: string,
   schema: string,
-  input: RecordEvidenceExtractionRunInput
-): Promise<void> {
+  input: RecordEvidenceExtractionRunInput,
+  existingClient?: DatabaseQueryable
+): Promise<string> {
   assertSafeSchema(schema);
-  const client = await acquireConnection(databaseUrl);
-  try {
-    await client.query(
+  const insert = async (client: DatabaseQueryable): Promise<string> => {
+    const result = await client.query<{ run_id: string }>(
       `INSERT INTO "${schema}".evidence_extraction_runs
          (organization_id, entity_type, entity_id, provider, model, prompt_version,
           extraction_schema_version, extraction_schema_name, rubric_version)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING run_id`,
       [
         input.organizationId,
         input.entityType,
@@ -666,6 +1433,18 @@ export async function recordEvidenceExtractionRun(
         input.rubricVersion
       ]
     );
+    const runId = result.rows[0]?.run_id;
+    if (runId === undefined) {
+      throw new Error("evidence extraction run insert returned no row");
+    }
+    return runId;
+  };
+  if (existingClient !== undefined) {
+    return insert(existingClient);
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    return await insert(client);
   } finally {
     client.release();
   }
@@ -798,6 +1577,30 @@ export interface SetInferenceKillSwitchInput {
     readonly actorUserId: string;
     readonly requestId: string;
   };
+}
+
+/** Fail closed when the singleton control row is absent. */
+export async function getInferenceKillSwitchStatus(
+  databaseUrl: string,
+  schema: string
+): Promise<{ readonly engaged: boolean; readonly reason?: string }> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ engaged: boolean; reason: string | null }>(
+      `SELECT engaged, reason FROM "${schema}".inference_kill_switch WHERE id = true`
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("inference_kill_switch has no row; refusing to assume inference is allowed");
+    }
+    return {
+      engaged: row.engaged,
+      ...(row.reason === null ? {} : { reason: row.reason })
+    };
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -980,6 +1783,260 @@ export async function getMembershipsForUser(
   }
 }
 
+// ---- AF-97: entering a deployment ----
+
+interface CallerOrganizationRow {
+  readonly organization_id: string;
+  readonly name: string;
+  readonly role: MembershipRole;
+}
+
+/**
+ * The organizations a signed-in caller may act in, with the role they
+ * hold in each.
+ *
+ * Every other route takes an organizationId it does not produce, so
+ * before this existed a user had exactly one way to learn their own:
+ * be told it out of band and paste it into a query string. This is the
+ * one query that turns a session into a set of places to act in, which
+ * is what an organization switcher renders.
+ *
+ * The organization name is only reachable through the caller's own
+ * membership rows -- the join, not a filter applied afterwards -- so an
+ * organizationId the caller has no membership for cannot be resolved to
+ * a name here, and the list cannot become an organization directory.
+ */
+export async function listOrganizationsForUser(
+  databaseUrl: string,
+  schema: string,
+  userId: string
+): Promise<readonly CallerOrganization[]> {
+  assertSafeSchema(schema);
+  // Same cross-organization lookup as getMembershipsForUser, and the same
+  // reason it must fail loudly: under a role RLS applies to, this returns
+  // zero rows for every caller, and an organization switcher that renders
+  // "you belong to no organizations" is indistinguishable from the truth.
+  await requireMembershipLookupVisibleOnce(databaseUrl, schema, "listing a user's organizations");
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<CallerOrganizationRow>(
+      `SELECT o.organization_id, o.name, m.role
+         FROM "${schema}".memberships m
+         INNER JOIN "${schema}".organizations o ON o.organization_id = m.organization_id
+        WHERE m.user_id = $1
+        ORDER BY o.name ASC, o.organization_id ASC`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      organizationId: row.organization_id,
+      name: row.name,
+      role: row.role
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+export interface BootstrapOrganizationOwnerInput {
+  readonly organizationName: string;
+  readonly email: string;
+  readonly displayName: string;
+}
+
+export interface BootstrapOrganizationOwnerResult {
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly organizationCreated: boolean;
+  readonly userCreated: boolean;
+  /** `promoted` means the user already belonged to this organization in a
+   * non-owner role and now owns it -- reported rather than silent, because
+   * it is the one privilege change this command can make to existing data. */
+  readonly membership: "created" | "promoted" | "unchanged";
+}
+
+/**
+ * Creates the first organization, user and owner membership of a
+ * deployment, atomically.
+ *
+ * A fresh deployment has none of the three, and no code path creates
+ * any: `POST /api/auth/magic-link/request` only mails a link to an email
+ * that already holds a membership, and an invite can only be issued by
+ * somebody who already owns an organization. That is a deliberate
+ * invite-only design (AF-16) with one missing step -- the first invite
+ * has nobody to come from -- so every route in the app was unreachable
+ * without hand-editing the database.
+ *
+ * This is the missing step, and it is deliberately NOT an HTTP route.
+ * Whatever creates the first owner cannot itself be behind
+ * authentication, so as a route it would be an unauthenticated
+ * privilege-granting endpoint that must be disabled after first use,
+ * and "we remembered to disable it" is not a security control. Requiring
+ * the operator to already hold database credentials moves the
+ * authorization to something the deployment already has to protect.
+ *
+ * Idempotent, so an interrupted or repeated run converges instead of
+ * creating a second organization with the same name: an existing
+ * organization of that name is reused, the user is matched by email, and
+ * the owner membership is upserted. See BootstrapOrganizationOwnerResult
+ * for what a repeat run reports.
+ */
+export async function bootstrapOrganizationOwner(
+  databaseUrl: string,
+  schema: string,
+  input: BootstrapOrganizationOwnerInput
+): Promise<BootstrapOrganizationOwnerResult> {
+  assertSafeSchema(schema);
+  const organizationName = input.organizationName.trim();
+  const displayName = input.displayName.trim();
+  const email = input.email.trim().toLowerCase();
+  // Checked here rather than left to the table's CHECK constraints: an
+  // operator running this by hand should get the reason, not a raw
+  // constraint-violation stack.
+  if (organizationName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty organization name");
+  }
+  if (displayName.length === 0) {
+    throw new Error("bootstrapOrganizationOwner requires a non-empty display name");
+  }
+  // Structural only, and deliberately not an attempt to restate the
+  // grammar (review #88). The authoritative check is contracts'
+  // `storedEmailSchema` -- the very object `POST /api/auth/magic-link/request`
+  // parses with -- applied by scripts/environment/bootstrap.mjs before it
+  // gets here, because this package may not depend on contracts and a
+  // second hand-written email regex would drift from the one that decides
+  // whether the owner can actually sign in.
+  //
+  // This still refuses what the table's own CHECK is too weak to catch:
+  // `position('@' in email) > 1` accepts `owner@`, `foo@@bar` and `a@b`,
+  // every one of which `z.email()` rejects. Left unchecked, the one
+  // command whose purpose is to create somebody who can sign in could
+  // create somebody who provably cannot.
+  const [localPart, domain, ...extraParts] = email.split("@");
+  if (
+    localPart === undefined ||
+    localPart.length === 0 ||
+    domain === undefined ||
+    extraParts.length > 0 ||
+    !/^[^\s@]+\.[^\s@]+$/u.test(domain)
+  ) {
+    throw new Error(
+      `bootstrapOrganizationOwner requires an email address of the form name@example.com; ` +
+        `an address the sign-in endpoint rejects would create an owner who can never request a link`
+    );
+  }
+
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // One transaction for all three rows: a crash between them would
+      // otherwise leave an organization nobody owns or a user with no
+      // membership, and the second is exactly the "half-onboarded account"
+      // the login path reports as no_account.
+      //
+      // organizations.name carries no unique constraint -- two real
+      // employers may share a name -- so "insert unless one exists" is a
+      // check-then-write that two concurrent runs could both pass,
+      // producing the duplicate organization the idempotency below exists
+      // to prevent. A transaction-scoped advisory lock on the name makes
+      // the pair atomic without constraining the table, and is released by
+      // COMMIT or ROLLBACK either way.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [organizationName]);
+      const insertedOrganization = await client.query<{ organization_id: string }>(
+        `INSERT INTO "${schema}".organizations (name)
+         SELECT $1
+          WHERE NOT EXISTS (SELECT 1 FROM "${schema}".organizations WHERE name = $1)
+         RETURNING organization_id`,
+        [organizationName]
+      );
+      const organizationCreated = insertedOrganization.rows[0] !== undefined;
+      const organizationId =
+        insertedOrganization.rows[0]?.organization_id ??
+        (
+          await client.query<{ organization_id: string }>(
+            `SELECT organization_id FROM "${schema}".organizations
+              WHERE name = $1
+              ORDER BY created_at ASC, organization_id ASC
+              LIMIT 1`,
+            [organizationName]
+          )
+        ).rows[0]?.organization_id;
+      if (organizationId === undefined) {
+        throw new Error("bootstrap did not resolve an organization");
+      }
+
+      // Whether this row is new is read from the insert itself rather than
+      // from a prior SELECT, because `xmax = 0` is true only for a tuple this
+      // statement inserted.
+      //
+      // `DO UPDATE SET email = EXCLUDED.email` rather than `DO NOTHING`
+      // (review #88, REV-008), matching provisionInvitedMembership above.
+      // DO NOTHING returns no row on conflict and does not block on a
+      // concurrent uncommitted insert of the same email; the fallback SELECT
+      // could not see that uncommitted row under READ COMMITTED either, so
+      // two operators bootstrapping the same person into differently named
+      // organizations at the same moment would leave one of them throwing
+      // "did not resolve a user". The advisory lock above only serialises
+      // runs naming the same organization, so it does not cover this. The
+      // no-op update takes the row lock, waits for the other transaction,
+      // and then returns the row.
+      //
+      // Setting `email` to itself is what makes it a no-op: the display name
+      // is deliberately not overwritten, because this command exists to grant
+      // access, and silently renaming a person whose name an operator typed
+      // differently is not that.
+      const insertedUser = await client.query<{ user_id: string; inserted: boolean }>(
+        `INSERT INTO "${schema}".users (email, display_name)
+         VALUES ($1, $2)
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+         RETURNING user_id, (xmax = 0) AS inserted`,
+        [email, displayName]
+      );
+      const userRow = insertedUser.rows[0];
+      if (userRow === undefined) {
+        throw new Error("bootstrap did not resolve a user");
+      }
+      const userCreated = userRow.inserted;
+      const userId = userRow.user_id;
+
+      // AF-18's memberships policy requires this for both the SELECT and
+      // the INSERT below under any role RLS applies to; is_local = true
+      // ties it to this transaction, so it cannot leak onto a later query
+      // sharing the pooled connection. Same reasoning as
+      // provisionInvitedMembership.
+      await client.query(`SELECT set_config('app.current_org_id', $1, true)`, [organizationId]);
+      const existing = await client.query<{ role: MembershipRole }>(
+        `SELECT role FROM "${schema}".memberships
+          WHERE organization_id = $1 AND user_id = $2
+          FOR UPDATE`,
+        [organizationId, userId]
+      );
+      const existingRole = existing.rows[0]?.role;
+      await client.query(
+        `INSERT INTO "${schema}".memberships (organization_id, user_id, role)
+         VALUES ($1, $2, 'owner')
+         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'owner'`,
+        [organizationId, userId]
+      );
+      await client.query("COMMIT");
+      return {
+        organizationId,
+        userId,
+        organizationCreated,
+        userCreated,
+        membership:
+          existingRole === undefined ? "created" : existingRole === "owner" ? "unchanged" : "promoted"
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Seeds one organization + user + membership and returns the user id.
  *
@@ -996,8 +2053,8 @@ export async function getMembershipsForUser(
  * invoke it.
  */
 /**
- * Provision a throwaway schema with only the migrations the magic-link
- * routes touch, and return its name.
+ * Provision a throwaway schema with the migrations the authentication and
+ * entry-point routes touch, and return its name.
  *
  * Lives here rather than in the test because `pg` is a packages/db
  * dependency and tests do not import it directly (the same reason
@@ -1007,6 +2064,13 @@ export async function getMembershipsForUser(
  * workstation after `pnpm dev:infra`, false in the Integration CI job, which
  * starts a bare postgres service with no migrations applied. All three route
  * tests passed locally and failed in CI.
+ *
+ * AF-97 widened it from the two magic-link migrations to the five the way
+ * INTO a deployment now spans: audit_events, because an invite writes its
+ * `admin_action` row in the same transaction as the token, and roles,
+ * because "a recruiter can reach a role" is the thing entering a deployment
+ * is for. One fixture rather than a near-identical second one, so the two
+ * cannot drift about what a route-level probe contains.
  */
 export async function provisionRouteProbeSchema(databaseUrl: string): Promise<string> {
   const schema = `route_probe_${randomBytes(4).toString("hex")}`;
@@ -1014,7 +2078,31 @@ export async function provisionRouteProbeSchema(databaseUrl: string): Promise<st
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA "${schema}"`);
-    for (const file of ["0002_organizations_users_memberships.sql", "0003_magic_link_tokens.sql"]) {
+    for (const file of [
+      "0002_organizations_users_memberships.sql",
+      "0003_magic_link_tokens.sql",
+      "0005_immutable_audit_events.sql",
+      // 0005_immutable_audit_events.sql leaves audit_events with an
+      // ON DELETE CASCADE that fights its own append-only trigger, and the
+      // file below is the fix; applying the first without the second would
+      // give the probe a shape no real database has ever had.
+      "0006_audit_events_delete_and_membership_fixes.sql",
+      "0009_roles.sql",
+      // The invite route deduplicates on this column (review #88, REV-007),
+      // so a probe without it would not exercise the route as it ships.
+      "0023_invite_idempotency.sql",
+      // The fingerprint that binds a key to the request it was issued for
+      // (review #88, REV-009) -- same reasoning as the migration above.
+      "0024_invite_idempotency_fingerprint.sql",
+      // The persisted replaceExistingRole intent redemption enforces
+      // (review #88, REV-010) -- same reasoning as the two migrations above.
+      "0027_invite_role_replacement_intent.sql",
+      // Tracks whether an invite's mail actually sent, so a replay of one
+      // that never delivered can be told apart from a real repeat send
+      // (review #88 round 5, REV-004) -- same reasoning as the migrations
+      // above.
+      "0028_invite_delivery_tracking.sql"
+    ]) {
       await admin.query(`SET search_path TO "${schema}"`);
       await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, file), "utf8"));
     }
@@ -1607,6 +2695,150 @@ export async function getRubricForRole(
          FROM "${schema}".rubrics
         WHERE role_id = $1
         ORDER BY (status = 'draft') DESC, version DESC
+        LIMIT 1`,
+      [roleId]
+    );
+    return result.rows[0] === undefined ? undefined : rowToRubric(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionQueueProbe {
+  readonly schema: string;
+  readonly organizationId: string;
+  readonly userId: string;
+  readonly roleId: string;
+  readonly applicationId: string;
+  readonly sourceIntakeId: string;
+  readonly rubricId: string;
+}
+
+/** A fully valid synthetic application/document/rubric chain for worker tests. */
+export async function provisionEvidenceExtractionQueueProbeSchema(
+  databaseUrl: string
+): Promise<EvidenceExtractionQueueProbe> {
+  const suffix = randomBytes(4).toString("hex");
+  const schema = `extraction_queue_probe_${suffix}`;
+  const organizationId = randomUUID();
+  const admin = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 });
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await admin.query(`SET search_path TO "${schema}"`);
+    for (const migration of [
+      "0002_organizations_users_memberships.sql",
+      "0006_evidence_extraction_runs.sql",
+      "0007_inference_usage_ledger.sql",
+      "0008_inference_kill_switch.sql",
+      "0009_inference_kill_switch_nonblank_reason.sql",
+      "0009_roles.sql",
+      "0010_kill_switch_reason_non_whitespace.sql",
+      "0011_rubrics.sql",
+      "0012_immutable_published_rubrics.sql",
+      "0013_file_intakes.sql",
+      "0014_file_intake_validation.sql",
+      "0015_canonical_text_extractions.sql",
+      "0016_applications_and_import_finalization.sql",
+      "0017_evidence_outcomes.sql",
+      "0018_evidence_corrections.sql",
+      "0019_correction_attribution.sql",
+      "0026_evidence_extraction_jobs.sql"
+    ]) {
+      await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, migration), "utf8"));
+    }
+    await admin.query(`INSERT INTO organizations (organization_id, name) VALUES ($1, 'AF-102 Synthetic Queue Probe')`, [
+      organizationId
+    ]);
+    const user = await admin.query<{ user_id: string }>(
+      `INSERT INTO users (email, display_name) VALUES ($1, 'AF-102 Probe') RETURNING user_id`,
+      [`af102_${suffix}@example.test`]
+    );
+    const userId = user.rows[0]?.user_id;
+    if (userId === undefined) throw new Error("queue probe did not create a user");
+    await admin.query(`INSERT INTO memberships (organization_id, user_id, role) VALUES ($1, $2, 'recruiter')`, [
+      organizationId,
+      userId
+    ]);
+    const role = await admin.query<{ role_id: string }>(
+      `INSERT INTO roles (organization_id, title, created_by_user_id) VALUES ($1, 'Synthetic Engineer', $2)
+       RETURNING role_id`,
+      [organizationId, userId]
+    );
+    const roleId = role.rows[0]?.role_id;
+    if (roleId === undefined) throw new Error("queue probe did not create a role");
+    const criteria = Array.from({ length: 5 }, (_, index) => ({
+      criterionId: `criterion_${index + 1}`,
+      description: `Synthetic criterion ${index + 1}`,
+      evidenceGuidance: `Find explicit evidence for criterion ${index + 1}`
+    }));
+    const rubric = await admin.query<{ rubric_id: string }>(
+      `INSERT INTO rubrics
+         (role_id, version, status, criteria, approved_by_user_id, approved_at)
+       VALUES ($1, 1, 'published', $2::jsonb, $3, clock_timestamp())
+       RETURNING rubric_id`,
+      [roleId, JSON.stringify(criteria), userId]
+    );
+    const rubricId = rubric.rows[0]?.rubric_id;
+    const csvIntake = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status,
+          created_by_user_id, sniffed_mime_type, size_bytes, sha256_hash)
+       VALUES ($1, $2, $3, 'applications.csv', 'text/csv', 'imported', $4, 'text/csv', 128, $5)
+       RETURNING intake_id`,
+      [organizationId, roleId, `probe/${suffix}/applications.csv`, userId, "a".repeat(64)]
+    );
+    const csvIntakeId = csvIntake.rows[0]?.intake_id;
+    if (csvIntakeId === undefined || rubricId === undefined) {
+      throw new Error("queue probe did not create rubric and CSV intake");
+    }
+    const application = await admin.query<{ application_id: string }>(
+      `INSERT INTO applications
+         (organization_id, role_id, intake_id, source_row_number, candidate_full_name, candidate_email)
+       VALUES ($1, $2, $3, 1, 'Synthetic Candidate', 'candidate@example.test')
+       RETURNING application_id`,
+      [organizationId, roleId, csvIntakeId]
+    );
+    const applicationId = application.rows[0]?.application_id;
+    const source = await admin.query<{ intake_id: string }>(
+      `INSERT INTO file_intakes
+         (organization_id, role_id, storage_key, declared_filename, declared_mime_type, status,
+          created_by_user_id, sniffed_mime_type, size_bytes, sha256_hash)
+       VALUES ($1, $2, $3, 'synthetic.pdf', 'application/pdf', 'validated', $4,
+               'application/pdf', 256, $5)
+       RETURNING intake_id`,
+      [organizationId, roleId, `probe/${suffix}/synthetic.pdf`, userId, "b".repeat(64)]
+    );
+    const sourceIntakeId = source.rows[0]?.intake_id;
+    if (applicationId === undefined || sourceIntakeId === undefined) {
+      throw new Error("queue probe did not create application and source intake");
+    }
+    const text = "Built and operated PostgreSQL services with TypeScript and reliable queue workers.";
+    await admin.query(
+      `INSERT INTO canonical_text_extractions (intake_id, pages, total_pages, quality)
+       VALUES ($1, $2::jsonb, 1, 'full')`,
+      [sourceIntakeId, JSON.stringify([{ pageNumber: 1, text, characterCount: text.length }])]
+    );
+    return { schema, organizationId, userId, roleId, applicationId, sourceIntakeId, rubricId };
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/** The immutable published rubric version used by hosted extraction. */
+export async function getLatestPublishedRubricForRole(
+  databaseUrl: string,
+  schema: string,
+  roleId: string
+): Promise<Rubric | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<RubricRow>(
+      `SELECT ${RUBRIC_COLUMNS}
+         FROM "${schema}".rubrics
+        WHERE role_id = $1 AND status = 'published'
+        ORDER BY version DESC
         LIMIT 1`,
       [roleId]
     );
@@ -2546,6 +3778,12 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0002_organizations_users_memberships.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0003_magic_link_tokens.sql"), "utf8"));
     await admin.query(readFileSync(join(MIGRATIONS_DIRECTORY, "0004_tenant_scoped_rls.sql"), "utf8"));
+    // redeemMagicLinkToken now reads replace_existing_role back on every
+    // redemption (review #88, REV-010), so a probe schema without it would
+    // fail on the SELECT rather than exercising RLS.
+    await admin.query(
+      readFileSync(join(MIGRATIONS_DIRECTORY, "0027_invite_role_replacement_intent.sql"), "utf8")
+    );
     await admin.query(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}'`);
     await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${role}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${role}`);
@@ -2615,11 +3853,15 @@ export async function assertMagicLinkRlsSafety(databaseUrl: string): Promise<voi
     }
 
     // A promotion re-invite: DO NOTHING would report success here while
-    // silently leaving the old role in place.
+    // silently leaving the old role in place. replaceExistingRole: true
+    // because this deliberately targets an email that already holds a
+    // membership (review #88, REV-010) -- without it, redemption now
+    // refuses the change before DO NOTHING/DO UPDATE is ever reached.
     await createMagicLinkToken(probeDatabaseUrl, schema, {
       tokenHash: `rls-reinvite-${suffix}`,
       email: invitedEmail,
       invite: { organizationId, role: "admin" },
+      replaceExistingRole: true,
       expiresAt
     });
     await redeemMagicLinkToken(probeDatabaseUrl, schema, `rls-reinvite-${suffix}`);
@@ -4172,11 +5414,11 @@ export interface RecordedEvidenceOutcome {
 export async function recordEvidenceOutcome(
   databaseUrl: string,
   schema: string,
-  input: RecordEvidenceOutcomeInput
+  input: RecordEvidenceOutcomeInput,
+  existingClient?: DatabaseQueryable
 ): Promise<void> {
   assertSafeSchema(schema);
-  const client = await acquireConnection(databaseUrl);
-  try {
+  const insert = async (client: DatabaseQueryable): Promise<void> => {
     await client.query(
       `INSERT INTO "${schema}".evidence_outcomes
          (organization_id, application_id, criterion_id, kind, outcome, run_id)
@@ -4190,6 +5432,14 @@ export async function recordEvidenceOutcome(
         input.runId ?? null
       ]
     );
+  };
+  if (existingClient !== undefined) {
+    await insert(existingClient);
+    return;
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await insert(client);
   } finally {
     client.release();
   }
@@ -4566,6 +5816,21 @@ export async function correctEvidenceOutcome(
             : { outcome: "idempotency_in_flight" };
         }
         claimId = claim.claimId;
+      }
+
+      // Serialize correction and worker completion for the same application.
+      // Whichever transaction obtains this lock second observes the first one's
+      // append, so a machine result can never become current over a human edit.
+      const application = await client.query(
+        `SELECT application_id
+           FROM "${schema}".applications
+          WHERE organization_id = $1 AND application_id = $2
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId]
+      );
+      if (application.rows[0] === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "nothing_to_correct" };
       }
 
       // What is actually load-bearing here, measured rather than
@@ -5470,6 +6735,878 @@ export async function listCandidateDecisionsForApplication(
       ...(row.supersedes_decision_id === null ? {} : { supersedesDecisionId: row.supersedes_decision_id }),
       decidedAt: row.decided_at.toISOString()
     }));
+  } finally {
+    client.release();
+  }
+}
+
+// ---- AF-102: durable evidence-extraction jobs ----
+
+interface EvidenceExtractionJobRow {
+  readonly job_id: string;
+  readonly organization_id: string;
+  readonly role_id: string;
+  readonly application_id: string;
+  readonly source_intake_id: string;
+  readonly rubric_id: string;
+  readonly workflow_version: string;
+  readonly enqueue_generation: string;
+  readonly state: EvidenceExtractionJob["state"];
+  readonly enqueued_at: Date;
+  readonly available_at: Date;
+  readonly started_at: Date | null;
+  readonly completed_at: Date | null;
+  readonly failed_at: Date | null;
+  readonly attempt_count: number;
+  readonly max_attempts: number;
+  readonly lease_owner: string | null;
+  readonly lease_expires_at: Date | null;
+  readonly failure_code: string | null;
+  readonly updated_at: Date;
+}
+
+const EVIDENCE_EXTRACTION_JOB_COLUMNS =
+  "job_id, organization_id, role_id, application_id, source_intake_id, rubric_id, workflow_version, " +
+  "enqueue_generation, state, enqueued_at, available_at, started_at, completed_at, failed_at, attempt_count, max_attempts, " +
+  "lease_owner, lease_expires_at, failure_code, updated_at";
+
+function rowToEvidenceExtractionJob(row: EvidenceExtractionJobRow): EvidenceExtractionJob {
+  return {
+    jobId: row.job_id,
+    organizationId: row.organization_id,
+    roleId: row.role_id,
+    applicationId: row.application_id,
+    sourceIntakeId: row.source_intake_id,
+    rubricId: row.rubric_id,
+    workflowVersion: row.workflow_version,
+    state: row.state,
+    enqueuedAt: row.enqueued_at.toISOString(),
+    availableAt: row.available_at.toISOString(),
+    ...(row.started_at === null ? {} : { startedAt: row.started_at.toISOString() }),
+    ...(row.completed_at === null ? {} : { completedAt: row.completed_at.toISOString() }),
+    ...(row.failed_at === null ? {} : { failedAt: row.failed_at.toISOString() }),
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    ...(row.lease_owner === null ? {} : { leaseOwner: row.lease_owner }),
+    ...(row.lease_expires_at === null ? {} : { leaseExpiresAt: row.lease_expires_at.toISOString() }),
+    ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
+    updatedAt: row.updated_at.toISOString()
+  };
+}
+
+function assertWorkerId(workerId: string): void {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(workerId)) {
+    throw new Error("workerId must contain only safe machine-identity characters");
+  }
+}
+
+function assertClaimAttempt(attemptCount: number): void {
+  if (!Number.isInteger(attemptCount) || attemptCount < 1) {
+    throw new Error("attemptCount must identify a positive claimed attempt");
+  }
+}
+
+function assertFailureCode(failureCode: string): void {
+  if (!/^[a-z][a-z0-9_]{0,63}$/u.test(failureCode)) {
+    throw new Error("failureCode must be a bounded machine-readable code");
+  }
+}
+
+export interface EnqueueEvidenceExtractionJobInput {
+  readonly organizationId: string;
+  readonly roleId: string;
+  readonly applicationId: string;
+  readonly sourceIntakeId: string;
+  readonly rubricId: string;
+  readonly workflowVersion: string;
+  readonly maxAttempts: number;
+  readonly now?: Date;
+}
+
+export type EnqueueEvidenceExtractionJobOutcome =
+  | { readonly outcome: "enqueued" | "requeued" | "replayed"; readonly job: EvidenceExtractionJob }
+  | { readonly outcome: "not_eligible" }
+  | { readonly outcome: "source_conflict" };
+
+/**
+ * One production enqueue boundary. The eligibility query proves, in the same
+ * transaction, that application, canonical document and published rubric all
+ * belong to the same tenant and role, then binds the first accepted source.
+ */
+export async function enqueueEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: EnqueueEvidenceExtractionJobInput
+): Promise<EnqueueEvidenceExtractionJobOutcome> {
+  assertSafeSchema(schema);
+  if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
+    throw new Error("maxAttempts must be a positive integer");
+  }
+  // Production enqueue timestamps come from PostgreSQL so queue-age and job
+  // ordering are not affected by web/DB host clock skew. Tests may inject a
+  // deterministic timestamp through the existing seam.
+  const requestedEnqueueAt = input.now ?? null;
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // Existing lifecycle writers lock job -> application. Follow the same
+      // order when this logical job already exists so enqueue cannot deadlock
+      // a completion while resetting or replaying it.
+      const preexisting = await client.query<EvidenceExtractionJobRow>(
+        `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+           FROM "${schema}".evidence_extraction_jobs
+          WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
+            AND rubric_id = $4 AND workflow_version = $5
+          FOR UPDATE`,
+        [input.organizationId, input.applicationId, input.sourceIntakeId, input.rubricId, input.workflowVersion]
+      );
+      const eligibility = await client.query<{ evidence_source_intake_id: string | null }>(
+        `SELECT a.evidence_source_intake_id
+           FROM "${schema}".applications a
+           JOIN "${schema}".file_intakes f
+             ON f.intake_id = $4 AND f.organization_id = a.organization_id AND f.role_id = a.role_id
+           JOIN "${schema}".canonical_text_extractions c ON c.intake_id = f.intake_id
+           JOIN "${schema}".rubrics r
+             ON r.rubric_id = $5 AND r.role_id = a.role_id AND r.status = 'published'
+          WHERE a.application_id = $3 AND a.organization_id = $1 AND a.role_id = $2
+            AND f.status = 'validated'
+            AND f.sniffed_mime_type IN ('application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+          FOR UPDATE OF a`,
+        [input.organizationId, input.roleId, input.applicationId, input.sourceIntakeId, input.rubricId]
+      );
+      const eligible = eligibility.rows[0];
+      if (eligible === undefined) {
+        await client.query("ROLLBACK");
+        return { outcome: "not_eligible" };
+      }
+      if (
+        eligible.evidence_source_intake_id !== null &&
+        eligible.evidence_source_intake_id !== input.sourceIntakeId
+      ) {
+        await client.query("ROLLBACK");
+        return { outcome: "source_conflict" };
+      }
+      if (eligible.evidence_source_intake_id === null) {
+        await client.query(
+          `UPDATE "${schema}".applications
+              SET evidence_source_intake_id = $2
+            WHERE application_id = $1`,
+          [input.applicationId, input.sourceIntakeId]
+        );
+      }
+
+      // If no row existed before the application lock, check again after it:
+      // a concurrent first enqueue may have committed while we waited.
+      const existingRow = preexisting.rows[0] ?? (
+        await client.query<EvidenceExtractionJobRow>(
+          `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE organization_id = $1 AND application_id = $2 AND source_intake_id = $3
+              AND rubric_id = $4 AND workflow_version = $5
+            FOR UPDATE`,
+          [
+            input.organizationId,
+            input.applicationId,
+            input.sourceIntakeId,
+            input.rubricId,
+            input.workflowVersion
+          ]
+        )
+      ).rows[0];
+      if (existingRow !== undefined) {
+        if (existingRow.state === "failed") {
+          const requeued = await client.query<EvidenceExtractionJobRow>(
+            `WITH next_enqueue AS (
+               SELECT COALESCE(MAX(enqueue_generation), 0) + 1 AS next_generation,
+                      COALESCE($2::timestamptz, clock_timestamp()) AS next_enqueued_at
+                 FROM "${schema}".evidence_extraction_jobs
+                WHERE organization_id = $4 AND application_id = $5
+             )
+             UPDATE "${schema}".evidence_extraction_jobs AS job
+                SET state = 'ready',
+                    enqueue_generation = next_enqueue.next_generation,
+                    enqueued_at = next_enqueue.next_enqueued_at,
+                    available_at = next_enqueue.next_enqueued_at,
+                    started_at = NULL, completed_at = NULL, failed_at = NULL,
+                    attempt_count = 0, max_attempts = $3,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    failure_code = NULL, updated_at = next_enqueue.next_enqueued_at
+               FROM next_enqueue
+              WHERE job.job_id = $1
+            RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+            [
+              existingRow.job_id,
+              requestedEnqueueAt,
+              input.maxAttempts,
+              input.organizationId,
+              input.applicationId
+            ]
+          );
+          const row = requeued.rows[0];
+          if (row === undefined) throw new Error("failed evidence-extraction job could not be requeued");
+          await client.query("COMMIT");
+          return { outcome: "requeued", job: rowToEvidenceExtractionJob(row) };
+        }
+        await client.query("COMMIT");
+        return { outcome: "replayed", job: rowToEvidenceExtractionJob(existingRow) };
+      }
+
+      const inserted = await client.query<EvidenceExtractionJobRow>(
+        `WITH next_enqueue AS (
+           SELECT COALESCE(MAX(enqueue_generation), 0) + 1 AS enqueue_generation,
+                  COALESCE($8::timestamptz, clock_timestamp()) AS enqueued_at
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE organization_id = $1 AND application_id = $3
+         )
+         INSERT INTO "${schema}".evidence_extraction_jobs
+           (organization_id, role_id, application_id, source_intake_id, rubric_id,
+            workflow_version, max_attempts, enqueue_generation,
+            enqueued_at, available_at, updated_at)
+         SELECT $1, $2, $3, $4, $5, $6, $7, next_enqueue.enqueue_generation,
+                next_enqueue.enqueued_at, next_enqueue.enqueued_at, next_enqueue.enqueued_at
+           FROM next_enqueue
+         RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+        [
+          input.organizationId,
+          input.roleId,
+          input.applicationId,
+          input.sourceIntakeId,
+          input.rubricId,
+          input.workflowVersion,
+          input.maxAttempts,
+          requestedEnqueueAt
+        ]
+      );
+      const created = inserted.rows[0];
+      if (created === undefined) throw new Error("evidence-extraction job insert returned no row");
+      await client.query("COMMIT");
+      return { outcome: "enqueued", job: rowToEvidenceExtractionJob(created) };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export async function getEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  jobId: string
+): Promise<EvidenceExtractionJob | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<EvidenceExtractionJobRow>(
+      `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+         FROM "${schema}".evidence_extraction_jobs
+        WHERE organization_id = $1 AND job_id = $2`,
+      [organizationId, jobId]
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : rowToEvidenceExtractionJob(row);
+  } finally {
+    client.release();
+  }
+}
+
+async function lockEvidenceApplication(
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow
+): Promise<void> {
+  const application = await client.query(
+    `SELECT application_id
+       FROM "${schema}".applications
+      WHERE organization_id = $1 AND application_id = $2
+      FOR UPDATE`,
+    [job.organization_id, job.application_id]
+  );
+  if (application.rows[0] === undefined) {
+    throw new Error("evidence-extraction job has no tenant-scoped application");
+  }
+}
+
+/**
+ * A worker result may become current only when no newer logical job has been
+ * enqueued for the application. enqueue_generation is allocated while holding
+ * the application row lock, so machine precedence is explicit and independent
+ * of completion order or host clocks. Application locking is also shared with
+ * the correction writer, so a correction racing completion is either observed
+ * and preserved, or is appended after the machine result and remains current.
+ */
+async function recordCurrentMachineOutcomes(
+  databaseUrl: string,
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow,
+  outcomes: readonly EvidenceOutcome[],
+  runId?: string
+): Promise<void> {
+  await lockEvidenceApplication(client, schema, job);
+  const newerJob = await client.query(
+    `SELECT 1
+       FROM "${schema}".evidence_extraction_jobs
+      WHERE organization_id = $1 AND application_id = $2
+        AND enqueue_generation > $3
+      LIMIT 1`,
+    [job.organization_id, job.application_id, job.enqueue_generation]
+  );
+  if (newerJob.rows[0] !== undefined) {
+    return;
+  }
+  for (const outcome of outcomes) {
+    if (
+      outcome.organizationId !== job.organization_id ||
+      outcome.candidateId !== job.application_id
+    ) {
+      throw new Error("machine evidence outcome attribution does not match its job");
+    }
+    const head = await client.query<{ corrected_by_user_id: string | null }>(
+      `SELECT corrected_by_user_id
+         FROM "${schema}".evidence_outcomes
+        WHERE organization_id = $1 AND application_id = $2 AND criterion_id = $3
+        ORDER BY recorded_at DESC, evidence_outcome_id DESC
+        LIMIT 1
+        FOR UPDATE`,
+      [job.organization_id, job.application_id, outcome.criterionId]
+    );
+    const current = head.rows[0];
+    if (
+      current?.corrected_by_user_id !== null &&
+      current?.corrected_by_user_id !== undefined
+    ) {
+      continue;
+    }
+    await recordEvidenceOutcome(databaseUrl, schema, {
+      organizationId: job.organization_id,
+      applicationId: job.application_id,
+      outcome,
+      ...(runId === undefined ? {} : { runId })
+    }, client);
+  }
+}
+
+async function recordTerminalEvidenceFailure(
+  databaseUrl: string,
+  client: ClientBase,
+  schema: string,
+  job: EvidenceExtractionJobRow,
+  failureCode: string,
+  runId?: string
+): Promise<void> {
+  const rubric = await client.query<{ criteria: readonly RubricCriterion[] }>(
+    `SELECT criteria FROM "${schema}".rubrics WHERE rubric_id = $1`,
+    [job.rubric_id]
+  );
+  const criteria = rubric.rows[0]?.criteria;
+  if (criteria === undefined) {
+    throw new Error("evidence-extraction job has no rubric criteria");
+  }
+  await recordCurrentMachineOutcomes(
+    databaseUrl,
+    client,
+    schema,
+    job,
+    buildEvidenceExtractionFailureOutcomes(
+      { organizationId: job.organization_id, applicationId: job.application_id },
+      criteria.map((criterion) => criterion.criterionId),
+      failureCode
+    ),
+    runId
+  );
+}
+
+export interface ClaimEvidenceExtractionJobInput {
+  readonly workerId: string;
+  readonly leaseDurationMs: number;
+  readonly now?: Date;
+}
+
+export interface ClaimEvidenceExtractionJobOutcome {
+  readonly job: EvidenceExtractionJob | undefined;
+  /**
+   * Jobs made durably terminal by this claim transaction because their last
+   * lease expired. The caller may publish one failure signal per transition
+   * after this function returns; no signal is owed when the transaction rolls
+   * back.
+   */
+  readonly exhaustedLeaseFailures: number;
+}
+
+async function resolveQueueClock(
+  client: ClientBase,
+  requestedNow: Date | undefined
+): Promise<Date | string> {
+  if (requestedNow !== undefined) {
+    return requestedNow;
+  }
+  // Keep PostgreSQL's sub-millisecond precision. Parsing this as a JavaScript
+  // Date truncates microseconds and can make an immediate completion appear
+  // earlier than started_at under load.
+  const result = await client.query<{ current_time: string }>(
+    "SELECT clock_timestamp()::text AS current_time"
+  );
+  const currentTime = result.rows[0]?.current_time;
+  if (currentTime === undefined) {
+    throw new Error("database clock query returned no row");
+  }
+  return currentTime;
+}
+
+export async function claimEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: ClaimEvidenceExtractionJobInput
+): Promise<ClaimEvidenceExtractionJobOutcome> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  if (!Number.isInteger(input.leaseDurationMs) || input.leaseDurationMs < 1) {
+    throw new Error("leaseDurationMs must be a positive integer");
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      // Enqueue availability is stamped by PostgreSQL in production. Use the
+      // same clock for an immediate claim so host skew cannot make a freshly
+      // enqueued job appear to be from the future.
+      const now = await resolveQueueClock(client, input.now);
+      const exhausted = await client.query<EvidenceExtractionJobRow>(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = 'failed', failed_at = $1, lease_owner = NULL, lease_expires_at = NULL,
+                failure_code = 'lease_expired_exhausted', updated_at = $1
+          WHERE state = 'running' AND lease_expires_at <= $1 AND attempt_count >= max_attempts
+        RETURNING ${EVIDENCE_EXTRACTION_JOB_COLUMNS}`,
+        [now]
+      );
+      for (const failedJob of [...exhausted.rows].sort((a, b) =>
+        a.application_id.localeCompare(b.application_id) || a.job_id.localeCompare(b.job_id)
+      )) {
+        await recordTerminalEvidenceFailure(
+          databaseUrl,
+          client,
+          schema,
+          failedJob,
+          "lease_expired_exhausted"
+        );
+      }
+      const result = await client.query<EvidenceExtractionJobRow>(
+        `WITH candidate AS (
+           SELECT job_id
+             FROM "${schema}".evidence_extraction_jobs
+            WHERE (
+              (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+            )
+              AND attempt_count < max_attempts
+            ORDER BY enqueued_at, job_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+         )
+         UPDATE "${schema}".evidence_extraction_jobs j
+            SET state = 'running',
+                started_at = COALESCE(j.started_at, $1),
+                attempt_count = j.attempt_count + 1,
+                lease_owner = $2,
+                lease_expires_at = $1 + ($3::bigint * interval '1 millisecond'),
+                updated_at = $1
+           FROM candidate
+          WHERE j.job_id = candidate.job_id
+         RETURNING j.${EVIDENCE_EXTRACTION_JOB_COLUMNS.split(", ").join(", j.")}`,
+        [now, input.workerId, input.leaseDurationMs]
+      );
+      await client.query("COMMIT");
+      const row = result.rows[0];
+      return {
+        job: row === undefined ? undefined : rowToEvidenceExtractionJob(row),
+        exhaustedLeaseFailures: exhausted.rows.length
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionJobContext {
+  readonly job: EvidenceExtractionJob;
+  readonly pages: readonly CanonicalTextPage[];
+  readonly quality: CanonicalTextQuality;
+  readonly rubricVersion: number;
+  readonly criteria: readonly RubricCriterion[];
+}
+
+export async function getEvidenceExtractionJobContext(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  jobId: string
+): Promise<EvidenceExtractionJobContext | undefined> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<EvidenceExtractionJobRow & {
+      pages: readonly CanonicalTextPage[];
+      quality: CanonicalTextQuality;
+      rubric_version: number;
+      criteria: readonly RubricCriterion[];
+    }>(
+      `SELECT j.${EVIDENCE_EXTRACTION_JOB_COLUMNS.split(", ").join(", j.")},
+              c.pages, c.quality, r.version AS rubric_version, r.criteria
+         FROM "${schema}".evidence_extraction_jobs j
+         JOIN "${schema}".canonical_text_extractions c ON c.intake_id = j.source_intake_id
+         JOIN "${schema}".rubrics r ON r.rubric_id = j.rubric_id AND r.status = 'published'
+        WHERE j.organization_id = $1 AND j.job_id = $2`,
+      [organizationId, jobId]
+    );
+    const row = result.rows[0];
+    return row === undefined
+      ? undefined
+      : {
+          job: rowToEvidenceExtractionJob(row),
+          pages: row.pages,
+          quality: row.quality,
+          rubricVersion: row.rubric_version,
+          criteria: row.criteria
+        };
+  } finally {
+    client.release();
+  }
+}
+
+export async function renewEvidenceExtractionJobLease(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly attemptCount: number;
+    readonly leaseDurationMs: number;
+    readonly now?: Date;
+  }
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const now = await resolveQueueClock(client, input.now);
+    const result = await client.query(
+      `UPDATE "${schema}".evidence_extraction_jobs
+          SET lease_expires_at = $5 + ($6::bigint * interval '1 millisecond'), updated_at = $5
+        WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+          AND attempt_count = $4 AND lease_expires_at > $5`,
+      [input.organizationId, input.jobId, input.workerId, input.attemptCount, now, input.leaseDurationMs]
+    );
+    return result.rowCount === 1;
+  } finally {
+    client.release();
+  }
+}
+
+export interface EvidenceExtractionRunMetadata {
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly extractionSchemaVersion: string;
+  readonly extractionSchemaName: string;
+  readonly rubricVersion: string;
+}
+
+async function lockOwnedJob(
+  client: ClientBase,
+  schema: string,
+  organizationId: string,
+  jobId: string,
+  workerId: string,
+  attemptCount: number,
+  now: Date | string
+): Promise<EvidenceExtractionJobRow | undefined> {
+  const result = await client.query<EvidenceExtractionJobRow>(
+    `SELECT ${EVIDENCE_EXTRACTION_JOB_COLUMNS}
+       FROM "${schema}".evidence_extraction_jobs
+      WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+        AND attempt_count = $4 AND lease_expires_at > $5
+      FOR UPDATE`,
+    [organizationId, jobId, workerId, attemptCount, now]
+  );
+  return result.rows[0];
+}
+
+export async function completeEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly attemptCount: number;
+    readonly outcomes: readonly EvidenceOutcome[];
+    readonly run?: EvidenceExtractionRunMetadata;
+    readonly now?: Date;
+  }
+): Promise<"completed" | "lease_lost"> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      const now = await resolveQueueClock(client, input.now);
+      const job = await lockOwnedJob(
+        client,
+        schema,
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        now
+      );
+      if (job === undefined) {
+        await client.query("ROLLBACK");
+        return "lease_lost";
+      }
+      const runId = input.run === undefined
+        ? undefined
+        : await recordEvidenceExtractionRun(databaseUrl, schema, {
+            organizationId: input.organizationId,
+            entityType: "application",
+            entityId: job.application_id,
+            provider: input.run.provider,
+            model: input.run.model,
+            promptVersion: input.run.promptVersion,
+            extractionSchemaVersion: input.run.extractionSchemaVersion,
+            extractionSchemaName: input.run.extractionSchemaName,
+            rubricVersion: input.run.rubricVersion
+          }, client);
+      await recordCurrentMachineOutcomes(databaseUrl, client, schema, job, input.outcomes, runId);
+      await client.query(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = 'completed', completed_at = $2, failed_at = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, failure_code = NULL, updated_at = $2
+          WHERE job_id = $1`,
+        [input.jobId, now]
+      );
+      await client.query("COMMIT");
+      return "completed";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+export async function retryOrFailEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly attemptCount: number;
+    readonly failureCode: string;
+    readonly retryable: boolean;
+    readonly availableAt: Date;
+    readonly run?: EvidenceExtractionRunMetadata;
+    readonly now?: Date;
+  }
+): Promise<"retrying" | "failed" | "lease_lost"> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
+  assertFailureCode(input.failureCode);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query("BEGIN");
+    try {
+      const now = await resolveQueueClock(client, input.now);
+      const job = await lockOwnedJob(
+        client,
+        schema,
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        now
+      );
+      if (job === undefined) {
+        await client.query("ROLLBACK");
+        return "lease_lost";
+      }
+      const runId = input.run === undefined
+        ? undefined
+        : await recordEvidenceExtractionRun(databaseUrl, schema, {
+          organizationId: input.organizationId,
+          entityType: "application",
+          entityId: job.application_id,
+          provider: input.run.provider,
+          model: input.run.model,
+          promptVersion: input.run.promptVersion,
+          extractionSchemaVersion: input.run.extractionSchemaVersion,
+          extractionSchemaName: input.run.extractionSchemaName,
+          rubricVersion: input.run.rubricVersion
+        }, client);
+      const retry = input.retryable && job.attempt_count < job.max_attempts;
+      if (!retry) {
+        await recordTerminalEvidenceFailure(
+          databaseUrl,
+          client,
+          schema,
+          job,
+          input.failureCode,
+          runId
+        );
+      }
+      await client.query(
+        `UPDATE "${schema}".evidence_extraction_jobs
+            SET state = $2::text,
+                available_at = CASE WHEN $2::text = 'ready' THEN $3::timestamptz ELSE available_at END,
+                failed_at = CASE WHEN $2::text = 'failed' THEN $4::timestamptz ELSE NULL::timestamptz END,
+                lease_owner = NULL, lease_expires_at = NULL,
+                failure_code = $5, updated_at = $4
+          WHERE job_id = $1`,
+        [input.jobId, retry ? "ready" : "failed", input.availableAt, now, input.failureCode]
+      );
+      await client.query("COMMIT");
+      return retry ? "retrying" : "failed";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** Operator controls (kill switch/budget cap) defer without consuming retries. */
+export async function deferEvidenceExtractionJob(
+  databaseUrl: string,
+  schema: string,
+  input: {
+    readonly organizationId: string;
+    readonly jobId: string;
+    readonly workerId: string;
+    readonly attemptCount: number;
+    readonly failureCode: string;
+    readonly availableAt: Date;
+    readonly now?: Date;
+  }
+): Promise<boolean> {
+  assertSafeSchema(schema);
+  assertWorkerId(input.workerId);
+  assertClaimAttempt(input.attemptCount);
+  assertFailureCode(input.failureCode);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const now = await resolveQueueClock(client, input.now);
+    const result = await client.query(
+      `UPDATE "${schema}".evidence_extraction_jobs
+          SET state = 'ready', available_at = $6, attempt_count = GREATEST(0, attempt_count - 1),
+              lease_owner = NULL, lease_expires_at = NULL, failure_code = $5, updated_at = $7
+        WHERE organization_id = $1 AND job_id = $2 AND state = 'running' AND lease_owner = $3
+          AND attempt_count = $4 AND lease_expires_at > $7`,
+      [
+        input.organizationId,
+        input.jobId,
+        input.workerId,
+        input.attemptCount,
+        input.failureCode,
+        input.availableAt,
+        now
+      ]
+    );
+    return result.rowCount === 1;
+  } finally {
+    client.release();
+  }
+}
+
+export async function recordWorkerHeartbeat(
+  databaseUrl: string,
+  schema: string,
+  workerId: string,
+  now: Date = new Date()
+): Promise<void> {
+  assertSafeSchema(schema);
+  assertWorkerId(workerId);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    await client.query(
+      `INSERT INTO "${schema}".worker_heartbeats (worker_id, last_seen_at)
+       VALUES ($1, $2)
+       ON CONFLICT (worker_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at`,
+      [workerId, now]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getEvidenceExtractionQueueMonitoringSnapshot(
+  databaseUrl: string,
+  schema: string,
+  now: Date = new Date()
+): Promise<EvidenceExtractionQueueMonitoringSnapshot> {
+  assertSafeSchema(schema);
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      oldest_ready_at: Date | null;
+      ready_jobs: string;
+      running_jobs: string;
+      failed_jobs: string;
+      completed_jobs: string;
+      total_attempts: string;
+      last_heartbeat_at: Date | null;
+    }>(
+      `SELECT
+         MIN(enqueued_at) FILTER (
+           WHERE (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+         ) AS oldest_ready_at,
+         COUNT(*) FILTER (
+           WHERE (state = 'ready' AND available_at <= $1)
+              OR (state = 'running' AND lease_expires_at <= $1)
+         )::text AS ready_jobs,
+         COUNT(*) FILTER (WHERE state = 'running' AND lease_expires_at > $1)::text AS running_jobs,
+         COUNT(*) FILTER (WHERE state = 'failed')::text AS failed_jobs,
+         COUNT(*) FILTER (WHERE state = 'completed')::text AS completed_jobs,
+         COALESCE(SUM(attempt_count), 0)::text AS total_attempts,
+         (SELECT MAX(last_seen_at) FROM "${schema}".worker_heartbeats) AS last_heartbeat_at
+       FROM "${schema}".evidence_extraction_jobs`,
+      [now]
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("queue monitoring query returned no row");
+    }
+    const oldestReadyAgeMs = row.oldest_ready_at === null
+      ? null
+      : Math.max(0, now.getTime() - row.oldest_ready_at.getTime());
+    const heartbeatAgeMs = row.last_heartbeat_at === null
+      ? null
+      : Math.max(0, now.getTime() - row.last_heartbeat_at.getTime());
+    return {
+      observedAt: now.toISOString(),
+      oldestReadyAgeMs,
+      readyJobs: Number(row.ready_jobs),
+      runningJobs: Number(row.running_jobs),
+      failedJobs: Number(row.failed_jobs),
+      completedJobs: Number(row.completed_jobs),
+      totalAttempts: Number(row.total_attempts),
+      lastHeartbeatAt: row.last_heartbeat_at?.toISOString() ?? null,
+      heartbeatAgeMs
+    };
   } finally {
     client.release();
   }

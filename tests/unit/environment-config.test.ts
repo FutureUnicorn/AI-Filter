@@ -6,7 +6,9 @@ import {
   assertEnvironmentIsolation,
   assertSyntheticDataAllowed,
   loadEnvironmentConfig,
+  loadEvidenceExtractionQueueConfig,
   loadMonitoringConfig,
+  loadWorkerProcessingConfig,
   publicEnvironmentSummary,
   type EnvironmentSource
 } from "../../packages/config/src/index.ts";
@@ -198,4 +200,67 @@ test("monitoring derives environment and release and requires an explicit valid 
       /SENTRY_TRACES_SAMPLE_RATE/u
     );
   }
+});
+
+test("worker processing is credential-free while disabled and validates hosted processing when enabled", () => {
+  assert.deepEqual(loadWorkerProcessingConfig({}), {
+    enabled: false,
+    concurrency: 1,
+    pollIntervalMs: 1_000,
+    heartbeatIntervalMs: 10_000,
+    leaseDurationMs: 60_000,
+    retryBaseDelayMs: 5_000,
+    maxAttempts: 3
+  });
+  assert.equal(loadWorkerProcessingConfig({ WORKER_CONCURRENCY: "16" }).concurrency, 16);
+  assert.throws(
+    () => loadWorkerProcessingConfig({ WORKER_CONCURRENCY: "17" }),
+    /WORKER_CONCURRENCY.*16/u
+  );
+  const enabled = loadWorkerProcessingConfig({
+    WORKER_PROCESSING_ENABLED: "true",
+    WORKER_INSTANCE_ID: "worker-staging-1",
+    OPENAI_API_KEY: "synthetic-key",
+    OPENAI_MODEL: "default-model",
+    OPENAI_ESCALATION_MODEL: "escalation-model",
+    INFERENCE_MAX_TOKENS_PER_PERIOD: "100000",
+    INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+    INFERENCE_BUDGET_PERIOD: "month",
+    WORKER_CONCURRENCY: "4"
+  });
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.workerId, "worker-staging-1");
+  assert.equal(enabled.concurrency, 4);
+  assert.equal(enabled.budget?.maxTokensPerPeriod, 100_000);
+  assert.equal(enabled.budget?.period, "month");
+  assert.equal(JSON.stringify(enabled).includes("candidate"), false);
+  assert.throws(
+    () => loadWorkerProcessingConfig({ WORKER_PROCESSING_ENABLED: "true" }),
+    /WORKER_INSTANCE_ID.*OPENAI_API_KEY.*OPENAI_MODEL.*OPENAI_ESCALATION_MODEL.*INFERENCE_MAX_TOKENS_PER_PERIOD/u
+  );
+  assert.throws(
+    () =>
+      loadWorkerProcessingConfig({
+        WORKER_PROCESSING_ENABLED: "true",
+        WORKER_INSTANCE_ID: "worker-1",
+        OPENAI_API_KEY: "synthetic-key",
+        OPENAI_MODEL: "default",
+        OPENAI_ESCALATION_MODEL: "escalation",
+        INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+        INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+        INFERENCE_BUDGET_PERIOD: "day",
+        WORKER_HEARTBEAT_INTERVAL_MS: "30000",
+        WORKER_LEASE_DURATION_MS: "60000"
+      }),
+    /less than half/u
+  );
+});
+
+test("web enqueue and worker use the same bounded retry count", () => {
+  assert.deepEqual(loadEvidenceExtractionQueueConfig({}), { maxAttempts: 3 });
+  assert.deepEqual(loadEvidenceExtractionQueueConfig({ WORKER_MAX_ATTEMPTS: "5" }), { maxAttempts: 5 });
+  assert.throws(
+    () => loadEvidenceExtractionQueueConfig({ WORKER_MAX_ATTEMPTS: "0" }),
+    /positive integer/u
+  );
 });

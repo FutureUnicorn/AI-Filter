@@ -43,23 +43,7 @@ interface UnhandledErrorExemption {
   readonly reason: string;
 }
 
-const UNHANDLED_ERROR_EXEMPTIONS: readonly UnhandledErrorExemption[] = [
-  {
-    className: "InferenceKillSwitchEngagedError",
-    consumerPackage: "@signal-audit/ai",
-    reason: "the inference pipeline has no caller on this branch yet; the worker that will run it is a later ticket"
-  },
-  {
-    className: "AiUsageUnavailableError",
-    consumerPackage: "@signal-audit/ai",
-    reason: "same: thrown by the OpenAI adapter, which nothing invokes yet"
-  },
-  {
-    className: "AiStructuredCallParseError",
-    consumerPackage: "@signal-audit/ai",
-    reason: "same: thrown by the OpenAI adapter, which nothing invokes yet"
-  }
-];
+const UNHANDLED_ERROR_EXEMPTIONS: readonly UnhandledErrorExemption[] = [];
 
 interface ExportedError {
   readonly className: string;

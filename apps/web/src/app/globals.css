@@ -69,3 +69,95 @@ code {
   color: #6b7876;
   font-style: italic;
 }
+
+/* AF-97: the sign-in form, the organization switcher, and the role and
+   invite forms -- the first pages here that take input rather than only
+   render a table.
+
+   Scoped to `.stacked-form` rather than written as bare `form`, `label`,
+   `button` and `input` selectors (review #88, REV-005). globals.css reaches
+   every page, so element selectors restyled the four buttons and labelled
+   fields on the rubric page and the two on the import page -- pages this
+   change does not otherwise touch, is not exercised by anything in the
+   gate, and does not claim to alter. Making the app visually consistent may
+   well be wanted; it is a deliberate visual decision for the tickets that
+   own those pages, not a side effect of the entry-point work. */
+
+.stacked-form {
+  margin-top: 2rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  max-width: 28rem;
+}
+
+.stacked-form h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.stacked-form label {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #176b57;
+}
+
+.stacked-form input[type="email"],
+.stacked-form input[type="text"],
+.stacked-form select {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid #b9c7c3;
+  border-radius: 0.375rem;
+  font: inherit;
+  font-size: 1rem;
+  background: #ffffff;
+  color: inherit;
+}
+
+.stacked-form input:disabled,
+.stacked-form select:disabled {
+  background: #eceff0;
+}
+
+.stacked-form button,
+.notice button {
+  padding: 0.6rem 1.1rem;
+  border: 0;
+  border-radius: 0.375rem;
+  background: #176b57;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.stacked-form button:disabled,
+.notice button:disabled {
+  background: #9bb3ac;
+  cursor: not-allowed;
+}
+
+.notice {
+  border-left: 4px solid #176b57;
+  padding-left: 0.85rem;
+  font-size: 1rem;
+}
+
+.footnote {
+  margin-top: 2.5rem;
+  font-size: 0.95rem;
+  color: #47565b;
+}
+
+.stacked-form .footnote {
+  margin-top: 0;
+}
+
+.organization-list {
+  margin-top: 1.5rem;
+  padding-left: 1.2rem;
+  font-size: 1.05rem;
+  line-height: 2;
+}

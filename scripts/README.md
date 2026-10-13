@@ -53,3 +53,16 @@ For a shadow-audit pilot, compare the resulting slate against what the
 employer's own process actually did — who advanced, who didn't, and whether
 anyone strong got missed either way. That comparison is the actual product
 at this stage, not the extraction script itself.
+
+## Not part of the pipeline: the target account list
+
+`target_accounts.py` is the one script here that never touches candidate
+material. It qualifies the employer accounts the pilot conversations come
+from:
+
+```bash
+uv run python scripts/target_accounts.py docs/validation/target-accounts.json
+```
+
+See [`../docs/validation/target-account-list.md`](../docs/validation/target-account-list.md)
+for the rules it enforces and where the register lives.

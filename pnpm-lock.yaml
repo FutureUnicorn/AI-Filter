@@ -78,9 +78,15 @@ importers:
       '@sentry/node':
         specifier: 10.75.0
         version: 10.75.0(@opentelemetry/core@2.11.0(@opentelemetry/api@1.9.1))(supports-color@8.1.1)
+      '@signal-audit/ai':
+        specifier: workspace:*
+        version: link:../../packages/ai
       '@signal-audit/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@signal-audit/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@signal-audit/db':
         specifier: workspace:*
         version: link:../../packages/db
