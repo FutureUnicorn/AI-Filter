@@ -239,6 +239,32 @@ const REFERENCE_EXEMPTIONS: ReadonlyArray<{
   readonly reason: string;
 }> = [
   {
+    referencing: "privacy_requests",
+    referenced: "applications",
+    columns: [
+      "application_id",
+      "due_at",
+      "extended_at",
+      "extension_reason",
+      "organization_id",
+      "outcome",
+      "received_at",
+      "received_by_user_id",
+      "refusal_reason",
+      "request_id",
+      "request_kind",
+      "resolved_at",
+      "resolved_by_user_id",
+      "status",
+      "subject_kind"
+    ],
+    reason:
+      "AF-64's privacy request. It references applications so a candidate request cannot name one " +
+      "that never existed. See APPLICATION_LINKED_EXEMPTIONS for why it is retained rather than " +
+      "purged. The column list is what makes this self-expiring: a request that grows a column has " +
+      "to be looked at again, and the two free-text ones are exactly where that matters."
+  },
+  {
     referencing: "candidate_data_erasures",
     referenced: "applications",
     columns: [
@@ -490,6 +516,17 @@ const APPLICATION_LINKED_EXEMPTIONS: ReadonlyArray<{
   readonly reason: string;
 }> = [
   {
+    table: "privacy_requests",
+    reason:
+      "AF-64's record of a privacy obligation: who asked, for what, by when, and what they were " +
+      "told. Exempt on the same footing as the erasure receipt and for the same kind of reason -- " +
+      "purging it destroys the only evidence that the request was answered in time, which is the " +
+      "thing a regulator asks for. It is subject to the same caveat its own comment in " +
+      "RETENTION_EXEMPT_TABLES states: refusal_reason and extension_reason are operator-written free " +
+      "text, and this exemption is false the moment a candidate's details are pasted into one. AF-66 " +
+      "REV-002 is what that failure looks like when it is load-bearing."
+  },
+  {
     table: "candidate_data_erasures",
     reason:
       "AF-62's erasure receipt, and the one table on this list whose exemption does not rest on the " +
@@ -520,6 +557,10 @@ test("every table carrying application_id is a planned retention surface", async
     "candidate_decisions",
     "evidence_outcomes",
     "import_rows",
+    // AF-64's privacy request. Same shape as the erasure receipt: it
+    // carries the identifier and is exempted on what the row is for, not
+    // on the identifier being harmless.
+    "privacy_requests",
     "review_timing_spans"
   ]);
 
