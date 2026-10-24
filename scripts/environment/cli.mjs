@@ -10,9 +10,11 @@ import {
   buildAlterRolePasswordStatement,
   buildDatabaseUrl,
   buildRotationCommand,
+  classifyRotationFailure,
   derivePreviewEnvironment,
   requireHostedControls,
   requireRotationControls,
+  rotationFailureMessage,
   resolvePreviewStateDirectory,
   validateCommitSha,
   validatePullRequestNumber
@@ -202,17 +204,6 @@ function hostedDatabaseAccess(project) {
   return { network, image };
 }
 
-/** True when `password` authenticates as the role. Quiet: this is a probe. */
-function passwordAuthenticates(command, password) {
-  const result = spawnSync("docker", command, {
-    cwd: repositoryRoot,
-    env: { ...process.env, PGPASSWORD: password },
-    input: "SELECT 1;\n",
-    encoding: "utf8"
-  });
-  return result.error === undefined && result.status === 0;
-}
-
 /**
  * AF-94: rotating POSTGRES_PASSWORD alone never reaches the database --
  * Postgres only applies it while initialising an empty data directory, and
@@ -222,17 +213,70 @@ function passwordAuthenticates(command, password) {
  * password match the secret being rotated in. Run it, then redeploy with
  * `up` so migrate/web/worker pick up the new value.
  *
- * The statement is sent on psql's stdin, and the outgoing password is
- * forwarded via a bare `--env PGPASSWORD` (Docker reads the value from this
- * process's own environment) rather than a flag value, so neither password
- * is ever written into a process's argv. See buildRotationCommand for why
- * this runs on the private network instead of `docker exec`.
+ * The statement is sent on psql's stdin; the outgoing and incoming passwords
+ * are forwarded by environment-variable name rather than flag values, so
+ * neither is written into argv. psql performs literal quoting from its
+ * environment variable, and stderr is captured instead of inherited to
+ * prevent query diagnostics from reaching terminal/CI output. See
+ * buildRotationCommand for why this runs on the private network.
  *
  * Rerunning after a successful rotation is a no-op rather than an error
  * (#86, REV-003): once the outgoing password is genuinely checked, a retry
  * would otherwise fail authentication indistinguishably from having typed
  * the wrong one -- on a credential path, mid-incident.
  */
+/**
+ * @param {{
+ *   appEnv: string,
+ *   user: string,
+ *   previousPassword: string,
+ *   nextPassword: string,
+ *   command: string[],
+ *   environment?: NodeJS.ProcessEnv,
+ *   execute?: (file: string, args: string[], options: { cwd: string, env: NodeJS.ProcessEnv, input: string, encoding: "utf8" }) => { status: number | null, error?: Error, stdout?: string, stderr?: string },
+ *   log?: (message: string) => void
+ * }} options
+ */
+export function runPasswordRotation({
+  appEnv,
+  user,
+  previousPassword,
+  nextPassword,
+  command,
+  environment = process.env,
+  execute = spawnSync,
+  log = console.log
+}) {
+  const run = (extraEnvironment, input) =>
+    execute("docker", command, {
+      cwd: repositoryRoot,
+      env: { ...environment, ...extraEnvironment },
+      input,
+      encoding: "utf8"
+    });
+
+  const probe = run({ PGPASSWORD: nextPassword }, "SELECT 1;\n");
+  if (probe.error === undefined && probe.status === 0) {
+    log(`${user}@${appEnv} already accepts the password in POSTGRES_PASSWORD; nothing to rotate. Continue from the redeploy step.`);
+    return;
+  }
+
+  const probeFailure = classifyRotationFailure(probe);
+  if (probeFailure !== "authentication") {
+    throw new Error(rotationFailureMessage(appEnv, probeFailure, probe.status));
+  }
+
+  const result = run(
+    { PGPASSWORD: previousPassword, SIGNAL_AUDIT_NEXT_PASSWORD: nextPassword },
+    buildAlterRolePasswordStatement(user)
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    const failure = classifyRotationFailure(result);
+    throw new Error(rotationFailureMessage(appEnv, failure, result.status));
+  }
+  log(`Rotated ${user}@${appEnv} to the password in POSTGRES_PASSWORD. Services fail authentication until you redeploy with 'up'.`);
+}
+
 function rotatePassword(appEnv) {
   requireHostedControls(appEnv, process.env);
   const { previousPassword, nextPassword } = requireRotationControls(process.env);
@@ -240,29 +284,7 @@ function rotatePassword(appEnv) {
   const database = `signal_audit_${appEnv}`;
   const { network, image } = hostedDatabaseAccess(`signal-audit-${appEnv}`);
   const command = buildRotationCommand({ image, network, user, database });
-
-  if (passwordAuthenticates(command, nextPassword)) {
-    console.log(
-      `${user}@${appEnv} already accepts the password in POSTGRES_PASSWORD; nothing to rotate. Continue from the redeploy step.`
-    );
-    return;
-  }
-
-  const result = spawnSync("docker", command, {
-    cwd: repositoryRoot,
-    env: { ...process.env, PGPASSWORD: previousPassword },
-    input: buildAlterRolePasswordStatement(user, nextPassword),
-    stdio: ["pipe", "inherit", "inherit"]
-  });
-  if (result.error !== undefined) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(
-      `password rotation for ${appEnv} failed with status ${result.status}. If the outgoing password was rejected, confirm POSTGRES_PASSWORD_PREVIOUS is the one the role currently accepts.`
-    );
-  }
-  console.log(
-    `Rotated ${user}@${appEnv} to the password in POSTGRES_PASSWORD. Services fail authentication until you redeploy with 'up'.`
-  );
+  runPasswordRotation({ appEnv, user, previousPassword, nextPassword, command });
 }
 
 function startEnvironment(environment, { local = false, seed = false } = {}, dockerRunner = runDocker) {

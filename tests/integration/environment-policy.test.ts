@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import {
   deployEnvironment,
   hostedEnvironment,
-  localEnvironment
+  localEnvironment,
+  runPasswordRotation
 } from "../../scripts/environment/cli.mjs";
 import { resolvePreviewStateDirectory } from "../../scripts/environment/model.mjs";
 
@@ -124,6 +125,61 @@ test("hosted environment examples contain references, never usable secrets", () 
     assert.match(contents, /<.*>/u);
     assert.doesNotMatch(contents, /sk-[A-Za-z0-9]/u);
   }
+});
+
+test("a failed ALTER ROLE never exposes the incoming password in output or diagnostics", () => {
+  const nextPassword = "never-log-this-next-password-@/#%";
+  const command = ["run", "--env", "SIGNAL_AUDIT_NEXT_PASSWORD", "psql"];
+  const calls: Array<{ args: string[]; options: { env: NodeJS.ProcessEnv; input: string } }> = [];
+  const logs: string[] = [];
+  const childOutput: string[] = [];
+  const execute = (_file: string, args: string[], options: { env: NodeJS.ProcessEnv; input: string }) => {
+    calls.push({ args, options });
+    if (calls.length === 1) {
+      const result = { status: 1, stdout: "", stderr: "FATAL: password authentication failed (SQLSTATE 28P01)" };
+      childOutput.push(result.stdout, result.stderr);
+      return result;
+    }
+    // Simulate psql's server-error output, including the echoed statement.
+    const result = {
+      status: 3,
+      stdout: `ERROR: syntax error near :'nextpw'\\nLINE 2: ${options.input}`,
+      stderr: "ERROR: forced SQL syntax error"
+    };
+    childOutput.push(result.stdout, result.stderr);
+    return result;
+  };
+
+  let thrown: Error | undefined;
+  try {
+    runPasswordRotation({
+      appEnv: "staging",
+      user: "svc_user",
+      previousPassword: "old-password-for-test-only-20",
+      nextPassword,
+      command,
+      environment: {},
+      execute,
+      log: (message: string) => logs.push(message)
+    });
+  } catch (error) {
+    assert.ok(error instanceof Error);
+    thrown = error;
+  }
+  assert.ok(thrown, "the forced SQL error must be reported");
+  assert.match(thrown.message, /unclassified reason/u);
+
+  assert.equal(calls.length, 2);
+  const [probe, rotation] = calls;
+  assert.ok(probe);
+  assert.ok(rotation);
+  assert.equal(probe.options.env.PGPASSWORD, nextPassword);
+  assert.equal(rotation.options.env.SIGNAL_AUDIT_NEXT_PASSWORD, nextPassword);
+  assert.ok(!rotation.args.some((argument) => argument.includes(nextPassword)), "the password must not enter argv");
+  assert.ok(!rotation.options.input.includes(nextPassword), "the password must not enter SQL text");
+  const observableOutput = [...childOutput, ...calls.flatMap(({ options }) => [options.input]), thrown.message, ...logs].join("\\n");
+  assert.ok(!observableOutput.includes(nextPassword), "stdout, stderr, SQL input, thrown errors and logs must not expose the password");
+  assert.deepEqual(logs, []);
 });
 
 test("server secrets cannot be exposed through Next public environment variables", () => {

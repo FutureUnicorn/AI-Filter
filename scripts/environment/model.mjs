@@ -138,6 +138,8 @@ export function buildRotationCommand({ image, network, user, database, host = "p
     network,
     "--env",
     "PGPASSWORD",
+    "--env",
+    "SIGNAL_AUDIT_NEXT_PASSWORD",
     image,
     "psql",
     "--no-psqlrc",
@@ -153,15 +155,61 @@ export function buildRotationCommand({ image, network, user, database, host = "p
 }
 
 /**
- * Built for a statement sent over psql's stdin, never through a shell, so
- * SQL string-literal quote doubling is the only escaping this needs.
+ * psql reads the incoming password from its environment with `\\getenv` and
+ * performs SQL-literal quoting via `:'nextpw'`. The secret therefore never
+ * appears in the SQL text or in diagnostics that echo the statement.
  */
-export function buildAlterRolePasswordStatement(user, password) {
+export function buildAlterRolePasswordStatement(user) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(user ?? "")) {
     throw new Error("POSTGRES_USER must be a safe PostgreSQL identifier to rotate its password");
   }
-  const escapedPassword = password.replace(/'/gu, "''");
-  return `ALTER ROLE "${user}" WITH PASSWORD '${escapedPassword}';`;
+  return `\\getenv nextpw SIGNAL_AUDIT_NEXT_PASSWORD\nALTER ROLE "${user}" WITH PASSWORD :'nextpw';\n`;
+}
+
+/** Categorize captured Docker/psql output without ever returning raw output. */
+export function classifyRotationFailure(result) {
+  const output = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+  const errorCode = result.error?.code;
+
+  if (
+    errorCode === "ENOENT" ||
+    errorCode === "EACCES" ||
+    /docker(?:\.exe)?: (?:command not found|not recognized)/iu.test(output) ||
+    /cannot connect to the docker daemon|failed to connect to (?:the )?docker|error during connect|docker daemon is not running/iu.test(output)
+  ) {
+    return "docker-unavailable";
+  }
+  if (/manifest unknown|pull access denied|failed to resolve reference|unable to pull image|no such image|failed to pull|pulling .* failed/iu.test(output)) {
+    return "image-unavailable";
+  }
+  if (errorCode === "ETIMEDOUT" || /\bETIMEDOUT\b|timed? ?out|timeout expired|deadline exceeded|i\/o timeout/iu.test(output)) return "timeout";
+  if (errorCode === "ECONNREFUSED" || /\bECONNREFUSED\b|connection refused/iu.test(output)) return "connection-refused";
+  if (/could not translate host name|name or service not known|network is unreachable|no route to host|temporary failure in name resolution/iu.test(output)) {
+    return "network-unavailable";
+  }
+  if (/SQLSTATE[^\r\n]*28P01|\b28P01\b|password authentication failed/iu.test(output)) {
+    return "authentication";
+  }
+  if (/SQLSTATE[^\r\n]*57P03|\b57P03\b|database system is (?:starting up|not yet accepting connections)|server is starting/iu.test(output)) {
+    return "container-not-ready";
+  }
+  return "command-failed";
+}
+
+/** Safe operator guidance; never includes Docker/psql output that may echo SQL. */
+export function rotationFailureMessage(appEnv, failure, status) {
+  const suffix = status === null || status === undefined ? "" : ` (exit status ${status})`;
+  const messages = {
+    authentication: `the outgoing database password was rejected for ${appEnv}; verify POSTGRES_PASSWORD_PREVIOUS is the password the role currently accepts`,
+    "docker-unavailable": "Docker is unavailable or its daemon cannot be reached; install/start Docker and verify daemon access",
+    "image-unavailable": "the psql image could not be pulled; verify registry access and the image reference, then retry",
+    "container-not-ready": "the PostgreSQL container is not ready; wait for its health check to pass, then retry",
+    "connection-refused": "the PostgreSQL endpoint refused the connection; verify the container and private network are healthy, then retry",
+    "network-unavailable": "the Docker private network cannot reach PostgreSQL; verify the project network and postgres service, then retry",
+    timeout: "the PostgreSQL connection timed out; inspect Docker/network/database health before retrying",
+    "command-failed": "the Docker/psql command failed for an unclassified reason; inspect Docker and PostgreSQL health before retrying"
+  };
+  return `password rotation for ${appEnv} failed${suffix}: ${messages[failure] ?? messages["command-failed"]}.`;
 }
 
 export function derivePreviewEnvironment(prValue, shaValue, source = process.env) {

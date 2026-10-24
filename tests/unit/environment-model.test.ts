@@ -6,10 +6,12 @@ import {
   buildAlterRolePasswordStatement,
   buildDatabaseUrl,
   buildRotationCommand,
+  classifyRotationFailure,
   derivePreviewEnvironment,
   environmentIdentity,
   requireHostedControls,
-  requireRotationControls
+  requireRotationControls,
+  rotationFailureMessage
 } from "../../scripts/environment/model.mjs";
 
 const hostedControls = {
@@ -97,6 +99,7 @@ test("the rotation command reaches the database where the password is actually c
   assert.equal(command[command.indexOf("--network") + 1], "signal-audit-staging_private");
   assert.equal(command[command.indexOf("--username") + 1], "svc_user");
   assert.equal(command[command.indexOf("--dbname") + 1], "signal_audit_staging");
+  assert.ok(command.includes("SIGNAL_AUDIT_NEXT_PASSWORD"));
 });
 
 test("the rotation command carries no password in its argv", () => {
@@ -143,13 +146,30 @@ test("rotation requires an outgoing password distinct from the incoming one", ()
   );
 });
 
-test("the ALTER ROLE statement SQL-escapes the password and rejects unsafe identifiers", () => {
-  assert.equal(
-    buildAlterRolePasswordStatement("svc_user", "o'brien's-pass"),
-    `ALTER ROLE "svc_user" WITH PASSWORD 'o''brien''s-pass';`
-  );
+test("the ALTER ROLE statement reads the incoming password from psql's environment and rejects unsafe identifiers", () => {
+  const statement = buildAlterRolePasswordStatement("svc_user");
+  assert.equal(statement, "\\getenv nextpw SIGNAL_AUDIT_NEXT_PASSWORD\nALTER ROLE \"svc_user\" WITH PASSWORD :'nextpw';\n");
   assert.throws(
-    () => buildAlterRolePasswordStatement('bad user; DROP TABLE x; --', "x".repeat(20)),
+    () => buildAlterRolePasswordStatement('bad user; DROP TABLE x; --'),
     /safe PostgreSQL identifier/u
   );
+});
+
+test("rotation failures distinguish authentication, Docker, image, readiness, connection and timeout errors", () => {
+  const cases = [
+    [{ status: 2, stderr: "FATAL: password authentication failed for user \\\"svc_user\\\"" }, "authentication", "verify POSTGRES_PASSWORD_PREVIOUS"],
+    [{ status: null, error: Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }) }, "docker-unavailable", "start Docker"],
+    [{ status: 125, stderr: "Cannot connect to the Docker daemon" }, "docker-unavailable", "daemon access"],
+    [{ status: 1, stderr: "failed to resolve reference: manifest unknown" }, "image-unavailable", "registry access"],
+    [{ status: 1, stderr: "FATAL: the database system is starting up (SQLSTATE 57P03)" }, "container-not-ready", "health check"],
+    [{ status: 1, stderr: "could not connect: connection refused" }, "connection-refused", "private network"],
+    [{ status: 1, stderr: "could not translate host name \\\"postgres\\\" to address" }, "network-unavailable", "private network"],
+    [{ status: 1, stderr: "connection timed out (ETIMEDOUT)" }, "timeout", "timed out"],
+    [{ status: 125, stderr: "unknown docker/psql error" }, "command-failed", "unclassified reason"]
+  ] as const;
+
+  for (const [result, expected, advice] of cases) {
+    assert.equal(classifyRotationFailure(result), expected);
+    assert.match(rotationFailureMessage("staging", expected, result.status), new RegExp(advice, "u"));
+  }
 });
