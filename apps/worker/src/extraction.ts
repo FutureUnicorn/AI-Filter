@@ -5,6 +5,7 @@ import {
   EVIDENCE_EXTRACTION_SCHEMA_NAME,
   EVIDENCE_EXTRACTION_SCHEMA_VERSION,
   InferenceKillSwitchEngagedError,
+  ProviderHttpError,
   mapRubricToEvidence,
   outcomesForSchemaValidationFailure,
   parseEvidenceExtractionResponse,
@@ -103,9 +104,9 @@ function metadataForRun(metadata: AiCallMetadata, rubricVersion: number) {
   };
 }
 
-function fallbackRun(model: string, rubricVersion: number) {
+function fallbackRun(provider: string, model: string, rubricVersion: number) {
   return {
-    provider: "openai",
+    provider,
     model,
     promptVersion: EVIDENCE_EXTRACTION_PROMPT_VERSION,
     extractionSchemaVersion: EVIDENCE_EXTRACTION_SCHEMA_VERSION,
@@ -115,6 +116,9 @@ function fallbackRun(model: string, rubricVersion: number) {
 }
 
 function safeProviderStatus(error: unknown): number | undefined {
+  if (error instanceof ProviderHttpError) {
+    return error.status;
+  }
   if (typeof error !== "object" || error === null || !("status" in error)) {
     return undefined;
   }
@@ -327,7 +331,7 @@ export async function processEvidenceExtractionJob(
     const run = parseError
       ? metadataForRun(error.metadata, context.rubricVersion)
       : usageMissing
-        ? fallbackRun(routing.model, context.rubricVersion)
+        ? fallbackRun(dependencies.config.provider ?? "openai", routing.model, context.rubricVersion)
         : undefined;
     const result = await retryOrFailEvidenceExtractionJob(dependencies.databaseUrl, dependencies.schema, {
       organizationId: job.organizationId,

@@ -234,6 +234,124 @@ test("worker processing is credential-free while disabled and validates hosted p
   assert.equal(enabled.budget?.maxTokensPerPeriod, 100_000);
   assert.equal(enabled.budget?.period, "month");
   assert.equal(JSON.stringify(enabled).includes("candidate"), false);
+  assert.equal(enabled.provider, "openai");
+  const claude = loadWorkerProcessingConfig({
+    WORKER_PROCESSING_ENABLED: "true",
+    WORKER_INSTANCE_ID: "worker-1",
+    AI_PROVIDER: "anthropic",
+    ANTHROPIC_API_KEY: "synthetic-key",
+    ANTHROPIC_MODEL: "claude-default",
+    ANTHROPIC_ESCALATION_MODEL: "claude-escalation",
+    INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+    INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+    INFERENCE_BUDGET_PERIOD: "day"
+  });
+  assert.equal(claude.provider, "anthropic");
+  assert.deepEqual(claude.openAi, {
+    apiKey: "synthetic-key",
+    defaultModel: "claude-default",
+    escalationModel: "claude-escalation"
+  });
+  assert.throws(
+    () =>
+      loadWorkerProcessingConfig({
+        WORKER_PROCESSING_ENABLED: "true",
+        WORKER_INSTANCE_ID: "worker-1",
+        AI_PROVIDER: "openai_compatible",
+        AI_API_KEY: "synthetic-key",
+        AI_MODEL: "m",
+        AI_ESCALATION_MODEL: "m",
+        INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+        INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+        INFERENCE_BUDGET_PERIOD: "day"
+      }),
+    /AI_BASE_URL/u
+  );
+  const compatible = loadWorkerProcessingConfig({
+    WORKER_PROCESSING_ENABLED: "true",
+    WORKER_INSTANCE_ID: "worker-1",
+    AI_PROVIDER: "openai_compatible",
+    AI_API_KEY: "synthetic-key",
+    AI_MODEL: "m",
+    AI_ESCALATION_MODEL: "m2",
+    AI_BASE_URL: "https://api.example.test/v1",
+    INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+    INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+    INFERENCE_BUDGET_PERIOD: "day"
+  });
+  assert.equal(compatible.provider, "openai_compatible");
+  assert.equal(compatible.openAi?.baseUrl, "https://api.example.test/v1");
+  for (const baseUrl of [
+    "http://api.example.test/v1",
+    "ftp://api.example.test/v1",
+    "https://user:password@api.example.test/v1",
+    "https://api.example.test/v1?api_key=secret",
+    "https://api.example.test/v1#fragment"
+  ]) {
+    assert.throws(
+      () =>
+        loadWorkerProcessingConfig({
+          WORKER_PROCESSING_ENABLED: "true",
+          WORKER_INSTANCE_ID: "worker-1",
+          AI_PROVIDER: "openai_compatible",
+          AI_API_KEY: "synthetic-key",
+          AI_MODEL: "m",
+          AI_ESCALATION_MODEL: "m2",
+          AI_BASE_URL: baseUrl,
+          INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+          INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+          INFERENCE_BUDGET_PERIOD: "day"
+        }),
+      /AI_BASE_URL/u
+    );
+  }
+  for (const baseUrl of ["http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:11434/v1"]) {
+    assert.equal(
+      loadWorkerProcessingConfig({
+        WORKER_PROCESSING_ENABLED: "true",
+        WORKER_INSTANCE_ID: "worker-1",
+        AI_PROVIDER: "openai_compatible",
+        AI_API_KEY: "synthetic-key",
+        AI_MODEL: "m",
+        AI_ESCALATION_MODEL: "m2",
+        AI_BASE_URL: baseUrl,
+        INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+        INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+        INFERENCE_BUDGET_PERIOD: "day"
+      }).openAi?.baseUrl,
+      baseUrl
+    );
+  }
+  assert.equal(
+    loadWorkerProcessingConfig({
+      WORKER_PROCESSING_ENABLED: "true",
+      WORKER_INSTANCE_ID: "worker-1",
+      AI_PROVIDER: "google",
+      AI_API_KEY: "synthetic-key",
+      AI_MODEL: "m",
+      AI_ESCALATION_MODEL: "m",
+      INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+      INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+      INFERENCE_BUDGET_PERIOD: "day"
+    }).provider,
+    "google"
+  );
+  assert.throws(() => loadWorkerProcessingConfig({ AI_PROVIDER: "nonsense" }), /AI_PROVIDER/u);
+  assert.throws(
+    () =>
+      loadWorkerProcessingConfig({
+        WORKER_PROCESSING_ENABLED: "true",
+        WORKER_INSTANCE_ID: "worker-1",
+        AI_PROVIDER: "anthropic",
+        OPENAI_API_KEY: "synthetic-key",
+        OPENAI_MODEL: "m",
+        OPENAI_ESCALATION_MODEL: "m",
+        INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+        INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+        INFERENCE_BUDGET_PERIOD: "day"
+      }),
+    /ANTHROPIC_API_KEY/u
+  );
   assert.throws(
     () => loadWorkerProcessingConfig({ WORKER_PROCESSING_ENABLED: "true" }),
     /WORKER_INSTANCE_ID.*OPENAI_API_KEY.*OPENAI_MODEL.*OPENAI_ESCALATION_MODEL.*INFERENCE_MAX_TOKENS_PER_PERIOD/u

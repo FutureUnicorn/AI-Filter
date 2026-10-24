@@ -300,6 +300,360 @@ export function createOpenAiAdapter(
   };
 }
 
+// ---- Anthropic (Claude) adapter ----
+//
+// Same AiAdapter port as the OpenAI adapter. Structured output is obtained by
+// forcing a single tool call whose input_schema is the caller's JSON schema,
+// and reading the tool input back as the output object. Token usage is the
+// provider-reported figure, and absent usage fails closed exactly as it does
+// for OpenAI.
+
+export interface AnthropicMessagesClient {
+  create(params: {
+    model: string;
+    max_tokens: number;
+    system: string;
+    messages: Array<{ role: "user"; content: string }>;
+    tools: Array<{ name: string; description: string; input_schema: Record<string, unknown> }>;
+    tool_choice: { type: "tool"; name: string };
+  }): Promise<{
+    content?: ReadonlyArray<{ type: string; name?: string; input?: unknown }>;
+    model?: string | undefined;
+    usage?: { input_tokens: number; output_tokens: number } | undefined;
+  }>;
+}
+
+export interface AnthropicAdapterConfig {
+  readonly apiKey: string;
+  readonly model: string;
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+  /** Upper bound on generated tokens per call (the Messages API requires one). */
+  readonly maxOutputTokens?: number;
+}
+
+const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION = "2023-06-01";
+
+/** Carries the HTTP status (and nothing else from the body) so callers can classify retries. */
+export class ProviderHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`Provider request failed with HTTP ${status}`);
+    this.name = "ProviderHttpError";
+    this.status = status;
+  }
+}
+
+function isProviderTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function createFetchAnthropicClient(apiKey: string): AnthropicMessagesClient {
+  return {
+    async create(params) {
+      const response = await fetch(ANTHROPIC_MESSAGES_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_API_VERSION
+        },
+        body: JSON.stringify(params)
+      });
+      if (!response.ok) {
+        // The body can echo candidate text; surface only the status.
+        throw new ProviderHttpError(response.status);
+      }
+      return (await response.json()) as Awaited<ReturnType<AnthropicMessagesClient["create"]>>;
+    }
+  };
+}
+
+export function createAnthropicAdapter(
+  config: AnthropicAdapterConfig,
+  client: AnthropicMessagesClient = createFetchAnthropicClient(config.apiKey)
+): AiAdapter {
+  return {
+    async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      let status: { readonly engaged: boolean; readonly reason?: string };
+      try {
+        status = await config.checkKillSwitch();
+      } catch (cause) {
+        throw new AiCallNotStartedError("kill_switch_check", cause);
+      }
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
+      }
+      if (!isOpenAiJsonSchema(input.jsonSchema)) {
+        throw new AiCallNotStartedError("input_validation");
+      }
+      const response = await client.create({
+        model: config.model,
+        max_tokens: config.maxOutputTokens ?? 4096,
+        system: input.systemPrompt,
+        messages: [{ role: "user", content: input.userPrompt }],
+        tools: [
+          {
+            name: input.schemaName,
+            description: "Return the structured result.",
+            input_schema: input.jsonSchema
+          }
+        ],
+        tool_choice: { type: "tool", name: input.schemaName }
+      });
+
+      if (
+        response.usage === undefined ||
+        response.usage === null ||
+        !isProviderTokenCount(response.usage.input_tokens) ||
+        !isProviderTokenCount(response.usage.output_tokens)
+      ) {
+        throw new AiUsageUnavailableError(config.model);
+      }
+      const metadata: AiCallMetadata = {
+        provider: "anthropic",
+        model: config.model,
+        ...(response.model === undefined ? {} : { resolvedModel: response.model }),
+        promptVersion: input.promptVersion,
+        schemaVersion: input.schemaVersion,
+        schemaName: input.schemaName,
+        usage: {
+          inputTokens: response.usage.input_tokens,
+          outputTokens: response.usage.output_tokens
+        }
+      };
+      const toolUse = response.content?.find(
+        (block) => block.type === "tool_use" && block.name === input.schemaName
+      );
+      if (toolUse === undefined || typeof toolUse.input !== "object" || toolUse.input === null) {
+        throw new AiStructuredCallParseError(metadata, new Error("No structured tool output in response"));
+      }
+      return { output: toolUse.input, metadata };
+    }
+  };
+}
+
+// ---- Google Gemini and OpenAI-compatible adapters, plus provider factory ----
+
+/** Posts JSON and returns the parsed body; failures expose only the HTTP status. */
+async function postJson<T>(url: string, headers: Record<string, string>, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    throw new ProviderHttpError(response.status);
+  }
+  return (await response.json()) as T;
+}
+
+export interface JsonTextCompletion {
+  readonly text: string | undefined;
+  readonly model?: string | undefined;
+  readonly usage?: { readonly inputTokens: number; readonly outputTokens: number } | undefined;
+}
+
+/** Provider-specific transport: sends one structured request, returns JSON text and usage. */
+export type JsonTextTransport = (request: {
+  readonly model: string;
+  readonly systemPrompt: string;
+  readonly userPrompt: string;
+  readonly schemaName: string;
+  readonly jsonSchema: Record<string, unknown>;
+}) => Promise<JsonTextCompletion>;
+
+export interface JsonTextAdapterConfig {
+  readonly provider: string;
+  readonly model: string;
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+/** Shared adapter for providers that return the structured result as JSON text. */
+export function createJsonTextAdapter(config: JsonTextAdapterConfig, transport: JsonTextTransport): AiAdapter {
+  return {
+    async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
+      let status: { readonly engaged: boolean; readonly reason?: string };
+      try {
+        status = await config.checkKillSwitch();
+      } catch (cause) {
+        throw new AiCallNotStartedError("kill_switch_check", cause);
+      }
+      if (status.engaged) {
+        throw new InferenceKillSwitchEngagedError(status.reason);
+      }
+      if (!isOpenAiJsonSchema(input.jsonSchema)) {
+        throw new AiCallNotStartedError("input_validation");
+      }
+      const response = await transport({
+        model: config.model,
+        systemPrompt: input.systemPrompt,
+        userPrompt: input.userPrompt,
+        schemaName: input.schemaName,
+        jsonSchema: input.jsonSchema
+      });
+      if (
+        response.usage === undefined ||
+        !isProviderTokenCount(response.usage.inputTokens) ||
+        !isProviderTokenCount(response.usage.outputTokens)
+      ) {
+        throw new AiUsageUnavailableError(config.model);
+      }
+      const metadata: AiCallMetadata = {
+        provider: config.provider,
+        model: config.model,
+        ...(response.model === undefined ? {} : { resolvedModel: response.model }),
+        promptVersion: input.promptVersion,
+        schemaVersion: input.schemaVersion,
+        schemaName: input.schemaName,
+        usage: { inputTokens: response.usage.inputTokens, outputTokens: response.usage.outputTokens }
+      };
+      let output: unknown;
+      try {
+        output = JSON.parse(response.text ?? "");
+      } catch (cause) {
+        throw new AiStructuredCallParseError(metadata, cause);
+      }
+      return { output, metadata };
+    }
+  };
+}
+
+export interface GoogleAdapterConfig extends Omit<JsonTextAdapterConfig, "provider"> {
+  readonly apiKey: string;
+  readonly baseUrl?: string;
+}
+
+export function createGoogleAdapter(config: GoogleAdapterConfig, transport?: JsonTextTransport): AiAdapter {
+  const base = (config.baseUrl ?? "https://generativelanguage.googleapis.com/v1beta").replace(/\/+$/u, "");
+  return createJsonTextAdapter(
+    { provider: "google", model: config.model, checkKillSwitch: config.checkKillSwitch },
+    transport ??
+      (async (request) => {
+        const body = await postJson<{
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          modelVersion?: string;
+          usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+        }>(
+          `${base}/models/${encodeURIComponent(request.model)}:generateContent`,
+          { "x-goog-api-key": config.apiKey },
+          {
+            systemInstruction: { parts: [{ text: request.systemPrompt }] },
+            contents: [{ role: "user", parts: [{ text: request.userPrompt }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              responseJsonSchema: request.jsonSchema
+            }
+          }
+        );
+        const usage = body.usageMetadata;
+        return {
+          text: body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join(""),
+          model: body.modelVersion,
+          usage:
+            usage?.promptTokenCount === undefined || usage.candidatesTokenCount === undefined
+              ? undefined
+              : { inputTokens: usage.promptTokenCount, outputTokens: usage.candidatesTokenCount }
+        };
+      })
+  );
+}
+
+export interface OpenAiCompatibleAdapterConfig extends Omit<JsonTextAdapterConfig, "provider"> {
+  readonly apiKey: string;
+  /** e.g. https://api.mistral.ai/v1, https://api.groq.com/openai/v1, http://localhost:11434/v1 */
+  readonly baseUrl: string;
+}
+
+function normalizeOpenAiCompatibleBaseUrl(value: string): string {
+  const normalized = value.trim().replace(/\/+$/u, "");
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new Error("OpenAI-compatible base URL is invalid");
+  }
+  const localLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && localLoopback)) {
+    throw new Error("OpenAI-compatible base URL must use HTTPS except for local loopback");
+  }
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    throw new Error("OpenAI-compatible base URL must not contain credentials, a query string, or a fragment");
+  }
+  return normalized;
+}
+
+/** Any server implementing POST {baseUrl}/chat/completions with json_schema response_format. */
+export function createOpenAiCompatibleAdapter(
+  config: OpenAiCompatibleAdapterConfig,
+  transport?: JsonTextTransport
+): AiAdapter {
+  const base = normalizeOpenAiCompatibleBaseUrl(config.baseUrl);
+  return createJsonTextAdapter(
+    { provider: "openai_compatible", model: config.model, checkKillSwitch: config.checkKillSwitch },
+    transport ??
+      (async (request) => {
+        const body = await postJson<{
+          choices?: Array<{ message?: { content?: string | null } }>;
+          model?: string;
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
+        }>(
+          `${base}/chat/completions`,
+          { authorization: `Bearer ${config.apiKey}` },
+          {
+            model: request.model,
+            messages: [
+              { role: "system", content: request.systemPrompt },
+              { role: "user", content: request.userPrompt }
+            ],
+            response_format: {
+              type: "json_schema",
+              json_schema: { name: request.schemaName, schema: request.jsonSchema, strict: true }
+            }
+          }
+        );
+        const usage = body.usage;
+        return {
+          text: body.choices?.[0]?.message?.content ?? undefined,
+          model: body.model,
+          usage:
+            usage?.prompt_tokens === undefined || usage.completion_tokens === undefined
+              ? undefined
+              : { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens }
+        };
+      })
+  );
+}
+
+export const AI_PROVIDERS = ["openai", "anthropic", "google", "openai_compatible"] as const;
+export type AiProviderName = (typeof AI_PROVIDERS)[number];
+
+export interface AiProviderAdapterConfig {
+  readonly provider: AiProviderName;
+  readonly apiKey: string;
+  readonly model: string;
+  readonly baseUrl?: string | undefined;
+  readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
+}
+
+export function createAiAdapter(config: AiProviderAdapterConfig): AiAdapter {
+  const { provider, apiKey, model, baseUrl, checkKillSwitch } = config;
+  switch (provider) {
+    case "openai":
+      return createOpenAiAdapter({ apiKey, model, checkKillSwitch });
+    case "anthropic":
+      return createAnthropicAdapter({ apiKey, model, checkKillSwitch });
+    case "google":
+      return createGoogleAdapter({ apiKey, model, checkKillSwitch });
+    case "openai_compatible":
+      if (baseUrl === undefined) {
+        throw new Error("openai_compatible provider requires a base URL");
+      }
+      return createOpenAiCompatibleAdapter({ apiKey, model, checkKillSwitch, baseUrl });
+  }
+}
+
 // ---- AF-35: factual extraction structured-output schema ----
 //
 // The states a model is actually asked to choose between when
