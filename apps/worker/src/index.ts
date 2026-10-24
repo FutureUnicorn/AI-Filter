@@ -37,6 +37,28 @@ export function startWorker(): string {
   return message;
 }
 
+/**
+ * AF-103: names which dependency was unreachable.
+ *
+ * `describeError` can only report what the thrown error carries, and a
+ * refused Postgres connection and a refused object-storage connection are
+ * both a plain Error with code ECONNREFUSED. Carrying the dependency on
+ * the error is what lets the health log say which one, without putting a
+ * connection string or a bucket name anywhere near the log stream.
+ */
+export class EnvironmentDependencyUnavailableError extends Error {
+  readonly dependencies: readonly ("database" | "object_storage")[];
+
+  constructor(
+    dependencies: readonly ("database" | "object_storage")[],
+    options?: { readonly cause?: unknown }
+  ) {
+    super(`environment dependency unavailable: ${dependencies.join(", ")}`, options);
+    this.name = "EnvironmentDependencyUnavailableError";
+    this.dependencies = dependencies;
+  }
+}
+
 export async function runEnvironmentSmokeCheck(
   source: Readonly<Record<string, string | undefined>> = process.env
 ): Promise<{
@@ -44,10 +66,29 @@ export async function runEnvironmentSmokeCheck(
   readonly environment: ReturnType<typeof publicEnvironmentSummary>;
 }> {
   const config = loadEnvironmentConfig(source);
-  await Promise.all([
+  // AF-103: settled, not all. Promise.all rejects with whichever dependency
+  // failed first and drops which one it was, and both arrive as the same
+  // Error with the same code when a dependency is simply unreachable:
+  // describeError reports {errorName:"Error", errorCode:"econnrefused"}
+  // for a refused Postgres connection and for a refused object-storage
+  // connection alike. The log was the only place the failing dependency
+  // could be named, and it could not name it. The web route at
+  // apps/web/src/app/health/environment/route.ts already reports each
+  // component separately; this mirrors it so both surfaces answer the
+  // same question the same way.
+  const [database, storage] = await Promise.allSettled([
     checkDatabaseConnection(config.database.url, config.database.schema),
     checkStorageConnection(config.storage)
   ]);
+  const unavailable = [
+    ...(database.status === "rejected" ? (["database"] as const) : []),
+    ...(storage.status === "rejected" ? (["object_storage"] as const) : [])
+  ];
+  if (unavailable.length > 0) {
+    throw new EnvironmentDependencyUnavailableError(unavailable, {
+      cause: database.status === "rejected" ? database.reason : (storage as PromiseRejectedResult).reason
+    });
+  }
   return {
     status: "ok",
     environment: publicEnvironmentSummary(config)
@@ -76,6 +117,12 @@ export function createWorkerHealthServer(
       logStructured("error", "worker.environment_health_failed", {
         errorName: diagnostic.errorName,
         errorCode: diagnostic.errorCode,
+        // AF-103: which dependency, not just what went wrong. entityType is
+        // already an allowlisted lowercase machine token, so this needs no
+        // new field on LogContext.
+        ...(error instanceof EnvironmentDependencyUnavailableError
+          ? { entityType: error.dependencies.join("_and_") }
+          : {}),
         statusCode: 503
       });
       response.writeHead(503, {
