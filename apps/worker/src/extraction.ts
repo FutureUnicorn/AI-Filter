@@ -21,6 +21,7 @@ import {
   completeEvidenceExtractionJob,
   deferEvidenceExtractionJob,
   getEvidenceExtractionJobContext,
+  getEvidenceExtractionQueueMonitoringSnapshot,
   recordWorkerHeartbeat,
   renewEvidenceExtractionJobLease,
   retryOrFailEvidenceExtractionJob
@@ -35,7 +36,9 @@ import type {
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 
 import { InferenceBudgetCappedError, executeBudgetedInference } from "./inference.ts";
-import { captureWorkerError, captureWorkerJobFailure } from "./observability.ts";
+import { captureWorkerError, captureWorkerJobFailure,
+  recordEvidenceExtractionQueueTelemetry
+} from "./observability.ts";
 
 export const EVIDENCE_EXTRACTION_PROMPT_VERSION = "1.0.0";
 const DOCUMENT_LABEL = "application_document";
@@ -404,19 +407,43 @@ export async function runEvidenceExtractionWorker(
     dependencies: EvidenceExtractionWorkerDependencies
   ) => Promise<boolean> = processNextEvidenceExtractionJob
 ): Promise<void> {
+  const clock = dependencies.now ?? (() => new Date());
   const writeHeartbeat = () =>
     recordWorkerHeartbeat(
       dependencies.databaseUrl,
       dependencies.schema,
       dependencies.config.workerId,
-      (dependencies.now ?? (() => new Date()))()
+      clock()
     );
+  // AF-67: publish the queue snapshot on the same tick as the heartbeat,
+  // not when a job is dequeued. A stalled worker dequeues nothing, so
+  // dequeue-driven telemetry goes silent exactly when the backlog is
+  // growing, and silence is indistinguishable from an empty queue. The
+  // heartbeat fires regardless of whether work is being claimed.
+  const publishQueueTelemetry = async (): Promise<void> => {
+    const snapshot = await getEvidenceExtractionQueueMonitoringSnapshot(
+      dependencies.databaseUrl,
+      dependencies.schema,
+      clock()
+    );
+    await recordEvidenceExtractionQueueTelemetry({
+      oldestReadyAgeMs: snapshot.oldestReadyAgeMs,
+      readyJobs: snapshot.readyJobs,
+      runningJobs: snapshot.runningJobs,
+      failedJobs: snapshot.failedJobs,
+      completedJobs: snapshot.completedJobs,
+      totalAttempts: snapshot.totalAttempts,
+      heartbeatAgeMs: snapshot.heartbeatAgeMs
+    });
+  };
   await writeHeartbeat();
+  await publishQueueTelemetry().catch((error: unknown) => captureWorkerError(error, "worker.job"));
   let heartbeatInFlight = false;
   const heartbeatTimer = setInterval(() => {
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
     void writeHeartbeat()
+      .then(publishQueueTelemetry)
       .catch((error: unknown) => captureWorkerError(error, "worker.job"))
       .finally(() => {
         heartbeatInFlight = false;
