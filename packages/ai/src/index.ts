@@ -210,10 +210,26 @@ export class AiUsageUnavailableError extends Error {
 export class AiStructuredCallParseError extends Error {
   readonly metadata: AiCallMetadata;
 
-  constructor(metadata: AiCallMetadata, cause: unknown) {
-    super(`Structured output for schema ${metadata.schemaName} was not valid JSON.`, { cause });
+  constructor(
+    metadata: AiCallMetadata,
+    cause: unknown,
+    message = `Structured output for schema ${metadata.schemaName} was not valid JSON.`
+  ) {
+    super(message, { cause });
     this.name = "AiStructuredCallParseError";
     this.metadata = metadata;
+  }
+}
+
+/** The provider billed the call but stopped before completing the structured output. */
+export class AiOutputTruncatedError extends AiStructuredCallParseError {
+  constructor(metadata: AiCallMetadata) {
+    super(
+      metadata,
+      new Error("Provider stopped at its output-token limit"),
+      `Structured output for schema ${metadata.schemaName} exceeded the provider output-token limit.`
+    );
+    this.name = "AiOutputTruncatedError";
   }
 }
 
@@ -319,6 +335,7 @@ export interface AnthropicMessagesClient {
   }): Promise<{
     content?: ReadonlyArray<{ type: string; name?: string; input?: unknown }>;
     model?: string | undefined;
+    stop_reason?: string | undefined;
     usage?: { input_tokens: number; output_tokens: number } | undefined;
   }>;
 }
@@ -374,6 +391,10 @@ export function createAnthropicAdapter(
   config: AnthropicAdapterConfig,
   client: AnthropicMessagesClient = createFetchAnthropicClient(config.apiKey)
 ): AiAdapter {
+  const maxOutputTokens = config.maxOutputTokens ?? 4096;
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    throw new Error("Anthropic max output tokens must be a positive safe integer");
+  }
   return {
     async runStructuredCall(input: AiStructuredCallInput): Promise<AiStructuredCallResult> {
       let status: { readonly engaged: boolean; readonly reason?: string };
@@ -390,7 +411,7 @@ export function createAnthropicAdapter(
       }
       const response = await client.create({
         model: config.model,
-        max_tokens: config.maxOutputTokens ?? 4096,
+        max_tokens: maxOutputTokens,
         system: input.systemPrompt,
         messages: [{ role: "user", content: input.userPrompt }],
         tools: [
@@ -423,6 +444,9 @@ export function createAnthropicAdapter(
           outputTokens: response.usage.output_tokens
         }
       };
+      if (response.stop_reason === "max_tokens") {
+        throw new AiOutputTruncatedError(metadata);
+      }
       const toolUse = response.content?.find(
         (block) => block.type === "tool_use" && block.name === input.schemaName
       );
@@ -634,16 +658,22 @@ export interface AiProviderAdapterConfig {
   readonly apiKey: string;
   readonly model: string;
   readonly baseUrl?: string | undefined;
+  readonly maxOutputTokens?: number | undefined;
   readonly checkKillSwitch: () => Promise<{ readonly engaged: boolean; readonly reason?: string }>;
 }
 
 export function createAiAdapter(config: AiProviderAdapterConfig): AiAdapter {
-  const { provider, apiKey, model, baseUrl, checkKillSwitch } = config;
+  const { provider, apiKey, model, baseUrl, maxOutputTokens, checkKillSwitch } = config;
   switch (provider) {
     case "openai":
       return createOpenAiAdapter({ apiKey, model, checkKillSwitch });
     case "anthropic":
-      return createAnthropicAdapter({ apiKey, model, checkKillSwitch });
+      return createAnthropicAdapter({
+        apiKey,
+        model,
+        checkKillSwitch,
+        ...(maxOutputTokens === undefined ? {} : { maxOutputTokens })
+      });
     case "google":
       return createGoogleAdapter({ apiKey, model, checkKillSwitch });
     case "openai_compatible":

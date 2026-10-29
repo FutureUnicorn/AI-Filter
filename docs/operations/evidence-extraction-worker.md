@@ -25,6 +25,11 @@ required provider settings are:
 | `google` | `AI_API_KEY`, `AI_MODEL`, `AI_ESCALATION_MODEL` |
 | `openai_compatible` | `AI_API_KEY`, `AI_MODEL`, `AI_ESCALATION_MODEL`, `AI_BASE_URL` |
 
+`ANTHROPIC_MAX_OUTPUT_TOKENS` controls Claude's required per-call generation
+ceiling and defaults to `4096`. Increase it when larger rubrics or quotations
+need more structured output. A response stopped at that ceiling is recorded
+with its real usage and retried as a distinct truncation failure.
+
 `AI_BASE_URL` is worker-only configuration. It must use HTTPS except for
 localhost or loopback development servers, and it cannot contain credentials,
 a query string, or a fragment. The web service receives none of the provider

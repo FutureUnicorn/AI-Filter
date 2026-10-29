@@ -1,4 +1,5 @@
 import {
+  AiOutputTruncatedError,
   AiStructuredCallParseError,
   AiUsageUnavailableError,
   EVIDENCE_EXTRACTION_JSON_SCHEMA,
@@ -322,10 +323,13 @@ export async function processEvidenceExtractionJob(
       });
       return deferred ? "deferred" : "lease_lost";
     }
+    const truncatedOutput = error instanceof AiOutputTruncatedError;
     const parseError = error instanceof AiStructuredCallParseError;
     const usageMissing = error instanceof AiUsageUnavailableError;
-    const failureCode = parseError
-      ? "model_output_invalid"
+    const failureCode = truncatedOutput
+      ? "model_output_truncated"
+      : parseError
+        ? "model_output_invalid"
       : usageMissing
         ? "provider_usage_missing"
         : retryableProviderError(error)

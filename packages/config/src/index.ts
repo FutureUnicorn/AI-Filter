@@ -260,6 +260,7 @@ export interface WorkerProcessingConfig {
     readonly defaultModel: string;
     readonly escalationModel: string;
     readonly baseUrl?: string;
+    readonly maxOutputTokens?: number;
   };
   readonly budget?: {
     readonly maxTokensPerPeriod: number;
@@ -432,6 +433,9 @@ const optionalRatio = z.preprocess(
   z.coerce.number().min(0).max(1).optional()
 );
 
+// Configuration and adapter construction are separate trust boundaries, so
+// both validate this value. A public-boundary parity test keeps the two checks
+// aligned without coupling the config package to a provider implementation.
 function isSecureOpenAiCompatibleBaseUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -480,6 +484,7 @@ const workerProcessingSchema = z
     ANTHROPIC_API_KEY: optionalNonEmpty,
     ANTHROPIC_MODEL: optionalNonEmpty,
     ANTHROPIC_ESCALATION_MODEL: optionalNonEmpty,
+    ANTHROPIC_MAX_OUTPUT_TOKENS: optionalPositiveInteger,
     AI_API_KEY: optionalNonEmpty,
     AI_MODEL: optionalNonEmpty,
     AI_ESCALATION_MODEL: optionalNonEmpty,
@@ -561,31 +566,39 @@ export function loadWorkerProcessingConfig(source: EnvironmentSource): WorkerPro
     return base;
   }
   const provider = value.AI_PROVIDER ?? "openai";
-  const credentials =
-    provider === "anthropic"
-      ? {
-          apiKey: value.ANTHROPIC_API_KEY!,
-          defaultModel: value.ANTHROPIC_MODEL!,
-          escalationModel: value.ANTHROPIC_ESCALATION_MODEL!
-        }
-      : provider === "openai"
-        ? {
-            apiKey: value.OPENAI_API_KEY!,
-            defaultModel: value.OPENAI_MODEL!,
-            escalationModel: value.OPENAI_ESCALATION_MODEL!
-          }
-        : provider === "openai_compatible"
-          ? {
-              apiKey: value.AI_API_KEY!,
-              defaultModel: value.AI_MODEL!,
-              escalationModel: value.AI_ESCALATION_MODEL!,
-              baseUrl: value.AI_BASE_URL!
-            }
-        : {
-            apiKey: value.AI_API_KEY!,
-            defaultModel: value.AI_MODEL!,
-            escalationModel: value.AI_ESCALATION_MODEL!
-          };
+  let credentials: NonNullable<WorkerProcessingConfig["openAi"]>;
+  switch (provider) {
+    case "anthropic":
+      credentials = {
+        apiKey: value.ANTHROPIC_API_KEY!,
+        defaultModel: value.ANTHROPIC_MODEL!,
+        escalationModel: value.ANTHROPIC_ESCALATION_MODEL!,
+        maxOutputTokens: value.ANTHROPIC_MAX_OUTPUT_TOKENS ?? 4096
+      };
+      break;
+    case "openai":
+      credentials = {
+        apiKey: value.OPENAI_API_KEY!,
+        defaultModel: value.OPENAI_MODEL!,
+        escalationModel: value.OPENAI_ESCALATION_MODEL!
+      };
+      break;
+    case "openai_compatible":
+      credentials = {
+        apiKey: value.AI_API_KEY!,
+        defaultModel: value.AI_MODEL!,
+        escalationModel: value.AI_ESCALATION_MODEL!,
+        baseUrl: value.AI_BASE_URL!
+      };
+      break;
+    case "google":
+      credentials = {
+        apiKey: value.AI_API_KEY!,
+        defaultModel: value.AI_MODEL!,
+        escalationModel: value.AI_ESCALATION_MODEL!
+      };
+      break;
+  }
   return {
     ...base,
     workerId: value.WORKER_INSTANCE_ID!,

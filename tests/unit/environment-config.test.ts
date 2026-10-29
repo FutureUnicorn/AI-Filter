@@ -250,8 +250,22 @@ test("worker processing is credential-free while disabled and validates hosted p
   assert.deepEqual(claude.openAi, {
     apiKey: "synthetic-key",
     defaultModel: "claude-default",
-    escalationModel: "claude-escalation"
+    escalationModel: "claude-escalation",
+    maxOutputTokens: 4096
   });
+  const claudeWithCustomCeiling = loadWorkerProcessingConfig({
+    WORKER_PROCESSING_ENABLED: "true",
+    WORKER_INSTANCE_ID: "worker-1",
+    AI_PROVIDER: "anthropic",
+    ANTHROPIC_API_KEY: "synthetic-key",
+    ANTHROPIC_MODEL: "claude-default",
+    ANTHROPIC_ESCALATION_MODEL: "claude-escalation",
+    ANTHROPIC_MAX_OUTPUT_TOKENS: "8192",
+    INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+    INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+    INFERENCE_BUDGET_PERIOD: "day"
+  });
+  assert.equal(claudeWithCustomCeiling.openAi?.maxOutputTokens, 8192);
   assert.throws(
     () =>
       loadWorkerProcessingConfig({

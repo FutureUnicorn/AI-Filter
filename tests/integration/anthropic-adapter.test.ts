@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   AiCallNotStartedError,
+  AiOutputTruncatedError,
   AiStructuredCallParseError,
   AiUsageUnavailableError,
   InferenceKillSwitchEngagedError,
@@ -71,6 +72,43 @@ test("forces a single tool call carrying the caller's schema", async () => {
   assert.equal(capture.params?.tools[0]?.input_schema, baseInput.jsonSchema);
   assert.equal(capture.params?.system, baseInput.systemPrompt);
   assert.equal(capture.params?.max_tokens, 4096);
+});
+
+test("uses a configured output-token ceiling", async () => {
+  const capture: { params?: Parameters<AnthropicMessagesClient["create"]>[0] } = {};
+  const adapter = createAnthropicAdapter(
+    { ...config, maxOutputTokens: 8192 },
+    fakeClient(
+      { content: [{ type: "tool_use", name: "evidence_response", input: {} }], usage: { input_tokens: 1, output_tokens: 1 } },
+      capture
+    )
+  );
+  await adapter.runStructuredCall(baseInput);
+  assert.equal(capture.params?.max_tokens, 8192);
+});
+
+test("a max-token stop is a distinct retryable parse failure carrying real usage", async () => {
+  const adapter = createAnthropicAdapter(
+    config,
+    fakeClient({
+      stop_reason: "max_tokens",
+      content: [{ type: "tool_use", name: "evidence_response", input: { items: [] } }],
+      usage: { input_tokens: 7, output_tokens: 4096 }
+    })
+  );
+  await assert.rejects(adapter.runStructuredCall(baseInput), (error: unknown) => {
+    assert.ok(error instanceof AiOutputTruncatedError);
+    assert.ok(error instanceof AiStructuredCallParseError);
+    assert.deepEqual(error.metadata.usage, { inputTokens: 7, outputTokens: 4096 });
+    return true;
+  });
+});
+
+test("an invalid output-token ceiling is rejected before a provider call", () => {
+  assert.throws(
+    () => createAnthropicAdapter({ ...config, maxOutputTokens: 0 }),
+    /positive safe integer/u
+  );
 });
 
 test("a response without the tool output is a parse error that still carries usage", async () => {

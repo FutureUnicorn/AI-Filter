@@ -206,6 +206,7 @@ async function main(): Promise<void> {
             apiKey: openAi.apiKey,
             model,
             baseUrl: openAi.baseUrl,
+            maxOutputTokens: openAi.maxOutputTokens,
             checkKillSwitch: () =>
               getInferenceKillSwitchStatus(environment.database.url, environment.database.schema)
           });

@@ -12,6 +12,7 @@ import {
   createOpenAiCompatibleAdapter
 } from "../../packages/ai/src/index.ts";
 import type { JsonTextTransport } from "../../packages/ai/src/index.ts";
+import { loadWorkerProcessingConfig } from "../../packages/config/src/index.ts";
 
 const input = {
   promptVersion: "v1",
@@ -33,6 +34,7 @@ interface CapturedProviderRequest {
   readonly url: string;
   readonly headers: Record<string, string>;
   readonly body: {
+    readonly max_tokens?: number;
     readonly response_format?: { readonly json_schema?: { readonly name?: string } };
     readonly generationConfig?: { readonly responseMimeType?: string };
   };
@@ -113,6 +115,49 @@ test("openai-compatible base URLs require HTTPS except for local loopback", () =
   }
 });
 
+test("config and adapter boundaries enforce the same OpenAI-compatible base URL policy", () => {
+  const cases = [
+    ["https://api.example.test/v1", true],
+    [" https://api.example.test/v1/ ", true],
+    ["http://localhost:11434/v1", true],
+    ["http://127.0.0.1:11434/v1", true],
+    ["http://[::1]:11434/v1", true],
+    ["http://api.example.test/v1", false],
+    ["ftp://api.example.test/v1", false],
+    ["https://user:password@api.example.test/v1", false],
+    ["https://api.example.test/v1?key=secret", false],
+    ["https://api.example.test/v1#fragment", false],
+    ["not a URL", false]
+  ] as const;
+  for (const [baseUrl, expected] of cases) {
+    let configAccepted = true;
+    try {
+      loadWorkerProcessingConfig({
+        WORKER_PROCESSING_ENABLED: "true",
+        WORKER_INSTANCE_ID: "worker-1",
+        AI_PROVIDER: "openai_compatible",
+        AI_API_KEY: "synthetic-key",
+        AI_MODEL: "m",
+        AI_ESCALATION_MODEL: "m2",
+        AI_BASE_URL: baseUrl,
+        INFERENCE_MAX_TOKENS_PER_PERIOD: "1000",
+        INFERENCE_ALERT_THRESHOLD_RATIO: "0.8",
+        INFERENCE_BUDGET_PERIOD: "day"
+      });
+    } catch {
+      configAccepted = false;
+    }
+    let adapterAccepted = true;
+    try {
+      createOpenAiCompatibleAdapter({ ...base, baseUrl }, ok);
+    } catch {
+      adapterAccepted = false;
+    }
+    assert.equal(configAccepted, expected, `config boundary disagreed for ${baseUrl}`);
+    assert.equal(adapterAccepted, expected, `adapter boundary disagreed for ${baseUrl}`);
+  }
+});
+
 test("the factory builds every provider and requires a base URL for openai_compatible", () => {
   for (const provider of ["openai", "anthropic", "google"] as const) {
     assert.equal(typeof createAiAdapter({ ...base, provider }).runStructuredCall, "function");
@@ -122,6 +167,24 @@ test("the factory builds every provider and requires a base URL for openai_compa
     "function"
   );
   assert.throws(() => createAiAdapter({ ...base, provider: "openai_compatible" }), /base URL/u);
+});
+
+test("the production factory forwards Anthropic's output-token ceiling", async () => {
+  let captured: CapturedProviderRequest["body"] | undefined;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    captured = JSON.parse(init.body as string) as CapturedProviderRequest["body"];
+    return new Response(JSON.stringify({
+      content: [{ type: "tool_use", name: "evidence_response", input: { items: [] } }],
+      usage: { input_tokens: 4, output_tokens: 2 }
+    }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    await createAiAdapter({ ...base, provider: "anthropic", maxOutputTokens: 8192 }).runStructuredCall(input);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(captured?.max_tokens, 8192);
 });
 
 test("openai-compatible and google adapters send the expected wire requests", async () => {
