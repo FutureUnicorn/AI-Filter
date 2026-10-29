@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { pathToFileURL } from "node:url";
 
-import { createOpenAiAdapter } from "@signal-audit/ai";
+import { createAiAdapter } from "@signal-audit/ai";
 import {
   loadEnvironmentConfig,
   loadWorkerProcessingConfig,
@@ -14,6 +14,7 @@ import {
   getInferenceKillSwitchStatus
 } from "@signal-audit/db";
 import { DOMAIN_LAYER_NAME } from "@signal-audit/domain";
+import type { AiAdapter } from "@signal-audit/domain";
 import { checkStorageConnection } from "@signal-audit/ingestion";
 import { describeError, logStructured } from "@signal-audit/security";
 import { runEvidenceExtractionWorker } from "./extraction.ts";
@@ -185,7 +186,7 @@ async function main(): Promise<void> {
     }
     const openAi = processing.openAi;
     const runtimeWorkerId = createWorkerRuntimeId(processing.workerId);
-    const adapters = new Map<string, ReturnType<typeof createOpenAiAdapter>>();
+    const adapters = new Map<string, AiAdapter>();
     processingLoop = runEvidenceExtractionWorker(
       {
         databaseUrl: environment.database.url,
@@ -200,9 +201,12 @@ async function main(): Promise<void> {
         adapterForModel(model) {
           const existing = adapters.get(model);
           if (existing !== undefined) return existing;
-          const created = createOpenAiAdapter({
+          const created = createAiAdapter({
+            provider: processing.provider ?? "openai",
             apiKey: openAi.apiKey,
             model,
+            baseUrl: openAi.baseUrl,
+            maxOutputTokens: openAi.maxOutputTokens,
             checkKillSwitch: () =>
               getInferenceKillSwitchStatus(environment.database.url, environment.database.schema)
           });

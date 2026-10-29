@@ -15,6 +15,7 @@ export type WorkerOperation =
 export const WORKER_JOB_FAILURE_CODES = [
   "invalid_job_context",
   "model_output_invalid",
+  "model_output_truncated",
   "provider_usage_missing",
   "provider_transient",
   "provider_permanent",
