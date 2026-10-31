@@ -15,7 +15,7 @@
 
 ## Dependencies
 
-| Relationship | Item and source | Current status | Blocking stage (review / merge / deploy / Done / none) | Effect | Owner and next action |
+| Relationship | Item and source | Current status | Blocking stage (review / merge / deployment / Done / none) | Effect | Owner and next action |
 |---|---|---|---|---|---|
 | [blocks / is blocked by / depends on / related to] | [Jira or external link] | [status] | [stage] | [specific effect] | [owner and action] |
 
