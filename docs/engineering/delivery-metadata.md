@@ -14,7 +14,7 @@ The pull request description carries a readable handoff for people and one fence
 | `targetBase` | Intended base branch; compared with the actual pull request base. |
 | `tickets` | One record per AF issue. Each has a unique Jira key and one or more acceptance criteria. |
 | `tickets[].acceptance[]` | Unique criterion id, description, `Met` / `Unmet` / `Deferred` / `Not verified`, evidence entries, and remaining action with human owner. `Met` needs evidence. `Deferred` needs a matching approved exception. |
-| `dependencies` | Relationship, reference, HTTPS source, native Jira link where applicable, current status, blocking stage, effect, owner, and next action. Stages are `review`, `merge`, `deployment`, `Done`, or `none`. |
+| `dependencies` | Declared ticket owner, relationship, reference, HTTPS source, native Jira link where applicable, current status, blocking stage, effect, owner, and next action. Stages are `review`, `merge`, `deployment`, `Done`, or `none`. |
 | `tests` | Classification, exact command or procedure, full tested SHA, result, and evidence. Classifications are `automated`, `mocked`, `live`, `manual`, or `unverified`. |
 | `humanEvidenceOwner` | Named human identity. An AI assistant cannot own or approve evidence. |
 | `aiAssistance` | Provider and tool names, or an empty array for human-only work. |

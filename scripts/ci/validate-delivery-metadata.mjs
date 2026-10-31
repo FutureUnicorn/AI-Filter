@@ -230,7 +230,7 @@ function validateAcceptance(errors, tickets, exceptions) {
   return seenTickets;
 }
 
-function validateDependencies(errors, dependencies) {
+function validateDependencies(errors, dependencies, issueKeys) {
   if (!Array.isArray(dependencies)) {
     errors.push("dependencies must be an array.");
     return;
@@ -242,6 +242,7 @@ function validateDependencies(errors, dependencies) {
         errors,
         dependency,
         [
+          "ticket",
           "relationship",
           "reference",
           "source",
@@ -256,6 +257,9 @@ function validateDependencies(errors, dependencies) {
       )
     ) {
       continue;
+    }
+    if (!ISSUE_KEY.test(dependency.ticket ?? "") || !issueKeys.has(dependency.ticket)) {
+      errors.push(`${path}.ticket must name a declared AF issue.`);
     }
     if (!DEPENDENCY_RELATIONSHIPS.has(dependency.relationship)) {
       errors.push(`${path}.relationship is invalid.`);
@@ -508,13 +512,14 @@ export function validateDeliveryMetadata(markdown, context = {}) {
     errors.push("Pull request title must include a declared Jira key.");
   }
 
-  validateDependencies(errors, metadata.dependencies);
+  validateDependencies(errors, metadata.dependencies, structuredKeys);
   const readableDependencies = sections.get("Dependencies") ?? "";
   if (Array.isArray(metadata.dependencies)) {
     for (const dependency of metadata.dependencies) {
       if (
         isRecord(dependency) &&
-        (!readableDependencies.includes(dependency.relationship) ||
+        (!readableDependencies.includes(dependency.ticket) ||
+          !readableDependencies.includes(dependency.relationship) ||
           !readableDependencies.includes(dependency.reference) ||
           !readableDependencies.includes(dependency.blockingStage))
       ) {

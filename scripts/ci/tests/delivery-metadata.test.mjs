@@ -127,6 +127,7 @@ test("Jira dependencies require source and native-link traceability", () => {
   const body = withMetadata(validBody, (metadata) => {
     metadata.dependencies = [
       {
+        ticket: "AF-106",
         relationship: "is blocked by",
         reference: "AF-67",
         source: "Jira says so",
@@ -145,10 +146,34 @@ test("Jira dependencies require source and native-link traceability", () => {
   assert.match(errors, /nativeLink must link to the referenced Jira issue/);
 });
 
+test("dependencies must belong to a declared ticket", () => {
+  const body = withMetadata(validBody, (metadata) => {
+    metadata.dependencies = [
+      {
+        ticket: "AF-999",
+        relationship: "related to",
+        reference: "operating-runbook",
+        source: "https://example.test/runbook",
+        nativeLink: null,
+        status: "Current",
+        blockingStage: "none",
+        effect: "Provides operator context.",
+        owner: "Operations owner",
+        nextAction: "Keep the runbook current."
+      }
+    ];
+  });
+  assert.match(
+    validateDeliveryMetadata(body, CONTEXT).errors.join("\n"),
+    /ticket must name a declared AF issue/
+  );
+});
+
 test("related-only dependencies cannot silently block a delivery stage", () => {
   const body = withMetadata(validBody, (metadata) => {
     metadata.dependencies = [
       {
+        ticket: "AF-106",
         relationship: "related to",
         reference: "operating-runbook",
         source: "https://example.test/runbook",
