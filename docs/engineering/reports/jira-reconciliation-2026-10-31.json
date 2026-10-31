@@ -1,0 +1,1345 @@
+{
+  "schemaVersion": 1,
+  "policyVersion": "AF-DELIVERY-1.0",
+  "generatedAt": "2026-10-31T13:22:04.825Z",
+  "snapshotDate": "2026-10-31",
+  "repository": "FutureUnicorn/AI-Filter",
+  "developHead": "bbe7aafd4a4ce3261263ca46ac9d267e43fd071d",
+  "mutationMode": "read-only",
+  "sprint": {
+    "boardId": 34,
+    "sprintId": 484,
+    "name": "AF Sprint 1",
+    "state": "active",
+    "startDate": "2026-10-12T16:16:45.342Z",
+    "endDate": "2026-10-26T16:16:43Z",
+    "issueCount": 44,
+    "byStatus": {
+      "Done": 19,
+      "In Review": 23,
+      "In Progress": 2
+    },
+    "drift": "Sprint remains active after its scheduled end; board-owner action is required to complete or extend it."
+  },
+  "openPullRequests": [
+    {
+      "number": 96,
+      "title": "Delivery governance: canonical policy and project skills",
+      "base": "develop",
+      "head": "feature/delivery-governance-policy",
+      "headSha": "5b3998e17c2045be6d7d4f586c7a723a2baab265",
+      "mergeStateStatus": "BLOCKED",
+      "reviewDecision": "REVIEW_REQUIRED",
+      "headChecks": [
+        {
+          "name": "CI / Lint",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Lint",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Typecheck",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Typecheck",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Unit",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Unit",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Integration",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Integration",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Architecture",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Architecture",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Build",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Build",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Required",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Required",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        }
+      ],
+      "url": "https://github.com/FutureUnicorn/AI-Filter/pull/96"
+    },
+    {
+      "number": 86,
+      "title": "AF-94: percent-encode hosted DATABASE_URL and add password rotation",
+      "base": "develop",
+      "head": "feature/AF-94-hosted-db-credentials",
+      "headSha": "22b90887950e461d92615510c49221475109085b",
+      "mergeStateStatus": "BEHIND",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "headChecks": [
+        {
+          "name": "CI / Lint",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Lint",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Typecheck",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Typecheck",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Unit",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Unit",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Integration",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Integration",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Architecture",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Architecture",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Build",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Build",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Required",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "CI / Required",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        }
+      ],
+      "url": "https://github.com/FutureUnicorn/AI-Filter/pull/86"
+    },
+    {
+      "number": 79,
+      "title": "AF-90: unauthenticated share link for the role-level audit report",
+      "base": "fix/AF-96-stack-rls-parity",
+      "head": "feature/AF-90-audit-report-share-link",
+      "headSha": "b1b03ce9647b68145c30ff39e163baad22665f39",
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "headChecks": [],
+      "url": "https://github.com/FutureUnicorn/AI-Filter/pull/79"
+    },
+    {
+      "number": 73,
+      "title": "AF-65: retry / dead-letter administration that cannot touch candidate data",
+      "base": "feature/AF-66-support-access-logging",
+      "head": "feature/AF-65-retry-dead-letter-administration",
+      "headSha": "6daff589115afee7bbf0334a73639ff1689ecbc6",
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "headChecks": [],
+      "url": "https://github.com/FutureUnicorn/AI-Filter/pull/73"
+    },
+    {
+      "number": 72,
+      "title": "AF-66: support-access logging, fail-closed and PII-free",
+      "base": "feature/AF-63-deletion-reconciliation",
+      "head": "feature/AF-66-support-access-logging",
+      "headSha": "5e2ab94fe586b325eeed9eaeaacd2006cc70237a",
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "headChecks": [],
+      "url": "https://github.com/FutureUnicorn/AI-Filter/pull/72"
+    }
+  ],
+  "records": [
+    {
+      "ticket": "AF-1",
+      "summary": "EPIC 1 - Product Foundation & Architecture",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "aggregate",
+      "deliveryStatus": "aggregate-no-direct-pr",
+      "pullRequests": [],
+      "acceptanceStatus": "not-applicable",
+      "acceptanceSummary": "Epic status must be derived from reviewed child outcomes; it has no direct delivery PR.",
+      "acceptanceEvidence": [
+        "Jira AF-1 child-ticket state"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep human control; review child-ticket outcomes rather than inferring epic completion from code merges.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-1"
+      ]
+    },
+    {
+      "ticket": "AF-3",
+      "summary": "EPIC 3 - Roles, Rubrics & Secure Intake",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "aggregate",
+      "deliveryStatus": "aggregate-no-direct-pr",
+      "pullRequests": [],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Epic contains delivered work and child tickets that still have acceptance gaps.",
+      "acceptanceEvidence": [
+        "PR #83",
+        "AF-24",
+        "AF-28",
+        "AF-33"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep human control; review child-ticket outcomes rather than inferring epic completion from code merges.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-3"
+      ]
+    },
+    {
+      "ticket": "AF-5",
+      "summary": "EPIC 5 - Recruiter Review Workflow",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "aggregate",
+      "deliveryStatus": "aggregate-no-direct-pr",
+      "pullRequests": [],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Epic contains delivered review workflow foundations and undelivered stacked work.",
+      "acceptanceEvidence": [
+        "PR #83",
+        "AF-45",
+        "AF-47",
+        "AF-48",
+        "AF-52",
+        "AF-53"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep human control; review child-ticket outcomes rather than inferring epic completion from code merges.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-5"
+      ]
+    },
+    {
+      "ticket": "AF-6",
+      "summary": "EPIC 6 - Audit Results & Validation Metrics",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "aggregate",
+      "deliveryStatus": "aggregate-no-direct-pr",
+      "pullRequests": [],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Metric and audit-report work remains in a feature-branch stack that has not reached develop.",
+      "acceptanceEvidence": [
+        "PRs #63, #66-#71 and #79"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep human control; review child-ticket outcomes rather than inferring epic completion from code merges.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-6"
+      ]
+    },
+    {
+      "ticket": "AF-24",
+      "summary": "Build recruiter roles list",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Roles list is delivered, but rubric approval, import readiness, and pipeline counts remain placeholders.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/roles/page.tsx:252",
+        "apps/web/src/app/roles/page.tsx:253",
+        "apps/web/src/app/api/roles/route.ts:26"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-24",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-28",
+      "summary": "Implement secure direct file upload",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "The private-bucket upload API is delivered, but there is no browser upload UI and the signed URL is reusable until expiry rather than one-use.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/api/roles/[roleId]/files/route.ts",
+        "apps/web/src/app/roles/page.tsx",
+        "tests/integration/upload-immutability.test.ts"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-28",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-33",
+      "summary": "Build processing/failure status UI",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "Counts, retry, and error-download code are present; browser-level interaction evidence remains missing.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/roles/[roleId]/import/page.tsx:199",
+        "apps/web/src/app/roles/[roleId]/import/page.tsx:240",
+        "apps/web/src/app/roles/[roleId]/import/page.tsx:244"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-33",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-45",
+      "summary": "Build tenant-scoped application review queue",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "The tenant-scoped queue is delivered, but the accepted evidence-processing state model remains unresolved.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/roles/[roleId]/applications/page.tsx:18",
+        "tests/integration/application-review-queue.test.ts"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-45",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-47",
+      "summary": "Add explicit state filters",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Only extraction-state filters work; incomplete, contradiction, and error filters remain disabled.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/roles/[roleId]/applications/page.tsx:43",
+        "apps/web/src/app/roles/[roleId]/applications/page.tsx:156"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-47",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-48",
+      "summary": "Build evidence card with source context",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 83,
+          "title": "Integration/rebuild feature stack",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+          "base": "develop",
+          "head": "integration/rebuild-feature-stack",
+          "headSha": "4ad5c90b5a14b1e73c96e60821b86bf33efdabc4",
+          "mergeSha": "6a5a36b4b45e1879ddb945af9ffde33636d3f1d6",
+          "mergedAt": "2026-09-18T05:40:59Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35311764272,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Evidence cards and citations are delivered, but the original application document is not shown beside them.",
+      "acceptanceEvidence": [
+        "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx:66",
+        "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx:184"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-48",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/83",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35311764272"
+      ]
+    },
+    {
+      "ticket": "AF-52",
+      "summary": "Implement low-evidence random audit sampling",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 61,
+          "title": "AF-52: implement low-evidence random audit sampling",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/61",
+          "base": "feature/AF-51-named-human-decision-recording",
+          "head": "feature/AF-52-low-evidence-audit-sampling",
+          "headSha": "5ddef7e582ad6b87ff7ad64356dd6de8c50203e4",
+          "mergeSha": "a06dc4c5cc8509dd81784ac8c5bd134401387346",
+          "mergedAt": "2026-10-12T16:23:27Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #61 base feature/AF-51-named-human-decision-recording"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-52",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/61"
+      ]
+    },
+    {
+      "ticket": "AF-53",
+      "summary": "Add keyboard-first review navigation",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 62,
+          "title": "AF-53: add keyboard-first review navigation",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/62",
+          "base": "feature/AF-52-low-evidence-audit-sampling",
+          "head": "feature/AF-53-keyboard-first-review-navigation",
+          "headSha": "e8de3ee57056474cb6868e66c42fb7a6c6c223c6",
+          "mergeSha": "8c5dd91d239f116ff0ced57881f064c2fb5c6c81",
+          "mergedAt": "2026-10-12T16:23:39Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #62 base feature/AF-52-low-evidence-audit-sampling"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-53",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/62"
+      ]
+    },
+    {
+      "ticket": "AF-54",
+      "summary": "Capture recruiter review timing",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 63,
+          "title": "AF-54: capture recruiter review timing",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/63",
+          "base": "feature/AF-53-keyboard-first-review-navigation",
+          "head": "feature/AF-54-capture-recruiter-review-timing",
+          "headSha": "28cee87cff4c6b9a21e652d712e7e8e8125370aa",
+          "mergeSha": "a4482ce5d444a0771f3c3114e65f5d5f423fdb61",
+          "mergedAt": "2026-10-12T16:23:48Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #63 base feature/AF-53-keyboard-first-review-navigation"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-54",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/63"
+      ]
+    },
+    {
+      "ticket": "AF-55",
+      "summary": "Calculate review-time reduction",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 66,
+          "title": "AF-55: calculate review-time reduction",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/66",
+          "base": "feature/AF-54-capture-recruiter-review-timing",
+          "head": "feature/AF-55-review-time-reduction",
+          "headSha": "ad0256714ca17143b0be6a387acedb32ae46e172",
+          "mergeSha": "6813479db46d61078e92ae3f389239a864cb566d",
+          "mergedAt": "2026-10-12T16:24:00Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #66 base feature/AF-54-capture-recruiter-review-timing"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-55",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/66"
+      ]
+    },
+    {
+      "ticket": "AF-56",
+      "summary": "Calculate qualified-candidate preservation",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 67,
+          "title": "AF-56: calculate qualified-candidate preservation",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/67",
+          "base": "feature/AF-55-review-time-reduction",
+          "head": "feature/AF-56-qualified-candidate-preservation",
+          "headSha": "0b2359dd71c892cd1fee8054c2bfda63b5c84a82",
+          "mergeSha": "dca1b13df68951369b41a70f8749d2d5342fe8b6",
+          "mergedAt": "2026-10-12T16:24:19Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #67 base feature/AF-55-review-time-reduction"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-56",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/67"
+      ]
+    },
+    {
+      "ticket": "AF-57",
+      "summary": "Calculate evidence precision/correction rate",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 68,
+          "title": "AF-57: calculate evidence precision / correction rate",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/68",
+          "base": "feature/AF-56-qualified-candidate-preservation",
+          "head": "feature/AF-57-evidence-precision-correction-rate",
+          "headSha": "bbb234c7f253a9e92ef432f939de4764650249a4",
+          "mergeSha": "21188d76997ed9311c17794686e72dabfaf3b4bb",
+          "mergedAt": "2026-10-12T16:24:32Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #68 base feature/AF-56-qualified-candidate-preservation"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-57",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/68"
+      ]
+    },
+    {
+      "ticket": "AF-59",
+      "summary": "Generate role-level audit report",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 69,
+          "title": "AF-59: generate role-level audit report",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/69",
+          "base": "feature/AF-57-evidence-precision-correction-rate",
+          "head": "feature/AF-59-role-level-audit-report",
+          "headSha": "68fbd2f8c76b024fc2f75d7b5e282c3486483782",
+          "mergeSha": "b5eb913f2b987aac8d778e2df39737a0bd82f5ff",
+          "mergedAt": "2026-10-12T16:24:44Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #69 base feature/AF-57-evidence-precision-correction-rate"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-59",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/69"
+      ]
+    },
+    {
+      "ticket": "AF-61",
+      "summary": "Implement retention policy",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 70,
+          "title": "AF-61: retention policy, and proof the purge it describes is currently impossible",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/70",
+          "base": "feature/AF-59-role-level-audit-report",
+          "head": "feature/AF-61-retention-policy",
+          "headSha": "6860510939baaafdf276b57fcc553da9f74315f5",
+          "mergeSha": "f5195e68cd27ba03f94a9351609addce0e298291",
+          "mergedAt": "2026-10-12T16:24:56Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #70 base feature/AF-59-role-level-audit-report"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-61",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/70"
+      ]
+    },
+    {
+      "ticket": "AF-62",
+      "summary": "Implement candidate-data deletion workflow",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 76,
+          "title": "AF-62: implement candidate-data deletion workflow",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/76",
+          "base": "feature/AF-65-retry-dead-letter-administration",
+          "head": "feature/AF-62-candidate-data-deletion-workflow",
+          "headSha": "4a4fd860be912277c60c147a936bcf339c1ea0f2",
+          "mergeSha": "6daff589115afee7bbf0334a73639ff1689ecbc6",
+          "mergedAt": "2026-10-12T17:23:44Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #76 base feature/AF-65-retry-dead-letter-administration"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-62",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/76"
+      ]
+    },
+    {
+      "ticket": "AF-63",
+      "summary": "Implement deletion reconciliation",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 71,
+          "title": "AF-63: deletion reconciliation that can see surfaces nobody classified",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/71",
+          "base": "feature/AF-61-retention-policy",
+          "head": "feature/AF-63-deletion-reconciliation",
+          "headSha": "c6a515a2073fc6c7f8978fedc77963be8b578212",
+          "mergeSha": "7d7bb4dab1bd49805326b497c3863868ec6c3e0d",
+          "mergedAt": "2026-10-12T16:25:08Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+      "acceptanceEvidence": [
+        "PR #71 base feature/AF-61-retention-policy"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-63",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/71"
+      ]
+    },
+    {
+      "ticket": "AF-65",
+      "summary": "Build internal retry/dead-letter administration",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "open-not-delivered",
+      "pullRequests": [
+        {
+          "number": 73,
+          "title": "AF-65: retry / dead-letter administration that cannot touch candidate data",
+          "state": "OPEN",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/73",
+          "base": "feature/AF-66-support-access-logging",
+          "head": "feature/AF-65-retry-dead-letter-administration",
+          "headSha": "6daff589115afee7bbf0334a73639ff1689ecbc6",
+          "mergeSha": null,
+          "mergedAt": null,
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR remains open against another feature branch and is not delivered to develop.",
+      "acceptanceEvidence": [
+        "PR #73 base feature/AF-66-support-access-logging"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-65",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/73"
+      ]
+    },
+    {
+      "ticket": "AF-66",
+      "summary": "Implement support-access logging",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "open-not-delivered",
+      "pullRequests": [
+        {
+          "number": 72,
+          "title": "AF-66: support-access logging, fail-closed and PII-free",
+          "state": "OPEN",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/72",
+          "base": "feature/AF-63-deletion-reconciliation",
+          "head": "feature/AF-66-support-access-logging",
+          "headSha": "5e2ab94fe586b325eeed9eaeaacd2006cc70237a",
+          "mergeSha": null,
+          "mergedAt": null,
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The PR remains open against another feature branch and is not delivered to develop.",
+      "acceptanceEvidence": [
+        "PR #72 base feature/AF-63-deletion-reconciliation"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-66",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/72"
+      ]
+    },
+    {
+      "ticket": "AF-90",
+      "summary": "Unauthenticated share link for the role-level audit report",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "open-not-delivered",
+      "pullRequests": [
+        {
+          "number": 79,
+          "title": "AF-90: unauthenticated share link for the role-level audit report",
+          "state": "OPEN",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/79",
+          "base": "fix/AF-96-stack-rls-parity",
+          "head": "feature/AF-90-audit-report-share-link",
+          "headSha": "b1b03ce9647b68145c30ff39e163baad22665f39",
+          "mergeSha": null,
+          "mergedAt": null,
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The stack-tip PR remains open against a feature branch and is not delivered to develop.",
+      "acceptanceEvidence": [
+        "PR #79 base fix/AF-96-stack-rls-parity"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-90",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/79"
+      ]
+    },
+    {
+      "ticket": "AF-94",
+      "summary": "Hosted database credentials: URL encoding and password rotation",
+      "owner": "Pradeep Sam",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "open-not-delivered",
+      "pullRequests": [
+        {
+          "number": 86,
+          "title": "AF-94: percent-encode hosted DATABASE_URL and add password rotation",
+          "state": "OPEN",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/86",
+          "base": "develop",
+          "head": "feature/AF-94-hosted-db-credentials",
+          "headSha": "22b90887950e461d92615510c49221475109085b",
+          "mergeSha": null,
+          "mergedAt": null,
+          "targetBase": true,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The direct PR is open, behind develop, and has changes requested; it is not delivered.",
+      "acceptanceEvidence": [
+        "PR #86"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-94",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/86"
+      ]
+    },
+    {
+      "ticket": "AF-96",
+      "summary": "EPIC 5 stack fails the memberships RLS tests that develop passes",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "stacked-not-delivered",
+      "pullRequests": [
+        {
+          "number": 78,
+          "title": "AF-96: make the stack's RLS probes pass without superuser",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/78",
+          "base": "feature/AF-64-privacy-export-delete-requests",
+          "head": "fix/AF-96-stack-rls-parity",
+          "headSha": "a423da0341c31417eb1b841d1854d3b863abf038",
+          "mergeSha": "2d5e833cd6c04ef901b571ec1e4a09c0a9bed954",
+          "mergedAt": "2026-10-13T04:29:24Z",
+          "targetBase": false,
+          "targetCi": null
+        }
+      ],
+      "acceptanceStatus": "unverified",
+      "acceptanceSummary": "The RLS parity PR merged only into the feature stack and is not delivered to develop.",
+      "acceptanceEvidence": [
+        "PR #78 base feature/AF-64-privacy-export-delete-requests"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "medium",
+      "proposedAction": "Keep the ticket open; the referenced work is not delivered to develop or main.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-96",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/78"
+      ]
+    },
+    {
+      "ticket": "AF-103",
+      "summary": "Health-probe failure logs carry none of the diagnostics the monitoring runbook promises",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 94,
+          "title": "AF-103/AF-104/AF-67: name the failing dependency, pin the budget emitter, publish queue age",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+          "base": "develop",
+          "head": "fix/af103-af104-monitoring-proof",
+          "headSha": "8712fcc1b125d14a435c782aa06c2beeabe110a6",
+          "mergeSha": "e26fffa65f1d80e086b53a3062ae2e7b6c86c1ae",
+          "mergedAt": "2026-10-24T10:26:55Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 40085948768,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768"
+          }
+        }
+      ],
+      "acceptanceStatus": "met",
+      "acceptanceSummary": "Worker health logs distinguish database, object-storage, and combined failures with secret-free regression coverage.",
+      "acceptanceEvidence": [
+        "apps/worker/src/index.ts:63",
+        "apps/worker/src/index.ts:118",
+        "tests/integration/worker.test.ts:223"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Human owner may move this ticket to Done after reviewing the verified merge, CI, acceptance, and dependency evidence.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-103",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768"
+      ]
+    },
+    {
+      "ticket": "AF-104",
+      "summary": "Token-budget detectors are provisioned for an operation no deployed code emits",
+      "owner": "Hemnaath B",
+      "jiraStatus": "In Review",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 94,
+          "title": "AF-103/AF-104/AF-67: name the failing dependency, pin the budget emitter, publish queue age",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+          "base": "develop",
+          "head": "fix/af103-af104-monitoring-proof",
+          "headSha": "8712fcc1b125d14a435c782aa06c2beeabe110a6",
+          "mergeSha": "e26fffa65f1d80e086b53a3062ae2e7b6c86c1ae",
+          "mergedAt": "2026-10-24T10:26:55Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 40085948768,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768"
+          }
+        }
+      ],
+      "acceptanceStatus": "met",
+      "acceptanceSummary": "The deployed worker reaches budget telemetry on settled and capped paths, with an architecture guard against silent drift.",
+      "acceptanceEvidence": [
+        "apps/worker/src/extraction.ts:278",
+        "apps/worker/src/inference.ts:126",
+        "tests/architecture/token-budget-monitors-have-an-emitter.test.ts:73"
+      ],
+      "dependencies": [
+        {
+          "ticket": "AF-102",
+          "expectedRelationship": "is blocked by",
+          "actualRelationship": null,
+          "linked": false,
+          "status": "Done",
+          "source": "AF-104 description and latest Jira comment identify AF-102 as the production-caller dependency.",
+          "url": "https://hemnaathusa.atlassian.net/browse/AF-102"
+        }
+      ],
+      "dependencyDrift": [
+        "AF-102"
+      ],
+      "confidence": "high",
+      "proposedAction": "Review and correct the native Jira dependency link before any status transition.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-104",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768",
+        "https://hemnaathusa.atlassian.net/browse/AF-102"
+      ]
+    },
+    {
+      "ticket": "AF-67",
+      "summary": "Implement monitoring and alerts",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "In Progress",
+      "kind": "operational",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 89,
+          "title": "AF-67: add privacy-safe monitoring, tracing and alert foundations",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/89",
+          "base": "develop",
+          "head": "feature/AF-67-monitoring-alerts",
+          "headSha": "144b09961a0a2b0728acef5561d015464065dd6a",
+          "mergeSha": "588dc8a4b2cbe67238710c7b4eed6af6a5cf0000",
+          "mergedAt": "2026-09-22T03:45:33Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 35684334613,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35684334613"
+          }
+        },
+        {
+          "number": 94,
+          "title": "AF-103/AF-104/AF-67: name the failing dependency, pin the budget emitter, publish queue age",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+          "base": "develop",
+          "head": "fix/af103-af104-monitoring-proof",
+          "headSha": "8712fcc1b125d14a435c782aa06c2beeabe110a6",
+          "mergeSha": "e26fffa65f1d80e086b53a3062ae2e7b6c86c1ae",
+          "mergedAt": "2026-10-24T10:26:55Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 40085948768,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768"
+          }
+        }
+      ],
+      "acceptanceStatus": "partial",
+      "acceptanceSummary": "Monitoring code and queue telemetry are delivered; live Sentry provisioning, thresholds, routing ownership, and staging drills remain unverified.",
+      "acceptanceEvidence": [
+        "docs/operations/monitoring.md",
+        "scripts/observability/sentry-alerts.mjs",
+        "Jira AF-67 comment 2026-10-31"
+      ],
+      "dependencies": [
+        {
+          "ticket": "AF-102",
+          "expectedRelationship": "is blocked by",
+          "actualRelationship": "is blocked by",
+          "linked": true,
+          "status": "Done",
+          "source": "Native Jira link and AF-67 comments identify AF-102 as the queue producer dependency.",
+          "url": "https://hemnaathusa.atlassian.net/browse/AF-102"
+        }
+      ],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "Keep the current Jira status; acceptance or operational evidence remains incomplete or unverified.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-67",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/89",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/94",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/35684334613",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40085948768",
+        "https://hemnaathusa.atlassian.net/browse/AF-102"
+      ]
+    },
+    {
+      "ticket": "AF-106",
+      "summary": "Support multiple AI providers behind the adapter (Anthropic, Google Gemini, OpenAI-compatible)",
+      "owner": "saikrishnaa103",
+      "jiraStatus": "Done",
+      "kind": "delivery",
+      "deliveryStatus": "delivered-to-target",
+      "pullRequests": [
+        {
+          "number": 95,
+          "title": "AF-106: provider-agnostic AI adapter (anthropic, google, openai-compatible)",
+          "state": "MERGED",
+          "url": "https://github.com/FutureUnicorn/AI-Filter/pull/95",
+          "base": "develop",
+          "head": "feature/AF-106-multi-provider-ai",
+          "headSha": "2bc41f58535f5c5afe4ff8e90ed713f7df283dda",
+          "mergeSha": "bbe7aafd4a4ce3261263ca46ac9d267e43fd071d",
+          "mergedAt": "2026-10-29T16:16:06Z",
+          "targetBase": true,
+          "targetCi": {
+            "runId": 40909882279,
+            "conclusion": "success",
+            "required": "success",
+            "url": "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40909882279"
+          }
+        }
+      ],
+      "acceptanceStatus": "met",
+      "acceptanceSummary": "Provider adapters, safety controls, configuration, and tests are delivered; Claude alone was live-verified while Gemini and OpenAI-compatible remain mock-only.",
+      "acceptanceEvidence": [
+        "packages/ai/src/index.ts",
+        "tests/integration/anthropic-adapter.test.ts",
+        "tests/integration/ai-provider-adapters.test.ts",
+        "docs/operations/evidence-extraction-worker.md"
+      ],
+      "dependencies": [],
+      "dependencyDrift": [],
+      "confidence": "high",
+      "proposedAction": "No status change proposed; retain the verified completed record.",
+      "sourceUrls": [
+        "https://hemnaathusa.atlassian.net/browse/AF-106",
+        "https://github.com/FutureUnicorn/AI-Filter/pull/95",
+        "https://github.com/FutureUnicorn/AI-Filter/actions/runs/40909882279"
+      ]
+    }
+  ],
+  "limitations": [
+    "No Jira comments, links, statuses, sprint fields, or other records were changed.",
+    "Acceptance findings are a 2026-10-31 code-and-ticket snapshot and require revalidation after later commits.",
+    "AF-67 live Sentry provisioning, alert routing, thresholds, and trigger/recovery drills were not verified.",
+    "AF-106 Claude was live-verified; Gemini and OpenAI-compatible providers were mock-tested only."
+  ]
+}
