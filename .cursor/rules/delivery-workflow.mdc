@@ -1,0 +1,6 @@
+---
+description: "AI-Filter Jira, testing, and pull request workflow (AF-DELIVERY-1.0)"
+alwaysApply: true
+---
+
+Read and follow `AGENTS.md` and `docs/engineering/delivery-workflow.md` before changing code. Preserve `docs/PRODUCT_BOUNDARY.md`, `docs/engineering/ci.md`, and applicable scoped instructions, especially `apps/web/AGENTS.md`. Jira investigation and dependency assessment precede coding; verified evidence precedes review; current pull request and head-SHA Jira evidence precedes ready-for-review; target-branch CI and human acceptance review precede a Done recommendation.
