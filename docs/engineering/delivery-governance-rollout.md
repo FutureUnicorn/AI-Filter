@@ -8,7 +8,7 @@ This document distinguishes repository functionality from administrative activat
 |---|---|---|
 | PR 1 | Policy, provider adapters, project skills, PR template, examples, drift guards | None; guidance only. |
 | PR 2 | Structural metadata schema, deterministic parser/tests, report-only workflow | Workflow must first exist on the branch GitHub uses for the selected event. |
-| PR 3 | Trusted Jira ticket, link, comment-author, PR/base/head, and CI verification | Jira bot identity and secret configuration; protected workflow source; pilot. |
+| PR 3 | Trusted Jira ticket, native-link, service-comment-author, PR/base/head, and CI verification with a current-head check | Default-branch deployment, least-privilege Jira identity and secrets, live pilot, and check-context proof. |
 | PR 4 | Verified post-merge comment upsert and scheduled read-only reconciliation | Jira write permission, concurrency policy, target-branch CI mapping. |
 | PR 5 | Historical drift report and evidence-backed correction proposals | Ticket-by-ticket human approval before any correction. |
 
@@ -20,6 +20,7 @@ This document distinguishes repository functionality from administrative activat
 - [ ] Create a least-privilege Jira service account that can read issues, links, comments, and status, and can write only delivery comments when post-merge sync is enabled.
 - [ ] Store Jira credentials only in the approved GitHub secret scope.
 - [ ] Deploy privileged workflow definitions from the trusted branch required by GitHub event semantics.
+- [ ] Deploy the trusted workflow to the default branch and configure least-privilege Jira comment credentials.
 - [ ] Pilot current-head ready verification on a dedicated AF ticket and pull request.
 - [ ] Prove a push makes prior ready evidence stale.
 - [ ] Prove retries update the bot's own comment instead of duplicating it.
@@ -38,4 +39,4 @@ Removing a required check from a ruleset, changing credential scope, enabling Ji
 
 Slice 2 introduces `Delivery Policy / PR Metadata (Report Only)` on the nonprivileged `pull_request` event. It validates the readable handoff and structured JSON, publishes warning annotations and a step summary, and intentionally returns success while the rollout is advisory.
 
-This check does not verify Jira or external evidence and must not be required in a branch ruleset. It is self-modifiable by the pull request code it evaluates, has no secrets or write permission, and has no `merge_group` context. Slice 3 must deploy a separate trusted verifier from protected workflow code before any enforcement proposal.
+This check does not verify Jira or external evidence and must not be required in a branch ruleset. It is self-modifiable by the pull request code it evaluates, has no secrets or write permission, and has no `merge_group` context. Slice 3 provides that separate verifier and its tests. It remains inactive until deployed from the default branch with approved secrets, and remains non-required until the live pilot proves the exact check context and failure behavior.

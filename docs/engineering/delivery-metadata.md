@@ -48,4 +48,4 @@ The valid fixture demonstrates a passing draft. The invalid fixture deliberately
 
 ## Promotion criteria
 
-The structural check can move beyond report-only only after a protected implementation independently fetches the actual PR, base, head, Jira issues, authorized Jira comments, links, and CI conclusions. It also needs a real passing and failing pilot, fork behavior review, merge-queue decision, exact check-context verification, and an explicit ruleset update. Slice 3 implements the trusted Jira verification pilot; it does not inherit trust from this parser.
+The structural check can move beyond report-only only after a protected implementation independently fetches the actual PR, base, head, Jira issues, authorized Jira comments, links, and CI conclusions. It also needs a real passing and failing pilot, fork behavior review, merge-queue decision, exact check-context verification, and an explicit ruleset update. Slice 3 implements the separate trusted Jira verification pilot in `docs/engineering/trusted-jira-handoff.md`; it does not inherit trust from this parser.

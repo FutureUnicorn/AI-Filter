@@ -146,3 +146,12 @@ not belong in the required pull-request pipeline.
 `.github/workflows/delivery-policy.yml` adds `Delivery Policy / PR Metadata (Report Only)` for pull requests targeting `develop`, `main`, or `feature/**`. It runs deterministic parser tests and reads the PR event file without secrets or write permission. Findings appear as warning annotations and in the step summary while the job exits successfully in report-only mode.
 
 The check does not independently verify Jira, GitHub CI, reviews, deployments, or acceptance evidence. It is not part of `CI / Required`, is not configured as a required ruleset check, and does not run for `merge_group`. See `docs/engineering/delivery-metadata.md` for the schema, trust boundary, and promotion criteria.
+
+
+## Trusted Jira handoff pilot
+
+`.github/workflows/jira-handoff.yml` implements the protected verifier described in `docs/engineering/trusted-jira-handoff.md`. It re-fetches the actual PR, head, `CI / Required` result, Jira tickets, native dependency links, and authorized current-head Jira comments before publishing `Jira Handoff / Ready`.
+
+The workflow uses protected default-branch code for both `workflow_run` completion and narrowly scoped `pull_request_target` metadata-change events. It never checks out or executes the pull request revision and installs no pull request dependencies in the credential-bearing job.
+
+This check is a pilot. It is not part of `CI / Required` and must not be added to a ruleset until the workflow is deployed to `main`, least-privilege Jira secrets are configured, passing and failing live pilots are recorded, the exact check context is observed, and merge-queue behavior is explicitly decided.

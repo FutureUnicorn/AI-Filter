@@ -16,7 +16,7 @@ import {
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const scriptPath = path.resolve(testDirectory, "../validate-delivery-metadata.mjs");
 const fixture = (name) =>
-  fs.readFileSync(path.join(testDirectory, "fixtures", name), "utf8");
+  fs.readFileSync(path.join(testDirectory, "fixtures", name), "utf8").replace(/\r\n/g, "\n");
 const validBody = fixture("valid-pr.md");
 const invalidBody = fixture("invalid-pr.md");
 const HEAD = "a".repeat(40);
