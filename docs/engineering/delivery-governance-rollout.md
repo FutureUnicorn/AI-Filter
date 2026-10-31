@@ -33,3 +33,9 @@ This document distinguishes repository functionality from administrative activat
 If a trusted Jira check fails because Jira is unavailable, the check reports an unavailable dependency and is retried after recovery. It must not report success from cached or self-declared PR data. If post-merge write-back fails, reconciliation reports the missing record and a controlled replay updates the same bot-owned marker.
 
 Removing a required check from a ruleset, changing credential scope, enabling Jira transitions, or weakening product and human approval controls requires explicit administrative review.
+
+## Report-only metadata state
+
+Slice 2 introduces `Delivery Policy / PR Metadata (Report Only)` on the nonprivileged `pull_request` event. It validates the readable handoff and structured JSON, publishes warning annotations and a step summary, and intentionally returns success while the rollout is advisory.
+
+This check does not verify Jira or external evidence and must not be required in a branch ruleset. It is self-modifiable by the pull request code it evaluates, has no secrets or write permission, and has no `merge_group` context. Slice 3 must deploy a separate trusted verifier from protected workflow code before any enforcement proposal.

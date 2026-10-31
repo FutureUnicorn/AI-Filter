@@ -1,0 +1,32 @@
+name: Delivery Policy
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft]
+    branches: [develop, main, "feature/**"]
+
+concurrency:
+  group: delivery-policy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-metadata:
+    name: Delivery Policy / PR Metadata (Report Only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the untrusted tested revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Node.js version
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Test the deterministic metadata parser
+        run: node --test scripts/ci/tests/delivery-metadata.test.mjs
+      - name: Report delivery metadata gaps
+        run: node scripts/ci/validate-delivery-metadata.mjs --event "$GITHUB_EVENT_PATH" --report-only

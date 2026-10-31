@@ -140,3 +140,9 @@ the `ci-required.needs` list, add their result to the fail-closed assertion, and
 update the CI policy test and this document. Live AI evaluations, production
 services, arbitrary internet data, retries that hide flakiness, and real PII do
 not belong in the required pull-request pipeline.
+
+## Delivery metadata report
+
+`.github/workflows/delivery-policy.yml` adds `Delivery Policy / PR Metadata (Report Only)` for pull requests targeting `develop`, `main`, or `feature/**`. It runs deterministic parser tests and reads the PR event file without secrets or write permission. Findings appear as warning annotations and in the step summary while the job exits successfully in report-only mode.
+
+The check does not independently verify Jira, GitHub CI, reviews, deployments, or acceptance evidence. It is not part of `CI / Required`, is not configured as a required ruleset check, and does not run for `merge_group`. See `docs/engineering/delivery-metadata.md` for the schema, trust boundary, and promotion criteria.
