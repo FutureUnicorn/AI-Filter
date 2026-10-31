@@ -108,6 +108,7 @@ test("the pull request template contains readable and structured delivery eviden
   assert.ok(template.includes('"schemaVersion": "1.0"'));
   assert.ok(template.includes('"humanEvidenceOwner"'));
   assert.ok(template.includes('"readyEvidence"'));
+  assert.ok(template.includes('"approvedExceptions"'));
   assert.ok(template.includes('State (Met / Unmet / Deferred / Not verified)'));
   assert.ok(!template.includes('Partial'));
 });

@@ -80,6 +80,7 @@
     "plan": "Replace with rollout or no-runtime-impact reason",
     "rollback": "Replace with rollback or no-runtime-impact reason"
   },
+  "approvedExceptions": [],
   "readyEvidence": null
 }
 ```
