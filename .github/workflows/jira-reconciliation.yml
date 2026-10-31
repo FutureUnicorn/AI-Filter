@@ -1,0 +1,61 @@
+name: GitHub-Jira Reconciliation
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: Merged delivery lookback, from 1 to 90 days
+        required: true
+        default: "14"
+        type: string
+
+concurrency:
+  group: github-jira-reconciliation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  report:
+    name: Jira Reconciliation / Read Only
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out protected default-branch implementation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Run reconciliation regression tests
+        run: node --test scripts/ci/tests/jira-reconciliation.test.mjs
+      - name: Build read-only reconciliation report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_SERVICE_ACCOUNT_ID: ${{ secrets.JIRA_SERVICE_ACCOUNT_ID }}
+          RECONCILIATION_LOOKBACK_DAYS: ${{ inputs.lookback_days || '14' }}
+        run: node scripts/ci/reconcile-github-jira.mjs
+      - name: Upload reconciliation evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: github-jira-reconciliation-${{ github.run_id }}
+          path: |
+            delivery-reconciliation.json
+            delivery-reconciliation.md
+          if-no-files-found: error
+          retention-days: 30

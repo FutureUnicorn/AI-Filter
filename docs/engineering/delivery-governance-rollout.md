@@ -9,7 +9,7 @@ This document distinguishes repository functionality from administrative activat
 | PR 1 | Policy, provider adapters, project skills, PR template, examples, drift guards | None; guidance only. |
 | PR 2 | Structural metadata schema, deterministic parser/tests, report-only workflow | Workflow must first exist on the branch GitHub uses for the selected event. |
 | PR 3 | Trusted Jira ticket, native-link, service-comment-author, PR/base/head, and CI verification with a current-head check | Default-branch deployment, least-privilege Jira identity and secrets, live pilot, and check-context proof. |
-| PR 4 | Verified post-merge comment upsert and scheduled read-only reconciliation | Jira write permission, concurrency policy, target-branch CI mapping. |
+| PR 4 | Verified target-branch merge comment upsert and scheduled read-only reconciliation artifacts | Default-branch deployment, Jira delivery-comment permission, schedule ownership, and an end-to-end replay pilot. |
 | PR 5 | Historical drift report and evidence-backed correction proposals | Ticket-by-ticket human approval before any correction. |
 
 ## Activation checklist
@@ -24,6 +24,7 @@ This document distinguishes repository functionality from administrative activat
 - [ ] Pilot current-head ready verification on a dedicated AF ticket and pull request.
 - [ ] Prove a push makes prior ready evidence stale.
 - [ ] Prove retries update the bot's own comment instead of duplicating it.
+- [ ] Prove exact merge-revision CI creates one merged comment and a scheduled reconciliation artifact.
 - [ ] Prove feature-branch merges cannot be reported as delivered to `develop`.
 - [ ] Verify exact check contexts for ordinary pull requests and any enabled merge queue.
 - [ ] Add the verified checks to `develop` and `main` rulesets through an explicit ruleset update reviewed by administrators.
