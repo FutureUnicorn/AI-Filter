@@ -52,7 +52,7 @@
 
 ## Structured delivery metadata
 
-<!-- Keep this JSON valid. PR 2 introduces report-only schema validation. PR 3 independently verifies the external values. -->
+<!-- Keep this JSON valid. The report-only check validates structure; PR 3 independently verifies external values. Field definitions: docs/engineering/delivery-metadata.md. -->
 
 ```json
 {
@@ -73,7 +73,15 @@
     }
   ],
   "dependencies": [],
-  "tests": [],
+  "tests": [
+    {
+      "classification": "unverified",
+      "command": "corepack pnpm check",
+      "revision": "0000000000000000000000000000000000000000",
+      "result": "not-run; replace with the actual result",
+      "evidence": "Replace with the CI URL, path, or qualified local output"
+    }
+  ],
   "humanEvidenceOwner": "github-login",
   "aiAssistance": [],
   "rollout": {
