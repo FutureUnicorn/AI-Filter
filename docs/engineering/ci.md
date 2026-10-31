@@ -155,3 +155,9 @@ The check does not independently verify Jira, GitHub CI, reviews, deployments, o
 The workflow uses protected default-branch code for both `workflow_run` completion and narrowly scoped `pull_request_target` metadata-change events. It never checks out or executes the pull request revision and installs no pull request dependencies in the credential-bearing job.
 
 This check is a pilot. It is not part of `CI / Required` and must not be added to a ruleset until the workflow is deployed to `main`, least-privilege Jira secrets are configured, passing and failing live pilots are recorded, the exact check context is observed, and merge-queue behavior is explicitly decided.
+
+## Verified merge evidence and reconciliation
+
+`.github/workflows/jira-post-merge.yml` writes one idempotent service-account delivery comment only after exact `develop` or `main` merge-revision CI succeeds. `.github/workflows/jira-reconciliation.yml` produces a bounded, read-only daily and manually dispatched drift report. Neither workflow transitions Jira.
+
+Both workflows must run from protected default-branch code with the approved Jira service identity. They remain administratively inactive until promoted to `main` and configured. See `docs/engineering/jira-delivery-reconciliation.md`.
