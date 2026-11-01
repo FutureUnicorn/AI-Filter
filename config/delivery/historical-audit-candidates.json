@@ -1,0 +1,483 @@
+{
+    "schemaVersion":  1,
+    "policyVersion":  "AF-DELIVERY-1.0",
+    "snapshotDate":  "2026-10-31",
+    "repository":  "FutureUnicorn/AI-Filter",
+    "jiraProject":  "AF",
+    "targetBranches":  [
+                           "develop",
+                           "main"
+                       ],
+    "candidates":  [
+                       {
+                           "ticket":  "AF-1",
+                           "kind":  "aggregate",
+                           "prNumbers":  [
+
+                                         ],
+                           "acceptanceStatus":  "not-applicable",
+                           "acceptanceSummary":  "Epic status must be derived from reviewed child outcomes; it has no direct delivery PR.",
+                           "evidence":  [
+                                            "Jira AF-1 child-ticket state"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-3",
+                           "kind":  "aggregate",
+                           "prNumbers":  [
+
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Epic contains delivered work and child tickets that still have acceptance gaps.",
+                           "evidence":  [
+                                            "PR #83",
+                                            "AF-24",
+                                            "AF-28",
+                                            "AF-33"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-5",
+                           "kind":  "aggregate",
+                           "prNumbers":  [
+
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Epic contains delivered review workflow foundations and undelivered stacked work.",
+                           "evidence":  [
+                                            "PR #83",
+                                            "AF-45",
+                                            "AF-47",
+                                            "AF-48",
+                                            "AF-52",
+                                            "AF-53"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-6",
+                           "kind":  "aggregate",
+                           "prNumbers":  [
+
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Metric and audit-report work remains in a feature-branch stack that has not reached develop.",
+                           "evidence":  [
+                                            "PRs #63, #66-#71 and #79"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-24",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Roles list is delivered, but rubric approval, import readiness, and pipeline counts remain placeholders.",
+                           "evidence":  [
+                                            "apps/web/src/app/roles/page.tsx:252",
+                                            "apps/web/src/app/roles/page.tsx:253",
+                                            "apps/web/src/app/api/roles/route.ts:26"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-28",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "The private-bucket upload API is delivered, but there is no browser upload UI and the signed URL is reusable until expiry rather than one-use.",
+                           "evidence":  [
+                                            "apps/web/src/app/api/roles/[roleId]/files/route.ts",
+                                            "apps/web/src/app/roles/page.tsx",
+                                            "tests/integration/upload-immutability.test.ts"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-33",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "Counts, retry, and error-download code are present; browser-level interaction evidence remains missing.",
+                           "evidence":  [
+                                            "apps/web/src/app/roles/[roleId]/import/page.tsx:199",
+                                            "apps/web/src/app/roles/[roleId]/import/page.tsx:240",
+                                            "apps/web/src/app/roles/[roleId]/import/page.tsx:244"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-45",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "The tenant-scoped queue is delivered, but the accepted evidence-processing state model remains unresolved.",
+                           "evidence":  [
+                                            "apps/web/src/app/roles/[roleId]/applications/page.tsx:18",
+                                            "tests/integration/application-review-queue.test.ts"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-47",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Only extraction-state filters work; incomplete, contradiction, and error filters remain disabled.",
+                           "evidence":  [
+                                            "apps/web/src/app/roles/[roleId]/applications/page.tsx:43",
+                                            "apps/web/src/app/roles/[roleId]/applications/page.tsx:156"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-48",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             83
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Evidence cards and citations are delivered, but the original application document is not shown beside them.",
+                           "evidence":  [
+                                            "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx:66",
+                                            "apps/web/src/app/roles/[roleId]/applications/[applicationId]/page.tsx:184"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-52",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             61
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #61 base feature/AF-51-named-human-decision-recording"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-53",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             62
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #62 base feature/AF-52-low-evidence-audit-sampling"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-54",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             63
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #63 base feature/AF-53-keyboard-first-review-navigation"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-55",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             66
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #66 base feature/AF-54-capture-recruiter-review-timing"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-56",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             67
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #67 base feature/AF-55-review-time-reduction"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-57",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             68
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #68 base feature/AF-56-qualified-candidate-preservation"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-59",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             69
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #69 base feature/AF-57-evidence-precision-correction-rate"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-61",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             70
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #70 base feature/AF-59-role-level-audit-report"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-62",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             76
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #76 base feature/AF-65-retry-dead-letter-administration"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-63",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             71
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR merged only into a feature branch; acceptance must be reverified after integration onto develop.",
+                           "evidence":  [
+                                            "PR #71 base feature/AF-61-retention-policy"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-65",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             73
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR remains open against another feature branch and is not delivered to develop.",
+                           "evidence":  [
+                                            "PR #73 base feature/AF-66-support-access-logging"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-66",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             72
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The PR remains open against another feature branch and is not delivered to develop.",
+                           "evidence":  [
+                                            "PR #72 base feature/AF-63-deletion-reconciliation"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-90",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             79
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The stack-tip PR remains open against a feature branch and is not delivered to develop.",
+                           "evidence":  [
+                                            "PR #79 base fix/AF-96-stack-rls-parity"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-94",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             86
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The direct PR is open, behind develop, and has changes requested; it is not delivered.",
+                           "evidence":  [
+                                            "PR #86"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-96",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             78
+                                         ],
+                           "acceptanceStatus":  "unverified",
+                           "acceptanceSummary":  "The RLS parity PR merged only into the feature stack and is not delivered to develop.",
+                           "evidence":  [
+                                            "PR #78 base feature/AF-64-privacy-export-delete-requests"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-103",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             94
+                                         ],
+                           "acceptanceStatus":  "met",
+                           "acceptanceSummary":  "Worker health logs distinguish database, object-storage, and combined failures with secret-free regression coverage.",
+                           "evidence":  [
+                                            "apps/worker/src/index.ts:63",
+                                            "apps/worker/src/index.ts:118",
+                                            "tests/integration/worker.test.ts:223"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-104",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             94
+                                         ],
+                           "acceptanceStatus":  "met",
+                           "acceptanceSummary":  "The deployed worker reaches budget telemetry on settled and capped paths, with an architecture guard against silent drift.",
+                           "evidence":  [
+                                            "apps/worker/src/extraction.ts:278",
+                                            "apps/worker/src/inference.ts:126",
+                                            "tests/architecture/token-budget-monitors-have-an-emitter.test.ts:73"
+                                        ],
+                           "dependencies":  [
+                                                {
+                                                    "ticket":  "AF-102",
+                                                    "relationship":  "is blocked by",
+                                                    "source":  "AF-104 description and latest Jira comment identify AF-102 as the production-caller dependency."
+                                                }
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-67",
+                           "kind":  "operational",
+                           "prNumbers":  [
+                                             89,
+                                             94
+                                         ],
+                           "acceptanceStatus":  "partial",
+                           "acceptanceSummary":  "Monitoring code and queue telemetry are delivered; live Sentry provisioning, thresholds, routing ownership, and staging drills remain unverified.",
+                           "evidence":  [
+                                            "docs/operations/monitoring.md",
+                                            "scripts/observability/sentry-alerts.mjs",
+                                            "Jira AF-67 comment 2026-10-31"
+                                        ],
+                           "dependencies":  [
+                                                {
+                                                    "ticket":  "AF-102",
+                                                    "relationship":  "is blocked by",
+                                                    "source":  "Native Jira link and AF-67 comments identify AF-102 as the queue producer dependency."
+                                                }
+                                            ]
+                       },
+                       {
+                           "ticket":  "AF-106",
+                           "kind":  "delivery",
+                           "prNumbers":  [
+                                             95
+                                         ],
+                           "acceptanceStatus":  "met",
+                           "acceptanceSummary":  "Provider adapters, safety controls, configuration, and tests are delivered; Claude alone was live-verified while Gemini and OpenAI-compatible remain mock-only.",
+                           "evidence":  [
+                                            "packages/ai/src/index.ts",
+                                            "tests/integration/anthropic-adapter.test.ts",
+                                            "tests/integration/ai-provider-adapters.test.ts",
+                                            "docs/operations/evidence-extraction-worker.md"
+                                        ],
+                           "dependencies":  [
+
+                                            ]
+                       }
+                   ]
+}
