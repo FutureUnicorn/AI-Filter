@@ -1,10 +1,12 @@
 import {
+  AiOutputTruncatedError,
   AiStructuredCallParseError,
   AiUsageUnavailableError,
   EVIDENCE_EXTRACTION_JSON_SCHEMA,
   EVIDENCE_EXTRACTION_SCHEMA_NAME,
   EVIDENCE_EXTRACTION_SCHEMA_VERSION,
   InferenceKillSwitchEngagedError,
+  ProviderHttpError,
   mapRubricToEvidence,
   outcomesForSchemaValidationFailure,
   parseEvidenceExtractionResponse,
@@ -21,6 +23,7 @@ import {
   completeEvidenceExtractionJob,
   deferEvidenceExtractionJob,
   getEvidenceExtractionJobContext,
+  getEvidenceExtractionQueueMonitoringSnapshot,
   recordWorkerHeartbeat,
   renewEvidenceExtractionJobLease,
   retryOrFailEvidenceExtractionJob
@@ -35,7 +38,9 @@ import type {
 import { CONTRACT_SCHEMA_VERSION } from "@signal-audit/domain";
 
 import { InferenceBudgetCappedError, executeBudgetedInference } from "./inference.ts";
-import { captureWorkerError, captureWorkerJobFailure } from "./observability.ts";
+import { captureWorkerError, captureWorkerJobFailure,
+  recordEvidenceExtractionQueueTelemetry
+} from "./observability.ts";
 
 export const EVIDENCE_EXTRACTION_PROMPT_VERSION = "1.0.0";
 const DOCUMENT_LABEL = "application_document";
@@ -103,9 +108,9 @@ function metadataForRun(metadata: AiCallMetadata, rubricVersion: number) {
   };
 }
 
-function fallbackRun(model: string, rubricVersion: number) {
+function fallbackRun(provider: string, model: string, rubricVersion: number) {
   return {
-    provider: "openai",
+    provider,
     model,
     promptVersion: EVIDENCE_EXTRACTION_PROMPT_VERSION,
     extractionSchemaVersion: EVIDENCE_EXTRACTION_SCHEMA_VERSION,
@@ -115,6 +120,9 @@ function fallbackRun(model: string, rubricVersion: number) {
 }
 
 function safeProviderStatus(error: unknown): number | undefined {
+  if (error instanceof ProviderHttpError) {
+    return error.status;
+  }
   if (typeof error !== "object" || error === null || !("status" in error)) {
     return undefined;
   }
@@ -315,10 +323,13 @@ export async function processEvidenceExtractionJob(
       });
       return deferred ? "deferred" : "lease_lost";
     }
+    const truncatedOutput = error instanceof AiOutputTruncatedError;
     const parseError = error instanceof AiStructuredCallParseError;
     const usageMissing = error instanceof AiUsageUnavailableError;
-    const failureCode = parseError
-      ? "model_output_invalid"
+    const failureCode = truncatedOutput
+      ? "model_output_truncated"
+      : parseError
+        ? "model_output_invalid"
       : usageMissing
         ? "provider_usage_missing"
         : retryableProviderError(error)
@@ -327,7 +338,7 @@ export async function processEvidenceExtractionJob(
     const run = parseError
       ? metadataForRun(error.metadata, context.rubricVersion)
       : usageMissing
-        ? fallbackRun(routing.model, context.rubricVersion)
+        ? fallbackRun(dependencies.config.provider ?? "openai", routing.model, context.rubricVersion)
         : undefined;
     const result = await retryOrFailEvidenceExtractionJob(dependencies.databaseUrl, dependencies.schema, {
       organizationId: job.organizationId,
@@ -404,19 +415,43 @@ export async function runEvidenceExtractionWorker(
     dependencies: EvidenceExtractionWorkerDependencies
   ) => Promise<boolean> = processNextEvidenceExtractionJob
 ): Promise<void> {
+  const clock = dependencies.now ?? (() => new Date());
   const writeHeartbeat = () =>
     recordWorkerHeartbeat(
       dependencies.databaseUrl,
       dependencies.schema,
       dependencies.config.workerId,
-      (dependencies.now ?? (() => new Date()))()
+      clock()
     );
+  // AF-67: publish the queue snapshot on the same tick as the heartbeat,
+  // not when a job is dequeued. A stalled worker dequeues nothing, so
+  // dequeue-driven telemetry goes silent exactly when the backlog is
+  // growing, and silence is indistinguishable from an empty queue. The
+  // heartbeat fires regardless of whether work is being claimed.
+  const publishQueueTelemetry = async (): Promise<void> => {
+    const snapshot = await getEvidenceExtractionQueueMonitoringSnapshot(
+      dependencies.databaseUrl,
+      dependencies.schema,
+      clock()
+    );
+    await recordEvidenceExtractionQueueTelemetry({
+      oldestReadyAgeMs: snapshot.oldestReadyAgeMs,
+      readyJobs: snapshot.readyJobs,
+      runningJobs: snapshot.runningJobs,
+      failedJobs: snapshot.failedJobs,
+      completedJobs: snapshot.completedJobs,
+      totalAttempts: snapshot.totalAttempts,
+      heartbeatAgeMs: snapshot.heartbeatAgeMs
+    });
+  };
   await writeHeartbeat();
+  await publishQueueTelemetry().catch((error: unknown) => captureWorkerError(error, "worker.job"));
   let heartbeatInFlight = false;
   const heartbeatTimer = setInterval(() => {
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
     void writeHeartbeat()
+      .then(publishQueueTelemetry)
       .catch((error: unknown) => captureWorkerError(error, "worker.job"))
       .finally(() => {
         heartbeatInFlight = false;

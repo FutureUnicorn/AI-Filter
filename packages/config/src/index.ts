@@ -254,10 +254,13 @@ export type InferenceBudgetPeriod = "day" | "month";
 export interface WorkerProcessingConfig {
   readonly enabled: boolean;
   readonly workerId?: string;
+  readonly provider?: "openai" | "anthropic" | "google" | "openai_compatible";
   readonly openAi?: {
     readonly apiKey: string;
     readonly defaultModel: string;
     readonly escalationModel: string;
+    readonly baseUrl?: string;
+    readonly maxOutputTokens?: number;
   };
   readonly budget?: {
     readonly maxTokensPerPeriod: number;
@@ -430,6 +433,37 @@ const optionalRatio = z.preprocess(
   z.coerce.number().min(0).max(1).optional()
 );
 
+// Configuration and adapter construction are separate trust boundaries, so
+// both validate this value. A public-boundary parity test keeps the two checks
+// aligned without coupling the config package to a provider implementation.
+function isSecureOpenAiCompatibleBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const localLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+    return (
+      (url.protocol === "https:" || (url.protocol === "http:" && localLoopback)) &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+const optionalAiBaseUrl = z.preprocess(
+  (value) => (value === "" || value === undefined ? undefined : value),
+  z
+    .string()
+    .trim()
+    .refine(
+      isSecureOpenAiCompatibleBaseUrl,
+      "AI_BASE_URL must use HTTPS; HTTP is allowed only for localhost or a loopback address, and credentials, query strings, and fragments are forbidden"
+    )
+    .optional()
+);
+
 const workerProcessingSchema = z
   .object({
     WORKER_PROCESSING_ENABLED: z.preprocess(
@@ -443,6 +477,18 @@ const workerProcessingSchema = z
     OPENAI_API_KEY: optionalNonEmpty,
     OPENAI_MODEL: optionalNonEmpty,
     OPENAI_ESCALATION_MODEL: optionalNonEmpty,
+    AI_PROVIDER: z.preprocess(
+      (value) => (value === "" || value === undefined ? undefined : value),
+      z.enum(["openai", "anthropic", "google", "openai_compatible"]).optional()
+    ),
+    ANTHROPIC_API_KEY: optionalNonEmpty,
+    ANTHROPIC_MODEL: optionalNonEmpty,
+    ANTHROPIC_ESCALATION_MODEL: optionalNonEmpty,
+    ANTHROPIC_MAX_OUTPUT_TOKENS: optionalPositiveInteger,
+    AI_API_KEY: optionalNonEmpty,
+    AI_MODEL: optionalNonEmpty,
+    AI_ESCALATION_MODEL: optionalNonEmpty,
+    AI_BASE_URL: optionalAiBaseUrl,
     INFERENCE_MAX_TOKENS_PER_PERIOD: optionalPositiveInteger,
     INFERENCE_ALERT_THRESHOLD_RATIO: optionalRatio,
     INFERENCE_BUDGET_PERIOD: z.preprocess(
@@ -461,11 +507,20 @@ const workerProcessingSchema = z
     if (!value.WORKER_PROCESSING_ENABLED) {
       return;
     }
+    const providerFields =
+      value.AI_PROVIDER === "anthropic"
+        ? (["ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_ESCALATION_MODEL"] as const)
+        : value.AI_PROVIDER === "google" || value.AI_PROVIDER === "openai_compatible"
+          ? ([
+              "AI_API_KEY",
+              "AI_MODEL",
+              "AI_ESCALATION_MODEL",
+              ...(value.AI_PROVIDER === "openai_compatible" ? (["AI_BASE_URL"] as const) : [])
+            ] as const)
+          : (["OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_ESCALATION_MODEL"] as const);
     for (const field of [
       "WORKER_INSTANCE_ID",
-      "OPENAI_API_KEY",
-      "OPENAI_MODEL",
-      "OPENAI_ESCALATION_MODEL",
+      ...providerFields,
       "INFERENCE_MAX_TOKENS_PER_PERIOD",
       "INFERENCE_ALERT_THRESHOLD_RATIO",
       "INFERENCE_BUDGET_PERIOD"
@@ -510,14 +565,47 @@ export function loadWorkerProcessingConfig(source: EnvironmentSource): WorkerPro
   if (!value.WORKER_PROCESSING_ENABLED) {
     return base;
   }
+  const provider = value.AI_PROVIDER ?? "openai";
+  let credentials: NonNullable<WorkerProcessingConfig["openAi"]>;
+  switch (provider) {
+    case "anthropic":
+      credentials = {
+        apiKey: value.ANTHROPIC_API_KEY!,
+        defaultModel: value.ANTHROPIC_MODEL!,
+        escalationModel: value.ANTHROPIC_ESCALATION_MODEL!,
+        maxOutputTokens: value.ANTHROPIC_MAX_OUTPUT_TOKENS ?? 4096
+      };
+      break;
+    case "openai":
+      credentials = {
+        apiKey: value.OPENAI_API_KEY!,
+        defaultModel: value.OPENAI_MODEL!,
+        escalationModel: value.OPENAI_ESCALATION_MODEL!
+      };
+      break;
+    case "openai_compatible":
+      credentials = {
+        apiKey: value.AI_API_KEY!,
+        defaultModel: value.AI_MODEL!,
+        escalationModel: value.AI_ESCALATION_MODEL!,
+        baseUrl: value.AI_BASE_URL!
+      };
+      break;
+    case "google":
+      credentials = {
+        apiKey: value.AI_API_KEY!,
+        defaultModel: value.AI_MODEL!,
+        escalationModel: value.AI_ESCALATION_MODEL!
+      };
+      break;
+  }
   return {
     ...base,
     workerId: value.WORKER_INSTANCE_ID!,
-    openAi: {
-      apiKey: value.OPENAI_API_KEY!,
-      defaultModel: value.OPENAI_MODEL!,
-      escalationModel: value.OPENAI_ESCALATION_MODEL!
-    },
+    provider,
+    // Credentials and models for the selected provider. The key name predates
+    // multi-provider support and is kept so existing consumers are unaffected.
+    openAi: credentials,
     budget: {
       maxTokensPerPeriod: value.INFERENCE_MAX_TOKENS_PER_PERIOD!,
       alertThresholdRatio: value.INFERENCE_ALERT_THRESHOLD_RATIO!,

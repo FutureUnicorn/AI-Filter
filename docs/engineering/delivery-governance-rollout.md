@@ -1,0 +1,43 @@
+# Delivery governance rollout
+
+This document distinguishes repository functionality from administrative activation. The canonical process is `docs/engineering/delivery-workflow.md`.
+
+## Incremental delivery
+
+| Slice | Repository functionality | Administrative dependency |
+|---|---|---|
+| PR 1 | Policy, provider adapters, project skills, PR template, examples, drift guards | None; guidance only. |
+| PR 2 | Structural metadata schema, deterministic parser/tests, report-only workflow | Workflow must first exist on the branch GitHub uses for the selected event. |
+| PR 3 | Trusted Jira ticket, native-link, service-comment-author, PR/base/head, and CI verification with a current-head check | Default-branch deployment, least-privilege Jira identity and secrets, live pilot, and check-context proof. |
+| PR 4 | Verified target-branch merge comment upsert and scheduled read-only reconciliation artifacts | Default-branch deployment, Jira delivery-comment permission, schedule ownership, and an end-to-end replay pilot. |
+| PR 5 | Historical drift report and evidence-backed correction proposals | Ticket-by-ticket human approval before any correction. |
+
+## Activation checklist
+
+- [ ] Review AF-DELIVERY-1.0 and provider adapters.
+- [ ] Run architecture drift tests and verify scoped `apps/web/AGENTS.md` remains intact.
+- [ ] Pilot structural metadata on a deliberately failing and a passing pull request.
+- [ ] Create a least-privilege Jira service account that can read issues, links, comments, and status, and can write only delivery comments when post-merge sync is enabled.
+- [ ] Store Jira credentials only in the approved GitHub secret scope.
+- [ ] Deploy privileged workflow definitions from the trusted branch required by GitHub event semantics.
+- [ ] Deploy the trusted workflow to the default branch and configure least-privilege Jira comment credentials.
+- [ ] Pilot current-head ready verification on a dedicated AF ticket and pull request.
+- [ ] Prove a push makes prior ready evidence stale.
+- [ ] Prove retries update the bot's own comment instead of duplicating it.
+- [ ] Prove exact merge-revision CI creates one merged comment and a scheduled reconciliation artifact.
+- [ ] Prove feature-branch merges cannot be reported as delivered to `develop`.
+- [ ] Verify exact check contexts for ordinary pull requests and any enabled merge queue.
+- [ ] Add the verified checks to `develop` and `main` rulesets through an explicit ruleset update reviewed by administrators.
+- [ ] Keep Jira transitions human controlled until protected transition governance is separately approved.
+
+## Recovery
+
+If a trusted Jira check fails because Jira is unavailable, the check reports an unavailable dependency and is retried after recovery. It must not report success from cached or self-declared PR data. If post-merge write-back fails, reconciliation reports the missing record and a controlled replay updates the same bot-owned marker.
+
+Removing a required check from a ruleset, changing credential scope, enabling Jira transitions, or weakening product and human approval controls requires explicit administrative review.
+
+## Report-only metadata state
+
+Slice 2 introduces `Delivery Policy / PR Metadata (Report Only)` on the nonprivileged `pull_request` event. It validates the readable handoff and structured JSON, publishes warning annotations and a step summary, and intentionally returns success while the rollout is advisory.
+
+This check does not verify Jira or external evidence and must not be required in a branch ruleset. It is self-modifiable by the pull request code it evaluates, has no secrets or write permission, and has no `merge_group` context. Slice 3 provides that separate verifier and its tests. It remains inactive until deployed from the default branch with approved secrets, and remains non-required until the live pilot proves the exact check context and failure behavior.

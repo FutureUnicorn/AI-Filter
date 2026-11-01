@@ -3,7 +3,11 @@ import {
   reserveInferenceBudget,
   settleInferenceReservation
 } from "@signal-audit/db";
-import { AiCallNotStartedError, InferenceKillSwitchEngagedError } from "@signal-audit/ai";
+import {
+  AiCallNotStartedError,
+  InferenceKillSwitchEngagedError,
+  ProviderHttpError
+} from "@signal-audit/ai";
 import {
   checkInferenceBudget,
   type AiAdapter,
@@ -63,6 +67,9 @@ function usageFromFailure(error: unknown): AiCallUsage | undefined {
 }
 
 function providerStatusFromFailure(error: unknown): number | undefined {
+  if (error instanceof ProviderHttpError) {
+    return error.status;
+  }
   if (typeof error !== "object" || error === null || !("status" in error)) {
     return undefined;
   }
