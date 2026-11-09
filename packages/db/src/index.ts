@@ -15,11 +15,13 @@ import type {
   CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRunRef,
+  CurrentEvidenceOutcomeKind,
   EvidenceExtractionJobRef,
   EvidenceExtractionJobState,
   EvidenceExtractionJob,
   EvidenceExtractionQueueMonitoringSnapshot,
   EvidenceOutcome,
+  EvidenceOutcomeKind,
   FailedDocumentRate,
   FileIntake,
   FileIntakeStatus,
@@ -5172,6 +5174,77 @@ export async function listCurrentEvidenceExtractionJobsForApplications(
       maxAttempts: row.max_attempts,
       ...(row.failure_code === null ? {} : { failureCode: row.failure_code })
     }));
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * AF-47: the current outcome kind for every criterion of every listed
+ * application, in one query.
+ *
+ * "Current" is the same rule listCurrentEvidenceOutcomesForApplication
+ * uses, newest recorded_at then newest id, so a recruiter correction
+ * (an append, 0018_evidence_corrections.sql) is what a filter sees. A
+ * test asserts the two reads agree on the same rows; if one changes its
+ * ordering without the other, a filter would disagree with the card.
+ *
+ * Only the lifted kind and criterion_id columns are selected. The jsonb
+ * outcome carries the verbatim quote, and a filter has no use for it.
+ */
+export async function listCurrentEvidenceOutcomeKindsForApplications(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationIds: readonly string[]
+): Promise<readonly CurrentEvidenceOutcomeKind[]> {
+  assertSafeSchema(schema);
+  if (applicationIds.length === 0) {
+    return [];
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ application_id: string; criterion_id: string; kind: EvidenceOutcomeKind }>(
+      `SELECT DISTINCT ON (application_id, criterion_id) application_id, criterion_id, kind
+         FROM "${schema}".evidence_outcomes
+        WHERE organization_id = $1 AND application_id = ANY($2::uuid[])
+        ORDER BY application_id, criterion_id, recorded_at DESC, evidence_outcome_id DESC`,
+      [organizationId, [...applicationIds]]
+    );
+    return result.rows.map((row) => ({
+      applicationId: row.application_id,
+      criterionId: row.criterion_id,
+      kind: row.kind
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * AF-47: which of the listed applications have at least one recorded
+ * human decision. Existence only: the queue needs to know whether a
+ * person has decided, never what they decided or why.
+ */
+export async function listApplicationIdsWithCandidateDecisions(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationIds: readonly string[]
+): Promise<readonly string[]> {
+  assertSafeSchema(schema);
+  if (applicationIds.length === 0) {
+    return [];
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{ application_id: string }>(
+      `SELECT DISTINCT application_id
+         FROM "${schema}".candidate_decisions
+        WHERE organization_id = $1 AND application_id = ANY($2::uuid[])`,
+      [organizationId, [...applicationIds]]
+    );
+    return result.rows.map((row) => row.application_id);
   } finally {
     client.release();
   }

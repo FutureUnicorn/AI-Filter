@@ -325,3 +325,65 @@ test("the current-job read follows a real job through every lifecycle state and 
   );
   assert.deepEqual(await stateOf(), { state: "extracted", job: { state: "completed", attemptCount: 1, maxAttempts: 2 } });
 });
+
+// ---- AF-47: review filters in the published contract ----
+
+const reviewQueue = (filters: readonly ("unreviewed" | "incomplete" | "contradiction" | "error")[] = []) =>
+  buildApplicationReviewQueue(
+    roleId,
+    [application("44444444-4444-4444-8444-444444444444", 1), application("55555555-5555-4555-8555-555555555555", 2)],
+    [],
+    [],
+    [],
+    {
+      rubricCriterionIds: ["python"],
+      decidedApplicationIds: ["44444444-4444-4444-8444-444444444444"],
+      currentOutcomes: [
+        { applicationId: "44444444-4444-4444-8444-444444444444", criterionId: "python", kind: "supported" },
+        { applicationId: "55555555-5555-4555-8555-555555555555", criterionId: "python", kind: "contradicted" }
+      ],
+      filters
+    }
+  );
+
+const issues = (value: unknown): string =>
+  applicationReviewQueueSchema.safeParse(value).error?.issues.map((issue) => issue.message).join(" ") ?? "";
+
+test("a queue with review flags and filters satisfies the contract", () => {
+  for (const queue of [reviewQueue(), reviewQueue(["contradiction"])]) {
+    const parsed = applicationReviewQueueSchema.safeParse(queue);
+    assert.ok(parsed.success, JSON.stringify(parsed.error?.issues));
+  }
+});
+
+test("review counts that disagree with an unfiltered queue's entries are rejected", () => {
+  const queue = reviewQueue();
+  assert.match(
+    issues({ ...queue, reviewFilterCounts: { ...queue.reviewFilterCounts, contradiction: 0 } }),
+    /reviewFilterCounts must match the entries/
+  );
+});
+
+test("an entry that matches none of the applied review filters is rejected", () => {
+  const queue = reviewQueue(["contradiction"]);
+  const decided = reviewQueue().entries[0];
+  assert.ok(decided !== undefined);
+  assert.match(issues({ ...queue, entries: [decided], shownCount: 1 }), /match one of the applied review filters/);
+});
+
+test("a failed extraction without the error flag, or flags out of order, is rejected", () => {
+  const queue = reviewQueue();
+  const entry = queue.entries[1];
+  assert.ok(entry !== undefined);
+  assert.match(
+    issues({
+      ...queue,
+      entries: [queue.entries[0], { ...entry, evidenceState: "extraction_failed", job: { state: "failed", attemptCount: 3, maxAttempts: 3 } }]
+    }),
+    /must carry the error flag/
+  );
+  assert.match(
+    issues({ ...queue, entries: [queue.entries[0], { ...entry, reviewFlags: ["contradiction", "unreviewed"] }] }),
+    /unique and in canonical order/
+  );
+});

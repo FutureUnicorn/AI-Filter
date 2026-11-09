@@ -1514,6 +1514,8 @@ export interface ApplicationQueueEntry {
   readonly lastExtractionAt?: string | undefined;
   /** The current job, when one has ever been enqueued. */
   readonly job?: ApplicationQueueJobSummary | undefined;
+  /** AF-47: which review filters this application matches, in canonical order. */
+  readonly reviewFlags: readonly ApplicationReviewFilter[];
 }
 
 export interface ApplicationReviewQueue extends VersionedRecord {
@@ -1532,8 +1534,15 @@ export interface ApplicationReviewQueue extends VersionedRecord {
   readonly processingCount: number;
   readonly extractionFailedCount: number;
   readonly extractedCount: number;
+  /**
+   * AF-47: whole-role count per review filter. Filters overlap, so these
+   * do not sum to totalCount; each is at most totalCount.
+   */
+  readonly reviewFilterCounts: Readonly<Record<ApplicationReviewFilter, number>>;
   /** Which states the caller asked for; empty means "no filter applied". */
   readonly appliedStates: readonly ApplicationEvidenceState[];
+  /** Which review filters the caller asked for; empty means none applied. */
+  readonly appliedFilters: readonly ApplicationReviewFilter[];
   /** entries.length, stated explicitly so a truncated response is detectable. */
   readonly shownCount: number;
   readonly entries: readonly ApplicationQueueEntry[];
@@ -1620,8 +1629,20 @@ export function buildApplicationReviewQueue(
   applications: readonly Application[],
   runs: readonly EvidenceExtractionRunRef[],
   states: readonly ApplicationEvidenceState[] = [],
-  jobs: readonly EvidenceExtractionJobRef[] = []
+  jobs: readonly EvidenceExtractionJobRef[] = [],
+  review: ApplicationReviewInputs = {}
 ): ApplicationReviewQueue {
+  const decided = new Set(review.decidedApplicationIds ?? []);
+  const outcomesByApplicationId = new Map<string, CurrentEvidenceOutcomeKind[]>();
+  for (const outcome of review.currentOutcomes ?? []) {
+    const existing = outcomesByApplicationId.get(outcome.applicationId);
+    if (existing === undefined) {
+      outcomesByApplicationId.set(outcome.applicationId, [outcome]);
+    } else {
+      existing.push(outcome);
+    }
+  }
+
   // Reduced here rather than trusted from the caller: the read returns one
   // job per application today, but if it ever returned several the newest
   // generation must still be the one that decides the state.
@@ -1659,9 +1680,16 @@ export function buildApplicationReviewQueue(
         runTimes.length === 0
           ? undefined
           : runTimes.reduce((latest, current) => (current > latest ? current : latest));
+      const reviewFlags = deriveApplicationReviewFilters({
+        evidenceState,
+        hasDecision: decided.has(application.applicationId),
+        rubricCriterionIds: review.rubricCriterionIds,
+        currentOutcomes: outcomesByApplicationId.get(application.applicationId) ?? []
+      });
       return {
         application,
         evidenceState,
+        reviewFlags,
         extractionRunCount: runTimes.length,
         ...(lastExtractionAt === undefined ? {} : { lastExtractionAt }),
         ...(job === undefined
@@ -1681,10 +1709,20 @@ export function buildApplicationReviewQueue(
   // never as part of either. AF-46's order is a property of the whole
   // queue, so a filtered view has to be a subsequence of it -- selecting
   // rows must not be able to reorder the rows it keeps.
+  // AF-47: OR within each dimension, AND across them. A recruiter who
+  // ticks "contradiction" and "error" wants either; one who also picks the
+  // extracted processing state wants those among the extracted ones.
   const requested = new Set(states);
-  const shown = requested.size === 0 ? entries : entries.filter((entry) => requested.has(entry.evidenceState));
+  const requestedFilters = new Set(review.filters ?? []);
+  const shown = entries.filter(
+    (entry) =>
+      (requested.size === 0 || requested.has(entry.evidenceState)) &&
+      (requestedFilters.size === 0 || entry.reviewFlags.some((flag) => requestedFilters.has(flag)))
+  );
   const countInState = (state: ApplicationEvidenceState): number =>
     entries.filter((entry) => entry.evidenceState === state).length;
+  const countWithFlag = (filter: ApplicationReviewFilter): number =>
+    entries.filter((entry) => entry.reviewFlags.includes(filter)).length;
 
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
@@ -1695,7 +1733,14 @@ export function buildApplicationReviewQueue(
     processingCount: countInState("processing"),
     extractionFailedCount: countInState("extraction_failed"),
     extractedCount: countInState("extracted"),
+    reviewFilterCounts: {
+      unreviewed: countWithFlag("unreviewed"),
+      incomplete: countWithFlag("incomplete"),
+      contradiction: countWithFlag("contradiction"),
+      error: countWithFlag("error")
+    },
     appliedStates: [...requested],
+    appliedFilters: APPLICATION_REVIEW_FILTERS.filter((filter) => requestedFilters.has(filter)),
     shownCount: shown.length,
     entries: shown
   };
@@ -1706,21 +1751,13 @@ export function buildApplicationReviewQueue(
 // "Filter by unreviewed/incomplete/contradiction/error state -- explicit
 // filters, never a hidden ranking."
 //
-// Of the four states the ticket names, exactly one is answerable from
-// data that exists. `unreviewed` is `pending_extraction`: no extraction
-// run has been recorded against the application (AF-40's
-// evidence_extraction_runs). `incomplete`, `contradiction` and `error`
-// are all per-criterion EvidenceOutcome kinds, and nothing persists
-// those -- EvidenceOutcome is a contract type the pipeline returns, with
-// no table behind it. Offering them as filters that quietly match
-// nothing would be worse than not offering them: a recruiter filtering
-// for contradictions and seeing an empty list would reasonably conclude
-// there are none.
-//
-// So the closed set below is the set that can be answered honestly, and
-// the UI shows the other three as unavailable with the reason, rather
-// than hiding them or faking them. When outcomes get a table this set
-// grows; nothing else about the mechanism has to change.
+// Two independent dimensions. The processing state below (AF-45's five
+// lifecycle states, parsed from `?state=`) says where an application is in
+// extraction. The ticket's four review filters (parsed from `?filter=`,
+// defined in the AF-47 outcome-backed section further down) say what its
+// persisted evidence and decisions show. The first version of this ticket
+// could answer only `unreviewed`, because nothing persisted per-criterion
+// outcomes; 0017_evidence_outcomes.sql now does.
 //
 // The "never a hidden ranking" half is structural, not a promise:
 // filtering is applied to an already-ordered queue as a subsequence, so
@@ -1768,6 +1805,148 @@ export function parseApplicationStateFilter(
     return { ok: false, unknownValues: [""] };
   }
   return { ok: true, states: [...new Set(requested.filter(isApplicationEvidenceState))] };
+}
+
+// ---- AF-47: outcome-backed review filters ----
+//
+// The ticket's four filters, wired to what is now persisted: the newest
+// evidence_outcomes row per criterion (so a recruiter correction counts,
+// see 0018_evidence_corrections.sql) and candidate_decisions. Definitions
+// approved by Hemnaath B on 2026-11-09:
+//
+//   unreviewed     no human advance/hold/decline decision recorded
+//   contradiction  a rubric criterion's current outcome is contradicted
+//   incomplete     a rubric criterion has no current outcome, or it is
+//                  unclear / processing / retrying
+//   error          processing state extraction_failed, or a criterion's
+//                  current outcome is an error kind
+//
+// not_found is deliberately complete: it means "absent from the supplied
+// material", which is a finished answer, and reading it as incomplete
+// would push every candidate who simply lacks a skill into a to-do pile.
+//
+// These are flags, not states. They overlap, so an application can be
+// unreviewed and contradicted at once, and the counts below do not
+// partition the total. Filtering is still a subsequence of AF-46's order.
+
+export type ApplicationReviewFilter = "unreviewed" | "incomplete" | "contradiction" | "error";
+
+export const APPLICATION_REVIEW_FILTERS: readonly ApplicationReviewFilter[] = [
+  "unreviewed",
+  "incomplete",
+  "contradiction",
+  "error"
+] as const;
+
+type OutcomeKindClass = "complete" | "incomplete" | "contradiction" | "error";
+
+/**
+ * Every outcome kind, classified exactly once. A Record over the union
+ * rather than a list per filter: adding a kind to EvidenceOutcome fails
+ * to compile here until someone decides which filter it belongs to,
+ * instead of silently matching none of them.
+ */
+export const EVIDENCE_OUTCOME_KIND_CLASS: Readonly<Record<EvidenceOutcomeKind, OutcomeKindClass>> = {
+  supported: "complete",
+  partially_supported: "complete",
+  not_found: "complete",
+  contradicted: "contradiction",
+  unclear: "incomplete",
+  processing: "incomplete",
+  retrying: "incomplete",
+  extraction_error: "error",
+  citation_invalid: "error",
+  invalid_source: "error",
+  unsupported_file: "error",
+  quarantined: "error",
+  failed: "error"
+};
+
+/** The current (newest) outcome kind for one criterion of one application. */
+export interface CurrentEvidenceOutcomeKind {
+  readonly applicationId: string;
+  readonly criterionId: string;
+  readonly kind: EvidenceOutcomeKind;
+}
+
+/** What the queue knows about review and evidence beyond processing state. */
+export interface ApplicationReviewInputs {
+  /** The role's latest published rubric criteria; undefined when none is published. */
+  readonly rubricCriterionIds?: readonly string[] | undefined;
+  readonly currentOutcomes?: readonly CurrentEvidenceOutcomeKind[] | undefined;
+  /** Applications with at least one recorded human decision. */
+  readonly decidedApplicationIds?: readonly string[] | undefined;
+  /** Requested filters; empty means no review filter applied. */
+  readonly filters?: readonly ApplicationReviewFilter[] | undefined;
+}
+
+/**
+ * Exported so each filter's rule is testable on its own.
+ *
+ * Only criteria in the role's current rubric are considered. An outcome
+ * filed under a criterion the rubric no longer has describes a question
+ * nobody is asking any more. With no published rubric there is no set of
+ * questions to be complete against, so the application is incomplete.
+ */
+export function deriveApplicationReviewFilters(input: {
+  readonly evidenceState: ApplicationEvidenceState;
+  readonly hasDecision: boolean;
+  readonly rubricCriterionIds: readonly string[] | undefined;
+  readonly currentOutcomes: readonly Pick<CurrentEvidenceOutcomeKind, "criterionId" | "kind">[];
+}): ApplicationReviewFilter[] {
+  const flags = new Set<ApplicationReviewFilter>();
+  if (!input.hasDecision) {
+    flags.add("unreviewed");
+  }
+  if (input.evidenceState === "extraction_failed") {
+    flags.add("error");
+  }
+  if (input.rubricCriterionIds === undefined) {
+    flags.add("incomplete");
+  }
+  const inRubric = input.rubricCriterionIds === undefined ? undefined : new Set(input.rubricCriterionIds);
+  const answered = new Set<string>();
+  for (const outcome of input.currentOutcomes) {
+    if (inRubric !== undefined && !inRubric.has(outcome.criterionId)) {
+      continue;
+    }
+    answered.add(outcome.criterionId);
+    const kindClass = EVIDENCE_OUTCOME_KIND_CLASS[outcome.kind];
+    if (kindClass !== "complete") {
+      flags.add(kindClass);
+    }
+  }
+  if (input.rubricCriterionIds?.some((criterionId) => !answered.has(criterionId))) {
+    flags.add("incomplete");
+  }
+  return APPLICATION_REVIEW_FILTERS.filter((filter) => flags.has(filter));
+}
+
+export type ApplicationReviewFilterParse =
+  | { readonly ok: true; readonly filters: readonly ApplicationReviewFilter[] }
+  | { readonly ok: false; readonly unknownValues: readonly string[] };
+
+/**
+ * Same rules as parseApplicationStateFilter, for the same reason: an
+ * unknown or empty filter is rejected, never dropped, because silently
+ * ignoring `?filter=contradiciton` would return the whole queue labelled
+ * as the contradictions.
+ */
+export function parseApplicationReviewFilter(rawValues: readonly string[]): ApplicationReviewFilterParse {
+  const requested = rawValues
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  const known = (value: string): value is ApplicationReviewFilter =>
+    (APPLICATION_REVIEW_FILTERS as readonly string[]).includes(value);
+  const unknownValues = [...new Set(requested.filter((value) => !known(value)))];
+  if (unknownValues.length > 0) {
+    return { ok: false, unknownValues };
+  }
+  if (requested.length === 0 && rawValues.length > 0) {
+    return { ok: false, unknownValues: [""] };
+  }
+  return { ok: true, filters: [...new Set(requested.filter(known))] };
 }
 
 /** Raw per-role counts, as read from file_intakes joined to extractions. */
