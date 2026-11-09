@@ -24,7 +24,10 @@ interface QueueEntry {
     readonly maxAttempts: number;
     readonly failureCode?: string;
   };
+  readonly reviewFlags: readonly ReviewFilter[];
 }
+
+type ReviewFilter = "unreviewed" | "incomplete" | "contradiction" | "error";
 
 interface ReviewQueue {
   readonly roleId: string;
@@ -34,7 +37,9 @@ interface ReviewQueue {
   readonly processingCount: number;
   readonly extractionFailedCount: number;
   readonly extractedCount: number;
+  readonly reviewFilterCounts: Readonly<Record<ReviewFilter, number>>;
   readonly appliedStates: readonly QueueEntry["evidenceState"][];
+  readonly appliedFilters: readonly ReviewFilter[];
   readonly shownCount: number;
   readonly entries: readonly QueueEntry[];
 }
@@ -80,15 +85,24 @@ function describeJob(entry: QueueEntry): string {
 }
 
 /**
- * AF-47 names four filters. Three of them cannot be answered from
- * anything stored: incomplete, contradiction and error are per-criterion
- * EvidenceOutcome kinds, and nothing persists those. They are shown
- * disabled with the reason rather than omitted, because a recruiter who
- * filters for contradictions and gets an empty list would reasonably
- * conclude there are none -- offering a filter that quietly matches
- * nothing is worse than not offering it.
+ * AF-47's four filters, each backed by persisted data: recorded human
+ * decisions and the current per-criterion evidence outcome. They overlap,
+ * so the per-filter counts do not add up to the total, and the hint under
+ * each label says exactly what it matches.
  */
-const UNAVAILABLE_FILTERS: readonly string[] = ["Incomplete", "Contradiction", "Error"];
+const REVIEW_FILTERS: readonly { readonly value: ReviewFilter; readonly label: string; readonly hint: string }[] = [
+  { value: "unreviewed", label: "Unreviewed", hint: "no advance, hold or decline recorded yet" },
+  { value: "incomplete", label: "Incomplete", hint: "a criterion has no result yet, or it is unclear" },
+  { value: "contradiction", label: "Contradiction", hint: "a criterion has conflicting evidence" },
+  { value: "error", label: "Error", hint: "extraction failed, or a criterion's evidence could not be used" }
+];
+
+const REVIEW_FLAG_LABELS: Readonly<Record<ReviewFilter, string>> = {
+  unreviewed: "Unreviewed",
+  incomplete: "Incomplete",
+  contradiction: "Contradiction",
+  error: "Error"
+};
 
 /**
  * AF-45: the recruiter's main working view for a role. Each row shows
@@ -97,11 +111,9 @@ const UNAVAILABLE_FILTERS: readonly string[] = ["Incomplete", "Contradiction", "
  * There is still no per-criterion verdict column: that is the evidence
  * card's job, and a processing state must never read as a verdict.
  *
- * AF-47: filters are explicit checkboxes that name the state they
- * select, and the counts they are compared against stay whole, so the
- * screen can always say how much a filter is hiding. The three states
- * the ticket names that nothing persists are shown disabled with the
- * reason, not omitted.
+ * AF-47: filters are explicit checkboxes that name what they select,
+ * and the counts they are compared against stay whole, so the screen can
+ * always say how much a filter is hiding.
  *
  * AF-46: the order is the employer's own file order, and the caption
  * says so out loud. That is a product guarantee, not an implementation
@@ -113,6 +125,7 @@ export default function ApplicationReviewQueuePage() {
   const roleId = params.roleId;
   const [state, setState] = useState<QueueState>({ kind: "loading" });
   const [selected, setSelected] = useState<readonly QueueEntry["evidenceState"][]>([]);
+  const [selectedFilters, setSelectedFilters] = useState<readonly ReviewFilter[]>([]);
 
   useEffect(() => {
     if (roleId === undefined) {
@@ -121,7 +134,10 @@ export default function ApplicationReviewQueuePage() {
     }
     let cancelled = false;
     setState({ kind: "loading" });
-    const query = selected.map((value) => `state=${encodeURIComponent(value)}`).join("&");
+    const query = [
+      ...selected.map((value) => `state=${encodeURIComponent(value)}`),
+      ...selectedFilters.map((value) => `filter=${encodeURIComponent(value)}`)
+    ].join("&");
     fetch(`/api/roles/${encodeURIComponent(roleId)}/applications${query === "" ? "" : `?${query}`}`, {
       headers: { Accept: "application/json" }
     })
@@ -142,7 +158,9 @@ export default function ApplicationReviewQueuePage() {
             processingCount: body.processingCount ?? 0,
             extractionFailedCount: body.extractionFailedCount ?? 0,
             extractedCount: body.extractedCount ?? 0,
+            reviewFilterCounts: body.reviewFilterCounts ?? { unreviewed: 0, incomplete: 0, contradiction: 0, error: 0 },
             appliedStates: body.appliedStates ?? [],
+            appliedFilters: body.appliedFilters ?? [],
             shownCount: body.shownCount ?? 0,
             entries: body.entries ?? []
           }
@@ -155,10 +173,16 @@ export default function ApplicationReviewQueuePage() {
     return () => {
       cancelled = true;
     };
-  }, [roleId, selected]);
+  }, [roleId, selected, selectedFilters]);
 
   const toggle = (value: QueueEntry["evidenceState"]): void => {
     setSelected((current) =>
+      current.includes(value) ? current.filter((entry) => entry !== value) : [...current, value]
+    );
+  };
+
+  const toggleFilter = (value: ReviewFilter): void => {
+    setSelectedFilters((current) =>
       current.includes(value) ? current.filter((entry) => entry !== value) : [...current, value]
     );
   };
@@ -174,7 +198,7 @@ export default function ApplicationReviewQueuePage() {
       {state.kind === "ready" && (
         <>
           <p>
-            {state.queue.appliedStates.length === 0
+            {state.queue.appliedStates.length === 0 && state.queue.appliedFilters.length === 0
               ? `${state.queue.totalCount} imported ${state.queue.totalCount === 1 ? "application" : "applications"}`
               : `Showing ${state.queue.shownCount} of ${state.queue.totalCount}`}{" "}
             · {state.queue.extractedCount} extracted · {state.queue.processingCount} processing ·{" "}
@@ -183,19 +207,26 @@ export default function ApplicationReviewQueuePage() {
           </p>
 
           <fieldset>
-            <legend>Filter by state</legend>
+            <legend>Filter by processing state</legend>
             {FILTERABLE_STATES.map((value) => (
               <label key={value}>
                 <input type="checkbox" checked={selected.includes(value)} onChange={() => toggle(value)} />{" "}
                 {EVIDENCE_STATE_LABELS[value]}
               </label>
             ))}
-            {UNAVAILABLE_FILTERS.map((label) => (
-              <label key={label} title="Needs per-criterion evidence outcomes, which are not stored yet.">
-                <input type="checkbox" disabled />
-                {" "}
-                {label} <span aria-hidden="true">—</span>{" "}
-                <small>not available yet: per-criterion evidence outcomes are not stored</small>
+          </fieldset>
+
+          <fieldset>
+            <legend>Filter by review state (shows applications matching any ticked filter)</legend>
+            {REVIEW_FILTERS.map((filter) => (
+              <label key={filter.value} title={filter.hint}>
+                <input
+                  type="checkbox"
+                  checked={selectedFilters.includes(filter.value)}
+                  onChange={() => toggleFilter(filter.value)}
+                />{" "}
+                {filter.label} ({state.queue.reviewFilterCounts[filter.value]} of {state.queue.totalCount}){" "}
+                <small>{filter.hint}</small>
               </label>
             ))}
           </fieldset>
@@ -221,6 +252,7 @@ export default function ApplicationReviewQueuePage() {
                   <th scope="col">Email</th>
                   <th scope="col">Evidence state</th>
                   <th scope="col">Attempts</th>
+                  <th scope="col">Review</th>
                   <th scope="col">Last extraction</th>
                 </tr>
               </thead>
@@ -232,6 +264,11 @@ export default function ApplicationReviewQueuePage() {
                     <td>{entry.application.candidateEmail}</td>
                     <td>{EVIDENCE_STATE_LABELS[entry.evidenceState]}</td>
                     <td>{describeJob(entry)}</td>
+                    <td>
+                      {entry.reviewFlags.length === 0
+                        ? "Reviewed, nothing flagged"
+                        : entry.reviewFlags.map((flag) => REVIEW_FLAG_LABELS[flag]).join(", ")}
+                    </td>
                     <td>{entry.lastExtractionAt ?? "—"}</td>
                   </tr>
                 ))}

@@ -41,7 +41,9 @@ test("an empty role produces an empty queue, not a missing one", () => {
     processingCount: 0,
     extractionFailedCount: 0,
     extractedCount: 0,
+    reviewFilterCounts: { unreviewed: 0, incomplete: 0, contradiction: 0, error: 0 },
     appliedStates: [],
+    appliedFilters: [],
     shownCount: 0,
     entries: []
   });

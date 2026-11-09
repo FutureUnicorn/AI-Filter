@@ -1,16 +1,21 @@
 import { buildApiError, generateRequestId, withRequestId } from "@signal-audit/contracts";
 import { loadEnvironmentConfig } from "@signal-audit/config";
 import {
+  getLatestPublishedRubricForRole,
   getMembershipsForUser,
   getRoleById,
+  listApplicationIdsWithCandidateDecisions,
   listApplicationsForRole,
+  listCurrentEvidenceOutcomeKindsForApplications,
   listCurrentEvidenceExtractionJobsForApplications,
   listEvidenceExtractionRunsForEntities
 } from "@signal-audit/db";
 import {
   APPLICATION_ENTITY_TYPE,
   APPLICATION_EVIDENCE_STATES,
+  APPLICATION_REVIEW_FILTERS,
   buildApplicationReviewQueue,
+  parseApplicationReviewFilter,
   parseApplicationStateFilter
 } from "@signal-audit/domain";
 import { authorizeResourceAccess, resourceAuthorizationErrorResponse } from "@signal-audit/security";
@@ -62,6 +67,15 @@ async function handleGET(request: NextRequest, context: RouteContext): Promise<R
     });
     return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
   }
+  const reviewFilter = parseApplicationReviewFilter(new URL(request.url).searchParams.getAll("filter"));
+  if (!reviewFilter.ok) {
+    const error = buildApiError({
+      requestId,
+      code: "invalid_request",
+      message: `Unsupported review filter: ${reviewFilter.unknownValues.map((value) => JSON.stringify(value)).join(", ")}. Supported: ${APPLICATION_REVIEW_FILTERS.join(", ")}.`
+    });
+    return Response.json(error.body, { status: error.status, headers: withRequestId(undefined, requestId) });
+  }
 
   try {
     const config = loadEnvironmentConfig(process.env);
@@ -88,7 +102,7 @@ async function handleGET(request: NextRequest, context: RouteContext): Promise<R
       role.roleId
     );
     const applicationIds = applications.map((application) => application.applicationId);
-    const [runs, jobs] = await Promise.all([
+    const [runs, jobs, currentOutcomes, decidedApplicationIds, rubric] = await Promise.all([
       listEvidenceExtractionRunsForEntities(
         config.database.url,
         config.database.schema,
@@ -101,10 +115,31 @@ async function handleGET(request: NextRequest, context: RouteContext): Promise<R
         config.database.schema,
         role.organizationId,
         applicationIds
-      )
+      ),
+      listCurrentEvidenceOutcomeKindsForApplications(
+        config.database.url,
+        config.database.schema,
+        role.organizationId,
+        applicationIds
+      ),
+      listApplicationIdsWithCandidateDecisions(
+        config.database.url,
+        config.database.schema,
+        role.organizationId,
+        applicationIds
+      ),
+      // The role was resolved and authorized above, so its id already
+      // belongs to the caller's organization.
+      getLatestPublishedRubricForRole(config.database.url, config.database.schema, role.roleId)
     ]);
 
-    return Response.json(buildApplicationReviewQueue(role.roleId, applications, runs, filter.states, jobs), {
+    const queue = buildApplicationReviewQueue(role.roleId, applications, runs, filter.states, jobs, {
+      rubricCriterionIds: rubric?.criteria.map((criterion) => criterion.criterionId),
+      currentOutcomes,
+      decidedApplicationIds,
+      filters: reviewFilter.filters
+    });
+    return Response.json(queue, {
       status: 200,
       headers: withRequestId(undefined, requestId)
     });

@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   ALLOWED_FILE_TYPES,
   APPLICATION_EVIDENCE_STATES,
+  APPLICATION_REVIEW_FILTERS,
   APPLICATION_IMPORT_FIELDS,
   AUDIT_ACTIONS,
   CANDIDATE_DECISION_KINDS,
@@ -936,8 +937,21 @@ export const applicationQueueEntrySchema = z.strictObject({
     .refine((job) => job.attemptCount <= job.maxAttempts, {
       message: "attemptCount cannot exceed maxAttempts"
     })
-    .optional()
+    .optional(),
+  // AF-47: canonical order and no repeats, so two responses describing the
+  // same application compare equal.
+  reviewFlags: z
+    .array(z.enum(APPLICATION_REVIEW_FILTERS))
+    .refine(
+      (flags) => flags.join(",") === APPLICATION_REVIEW_FILTERS.filter((filter) => flags.includes(filter)).join(","),
+      { message: "reviewFlags must be unique and in canonical order" }
+    )
 })
+  // A failed extraction is an error a recruiter has to see; a response
+  // that drops the flag is hiding exactly that.
+  .refine((entry) => entry.evidenceState !== "extraction_failed" || entry.reviewFlags.includes("error"), {
+    message: "an extraction_failed application must carry the error flag"
+  })
   // The processing state and the job it is derived from are one fact; a
   // response where they disagree is describing an application in two
   // places at once.
@@ -968,7 +982,14 @@ export const applicationReviewQueueSchema = z
     processingCount: z.number().int().min(0),
     extractionFailedCount: z.number().int().min(0),
     extractedCount: z.number().int().min(0),
+    reviewFilterCounts: z.strictObject({
+      unreviewed: z.number().int().min(0),
+      incomplete: z.number().int().min(0),
+      contradiction: z.number().int().min(0),
+      error: z.number().int().min(0)
+    }),
     appliedStates: z.array(z.enum(APPLICATION_EVIDENCE_STATES)),
+    appliedFilters: z.array(z.enum(APPLICATION_REVIEW_FILTERS)),
     shownCount: z.number().int().min(0),
     entries: z.array(applicationQueueEntrySchema)
   })
@@ -988,8 +1009,35 @@ export const applicationReviewQueueSchema = z
   .refine((queue) => queue.shownCount <= queue.totalCount, {
     message: "shownCount cannot exceed totalCount"
   })
-  .refine((queue) => queue.appliedStates.length > 0 || queue.shownCount === queue.totalCount, {
-    message: "an unfiltered queue must show every application it counted"
+  .refine(
+    (queue) => queue.appliedStates.length > 0 || queue.appliedFilters.length > 0 || queue.shownCount === queue.totalCount,
+    { message: "an unfiltered queue must show every application it counted" }
+  )
+  .refine(
+    (queue) =>
+      APPLICATION_REVIEW_FILTERS.every((filter) => queue.reviewFilterCounts[filter] <= queue.totalCount),
+    { message: "a review filter cannot match more applications than the role has" }
+  )
+  // Counts are whole-role, so they can only be checked against the entries
+  // when nothing is hidden. Then they must agree exactly.
+  .refine(
+    (queue) =>
+      queue.shownCount !== queue.totalCount ||
+      APPLICATION_REVIEW_FILTERS.every(
+        (filter) =>
+          queue.reviewFilterCounts[filter] === queue.entries.filter((entry) => entry.reviewFlags.includes(filter)).length
+      ),
+    { message: "reviewFilterCounts must match the entries when every application is shown" }
+  )
+  .refine(
+    (queue) =>
+      queue.entries.every(
+        (entry) => queue.appliedFilters.length === 0 || entry.reviewFlags.some((flag) => queue.appliedFilters.includes(flag))
+      ),
+    { message: "every entry returned must match one of the applied review filters" }
+  )
+  .refine((queue) => new Set(queue.appliedFilters).size === queue.appliedFilters.length, {
+    message: "appliedFilters must not repeat a filter"
   })
   .refine(
     (queue) => queue.entries.every((entry) => queue.appliedStates.length === 0 || queue.appliedStates.includes(entry.evidenceState)),
