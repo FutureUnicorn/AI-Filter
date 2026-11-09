@@ -1339,7 +1339,7 @@ export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
 // narrower than the ticket's wording suggests and that is deliberate.
 // The first version of this queue could report only two states, because
 // the only durable record that extraction had happened was AF-40's
-// evidence_extraction_runs. AF-102's job table and 0017's evidence_outcomes
+// evidence_extraction_runs. AF-102's job table and the evidence_outcomes table from 0017_evidence_outcomes.sql
 // have since landed, so the processing lifecycle below is derived from the
 // job table. Per-criterion outcome kinds (supported, contradicted, ...) are
 // a different axis and belong to the filters and the evidence card, not to

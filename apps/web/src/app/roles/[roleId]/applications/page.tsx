@@ -65,7 +65,7 @@ const FILTERABLE_STATES: readonly QueueEntry["evidenceState"][] = [
  * What a recruiter needs to know about the attempts behind a state: a
  * queued job that has already failed once is retrying, not new, and a
  * failed one is not going to finish on its own. The failure code is a
- * closed machine token (0026's CHECK), never provider text.
+ * closed machine token (the CHECK in 0026_evidence_extraction_jobs.sql), never provider text.
  */
 function describeJob(entry: QueueEntry): string {
   const job = entry.job;
