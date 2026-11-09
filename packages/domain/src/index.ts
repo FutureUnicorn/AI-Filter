@@ -1337,16 +1337,13 @@ export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
 //
 // The honest scope of "evidence-processing state" here, because it is
 // narrower than the ticket's wording suggests and that is deliberate.
-// AF-13 defines a rich EvidenceOutcome union (supported, contradicted,
-// unclear, citation_invalid, quarantined, ...), but nothing persists
-// those: it is a contract type the pipeline returns, with no table
-// behind it. The only durable evidence that extraction ran against an
-// entity is AF-40's evidence_extraction_runs. So this reports the two
-// states actually derivable from stored data and says so, rather than
-// adding a per-criterion status column the database cannot back. When
-// evidence outcomes get a table, this union gains members; it is not
-// retrofitted with guesses now. That is the same call AF-24 made for
-// rubric approval and import readiness on the roles list.
+// The first version of this queue could report only two states, because
+// the only durable record that extraction had happened was AF-40's
+// evidence_extraction_runs. AF-102's job table and 0017's evidence_outcomes
+// have since landed, so the processing lifecycle below is derived from the
+// job table. Per-criterion outcome kinds (supported, contradicted, ...) are
+// a different axis and belong to the filters and the evidence card, not to
+// this processing state.
 
 /**
  * The entity_type an evidence_extraction_runs row uses when the entity
@@ -1357,10 +1354,35 @@ export function buildImportErrorsCsv(rows: readonly ImportRow[]): string {
  */
 export const APPLICATION_ENTITY_TYPE = "application";
 
-export type ApplicationEvidenceState = "pending_extraction" | "extracted";
+// AF-45 (completing the state set): AF-102's evidence_extraction_jobs
+// now records where each application is in processing, so the queue
+// reports the whole lifecycle instead of only "has a run been recorded".
+// The current job is the application's highest enqueue_generation: every
+// enqueue and every operator requeue allocates a new generation under the
+// application's row lock, so it is a total order per application that
+// timestamps are not.
+//
+//   pending_extraction  no job and no recorded run: nothing has asked for it
+//   queued              current job is ready (first attempt or waiting to retry)
+//   processing          current job is running under a worker lease
+//   extraction_failed   current job failed terminally (retries exhausted)
+//   extracted           current job completed, or a run was recorded with no job
+//
+// The current job wins over older runs on purpose. An application that was
+// extracted once and has since been requeued is being reprocessed, and
+// showing it as "extracted" would present stale results as current.
+export type ApplicationEvidenceState =
+  | "pending_extraction"
+  | "queued"
+  | "processing"
+  | "extraction_failed"
+  | "extracted";
 
 export const APPLICATION_EVIDENCE_STATES: readonly ApplicationEvidenceState[] = [
   "pending_extraction",
+  "queued",
+  "processing",
+  "extraction_failed",
   "extracted"
 ] as const;
 
@@ -1461,12 +1483,37 @@ export interface EvidenceExtractionRunRef {
   readonly createdAt: string;
 }
 
+/**
+ * The application's current extraction job, as the queue needs it: the
+ * delivery state and attempt bookkeeping only. Lease owners, intake and
+ * rubric ids stay out of the recruiter view.
+ */
+export interface EvidenceExtractionJobRef {
+  readonly applicationId: string;
+  readonly state: EvidenceExtractionJobState;
+  /** Per-application allocation order; higher is newer. */
+  readonly enqueueGeneration: number;
+  readonly attemptCount: number;
+  readonly maxAttempts: number;
+  /** Machine token from the last failed attempt, if any. */
+  readonly failureCode?: string | undefined;
+}
+
+export interface ApplicationQueueJobSummary {
+  readonly state: EvidenceExtractionJobState;
+  readonly attemptCount: number;
+  readonly maxAttempts: number;
+  readonly failureCode?: string | undefined;
+}
+
 export interface ApplicationQueueEntry {
   readonly application: Application;
   readonly evidenceState: ApplicationEvidenceState;
   readonly extractionRunCount: number;
   /** Most recent run for this application, when at least one exists. */
   readonly lastExtractionAt?: string | undefined;
+  /** The current job, when one has ever been enqueued. */
+  readonly job?: ApplicationQueueJobSummary | undefined;
 }
 
 export interface ApplicationReviewQueue extends VersionedRecord {
@@ -1479,7 +1526,11 @@ export interface ApplicationReviewQueue extends VersionedRecord {
    * can honestly say "showing 3 of 12".
    */
   readonly totalCount: number;
+  /** One count per ApplicationEvidenceState; together they partition totalCount. */
   readonly pendingExtractionCount: number;
+  readonly queuedCount: number;
+  readonly processingCount: number;
+  readonly extractionFailedCount: number;
   readonly extractedCount: number;
   /** Which states the caller asked for; empty means "no filter applied". */
   readonly appliedStates: readonly ApplicationEvidenceState[];
@@ -1545,12 +1596,43 @@ export function compareApplicationsBySourceOrder(a: Application, b: Application)
   );
 }
 
+/** The one mapping from job state to queue state; the contract imports it. */
+export const JOB_STATE_TO_EVIDENCE_STATE: Readonly<Record<EvidenceExtractionJobState, ApplicationEvidenceState>> = {
+  ready: "queued",
+  running: "processing",
+  failed: "extraction_failed",
+  completed: "extracted"
+};
+
+/** Exported so the state precedence is testable on its own. */
+export function deriveApplicationEvidenceState(
+  currentJob: Pick<EvidenceExtractionJobRef, "state"> | undefined,
+  extractionRunCount: number
+): ApplicationEvidenceState {
+  if (currentJob !== undefined) {
+    return JOB_STATE_TO_EVIDENCE_STATE[currentJob.state];
+  }
+  return extractionRunCount > 0 ? "extracted" : "pending_extraction";
+}
+
 export function buildApplicationReviewQueue(
   roleId: string,
   applications: readonly Application[],
   runs: readonly EvidenceExtractionRunRef[],
-  states: readonly ApplicationEvidenceState[] = []
+  states: readonly ApplicationEvidenceState[] = [],
+  jobs: readonly EvidenceExtractionJobRef[] = []
 ): ApplicationReviewQueue {
+  // Reduced here rather than trusted from the caller: the read returns one
+  // job per application today, but if it ever returned several the newest
+  // generation must still be the one that decides the state.
+  const currentJobByApplicationId = new Map<string, EvidenceExtractionJobRef>();
+  for (const job of jobs) {
+    const existing = currentJobByApplicationId.get(job.applicationId);
+    if (existing === undefined || job.enqueueGeneration > existing.enqueueGeneration) {
+      currentJobByApplicationId.set(job.applicationId, job);
+    }
+  }
+
   const runsByApplicationId = new Map<string, string[]>();
   for (const run of runs) {
     if (run.entityType !== APPLICATION_ENTITY_TYPE) {
@@ -1568,18 +1650,30 @@ export function buildApplicationReviewQueue(
     .sort(compareApplicationsBySourceOrder)
     .map((application): ApplicationQueueEntry => {
       const runTimes = runsByApplicationId.get(application.applicationId) ?? [];
-      if (runTimes.length === 0) {
-        return { application, evidenceState: "pending_extraction", extractionRunCount: 0 };
-      }
+      const job = currentJobByApplicationId.get(application.applicationId);
+      const evidenceState = deriveApplicationEvidenceState(job, runTimes.length);
       // Max by string comparison is safe here: these are ISO-8601 UTC
       // timestamps produced by toISOString(), so lexical order is
       // chronological order for every value this can receive.
-      const lastExtractionAt = runTimes.reduce((latest, current) => (current > latest ? current : latest));
+      const lastExtractionAt =
+        runTimes.length === 0
+          ? undefined
+          : runTimes.reduce((latest, current) => (current > latest ? current : latest));
       return {
         application,
-        evidenceState: "extracted",
+        evidenceState,
         extractionRunCount: runTimes.length,
-        lastExtractionAt
+        ...(lastExtractionAt === undefined ? {} : { lastExtractionAt }),
+        ...(job === undefined
+          ? {}
+          : {
+              job: {
+                state: job.state,
+                attemptCount: job.attemptCount,
+                maxAttempts: job.maxAttempts,
+                ...(job.failureCode === undefined ? {} : { failureCode: job.failureCode })
+              }
+            })
       };
     });
 
@@ -1589,13 +1683,18 @@ export function buildApplicationReviewQueue(
   // rows must not be able to reorder the rows it keeps.
   const requested = new Set(states);
   const shown = requested.size === 0 ? entries : entries.filter((entry) => requested.has(entry.evidenceState));
+  const countInState = (state: ApplicationEvidenceState): number =>
+    entries.filter((entry) => entry.evidenceState === state).length;
 
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     roleId,
     totalCount: entries.length,
-    pendingExtractionCount: entries.filter((entry) => entry.evidenceState === "pending_extraction").length,
-    extractedCount: entries.filter((entry) => entry.evidenceState === "extracted").length,
+    pendingExtractionCount: countInState("pending_extraction"),
+    queuedCount: countInState("queued"),
+    processingCount: countInState("processing"),
+    extractionFailedCount: countInState("extraction_failed"),
+    extractedCount: countInState("extracted"),
     appliedStates: [...requested],
     shownCount: shown.length,
     entries: shown

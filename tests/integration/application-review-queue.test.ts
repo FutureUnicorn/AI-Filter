@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { randomUUID } from "node:crypto";
+
+import { EVIDENCE_EXTRACTION_WORKFLOW_VERSION } from "../../packages/contracts/src/index.ts";
 import {
   assertApplicantOrderingPreserved,
-  assertApplicationQueueTenantIsolation
+  assertApplicationQueueTenantIsolation,
+  claimEvidenceExtractionJob,
+  completeEvidenceExtractionJob,
+  dropProbeSchema,
+  enqueueEvidenceExtractionJob,
+  listCurrentEvidenceExtractionJobsForApplications,
+  provisionEvidenceExtractionQueueProbeSchema,
+  retryOrFailEvidenceExtractionJob
 } from "../../packages/db/src/index.ts";
 import { applicationReviewQueueSchema } from "../../packages/contracts/src/index.ts";
 import { CONTRACT_SCHEMA_VERSION, buildApplicationReviewQueue } from "../../packages/domain/src/index.ts";
@@ -150,4 +160,168 @@ test("two imports sharing a created_at keep the employer's original order in the
     );
   }
   await assertApplicantOrderingPreserved(databaseUrl);
+});
+
+// ---- AF-45: the complete processing-state set ----
+
+function requireDatabase(): string {
+  const databaseUrl = process.env.SIGNAL_AUDIT_RLS_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.length === 0) {
+    assert.fail("SIGNAL_AUDIT_RLS_DATABASE_URL must be set so CI exercises the queue's job states against real Postgres");
+  }
+  return databaseUrl;
+}
+
+const queuedEntry = () =>
+  buildApplicationReviewQueue(roleId, [application("44444444-4444-4444-8444-444444444444", 1)], [], [], [
+    {
+      applicationId: "44444444-4444-4444-8444-444444444444",
+      state: "ready",
+      enqueueGeneration: 1,
+      attemptCount: 1,
+      maxAttempts: 3,
+      failureCode: "provider_transient"
+    }
+  ]);
+
+test("a queue with job-backed states satisfies the published contract", () => {
+  const parsed = applicationReviewQueueSchema.safeParse(queuedEntry());
+  assert.ok(parsed.success, JSON.stringify(parsed.error?.issues));
+});
+
+test("an evidence state that disagrees with its own job is rejected", () => {
+  const queue = queuedEntry();
+  const firstEntry = queue.entries[0];
+  assert.ok(firstEntry !== undefined);
+  const contradictory = { ...queue, entries: [{ ...firstEntry, evidenceState: "extracted" }] };
+  assert.match(
+    applicationReviewQueueSchema.safeParse(contradictory).error?.issues.map((issue) => issue.message).join(" ") ?? "",
+    /must match the current job's state/
+  );
+});
+
+test("a job summary with impossible attempts or a free-text failure code is rejected", () => {
+  const queue = queuedEntry();
+  const firstEntry = queue.entries[0];
+  assert.ok(firstEntry?.job !== undefined);
+  for (const job of [
+    { ...firstEntry.job, attemptCount: 4 },
+    { ...firstEntry.job, failureCode: "Provider said: rate limited for jordan@example.com" },
+    { ...firstEntry.job, leaseOwner: "worker-7" }
+  ]) {
+    assert.equal(
+      applicationReviewQueueSchema.safeParse({ ...queue, entries: [{ ...firstEntry, job }] }).success,
+      false,
+      JSON.stringify(job)
+    );
+  }
+});
+
+test("the current-job read follows a real job through every lifecycle state and stays tenant-scoped", async (t) => {
+  const databaseUrl = requireDatabase();
+  const probe = await provisionEvidenceExtractionQueueProbeSchema(databaseUrl);
+  t.after(() => dropProbeSchema(databaseUrl, probe.schema));
+  const read = async (organizationId = probe.organizationId) =>
+    listCurrentEvidenceExtractionJobsForApplications(databaseUrl, probe.schema, organizationId, [probe.applicationId]);
+  const stateOf = async () => {
+    const jobs = await read();
+    assert.equal(jobs.length, 1, "one current job per application");
+    const queue = buildApplicationReviewQueue(
+      probe.roleId,
+      [{ ...application(probe.applicationId, 1), organizationId: probe.organizationId, roleId: probe.roleId }],
+      [],
+      [],
+      jobs
+    );
+    assert.ok(applicationReviewQueueSchema.safeParse(queue).success);
+    return { state: queue.entries[0]?.evidenceState, job: queue.entries[0]?.job };
+  };
+
+  assert.deepEqual(await read(), [], "nothing enqueued yet");
+
+  const input = {
+    organizationId: probe.organizationId,
+    roleId: probe.roleId,
+    applicationId: probe.applicationId,
+    sourceIntakeId: probe.sourceIntakeId,
+    rubricId: probe.rubricId,
+    workflowVersion: EVIDENCE_EXTRACTION_WORKFLOW_VERSION,
+    maxAttempts: 2
+  } as const;
+  const enqueued = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, input);
+  assert.equal(enqueued.outcome, "enqueued");
+  assert.deepEqual(await stateOf(), { state: "queued", job: { state: "ready", attemptCount: 0, maxAttempts: 2 } });
+
+  // The IDOR half: the application id is real, the organization is not its own.
+  assert.deepEqual(await read(randomUUID()), [], "another organization must not see this application's job");
+
+  const base = Date.now() + 1_000;
+  const firstClaim = (
+    await claimEvidenceExtractionJob(databaseUrl, probe.schema, { workerId: "worker-a", leaseDurationMs: 10_000, now: new Date(base) })
+  ).job;
+  assert.ok(firstClaim !== undefined);
+  assert.equal((await stateOf()).state, "processing");
+
+  assert.equal(
+    await retryOrFailEvidenceExtractionJob(databaseUrl, probe.schema, {
+      organizationId: probe.organizationId,
+      jobId: firstClaim.jobId,
+      workerId: "worker-a",
+      attemptCount: firstClaim.attemptCount,
+      failureCode: "provider_transient",
+      retryable: true,
+      availableAt: new Date(base + 2_000),
+      now: new Date(base + 1_000)
+    }),
+    "retrying"
+  );
+  assert.deepEqual(await stateOf(), {
+    state: "queued",
+    job: { state: "ready", attemptCount: 1, maxAttempts: 2, failureCode: "provider_transient" }
+  });
+
+  const secondClaim = (
+    await claimEvidenceExtractionJob(databaseUrl, probe.schema, { workerId: "worker-b", leaseDurationMs: 10_000, now: new Date(base + 2_000) })
+  ).job;
+  assert.ok(secondClaim !== undefined);
+  assert.equal(
+    await retryOrFailEvidenceExtractionJob(databaseUrl, probe.schema, {
+      organizationId: probe.organizationId,
+      jobId: secondClaim.jobId,
+      workerId: "worker-b",
+      attemptCount: secondClaim.attemptCount,
+      failureCode: "provider_transient",
+      retryable: true,
+      availableAt: new Date(base + 4_000),
+      now: new Date(base + 3_000)
+    }),
+    "failed"
+  );
+  assert.deepEqual(await stateOf(), {
+    state: "extraction_failed",
+    job: { state: "failed", attemptCount: 2, maxAttempts: 2, failureCode: "provider_transient" }
+  });
+
+  // An operator requeue allocates a new generation; the read must follow it
+  // rather than keep reporting the failure it replaced.
+  const requeued = await enqueueEvidenceExtractionJob(databaseUrl, probe.schema, { ...input, now: new Date(base + 5_000) });
+  assert.equal(requeued.outcome, "requeued");
+  assert.equal((await stateOf()).state, "queued");
+
+  const finalClaim = (
+    await claimEvidenceExtractionJob(databaseUrl, probe.schema, { workerId: "worker-c", leaseDurationMs: 10_000, now: new Date(base + 6_000) })
+  ).job;
+  assert.ok(finalClaim !== undefined);
+  assert.equal(
+    await completeEvidenceExtractionJob(databaseUrl, probe.schema, {
+      organizationId: probe.organizationId,
+      jobId: finalClaim.jobId,
+      workerId: "worker-c",
+      attemptCount: finalClaim.attemptCount,
+      outcomes: [],
+      now: new Date(base + 7_000)
+    }),
+    "completed"
+  );
+  assert.deepEqual(await stateOf(), { state: "extracted", job: { state: "completed", attemptCount: 1, maxAttempts: 2 } });
 });

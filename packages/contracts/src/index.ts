@@ -9,8 +9,10 @@ import {
   AUDIT_ACTIONS,
   CANDIDATE_DECISION_KINDS,
   CONTRACT_SCHEMA_VERSION,
+  EVIDENCE_EXTRACTION_JOB_STATES,
   FILE_INTAKE_STATUSES,
   IMPORT_ROW_OUTCOMES,
+  JOB_STATE_TO_EVIDENCE_STATE,
   MAX_RUBRIC_CRITERIA,
   MEMBERSHIP_ROLES,
   METRIC_LIMITATION_CODES,
@@ -921,15 +923,40 @@ export const applicationQueueEntrySchema = z.strictObject({
   application: applicationSchema,
   evidenceState: z.enum(APPLICATION_EVIDENCE_STATES),
   extractionRunCount: z.number().int().min(0),
-  lastExtractionAt: z.iso.datetime().optional()
-}) satisfies z.ZodType<ApplicationQueueEntry>;
+  lastExtractionAt: z.iso.datetime().optional(),
+  job: z
+    .strictObject({
+      state: z.enum(EVIDENCE_EXTRACTION_JOB_STATES),
+      attemptCount: z.number().int().min(0),
+      maxAttempts: z.number().int().min(1),
+      // Same pattern as the failure_code CHECK in 0026_evidence_extraction_jobs.sql:
+      // a closed machine token, never provider text.
+      failureCode: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/).optional()
+    })
+    .refine((job) => job.attemptCount <= job.maxAttempts, {
+      message: "attemptCount cannot exceed maxAttempts"
+    })
+    .optional()
+})
+  // The processing state and the job it is derived from are one fact; a
+  // response where they disagree is describing an application in two
+  // places at once.
+  .refine((entry) => entry.job === undefined || entry.evidenceState === JOB_STATE_TO_EVIDENCE_STATE[entry.job.state], {
+    message: "evidenceState must match the current job's state"
+  })
+  .refine(
+    (entry) =>
+      entry.job !== undefined ||
+      entry.evidenceState === (entry.extractionRunCount > 0 ? "extracted" : "pending_extraction"),
+    { message: "without a job, evidenceState is extracted exactly when a run was recorded" }
+  ) satisfies z.ZodType<ApplicationQueueEntry>;
 
 /**
- * The counts are validated as a partition, not as three free integers:
- * a response where pendingExtractionCount + extractedCount does not
- * equal totalCount is describing a queue that cannot exist, and the
- * contract should reject it rather than let a UI render a total that
- * disagrees with its own breakdown.
+ * The counts are validated as a partition, not as free integers: a
+ * response where the per-state counts do not sum to totalCount is
+ * describing a queue that cannot exist, and the contract should reject
+ * it rather than let a UI render a total that disagrees with its own
+ * breakdown.
  */
 export const applicationReviewQueueSchema = z
   .strictObject({
@@ -937,14 +964,24 @@ export const applicationReviewQueueSchema = z
     roleId: z.uuid(),
     totalCount: z.number().int().min(0),
     pendingExtractionCount: z.number().int().min(0),
+    queuedCount: z.number().int().min(0),
+    processingCount: z.number().int().min(0),
+    extractionFailedCount: z.number().int().min(0),
     extractedCount: z.number().int().min(0),
     appliedStates: z.array(z.enum(APPLICATION_EVIDENCE_STATES)),
     shownCount: z.number().int().min(0),
     entries: z.array(applicationQueueEntrySchema)
   })
-  .refine((queue) => queue.pendingExtractionCount + queue.extractedCount === queue.totalCount, {
-    message: "pendingExtractionCount and extractedCount must sum to totalCount"
-  })
+  .refine(
+    (queue) =>
+      queue.pendingExtractionCount +
+        queue.queuedCount +
+        queue.processingCount +
+        queue.extractionFailedCount +
+        queue.extractedCount ===
+      queue.totalCount,
+    { message: "the per-state counts must sum to totalCount" }
+  )
   .refine((queue) => queue.entries.length === queue.shownCount, {
     message: "shownCount must match the number of entries returned"
   })
