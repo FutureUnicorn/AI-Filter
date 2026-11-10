@@ -337,7 +337,7 @@ the GitHub secret store does not make it reachable either; nothing exports it.
    read -rsp 'outgoing password: ' POSTGRES_PASSWORD_PREVIOUS; echo
    read -rsp 'new password: ' POSTGRES_PASSWORD; echo
    export POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
-   node scripts/environment/cli.mjs <staging|production> rotate-password
+   node scripts/environment/cli.mjs staging rotate-password     # or: production
    unset POSTGRES_PASSWORD_PREVIOUS POSTGRES_PASSWORD
    ```
 
@@ -360,9 +360,9 @@ the GitHub secret store does not make it reachable either; nothing exports it.
    about ten seconds, so every request begins failing authentication. Step 3
    rebuilds images, so expect minutes, not seconds. Authentication errors
    during this window are the rotation working, not failing.
-3. Run `<staging|production> up` as normal. `migrate`, `web`, and `worker`
-   redeploy with the new password, which the role now accepts, and the
-   environment recovers.
+3. Run `node scripts/environment/cli.mjs staging up` (or `production`) as
+   normal. `migrate`, `web`, and `worker` redeploy with the new password,
+   which the role now accepts, and the environment recovers.
 
 If step 2 reported success but step 3 failed, do not start over from step 1:
 the role is already on the new password. Rerunning `rotate-password` is safe
