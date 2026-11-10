@@ -1,14 +1,24 @@
-"""AF-74: the deterministic qualifier behind the 30-account target list.
+"""AF-74/AF-75: the deterministic qualifier and priority score behind the
+30-account target list.
 
 The list that feeds Gate 1 (20 employer interviews) is only as good as the
 rule that decides what belongs on it. Kept in a founder's head, that rule
 drifts toward "companies I can get a meeting with." So it lives here
 instead: one mechanical pass over a register of accounts, three possible
-outcomes per account, and a source-dated claim behind every qualifier.
+qualification outcomes per account, a source-dated claim behind every
+qualifier, and -- for whatever qualifies -- a 0-100 priority score (AF-75)
+that orders outreach within the qualified set.
+
+The score is additive on top of AF-74's qualification/tier outcome, not a
+replacement for it: an account that is disqualified or needs_evidence has
+no score, and the tier A/B split this file already shipped is untouched.
 
 Nothing here touches candidate data. These states describe employer
 accounts in a sales register -- POL-002/POL-003 in docs/PRODUCT_BOUNDARY.md
-are about candidates, and no part of this file may ever be pointed at one.
+prohibit ranking and scoring *candidates*; this is prospect research about
+employers, and no part of this file may ever be pointed at candidate
+material. See docs/validation/target-account-list.md for the scope
+boundary this relies on.
 
 Run it against the register:
 
@@ -16,7 +26,7 @@ Run it against the register:
     uv run python scripts/target_accounts.py <register> --as-of 2026-09-20
 
 See docs/validation/target-account-list.md for the qualification contract
-this implements and where the real register lives.
+and scoring formula this implements, and where the real register lives.
 """
 
 from __future__ import annotations
@@ -45,6 +55,32 @@ TARGET_ACCOUNT_COUNT = 30
 
 # Every qualifier below has to be backed by a dated, sourced claim.
 REQUIRED_CLAIMS = ("headcount", "hiring_volume", "ats", "buyer")
+
+# AF-75: the priority score for an already-qualified account. Five factors
+# from the ticket, 20 points each -- the ticket names the factors but gives
+# no weighting, so this keeps the simplest defensible split rather than
+# inventing an uneven one. It orders outreach within the qualified set; it
+# never changes Qualification or Tier, which AF-74 already shipped.
+POINTS_PER_FACTOR = 20
+
+# Hiring volume above this multiple of the qualifying minimum stops adding
+# urgency to the score -- the pain is already unmistakable by then.
+HIRING_VOLUME_SCORE_CEILING = MINIMUM_APPLICATIONS_PER_REQUISITION * 3
+
+# Buyer titles that can sign a $500 pilot without routing the decision to
+# someone else. The remaining BUYER_TITLES still qualify under AF-74 -- they
+# can be the account's named buyer -- they just score lower here, since an
+# operations-lead or sourcer-adjacent title is more often a champion than
+# the person who actually approves spend.
+SENIOR_BUYER_TITLES = frozenset(
+    {"head_of_talent", "director_of_talent", "vp_talent", "head_of_recruiting"}
+)
+
+# A claim naming this as its subject backs the "recent comparable role"
+# scoring factor. It is deliberately not in REQUIRED_CLAIMS: missing or
+# stale evidence for it costs points, it does not move an account out of
+# Qualified the way a missing headcount/hiring_volume/ats/buyer claim does.
+RECENT_COMPARABLE_ROLE_CLAIM = "recent_comparable_role"
 
 
 class AtsFraudTooling(str, Enum):
@@ -155,6 +191,13 @@ class Account:
     # states") for a prohibited candidate employment outcome. Different
     # subject, opposite intent, and this repository greps for identifiers.
     outreach_opt_out: bool = False
+    # AF-75: whether the account has posted or filled a role comparable to
+    # its high-volume pattern recently (evidenced by a dated claim named
+    # "recent_comparable_role" -- see RECENT_COMPARABLE_ROLE_CLAIM). Scoring
+    # input only: unlike the fields above, this never disqualifies or
+    # forces needs_evidence, so it defaults to False rather than being
+    # required, matching outreach_opt_out's treatment, not headcount's.
+    recent_comparable_role: bool = False
     claims: tuple[Claim, ...] = ()
 
     def claim_for(self, name: str) -> Claim | None:
@@ -167,12 +210,103 @@ class Account:
 
 
 @dataclass(frozen=True)
+class ScoreBreakdown:
+    """AF-75's 0-100 priority score for one qualified account: five factors,
+    POINTS_PER_FACTOR (20) points each. Only meaningful for an account that
+    is already Qualified -- see AccountAssessment.score."""
+
+    company_size: int
+    hiring_volume: int
+    ats_feature_gap: int
+    buyer_access: int
+    recent_comparable_role: int
+
+    @property
+    def total(self) -> int:
+        return (
+            self.company_size
+            + self.hiring_volume
+            + self.ats_feature_gap
+            + self.buyer_access
+            + self.recent_comparable_role
+        )
+
+
+def _company_size_score(account: Account) -> int:
+    """Smaller scores higher, within the qualifying 50-1,000 band. The
+    band's own rationale (MAXIMUM_HEADCOUNT) is that the buyer becomes a
+    committee as headcount climbs toward 1,000; this rewards distance from
+    that risk rather than treating every qualifying headcount alike."""
+    span = MAXIMUM_HEADCOUNT - MINIMUM_HEADCOUNT
+    distance_from_committee_risk = MAXIMUM_HEADCOUNT - account.headcount
+    fraction = max(0.0, min(1.0, distance_from_committee_risk / span))
+    return round(POINTS_PER_FACTOR * fraction)
+
+
+def _hiring_volume_score(account: Account) -> int:
+    """Scales from the qualifying minimum (0 points -- just barely in) up to
+    HIRING_VOLUME_SCORE_CEILING (full points)."""
+    span = HIRING_VOLUME_SCORE_CEILING - MINIMUM_APPLICATIONS_PER_REQUISITION
+    distance_above_minimum = (
+        account.applications_per_requisition - MINIMUM_APPLICATIONS_PER_REQUISITION
+    )
+    fraction = max(0.0, min(1.0, distance_above_minimum / span))
+    return round(POINTS_PER_FACTOR * fraction)
+
+
+def _ats_feature_gap_score(tier: Tier) -> int:
+    """Mirrors the tier this account already earned: tier A's pitch stands
+    without caveats (full points), tier B's needs the "before you enable
+    it" frame (half)."""
+    if tier is Tier.A:
+        return POINTS_PER_FACTOR
+    if tier is Tier.B:
+        return POINTS_PER_FACTOR // 2
+    return 0
+
+
+def _buyer_access_score(account: Account) -> int:
+    """Full points for a title that can approve a $500 pilot alone; half
+    for a qualifying but more operational title that is more often a
+    champion routing the decision upward."""
+    if account.buyer_title in SENIOR_BUYER_TITLES:
+        return POINTS_PER_FACTOR
+    return POINTS_PER_FACTOR // 2
+
+
+def _recent_comparable_role_score(account: Account, as_of: date) -> int:
+    """Full points only when the flag is set *and* backed by a fresh,
+    sourced claim -- an unevidenced flag earns nothing, the same standard
+    the rest of this register holds every other factor to."""
+    if not account.recent_comparable_role:
+        return 0
+    claim = account.claim_for(RECENT_COMPARABLE_ROLE_CLAIM)
+    if claim is None or not claim.is_fresh(as_of):
+        return 0
+    return POINTS_PER_FACTOR
+
+
+def score_account(account: Account, tier: Tier, as_of: date) -> ScoreBreakdown:
+    return ScoreBreakdown(
+        company_size=_company_size_score(account),
+        hiring_volume=_hiring_volume_score(account),
+        ats_feature_gap=_ats_feature_gap_score(tier),
+        buyer_access=_buyer_access_score(account),
+        recent_comparable_role=_recent_comparable_role_score(account, as_of),
+    )
+
+
+@dataclass(frozen=True)
 class AccountAssessment:
     account: Account
     qualification: Qualification
     tier: Tier
     # Why it is disqualified, or which claims are missing or stale.
     reasons: tuple[str, ...] = ()
+    # AF-75 priority score. Only set when qualification is QUALIFIED --
+    # scoring an account that isn't on the list at all would imply an
+    # ordering among accounts that aren't comparable in the first place.
+    score: ScoreBreakdown | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +328,15 @@ class RegisterReport:
     @property
     def shortfall(self) -> int:
         return max(0, TARGET_ACCOUNT_COUNT - len(self.qualified))
+
+    @property
+    def ranked(self) -> tuple[AccountAssessment, ...]:
+        """Qualified accounts ordered by AF-75 priority score, highest
+        first. Company name breaks a tie so the order is deterministic
+        rather than depending on register insertion order."""
+        return tuple(
+            sorted(self.qualified, key=lambda a: (-a.score.total, a.account.company))
+        )
 
 
 def _disqualifiers(account: Account) -> list[str]:
@@ -307,7 +450,9 @@ def assess(account: Account, as_of: date) -> AccountAssessment:
             ),
         )
 
-    return AccountAssessment(account, Qualification.QUALIFIED, tier)
+    return AccountAssessment(
+        account, Qualification.QUALIFIED, tier, score=score_account(account, tier, as_of)
+    )
 
 
 def assess_register(accounts: list[Account], as_of: date) -> RegisterReport:
@@ -343,6 +488,7 @@ _ALLOWED_RECORD_KEYS = frozenset(
         "ats_fraud_tooling",
         "buyer_title",
         "outreach_opt_out",
+        "recent_comparable_role",
         "claims",
     }
 )
@@ -521,6 +667,11 @@ def parse_account(record: dict) -> Account:
         outreach_opt_out=_require_bool(
             record.get("outreach_opt_out", False), "outreach_opt_out", account_id
         ),
+        recent_comparable_role=_require_bool(
+            record.get("recent_comparable_role", False),
+            "recent_comparable_role",
+            account_id,
+        ),
         claims=tuple(claims),
     )
 
@@ -543,7 +694,7 @@ def format_report(report: RegisterReport) -> str:
     for assessment in report.assessments:
         label = assessment.qualification.value.upper()
         if assessment.qualification is Qualification.QUALIFIED:
-            label = f"{label} (tier {assessment.tier.value})"
+            label = f"{label} (tier {assessment.tier.value}, score {assessment.score.total})"
         lines.append(f"[{label}] {assessment.account.company}")
         for reason in assessment.reasons:
             lines.append(f"    - {reason}")
@@ -564,6 +715,18 @@ def format_report(report: RegisterReport) -> str:
         lines.append(
             f"\nAF-74 is not met: {report.shortfall} more qualified accounts needed."
         )
+
+    ranked = report.ranked
+    if ranked:
+        lines.extend(["", "AF-75 ranked target list (priority score, 0-100):"])
+        for assessment in ranked:
+            score = assessment.score
+            lines.append(
+                f"  {score.total:3d}  {assessment.account.company} (tier {assessment.tier.value})"
+                f"  [size {score.company_size} | volume {score.hiring_volume} |"
+                f" ats gap {score.ats_feature_gap} | buyer {score.buyer_access} |"
+                f" comparable role {score.recent_comparable_role}]"
+            )
 
     return "\n".join(lines)
 

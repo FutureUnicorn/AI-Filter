@@ -10,6 +10,11 @@ from target_accounts import (  # noqa: E402
     Account,
     AtsFraudTooling,
     Claim,
+    HIRING_VOLUME_SCORE_CEILING,
+    MAXIMUM_HEADCOUNT,
+    MINIMUM_APPLICATIONS_PER_REQUISITION,
+    MINIMUM_HEADCOUNT,
+    POINTS_PER_FACTOR,
     Qualification,
     RegisterError,
     TARGET_ACCOUNT_COUNT,
@@ -272,6 +277,10 @@ def test_a_quoted_boolean_is_rejected_rather_than_coerced():
             lambda value=value: parse_account(_record(outreach_opt_out=value)),
             "expected a JSON boolean",
         )
+        _assert_register_error(
+            lambda value=value: parse_account(_record(recent_comparable_role=value)),
+            "expected a JSON boolean",
+        )
 
 
 def test_an_unknown_field_is_rejected_by_name():
@@ -469,6 +478,168 @@ def test_the_example_register_parses_and_covers_every_outcome():
     assert states == set(Qualification)
     assert tiers == {Tier.A, Tier.B}
     assert not report.meets_target
+
+
+def test_recent_comparable_role_defaults_to_false_when_omitted():
+    """The field is optional -- it must not force every pre-AF-75 record in
+    an existing register to be rewritten before it parses again."""
+    account = parse_account(_record())
+    assert account.recent_comparable_role is False
+
+
+def test_a_disqualified_account_has_no_score():
+    assessment = assess(_account(headcount=5_000), AS_OF)
+    assert assessment.qualification is Qualification.DISQUALIFIED
+    assert assessment.score is None
+
+
+def test_a_needs_evidence_account_has_no_score():
+    assessment = assess(_account(claims=()), AS_OF)
+    assert assessment.qualification is Qualification.NEEDS_EVIDENCE
+    assert assessment.score is None
+
+
+def test_qualified_account_score_is_between_zero_and_one_hundred():
+    assessment = assess(_account(), AS_OF)
+    assert assessment.qualification is Qualification.QUALIFIED
+    assert 0 <= assessment.score.total <= 100
+
+
+def test_company_size_score_favors_the_low_end_of_the_qualifying_band():
+    """The band's own rationale is that the buyer becomes a committee
+    approaching 1,000 headcount, so the score should reward distance from
+    that end, not the midpoint or the top."""
+    smallest = assess(_account(headcount=MINIMUM_HEADCOUNT), AS_OF)
+    largest = assess(_account(headcount=MAXIMUM_HEADCOUNT), AS_OF)
+    assert smallest.score.company_size == POINTS_PER_FACTOR
+    assert largest.score.company_size == 0
+
+
+def test_hiring_volume_score_saturates_at_the_ceiling():
+    at_minimum = assess(
+        _account(applications_per_requisition=MINIMUM_APPLICATIONS_PER_REQUISITION), AS_OF
+    )
+    at_ceiling = assess(
+        _account(applications_per_requisition=HIRING_VOLUME_SCORE_CEILING), AS_OF
+    )
+    above_ceiling = assess(
+        _account(applications_per_requisition=HIRING_VOLUME_SCORE_CEILING * 10), AS_OF
+    )
+    assert at_minimum.score.hiring_volume == 0
+    assert at_ceiling.score.hiring_volume == POINTS_PER_FACTOR
+    assert above_ceiling.score.hiring_volume == POINTS_PER_FACTOR
+
+
+def test_ats_feature_gap_score_mirrors_the_tier():
+    tier_a = assess(_account(), AS_OF)
+    tier_b = assess(
+        _account(
+            ats_platform="greenhouse",
+            ats_fraud_tooling=AtsFraudTooling.AVAILABLE_NOT_ENABLED,
+        ),
+        AS_OF,
+    )
+    assert tier_a.score.ats_feature_gap == POINTS_PER_FACTOR
+    assert tier_b.score.ats_feature_gap == POINTS_PER_FACTOR // 2
+
+
+def test_buyer_access_score_rewards_a_senior_decision_maker():
+    senior = assess(_account(buyer_title="head_of_talent"), AS_OF)
+    operational = assess(_account(buyer_title="recruiting_operations_lead"), AS_OF)
+    assert senior.score.buyer_access == POINTS_PER_FACTOR
+    assert operational.score.buyer_access == POINTS_PER_FACTOR // 2
+
+
+def _claims_with_recent_comparable_role(
+    observed_on: date = date(2026, 9, 10),
+    *,
+    required_claims_observed_on: date = date(2026, 9, 10),
+):
+    return _claims(required_claims_observed_on) + (
+        Claim(
+            claim="recent_comparable_role",
+            source="https://example.invalid/careers",
+            observed_on=observed_on,
+        ),
+    )
+
+
+def test_recent_comparable_role_scores_only_when_flagged_and_evidenced():
+    flagged_and_fresh = assess(
+        _account(
+            recent_comparable_role=True,
+            claims=_claims_with_recent_comparable_role(),
+        ),
+        AS_OF,
+    )
+    flagged_without_claim = assess(_account(recent_comparable_role=True), AS_OF)
+    flagged_with_stale_claim = assess(
+        _account(
+            recent_comparable_role=True,
+            claims=_claims_with_recent_comparable_role(observed_on=date(2026, 2, 11)),
+        ),
+        AS_OF,
+    )
+    claim_without_flag = assess(
+        _account(
+            recent_comparable_role=False,
+            claims=_claims_with_recent_comparable_role(),
+        ),
+        AS_OF,
+    )
+    assert flagged_and_fresh.score.recent_comparable_role == POINTS_PER_FACTOR
+    assert flagged_without_claim.score.recent_comparable_role == 0
+    assert flagged_with_stale_claim.score.recent_comparable_role == 0
+    assert claim_without_flag.score.recent_comparable_role == 0
+
+
+def test_missing_recent_comparable_role_evidence_does_not_block_qualification():
+    """Unlike REQUIRED_CLAIMS, this factor only costs points when
+    unevidenced -- it must never push an otherwise-qualified account to
+    needs_evidence."""
+    assessment = assess(_account(recent_comparable_role=True), AS_OF)
+    assert assessment.qualification is Qualification.QUALIFIED
+    assert assessment.score.recent_comparable_role == 0
+
+
+def test_report_ranks_qualified_accounts_by_score_descending():
+    high_score = _account(
+        account_id="high",
+        company="High Score Co",
+        headcount=MINIMUM_HEADCOUNT,
+        applications_per_requisition=HIRING_VOLUME_SCORE_CEILING,
+        buyer_title="head_of_talent",
+        recent_comparable_role=True,
+        claims=_claims_with_recent_comparable_role(),
+    )
+    low_score = _account(
+        account_id="low",
+        company="Low Score Co",
+        headcount=MAXIMUM_HEADCOUNT,
+        applications_per_requisition=MINIMUM_APPLICATIONS_PER_REQUISITION,
+        ats_platform="greenhouse",
+        ats_fraud_tooling=AtsFraudTooling.AVAILABLE_NOT_ENABLED,
+        buyer_title="recruiting_operations_lead",
+    )
+    report = assess_register([low_score, high_score], AS_OF)
+    assert [a.account.account_id for a in report.ranked] == ["high", "low"]
+    assert report.ranked[0].score.total == 100
+    assert report.ranked[1].score.total == 20
+
+
+def test_ranking_breaks_ties_on_company_name_for_determinism():
+    tied_a = _account(account_id="a", company="Alpha Co")
+    tied_b = _account(account_id="b", company="Beta Co")
+    report = assess_register([tied_b, tied_a], AS_OF)
+    assert report.ranked[0].score.total == report.ranked[1].score.total
+    assert [a.account.company for a in report.ranked] == ["Alpha Co", "Beta Co"]
+
+
+def test_an_unknown_field_still_rejects_a_misspelled_recent_comparable_role():
+    _assert_register_error(
+        lambda: parse_account(_record(recent_comperable_role=True)),
+        "unknown field(s) ['recent_comperable_role']",
+    )
 
 
 def test_the_example_register_holds_no_real_company_or_contact_data():
