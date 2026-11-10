@@ -15,6 +15,8 @@ import type {
   CsvColumnMapping,
   DomainPort,
   EvidenceExtractionRunRef,
+  EvidenceExtractionJobRef,
+  EvidenceExtractionJobState,
   EvidenceExtractionJob,
   EvidenceExtractionQueueMonitoringSnapshot,
   EvidenceOutcome,
@@ -5113,6 +5115,62 @@ export async function listEvidenceExtractionRunsForEntities(
       entityType: row.entity_type,
       entityId: row.entity_id,
       createdAt: row.created_at.toISOString()
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * AF-45: the current extraction job for each application, one row each.
+ *
+ * "Current" is the highest enqueue_generation, which enqueue allocates
+ * under the application's row lock for both new jobs and operator
+ * requeues (see enqueueEvidenceExtractionJob), so it is a total order per
+ * application where enqueued_at is not. The later sort keys only make the
+ * result deterministic if that invariant were ever broken.
+ *
+ * Scoped by organization as well as by the application ids the caller
+ * already resolved, for the same reason listApplicationsForRole takes
+ * both: the ids alone would read a sibling tenant's jobs if a caller ever
+ * passed the wrong list. Only delivery state is selected: lease owners,
+ * intake and rubric ids do not belong in the recruiter view.
+ */
+export async function listCurrentEvidenceExtractionJobsForApplications(
+  databaseUrl: string,
+  schema: string,
+  organizationId: string,
+  applicationIds: readonly string[]
+): Promise<readonly EvidenceExtractionJobRef[]> {
+  assertSafeSchema(schema);
+  if (applicationIds.length === 0) {
+    return [];
+  }
+  const client = await acquireConnection(databaseUrl);
+  try {
+    const result = await client.query<{
+      application_id: string;
+      state: EvidenceExtractionJobState;
+      enqueue_generation: string;
+      attempt_count: number;
+      max_attempts: number;
+      failure_code: string | null;
+    }>(
+      `SELECT DISTINCT ON (application_id)
+              application_id, state, enqueue_generation, attempt_count, max_attempts, failure_code
+         FROM "${schema}".evidence_extraction_jobs
+        WHERE organization_id = $1 AND application_id = ANY($2::uuid[])
+        ORDER BY application_id, enqueue_generation DESC, enqueued_at DESC, job_id DESC`,
+      [organizationId, [...applicationIds]]
+    );
+    return result.rows.map((row) => ({
+      applicationId: row.application_id,
+      state: row.state,
+      // bigint arrives as a string; generations are small positive counters.
+      enqueueGeneration: Number(row.enqueue_generation),
+      attemptCount: row.attempt_count,
+      maxAttempts: row.max_attempts,
+      ...(row.failure_code === null ? {} : { failureCode: row.failure_code })
     }));
   } finally {
     client.release();

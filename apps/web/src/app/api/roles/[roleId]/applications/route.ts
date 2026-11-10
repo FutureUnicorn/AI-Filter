@@ -4,6 +4,7 @@ import {
   getMembershipsForUser,
   getRoleById,
   listApplicationsForRole,
+  listCurrentEvidenceExtractionJobsForApplications,
   listEvidenceExtractionRunsForEntities
 } from "@signal-audit/db";
 import {
@@ -86,15 +87,24 @@ async function handleGET(request: NextRequest, context: RouteContext): Promise<R
       role.organizationId,
       role.roleId
     );
-    const runs = await listEvidenceExtractionRunsForEntities(
-      config.database.url,
-      config.database.schema,
-      role.organizationId,
-      APPLICATION_ENTITY_TYPE,
-      applications.map((application) => application.applicationId)
-    );
+    const applicationIds = applications.map((application) => application.applicationId);
+    const [runs, jobs] = await Promise.all([
+      listEvidenceExtractionRunsForEntities(
+        config.database.url,
+        config.database.schema,
+        role.organizationId,
+        APPLICATION_ENTITY_TYPE,
+        applicationIds
+      ),
+      listCurrentEvidenceExtractionJobsForApplications(
+        config.database.url,
+        config.database.schema,
+        role.organizationId,
+        applicationIds
+      )
+    ]);
 
-    return Response.json(buildApplicationReviewQueue(role.roleId, applications, runs, filter.states), {
+    return Response.json(buildApplicationReviewQueue(role.roleId, applications, runs, filter.states, jobs), {
       status: 200,
       headers: withRequestId(undefined, requestId)
     });

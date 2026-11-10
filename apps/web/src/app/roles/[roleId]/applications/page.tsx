@@ -15,15 +15,24 @@ interface QueueApplication {
 
 interface QueueEntry {
   readonly application: QueueApplication;
-  readonly evidenceState: "pending_extraction" | "extracted";
+  readonly evidenceState: "pending_extraction" | "queued" | "processing" | "extraction_failed" | "extracted";
   readonly extractionRunCount: number;
   readonly lastExtractionAt?: string;
+  readonly job?: {
+    readonly state: "ready" | "running" | "completed" | "failed";
+    readonly attemptCount: number;
+    readonly maxAttempts: number;
+    readonly failureCode?: string;
+  };
 }
 
 interface ReviewQueue {
   readonly roleId: string;
   readonly totalCount: number;
   readonly pendingExtractionCount: number;
+  readonly queuedCount: number;
+  readonly processingCount: number;
+  readonly extractionFailedCount: number;
   readonly extractedCount: number;
   readonly appliedStates: readonly QueueEntry["evidenceState"][];
   readonly shownCount: number;
@@ -36,11 +45,39 @@ type QueueState =
   | { readonly kind: "ready"; readonly queue: ReviewQueue };
 
 const EVIDENCE_STATE_LABELS: Readonly<Record<QueueEntry["evidenceState"], string>> = {
-  pending_extraction: "Not yet processed",
+  pending_extraction: "Not yet queued",
+  queued: "Queued",
+  processing: "Processing",
+  extraction_failed: "Extraction failed",
   extracted: "Evidence extracted"
 };
 
-const FILTERABLE_STATES: readonly QueueEntry["evidenceState"][] = ["pending_extraction", "extracted"];
+// Lifecycle order, matching APPLICATION_EVIDENCE_STATES in @signal-audit/domain.
+const FILTERABLE_STATES: readonly QueueEntry["evidenceState"][] = [
+  "pending_extraction",
+  "queued",
+  "processing",
+  "extraction_failed",
+  "extracted"
+];
+
+/**
+ * What a recruiter needs to know about the attempts behind a state: a
+ * queued job that has already failed once is retrying, not new, and a
+ * failed one is not going to finish on its own. The failure code is a
+ * closed machine token (the CHECK in 0026_evidence_extraction_jobs.sql), never provider text.
+ */
+function describeJob(entry: QueueEntry): string {
+  const job = entry.job;
+  if (job === undefined) return "Never queued";
+  const attempts = `attempt ${job.attemptCount} of ${job.maxAttempts}`;
+  if (job.state === "failed") return `Gave up after ${attempts}${job.failureCode ? ` (${job.failureCode})` : ""}`;
+  if (job.state === "ready" && job.attemptCount > 0) {
+    return `Retrying after ${attempts}${job.failureCode ? ` (${job.failureCode})` : ""}`;
+  }
+  if (job.state === "running") return `Running, ${attempts}`;
+  return job.state === "ready" ? "Waiting for a worker" : `Finished, ${attempts}`;
+}
 
 /**
  * AF-47 names four filters. Three of them cannot be answered from
@@ -54,13 +91,11 @@ const FILTERABLE_STATES: readonly QueueEntry["evidenceState"][] = ["pending_extr
 const UNAVAILABLE_FILTERS: readonly string[] = ["Incomplete", "Contradiction", "Error"];
 
 /**
- * AF-45: the recruiter's main working view for a role.
- *
- * Two things are deliberately absent rather than mocked. There is no
- * per-criterion evidence verdict column, because nothing persists
- * EvidenceOutcome yet -- only whether an extraction run happened. And
- * there are no filters: AF-47 owns those, so inventing them here would
- * be work that ticket then has to undo.
+ * AF-45: the recruiter's main working view for a role. Each row shows
+ * where the application is in processing (not queued, queued, processing,
+ * failed, extracted) from AF-102's job table, plus the attempts behind it.
+ * There is still no per-criterion verdict column: that is the evidence
+ * card's job, and a processing state must never read as a verdict.
  *
  * AF-47: filters are explicit checkboxes that name the state they
  * select, and the counts they are compared against stay whole, so the
@@ -103,6 +138,9 @@ export default function ApplicationReviewQueuePage() {
             roleId: body.roleId ?? roleId,
             totalCount: body.totalCount ?? 0,
             pendingExtractionCount: body.pendingExtractionCount ?? 0,
+            queuedCount: body.queuedCount ?? 0,
+            processingCount: body.processingCount ?? 0,
+            extractionFailedCount: body.extractionFailedCount ?? 0,
             extractedCount: body.extractedCount ?? 0,
             appliedStates: body.appliedStates ?? [],
             shownCount: body.shownCount ?? 0,
@@ -139,8 +177,9 @@ export default function ApplicationReviewQueuePage() {
             {state.queue.appliedStates.length === 0
               ? `${state.queue.totalCount} imported ${state.queue.totalCount === 1 ? "application" : "applications"}`
               : `Showing ${state.queue.shownCount} of ${state.queue.totalCount}`}{" "}
-            · {state.queue.extractedCount} with evidence extracted · {state.queue.pendingExtractionCount} not yet
-            processed.
+            · {state.queue.extractedCount} extracted · {state.queue.processingCount} processing ·{" "}
+            {state.queue.queuedCount} queued · {state.queue.extractionFailedCount} failed ·{" "}
+            {state.queue.pendingExtractionCount} not yet queued.
           </p>
 
           <fieldset>
@@ -172,8 +211,8 @@ export default function ApplicationReviewQueuePage() {
             <table>
               <caption>
                 Every imported application for this role, in the order the file was uploaded in. This queue is never
-                ranked, scored or prioritised — there is no score to sort by. Evidence state reflects whether
-                extraction has run; per-criterion verdicts are not stored yet, so none are shown.
+                ranked, scored or prioritised. There is no score to sort by. Evidence state is where the application
+                is in processing; it is never a verdict about the candidate.
               </caption>
               <thead>
                 <tr>
@@ -181,6 +220,7 @@ export default function ApplicationReviewQueuePage() {
                   <th scope="col">Candidate</th>
                   <th scope="col">Email</th>
                   <th scope="col">Evidence state</th>
+                  <th scope="col">Attempts</th>
                   <th scope="col">Last extraction</th>
                 </tr>
               </thead>
@@ -191,6 +231,7 @@ export default function ApplicationReviewQueuePage() {
                     <td>{entry.application.candidateFullName}</td>
                     <td>{entry.application.candidateEmail}</td>
                     <td>{EVIDENCE_STATE_LABELS[entry.evidenceState]}</td>
+                    <td>{describeJob(entry)}</td>
                     <td>{entry.lastExtractionAt ?? "—"}</td>
                   </tr>
                 ))}
