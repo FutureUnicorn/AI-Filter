@@ -1,7 +1,11 @@
 x-runtime-environment: &runtime-environment
   APP_ENV: ${APP_ENV:?APP_ENV is required}
   DEPLOYMENT_COMMIT_SHA: ${DEPLOYMENT_COMMIT_SHA:?DEPLOYMENT_COMMIT_SHA is required}
-  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+  # Built (and percent-encoded) by scripts/environment/model.mjs#buildDatabaseUrl
+  # -- see AF-94: interpolating POSTGRES_USER/POSTGRES_PASSWORD into this URI
+  # directly let an unencoded `/`, `?`, `#`, or `@` in a generated password
+  # corrupt or silently reparse it.
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
   DATABASE_SCHEMA: ${DATABASE_SCHEMA:?DATABASE_SCHEMA is required}
   STORAGE_ENDPOINT: http://storage:9000
   STORAGE_REGION: ${STORAGE_REGION:-us-east-1}
