@@ -3,12 +3,15 @@
 ## Status
 
 This document implements [AF-74](https://hemnaathusa.atlassian.net/browse/AF-74)
-under the [AF-8 Customer Validation & Paid Pilots epic](https://hemnaathusa.atlassian.net/browse/AF-8).
+and [AF-75](https://hemnaathusa.atlassian.net/browse/AF-75) under the
+[AF-8 Customer Validation & Paid Pilots epic](https://hemnaathusa.atlassian.net/browse/AF-8).
 
 It defines what belongs on the initial 30-account target list, what evidence
-an account needs before it counts, and how the list is checked. The rules are
-executable: `scripts/target_accounts.py` is the only thing that decides
-whether the list meets AF-74, and this document is its prose.
+an account needs before it counts, how outreach is ordered within the
+qualified set, and how the list is checked. The rules are executable:
+`scripts/target_accounts.py` is the only thing that decides whether the list
+meets AF-74 and what AF-75's priority score is, and this document is its
+prose.
 
 The list feeds Gate 1 in [`../VALIDATION_STATUS.md`](../VALIDATION_STATUS.md) —
 20 employer interviews, of which at least 12 must have seen 200+ applications
@@ -88,6 +91,39 @@ Two values do not reach a tier at all:
   caveats, so it is `needs_evidence` too. Guessing here is how a list quietly
   fills up with accounts that already solved the problem.
 
+## Priority score (AF-75)
+
+Tier sets a coarse outreach bucket. Within a bucket -- and across buckets,
+since the score can put a strong tier B account ahead of a marginal tier A
+one -- `scripts/target_accounts.py` also computes a 0-100 priority score for
+every **qualified** account. A disqualified or needs-evidence account has no
+score: scoring an account that isn't on the list yet would imply an ordering
+among accounts that aren't comparable in the first place, and AF-75 only
+ranks the target list, it does not change what qualifies for it.
+
+The score is five factors from the AF-75 ticket, 20 points each. The ticket
+names the factors and gives no weighting between them, so the formula keeps
+the simplest defensible split rather than inventing an uneven one:
+
+| Factor | Points | Rule |
+|---|---|---|
+| Company size | 0–20 | Scales with distance from `MAXIMUM_HEADCOUNT` (1,000). The qualifying band's own rationale is that the buyer becomes a committee near that end, so a smaller qualifying account scores higher, not a larger one. |
+| Active high-volume hiring | 0–20 | Scales from the qualifying minimum (200/req, 0 points) up to 3x that (600/req, full points), then saturates. |
+| ATS feature gap | 0–20 | Mirrors the tier already assigned: tier A (no native tooling) scores full points, tier B (tooling available but off) scores half. |
+| Buyer access | 0–20 | Full points for a buyer title that can approve a $500 pilot alone (`head_of_talent`, `director_of_talent`, `vp_talent`, `head_of_recruiting`); half for a qualifying but more operational title (`recruiting_operations_lead`, `talent_acquisition_lead`) that is more often a champion than the approver. |
+| Recent comparable role | 0–20 | Full points only when `recent_comparable_role` is `true` **and** backed by a fresh, dated `recent_comparable_role` claim -- the same evidence discipline every other factor in this document already requires. An unevidenced `true` scores 0, it does not raise an error: this field is scoring-only and never moves an account out of `qualified`. |
+
+`recent_comparable_role` records whether the account has posted or filled a
+role matching its high-volume pattern recently -- a live signal that the
+pain is current, not a stale one from the account's original qualification.
+It defaults to `false` and is not in `REQUIRED_CLAIMS`: unlike headcount,
+hiring volume, ATS, and buyer, missing or stale evidence for it costs points
+on the score, it does not push the account to `needs_evidence`.
+
+Running the check prints a ranked list of qualified accounts under the
+qualification report, highest score first, with the five-factor breakdown
+next to each one so the number is never the only thing on the page.
+
 ## Evidence rule
 
 Every hard qualifier needs a dated, sourced claim in the record: `headcount`,
@@ -141,10 +177,21 @@ are `.invalid` on purpose.
   "ats_fraud_tooling": "absent",
   "buyer_title": "head_of_talent",
   "outreach_opt_out": false,
+  "recent_comparable_role": false,
   "claims": [
     {"claim": "headcount", "source": "https://…/about", "observed_on": "2026-09-08"}
   ]
 }
+```
+
+`recent_comparable_role` is optional and defaults to `false` -- an existing
+record written before AF-75 still parses without it. Setting it to `true`
+only affects the priority score (see "Priority score (AF-75)" above), and
+only counts toward that score when it is also backed by a dated
+`recent_comparable_role` claim, the same as any other evidenced factor:
+
+```json
+{"claim": "recent_comparable_role", "source": "https://…/careers (senior backend req posted 2026-08-28)", "observed_on": "2026-09-01"}
 ```
 
 `ats_fraud_tooling` is one of `absent`, `available_not_enabled`, `native`, or
@@ -182,14 +229,18 @@ uv run python scripts/target_accounts.py \
 ```
 
 That run reports two qualified (one tier A, one tier B), two needing
-evidence, two disqualified, and exits 1 on the 28-account shortfall.
+evidence, two disqualified, exits 1 on the 28-account shortfall, and prints
+the two qualified accounts' AF-75 priority scores and breakdowns, ranked
+highest first.
 
 ## Current status
 
-The qualification contract and its check are in place. The register itself is
-empty — **0 of 30 accounts qualified**. Populating it is founder research,
-account by account, against the rules above; AF-74 is done when the check
-exits 0 on the real register and the roll-up is attached to the ticket.
+The qualification contract, the priority score, and the check that computes
+both are in place. The register itself is empty — **0 of 30 accounts
+qualified**. Populating it is founder research, account by account, against
+the rules above; AF-74 is done when the check exits 0 on the real register
+and the roll-up is attached to the ticket. AF-75 is done when that same real
+register's ranked output is attached alongside it.
 
 Until then, no account on the list is "warm" and no number in this document
 should be reported as validated evidence.

@@ -24,11 +24,13 @@
     "ats_platform": "greenhouse",
     "ats_fraud_tooling": "available_not_enabled",
     "buyer_title": "recruiting_operations_lead",
+    "recent_comparable_role": true,
     "claims": [
       {"claim": "headcount", "source": "https://example.invalid/harborline/press", "observed_on": "2026-09-01"},
       {"claim": "hiring_volume", "source": "discovery call notes, 2026-09-02", "observed_on": "2026-09-02"},
       {"claim": "ats", "source": "application form footer, checked 2026-09-01", "observed_on": "2026-09-01"},
-      {"claim": "buyer", "source": "https://example.invalid/harborline/team", "observed_on": "2026-09-01"}
+      {"claim": "buyer", "source": "https://example.invalid/harborline/team", "observed_on": "2026-09-01"},
+      {"claim": "recent_comparable_role", "source": "https://example.invalid/harborline/careers (senior backend req posted 2026-08-28, matches the high-volume pattern)", "observed_on": "2026-09-01"}
     ]
   },
   {
